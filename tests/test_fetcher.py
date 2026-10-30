@@ -208,7 +208,7 @@ def test_https_connects_to_the_checked_address_with_the_hostname_for_tls(monkeyp
 
     def fake_create_connection(address: tuple[str, int], timeout: float | None = None) -> Any:
         seen["address"] = address
-        return object()
+        return socket.socket()  # never connected
 
     monkeypatch.setattr("local_assistant.fetcher.socket.create_connection", fake_create_connection)
     conn = _PinnedHTTPSConnection(
@@ -216,6 +216,7 @@ def test_https_connects_to_the_checked_address_with_the_hostname_for_tls(monkeyp
     )
     conn.connect()
     assert seen == {"address": ("93.184.216.34", 443), "sni": "example.org"}
+    conn.close()
 
 
 def test_non_text_charset_falls_back_to_utf8(port: int) -> None:
@@ -237,6 +238,55 @@ def test_a_slow_site_hits_the_total_deadline(port: int) -> None:
     with pytest.raises(FetchError, match="too slow"):
         make(total_timeout=0.5).fetch(f"http://site.test:{port}/drip")
     assert time.monotonic() - started < 2.0
+
+
+@contextlib.contextmanager
+def dripping(prefix: bytes, drip: bytes, seconds: float = 6.0) -> Iterator[int]:
+    """A server that reads the request (or the TLS hello), sends `prefix`, then `drip` every 0.1 s for `seconds`: each
+    socket read gets its byte in time, so only a deadline over the whole request ends the fetch (review I36)."""
+    server = socket.create_server(("127.0.0.1", 0))
+    stop = threading.Event()
+
+    def serve() -> None:
+        with contextlib.suppress(OSError):
+            conn, _ = server.accept()
+            with conn:
+                conn.recv(65_536)
+                conn.sendall(prefix)
+                end = time.monotonic() + seconds
+                while not stop.is_set() and time.monotonic() < end:
+                    conn.sendall(drip)
+                    time.sleep(0.1)
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    try:
+        yield server.getsockname()[1]
+    finally:
+        stop.set()
+        server.close()
+        thread.join(2)
+
+
+@pytest.mark.parametrize(
+    ("scheme", "prefix", "drip"),
+    [
+        ("http", b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nX-Slow: ", b"x"),  # a header, a byte at a time
+        ("http", b"HTTP/1.1 2", b"0"),  # the status line
+        (  # the chunked body's trailer
+            "http",
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nok\r\n0\r\nX-T: ",
+            b"x",
+        ),
+        ("https", b"\x16\x03\x03\x40\x00", b"\x00"),  # the TLS handshake: a 16 KB record, a byte at a time
+    ],
+)
+def test_a_site_that_drips_never_outlasts_the_total_deadline(scheme: str, prefix: bytes, drip: bytes) -> None:
+    with dripping(prefix, drip) as port:
+        started = time.monotonic()
+        with pytest.raises(FetchError, match="too slow"):
+            make(timeout=2, total_timeout=0.5).fetch(f"{scheme}://site.test:{port}/")
+        assert time.monotonic() - started < 1.5
 
 
 def test_system_resolver_asks_for_ipv4_only(monkeypatch: pytest.MonkeyPatch) -> None:

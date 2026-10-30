@@ -282,7 +282,10 @@ def test_each_part_has_its_label_verb_and_fix() -> None:
     assert shared.text == "failing since 11:40: the folder cannot be read"
     assert "scripts/share-documents.sh" in shared.fix and "sudo" not in shared.fix
     built = describe("documents", Record(failed=NOW, reason="helper_missing"), NOW, TZ)
-    assert built.fix == "cd tools/documents && swift build -c release (in her own user a deploy builds it: see doctor)"
+    assert (
+        built.fix
+        == "cd tools/documents && swift build -c release (in her own macOS account a deploy builds it: see doctor)"
+    )
     parts = ("voice", "calendar", "calendar:work", "devices", "web", "places", "spotify", "mail:home", "youtube")
     for part in (*parts, "documents"):
         for reason in get_args(Reason):
@@ -342,7 +345,7 @@ def test_lines_cover_each_enabled_part_in_order() -> None:
         "Calendar",
         "Lights and plugs",
         "Web search",
-        "Places",
+        "OpenStreetMap",  # Google Maps only once Google was asked (with its key)
         "Spotify",
         "YouTube",
         "Documents",
@@ -382,13 +385,33 @@ def test_a_caldav_calendar_has_its_own_reasons_and_fixes() -> None:
     assert refused.fix.startswith("a new app-specific password, then scripts/set-calendar-password.sh family")
     missing = describe("calendar:family", Record(failed=NOW, reason="no_calendar"), NOW, TZ)
     assert missing.text == "failing since 11:40: no calendar by that name"
-    assert "caldav and calendar in config.toml" in missing.fix
+    assert missing.fix.startswith("check caldav and calendar")
     assert describe("calendar", Record(failed=NOW, reason="no_password"), NOW, TZ).fix == (
         "scripts/set-calendar-password.sh"  # the calendar named calendar: its password is CALDAV_PASSWORD
     )
     assert describe("calendar", Record(failed=NOW, reason="password_refused"), NOW, TZ).fix == (
-        "a new app-specific password, then scripts/set-calendar-password.sh (or check user in config.toml)"
+        "a new app-specific password, then scripts/set-calendar-password.sh (or check user in "
+        "~/.config/local-assistant/config.toml; in her own macOS account /var/estia/.config/local-assistant/config.toml, "
+        "opened with /usr/bin/sudo /usr/local/estia/bin/estia config)"
     )  # no name: no double space where it would be
+
+
+def test_a_calendar_fix_names_the_config_where_it_is_before_and_after_the_move() -> None:
+    """Setup docs review, 25 Oct: "check … in config.toml" sent the owner to a file the move into her own macOS account
+    took away from his home. Doctor's fixes, the digest and /status name both places, and how to open hers."""
+    from local_assistant import ownuser
+    from local_assistant.config import DEFAULT_CONFIG_PATH
+
+    yours = "~/" + str(DEFAULT_CONFIG_PATH.relative_to(Path.home()))
+    hers = f"in her own macOS account {ownuser.HOME / ownuser.HER_CONFIG}, opened with {ownuser.ESTIA} config"
+    assert f"{yours}; {hers}" == prompts.CONFIG_WHERE
+    for reason in ("no_calendar", "password_refused"):
+        fix = describe("calendar:family", Record(failed=NOW, reason=reason), NOW, TZ).fix
+        assert prompts.CONFIG_WHERE in fix, reason
+        assert "in config.toml" not in fix, reason
+    assert prompts.CALENDAR_WHY["no_calendar"] == (
+        f"no calendar by that name on the server (check caldav and calendar in {prompts.CONFIG_WHERE})"
+    )
 
 
 def test_a_named_calendar_has_its_label_and_its_own_fixes() -> None:
@@ -462,6 +485,34 @@ def test_the_linked_devices_count_is_kept_with_when_it_was_checked(tmp_path: Pat
     assert part_status.read_security(path).linked_devices == 2
 
 
+def test_signal_clis_connection_is_kept_with_its_restarts_and_the_kind_of_failure(tmp_path: Path) -> None:
+    """Logged out by Signal, signal-cli ends at every start (review S2): since when it is not connected, how often it
+    started again since and the kind of the last failure, from a fixed list; a restart of the bridge keeps them, and
+    the next time it is ready clears them, keeping when."""
+    path = tmp_path / "data" / "status.json"
+    clock = Clock()
+    status = PartStatus(path, clock=clock)
+    status.signal_ready()
+    assert security_file(path) == {"signal_ready": NOW}
+    clock.now += 60
+    status.signal_failed("exited")
+    clock.now += 60
+    PartStatus(path, clock=clock).signal_failed("not registered")  # the bridge started again meanwhile
+    found = part_status.read_security(path)
+    assert (found.signal_ready, found.signal_down, found.signal_restarts, found.signal_failure) == (
+        NOW,
+        NOW + 60,
+        2,
+        "not registered",
+    )
+    status = PartStatus(path, clock=clock)
+    status.signal_failed("whatever signal-cli said")  # never its words: the fixed kind for an unknown one
+    assert part_status.read_security(path).signal_failure == "exited"
+    clock.now += 60
+    status.signal_ready()
+    assert security_file(path) == {"signal_ready": NOW + 180}
+
+
 def test_the_model_pause_is_kept_from_its_first_time_until_it_ends(tmp_path: Path) -> None:
     path = tmp_path / "data" / "status.json"
     clock = Clock()
@@ -516,3 +567,10 @@ def test_a_hue_bridge_problem_names_its_own_fix(reason: str, text: str, fix: str
     line = describe("devices", Record(failed=NOW - 300, reason=reason), NOW, TZ)
     assert line.state == "failing" and line.text.endswith(f": {text}") and fix in line.fix
     assert "TP-Link" not in line.text + line.fix  # the Hue Bridge's pairing is not the TP-Link login
+
+
+def test_google_maps_has_a_line_once_google_was_asked() -> None:
+    cfg = Config(bot_number="+306900000000", allowed_acis=frozenset({ME}), maps_enabled=True)
+    assert [line.label for line in lines(cfg, {}, NOW)] == ["OpenStreetMap", "YouTube"]
+    asked = lines(cfg, {"places": Record(ok=NOW), "osm": Record(ok=NOW)}, NOW)
+    assert [line.label for line in asked] == ["Google Maps", "OpenStreetMap", "YouTube"]

@@ -27,6 +27,7 @@ from zoneinfo import ZoneInfo
 
 from local_assistant import prompts
 from local_assistant.config import DEFAULT_NAME
+from local_assistant.language import guard_pieces
 from local_assistant.store import Reminder, ReminderRepeat, ReminderSource, Store
 
 log = logging.getLogger(__name__)
@@ -76,22 +77,15 @@ _LINKISH = re.compile(r"(?:https?://|www\.)\S+|\b[\w-]+(?:\.[\w-]+)+/\S*", re.IG
 OWN_SHARE = 0.5  # the overlap rule: at least half a reminder's words are the user's
 
 
-def _spaceless(char: str) -> bool:
-    """A character of a script written without spaces (Japanese kana, Chinese and Japanese characters)."""
-    return "\u3040" <= char <= "\u30ff" or "\u3400" <= char <= "\u9fff"
-
-
 def _tokens(text: str) -> list[str]:
-    """Words for the overlap rule: lowercase; a script without spaces counts per character; a word of one or two
-    letters is left out (a, to, je) unless it holds a digit."""
+    """Words for the overlap rule: lowercase; Japanese, Chinese and Korean by `language.guard_pieces` (pairs of
+    characters, a Korean word's forms; second review of 0.9.8, redteam-06: by single characters, "お金を送る" passed on
+    "それを送ってくれる?"); another word of one or two letters is left out (a, to, je) unless it holds a digit."""
     tokens: list[str] = []
     for word in _WORDS.findall(text.casefold()):
-        spaceless = [char for char in word if _spaceless(char)]
-        if spaceless:
-            tokens += spaceless
-            word = "".join(char for char in word if not _spaceless(char))
-        if len(word) >= 3 or any(char.isdigit() for char in word):
-            tokens.append(word)
+        pieces, others = guard_pieces(word)
+        tokens += pieces
+        tokens += [other for other in others if len(other) >= 3 or any(char.isdigit() for char in other)]
     return tokens
 
 
@@ -274,6 +268,8 @@ class Created:
     note: str  # the code-written confirmation for the user (a note: in Gemma's history only as code's, code_notes)
     spoken: str  # the same in a line to say on a call (English)
     result: str  # what Gemma's tool gets
+    # one asked for again (`note` empty: no second confirmation): what /remind answers instead, never an empty reply
+    already: str = ""
 
 
 class Reminders:
@@ -359,6 +355,12 @@ class Reminders:
         if due - now > MAX_AHEAD_S:
             raise ReminderError("too_far")
         wants_call = bool(call)
+        same = self._same(aci, words, meant.strftime(MEANT), wants_call, rhythm)
+        if same is not None:  # asked twice (two identical calls, or again later): kept once, told once (review I26)
+            log.info("reminder %d asked for again: kept once", same.id)
+            when = when_text(self.local(same.due_at), today)
+            result = prompts.REMINDER_ALREADY.format(id=same.id, when=when)
+            return Created(same, "", "", result, already=prompts.REMINDER_ALREADY_NOTE.format(id=same.id, when=when))
         self._check_limits(aci, now, today, meant, wants_call and self.calls)
         rid = self._store.add_reminder(
             aci,
@@ -377,6 +379,22 @@ class Reminders:
         log.info("reminder %d set (%s, %s%s)", rid, source, rhythm, ", call" if wants_call else "")
         self._changed()
         return self._created(reminder, today, shifted=shifted)
+
+    def made_by(self, aci: str, message_id: int) -> list[Created]:
+        """The open reminders an earlier answer to this message set (by Gemma), as their notes again."""
+        today = self.local(self._clock())
+        mine = self._store.open_reminders(aci)
+        return [
+            self._created(r, today, shifted=False)
+            for r in mine
+            if r.source == "chat" and r.source_message_id == message_id
+        ]
+
+    def _same(self, aci: str, words: str, meant: str, call: bool, repeat: ReminderRepeat) -> Reminder | None:
+        """An open reminder of this user with the same words (case and spacing aside), time, call and repeat."""
+        wanted = ("open", words.casefold(), meant, call, repeat)
+        mine = self._store.open_reminders(aci)
+        return next((r for r in mine if (r.status, r.text.casefold(), r.local_time, r.call, r.repeat) == wanted), None)
 
     def _meant_at(self, value: str, today: datetime, earliest: float, repeat: ReminderRepeat) -> datetime:
         clock = _HHMM.match(value)
@@ -561,7 +579,7 @@ class ReminderScheduler:
         self,
         store: Store,
         reminders: Reminders,
-        send: Callable[[int], Awaitable[None]],
+        send: Callable[[int], Awaitable[object]],
         *,
         calls: CallPlacer | None = None,
         in_call: Callable[[], bool] = lambda: False,
@@ -666,7 +684,12 @@ class ReminderScheduler:
         return self._store.message(out_id).status == "sent"
 
     async def _fire_text(self, reminder: Reminder, now: float) -> None:
-        text = prompts.REMINDER_NOTE.format(text=reminder.text) + self._repeat_suffix(reminder)
+        if now - reminder.due_at > ON_TIME_S:  # it waited (the lock, a call): never sent as if on time (review O4)
+            due = _short_when(self._reminders.local(reminder.due_at), self._reminders.local(now))
+            text = prompts.REMINDER_NOTE_LATE.format(when=due, text=reminder.text)
+        else:
+            text = prompts.REMINDER_NOTE.format(text=reminder.text)
+        text += self._repeat_suffix(reminder)
         out_id = self._fence(reminder, text)
         await self._send(out_id)
         if self._sent(out_id):
@@ -696,14 +719,17 @@ class ReminderScheduler:
             retry.next = now + RETRY_S
 
     def _complete(self, reminder: Reminder, outcome: str) -> None:
-        """Done, or open again for the next occurrence of a repeat; a note that never went out is failed."""
+        """Done, or open again for the next occurrence of a repeat; a note that never went out is failed. One cancelled
+        while its note was sent (`reminder` was read before) stays cancelled (review O3)."""
         now = self._clock()
         if reminder.repeat != "none":
             meant, due = next_occurrence(reminder.local_time, reminder.repeat, self._tz, after=now)
-            self._store.reschedule_reminder(reminder.id, meant, due, outcome=outcome, at=iso(now))
+            done = self._store.reschedule_reminder(reminder.id, meant, due, outcome=outcome, at=iso(now))
         else:
             status: Literal["done", "failed"] = "failed" if outcome == "send_failed" else "done"
-            self._store.finish_reminder(reminder.id, status, outcome, at=iso(now))
+            done = self._store.finish_reminder(reminder.id, status, outcome, at=iso(now))
+        if not done:
+            log.info("reminder %d: cancelled while it fired; it stays cancelled", reminder.id)
 
     # call reminders
 
@@ -764,14 +790,18 @@ class ReminderScheduler:
         out_id = self._fence(reminder, self._call_note(reminder, why))
         await self._send(out_id)  # the text first, always (also when the call cannot be placed)
         sent = self._sent(out_id)
-        if not sent:
-            self._store.set_status(out_id, "ignored")
         if why or self._calls is None:
             log.info("reminder %d: no call (%s)", reminder.id, why)
+            if not sent:  # the text is all there is: tried again as a text reminder's, which records what went out
+                log.warning("reminder %d: the note did not go out; trying again in 5 minutes", reminder.id)
+                self._retries[reminder.id] = _Retry(out_id, now, now + RETRY_S)
+                return
             if why not in ("in_call", "late", "locked"):  # still asleep, maybe: one more text unless the user wrote
                 await self._second_text(reminder, out_id)
-            self._finish_call(reminder.id, "sent" if sent else "send_failed")
+            self._finish_call(reminder.id, "sent")
             return
+        if not sent:  # the call follows at once: its "calling you now" would be untrue later, so never sent again
+            self._store.set_status(out_id, "ignored")
         self._count_call(now)
         wake = is_wake(reminder.local_time)
         first_at = _hhmm(self._reminders.local(now))

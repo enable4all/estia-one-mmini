@@ -11,10 +11,11 @@ import time
 from collections.abc import Callable, Collection
 from typing import TYPE_CHECKING
 
-from local_assistant import chords, prompts
+from local_assistant import calls, chords, prompts
 from local_assistant.babble import Session
+from local_assistant.brain import defang_links
 from local_assistant.calendar_tools import GLANCE_NOT_READ, CalendarTools
-from local_assistant.calls import Turn, speakable, voice_ready, whole_sentences
+from local_assistant.calls import Turn, heard, last_asks, speakable, summary_transcript, voice_ready, whole_sentences
 from local_assistant.gemma import GemmaError, ModelPausedError
 from local_assistant.language import ENGLISH, is_yes
 from local_assistant.timefmt import local_hhmm
@@ -25,16 +26,14 @@ if TYPE_CHECKING:
 log = logging.getLogger("local_assistant")  # the app's own logger: its lines keep their name in bridge.log
 
 PRACTICE_DRAIN_S = 120.0  # after a practice call, texts typed during it are answered as practice for at most this
-CALL_MAX_TOKENS = 300  # spoken answers stay short (a few sentences); a cut-off one ends at its last whole sentence
+PRACTICE_CALL_MAX_TOKENS = 300  # a practice call's turn: a few sentences and one question (review of 26 Oct, DLG-02)
 
 # a yes to her offer of the day's rundown on a call: code reads today's calendar and the mail digest itself (live
 # evals, 13 Oct: after "yes please" she called no tool, 7 of 7), as her own tool calls would
 RUNDOWN_READS = (("calendar_agenda", '{"start": "today", "days": 1}'), ("mail_digest", "{}"))
 
 
-def asks(answer: str) -> bool:
-    """Whether her answer asks something (a question mark, also the full-width one)."""
-    return "?" in answer or "？" in answer
+asks = last_asks  # her answer asks something: its last sentence (one asked on its way answers no yes; DLG-05)
 
 
 def rundown_reads(offer: str, said: str, language: str, *, calendar: bool, mail: bool) -> tuple[tuple[str, str], ...]:
@@ -87,6 +86,7 @@ class CallHost:
 
     def __init__(self, app: App, *, glance_wait: float, warm_up_seconds: float, warm_up_glance: float) -> None:
         self.app = app
+        self.max_tokens, self.turn_timeout = calls.call_limits(app.cfg.calls_turn_timeout_seconds)  # by the tier
         # app.py's GLANCE_WAIT_SECONDS, WARM_UP_SECONDS and WARM_UP_GLANCE_SECONDS (what they say is there)
         self.glance_wait = glance_wait
         self.warm_up_seconds = warm_up_seconds
@@ -98,6 +98,11 @@ class CallHost:
         # last call's, which its summary is checked against
         self.chords_in_call: list[tuple[chords.Result, str]] = []
         self.chords_after: list[chords.Result] = []
+        # the latest background send of a call turn's notes (`call_notes`): each waits for the one before, in order
+        self.sending: asyncio.Task[None] | None = None
+        # what a call turn cut off by its time limit or the call's end had already done (Brain.answer's `on_cancel`):
+        # its notes, and those quoting outside text, sent when the call drops the turn (`call_drop_waiting`)
+        self.undone: list[tuple[tuple[str, ...], tuple[str, ...]]] = []
 
     async def calls_forever(self) -> None:
         """The call loop never takes the bridge down (a TaskGroup task that raises would)."""
@@ -129,6 +134,21 @@ class CallHost:
                 calendar = asyncio.create_task(self.calendar_glance(self.app.calendar), name="call-glance")
             self.glance = CallGlance(at, self.mail_glance(), calendar)
 
+    def text_waits(self, aci: str, message_id: int) -> None:
+        """A message from `aci` waits for the call's end (a text, voice note, photo or document, or a command that
+        waits): code's line in that account's chat at once, once a call; none for a practice call's own turns
+        (`CallManager.text_waits` decides, and has her say it on the call for the caller's)."""
+        if not self.app._no_call.is_set() and self.app.calls is not None and self.app.calls.text_waits(aci):
+            self.app._background.add(task := asyncio.create_task(self.text_line(aci, message_id)))
+            task.add_done_callback(self.app._background.discard)
+
+    async def text_line(self, aci: str, message_id: int) -> None:
+        """Code's line for a message that waits for the call's end, in one place (a more specific line may win here for
+        its message): sent, never stored, as the lock's replies (never in her history, never sent again); not once
+        /lock came."""
+        if not self.app.guard.locked and await self.app._deliver(aci, prompts.CALL_TEXT_WAITS, "the call's line"):
+            log.info("message %d waits for the call's end: code's line sent", message_id)
+
     def call_ended(self) -> None:
         self.drop_glance()  # the next call counts again
         if self.app.devices:
@@ -151,7 +171,9 @@ class CallHost:
         yes (code) or Gemma with the same tools as text; device notes and profile notes go out as texts. A turn of a
         practice call (`practice`, the call's own flag: only a call the user made during practice) goes to practice;
         a call she placed for a reminder is an ordinary call, even during practice. `on_retry`: told once when
-        Gemma's first try came back empty, before it is asked again (the call says an acknowledgement)."""
+        Gemma's first try came back empty, before it is asked again (the call says an acknowledgement). The lookup
+        guard's window counts from here, the waits below included (review of 0.9.7, C12)."""
+        started = self.app.brain.now()
         self.app.profiler.note_activity()
         await self.app._worker_idle.wait()  # a text that was being answered when the call came in finishes first
         session = self.app.babble.running(aci) if practice else None
@@ -166,7 +188,8 @@ class CallHost:
             confirmed = await self.app.devices.confirm(said, aci)
             if confirmed is not None:
                 await self.call_notes(aci, conversation_id, said_id, [confirmed])
-                return Turn("", code_text=speakable(confirmed))  # code's words (English)
+                line = speakable(confirmed)  # code's words (English), texted too
+                return Turn("", code_text=line, also_texted=(line,))
         message = self.app.store.message(said_id)
         conversation = self.app.context.enforce_limit(self.app.store.conversation(conversation_id))
         glance = await self.glance_now()
@@ -175,22 +198,27 @@ class CallHost:
             reply = await self.app.brain.answer(
                 conversation,
                 message,
-                max_tokens=CALL_MAX_TOKENS,
+                max_tokens=self.max_tokens,
                 on_tools=on_tools,
                 glance=glance,
                 reads=reads,
                 on_retry=on_retry,
                 chords_before=[result for result, _ in self.chords_in_call],
+                on_cancel=self.left_undone,
+                started=started,
+                turn_limit=self.turn_timeout,  # the lookup guard's window: a third of it
             )
         except GemmaError as exc:
             log.error("call turn: Gemma failed: %s", exc)
-            await self.call_drop_waiting(aci)  # the user never heard a question; a device that switched is reported
+            await self.call_drop_waiting(aci, exc.notes, exc.outside)  # a device that switched, a reminder set: told
             if isinstance(exc, ModelPausedError):
                 return Turn("", code_text=self.app._paused_spoken())
-            return Turn(prompts.call_lines(self.app.language, name=self.app.cfg.name).lost)
+            return Turn(prompts.call_lines(self.app.language, name=self.app.cfg.name).lost, failed=True)
         # cut off at the token limit: never stop mid-sentence. Code's line why no reminder was set (her words about it
-        # are left out of the reply) is said in English after hers and any question, and kept
-        said_text = whole_sentences(reply.hers)
+        # are left out of the reply) is said in English after hers, before any question, and kept
+        said_text = whole_sentences(reply.hers, cut=reply.cut)
+        if not glance:  # her closing question after a full answer goes; with the glance her offer of the rundown stays
+            said_text = calls.without_closing_questions(said_text, name=self.app.cfg.name, language=self.app.language)
         code_line = speakable(reply.not_set_spoken) if reply.not_set else ""
         asks_yes = bool(self.app.devices and self.app.devices.pending)
         question = ""
@@ -198,24 +226,41 @@ class CallHost:
             asks_yes and self.app.devices is not None
         ):  # the caller hears exactly what a yes will do (the note is a text)
             question = speakable(self.app.devices.question())
-            if (
-                self.app.language != ENGLISH
-            ):  # Gemma may claim it is done already: only code's question is said and kept
+            # Gemma in another language may claim it is done already: only code's question, said and kept; her words
+            # that are code's question (brain's line for an answer with no words of hers) are said once, last
+            if self.app.language != ENGLISH or reply.hers == self.app.devices.question():
                 said_text = ""
-        kept = " ".join(part for part in (said_text, question, code_line) if part)
+        kept = " ".join(part for part in (said_text, code_line, question) if part)  # as said: the question last
         if glance and state is not None and state is self.glance:
-            state.note(said_text)  # her offer of the rundown: a yes to it next turn reads the day
+            state.note(heard(said_text))  # her offer of the rundown, as said: a yes to it next turn reads the day
         reply_id = self.app.store.add_call_reply(conversation_id, aci, kept, said_id)
         device_note = self.app.devices.take_note() if self.app.devices else ""
         # [chords]: the chords note is not sent during the call: said now, texted in one message after it
         self.chords_in_call += [(result, reply.sources) for result in reply.chords_results]
-        notes = [note for note in (reply.sources, device_note, reply.notice, reply.reminder, reply.device) if note]
+        guards = (reply.reminder, reply.device, reply.lookup)  # code's true lines (lookup: a promise that never ran)
+        notes = [note for note in (reply.sources, device_note, reply.notice, *guards) if note]
         outside = {reply.sources} | ({reply.notice} if reply.read_outside else set())  # quoting outside text
         await self.call_notes(aci, conversation_id, said_id, notes, outside=outside)
-        log.info("call turn %d answered: %d tool calls", said_id, reply.tool_calls)
-        spoken = (reply.chords_spoken, reply.device_spoken, question, code_line, reply.reminder_spoken)
+        log.info("call turn %d answered: %d tool calls; model: %s", said_id, reply.tool_calls, reply.timing.line())
+        # the device question last: only her last sentence is said whole, so a yes right after it lands on it
+        spoken = (reply.lookup, reply.chords_spoken, reply.device_spoken, code_line, reply.reminder_spoken, question)
         code_text = " ".join(line for line in spoken if line)  # English
-        return Turn(said_text, reply_id=reply_id, asks_yes=asks_yes, end_call=reply.end_call, code_text=code_text)
+        kept_code = tuple(line for line in (code_line, question) if line)  # kept in her reply, as `kept`
+        # texted on their own too: never in the rest of an answer her voice stopped for. The chords line only when every
+        # result it tells moved: the message after the call holds only those (review of 28 Oct, pipeline-02)
+        told = chords.told(reply.chords_results)
+        chords_texted = reply.chords_spoken if told and all(result.moved for result in told) else ""
+        texted = (reply.lookup, chords_texted, reply.device_spoken, reply.reminder_spoken)
+        return Turn(
+            said_text,
+            reply_id=reply_id,
+            asks_yes=asks_yes,
+            end_call=reply.end_call,
+            code_text=code_text,
+            kept_code=kept_code,
+            also_texted=tuple(line for line in texted if line),
+            outside=reply.read_outside,
+        )
 
     async def call_warm_up(self, aci: str, *, practice: bool = False) -> None:
         """The model's warm-up for a call that starts (CallManager: while it rings, or once a call she placed is
@@ -320,7 +365,7 @@ class CallHost:
             reply = await self.app.brain.answer(
                 conversation,
                 message,
-                max_tokens=CALL_MAX_TOKENS,
+                max_tokens=PRACTICE_CALL_MAX_TOKENS,
                 practice=self.app.babble.turn(spoken=True),
                 on_retry=on_retry,
             )
@@ -328,13 +373,16 @@ class CallHost:
             log.error("practice call turn: Gemma failed: %s", exc)
             if isinstance(exc, ModelPausedError):  # as on an ordinary call: code's line (English), never the model's
                 return Turn("", code_text=self.app._paused_spoken())
-            return Turn(prompts.call_lines(practice.code, name=self.app.cfg.name).lost)
-        said_text = whole_sentences(reply.text)
+            return Turn(prompts.call_lines(practice.code, name=self.app.cfg.name).lost, failed=True)
+        said_text = whole_sentences(reply.text, cut=reply.cut)
         reply_id = self.app.store.add_call_reply(conversation_id, aci, said_text, said_id)
         if reply.reminder:
             await self.call_notes(aci, conversation_id, said_id, [reply.reminder])
-        log.info("practice call turn %d answered", said_id)
-        return Turn(said_text, reply_id=reply_id, end_call=reply.end_call, code_text=reply.reminder_spoken)
+        log.info("practice call turn %d answered; model: %s", said_id, reply.timing.line())
+        texted = (reply.reminder_spoken,) if reply.reminder and reply.reminder_spoken else ()  # its note: a text too
+        return Turn(
+            said_text, reply_id=reply_id, end_call=reply.end_call, code_text=reply.reminder_spoken, also_texted=texted
+        )
 
     async def practice_call_ended(self, aci: str) -> None:
         """A practice call the user spoke in ended: practice ends and its recap goes out at once (no quiet-hours wait),
@@ -350,15 +398,31 @@ class CallHost:
         if ended is not None:
             await self.app.babble.finish(ended)
 
-    async def call_drop_waiting(self, aci: str) -> None:
-        """Drop a device action waiting for a yes; what did switch in the meantime is still a note (as in text)."""
-        if self.app.devices is None:
-            return
-        self.app.devices.cancel()
-        note = self.app.devices.take_note()
-        if note:
-            conversation_id = self.app.store.current_conversation().id
-            await self.call_notes(aci, conversation_id, None, [note])
+    def left_undone(self, done: tuple[str, ...], outside: tuple[str, ...]) -> None:
+        """A call turn was cut off (Brain.answer's `on_cancel`): what it had done waits for `call_drop_waiting`."""
+        self.undone.append((done, outside))
+
+    async def call_drop_waiting(self, aci: str, done: Collection[str] = (), outside: Collection[str] = ()) -> None:
+        """Drop a device action waiting for a yes; what did switch in the meantime is still a note (as in text), and so
+        is what else a turn did before Gemma failed (`done`, GemmaError.notes; `outside`: those quoting outside text)
+        or before it was cut off (`left_undone`; review of 0.9.7, C5)."""
+        if self.app.devices is not None:
+            self.app.devices.cancel()
+        undone, self.undone = self.undone, []
+        done = [*done, *(note for notes, _ in undone for note in notes)]
+        outside = {*outside, *(note for _, quoted in undone for note in quoted)}
+        notes = [note for note in (self.app.devices.take_note() if self.app.devices else "", *done) if note]
+        if notes:
+            await self.call_notes(aci, self.app.store.current_conversation().id, None, notes, outside=outside)
+
+    async def call_standby(self, aci: str) -> None:
+        """Standby starts: her offer of the rundown and a device action waiting for a yes are dropped (her wake line,
+        "Yes?", invites a yes that must read and switch nothing); a dropped device action gets code's note why."""
+        if self.glance is not None:
+            self.glance.take_offer()
+        if self.app.devices is not None:
+            self.app.devices.standby()
+        await self.call_drop_waiting(aci)
 
     def call_interrupted(self, reply_id: int, heard: str) -> None:
         """The user talked over the answer: history keeps what they heard of it."""
@@ -369,8 +433,23 @@ class CallHost:
         return self.app._call_voice is not None and voice_ready(await self.app._call_voice.health())
 
     async def call_note(self, aci: str, text: str, *, outside: bool = False) -> None:
+        """One note about a call (the call is over, or never began), sent after the call's turn notes still on their
+        way, in order."""
         conversation_id = self.app.store.current_conversation().id
-        await self.app._send(self.app.store.add_outgoing(conversation_id, aci, "note", text, None, outside=outside))
+        out_id = self.app.store.add_outgoing(conversation_id, aci, "note", text, None, outside=outside)
+        if self.sending is not None:
+            await asyncio.wait({self.sending})  # never raises, also when it was cancelled
+        await self.app._send(out_id)
+
+    async def call_text(self, aci: str, text: str, *, reply_id: int | None, outside: bool) -> None:
+        """Code's text to the caller during the call (the rest of an answer her voice stopped for: Kokoro's one line a
+        turn, calls.py): code's note in the conversation of her reply `reply_id` (the current one for None), after the
+        turn's own notes, sent in the background; in her history as code's note (rule 6), `outside` when it quotes
+        outside text."""
+        reply = self.app.store.message(reply_id) if reply_id is not None else None
+        conversation_id = reply.conversation_id if reply is not None else self.app.store.current_conversation().id
+        said_id = reply.reply_to_id if reply is not None else None  # the caller's turn it answers
+        await self.call_notes(aci, conversation_id, said_id, [text], outside={text} if outside else ())
 
     async def call_chords(self, aci: str) -> None:
         """[chords]: after the call, one message from code: every chords result of the call in call order, its fixed
@@ -396,9 +475,9 @@ class CallHost:
 
     async def call_summary(self, aci: str, lines: list[str], minutes: int) -> None:
         """A short summary of the call as a note (in her history as code's note quoting outside text: Gemma wrote it,
-        and the call may have read some). After a call with a chords result, a
-        summary sentence with another chord is left out: code's message holds the exact ones."""
-        transcript = "\n".join(lines)[-12_000:]
+        and the call may have read some), its links defanged unless the caller said them (review I33). After a call
+        with a chords result, a summary sentence with another chord is left out: code's message holds the exact ones."""
+        transcript = summary_transcript(lines)
         messages = [
             {"role": "system", "content": prompts.CALL_SUMMARY_RULES.format(name=self.app.cfg.name)},
             {"role": "user", "content": transcript},
@@ -408,7 +487,7 @@ class CallHost:
         except GemmaError as exc:
             log.warning("call summary: Gemma failed: %s", exc)
             return
-        summary = completion.content.strip()
+        summary = defang_links(completion.content.strip(), "\n".join(n for n in lines if n.startswith("User: ")))
         if summary and self.chords_after:
             checked = chords.check(summary, results=self.chords_after, sources=[], language=self.app.language)
             if checked.left_out:
@@ -420,7 +499,27 @@ class CallHost:
     async def call_notes(
         self, aci: str, conversation_id: int, reply_to: int | None, notes: list[str], *, outside: Collection[str] = ()
     ) -> None:
-        """Code's notes after a call turn; `outside`: the ones that quote outside text (code_notes)."""
-        for note in notes:
-            out_id = self.app.store.add_outgoing(conversation_id, aci, "note", note, reply_to, outside=note in outside)
-            await self.app._send(out_id)
+        """Code's notes after a call turn, stored in order at once and sent in order in the background (review of
+        0.9.7, C4: sent one at a time before the turn returned, with Signal's retries and rate-limit waits, every such
+        answer waited for them before her first word); one that cannot go out now is sent again by the resend pass.
+        `outside`: the ones that quote outside text (code_notes)."""
+        add = self.app.store.add_outgoing
+        if ids := [add(conversation_id, aci, "note", note, reply_to, outside=note in outside) for note in notes]:
+            self.send_later(ids)
+
+    def send_later(self, ids: list[int]) -> None:
+        """Send these stored notes in the background, in order, after the ones before them."""
+        before = self.sending
+
+        async def send() -> None:
+            if before is not None:
+                await asyncio.wait({before})  # in order; never raises, also when it was cancelled
+            for out_id in ids:
+                try:
+                    await self.app._send(out_id)
+                except Exception:  # stored: the resend pass tries again
+                    log.exception("calls: a note of a call turn could not be sent")
+
+        self.sending = task = asyncio.create_task(send(), name="call-notes")
+        self.app._background.add(task)
+        task.add_done_callback(self.app._background.discard)

@@ -70,15 +70,32 @@ public enum NumberNormalizer {
     /// Clock times in words, as people say them (owner, 16 Oct: "13:00" was read "one three zero zero"; "the 'am',
     /// 'pm'": "7pm" was "sevenpm"): the hour on the 12-hour clock with its part of the day, noon and midnight by name;
     /// an hour alone only with am/pm; a range ("14:00–15:00", "3-5pm") names a part they share once ("two to three in
-    /// the afternoon").
-    public static func timesOfDay(_ text: String) -> String {
-        let ranges = timeRange.replace(text) { g in
-            guard let (start, end) = range(g) else { return g[0] }
+    /// the afternoon"). A time before noon without am/pm says "in the morning" only when nothing before it (`before`:
+    /// what she said before this text, then this text up to the time) or in the rest of its sentence says evening or
+    /// night (the Pocket TTS spike, 24 Oct: "Shall I remind you at 7:30?" after "closes at 8 tonight" was "seven
+    /// thirty in the morning"); else the time alone. An hour with its leading zero ("07:00", the 24-hour clock) always
+    /// keeps its morning.
+    public static func timesOfDay(_ text: String, before: String = "") -> String {
+        let ranges = timeRange.rewrite(text) { m in
+            guard let (start, end) = range(m.groups, morning: morning(m, before: before)) else { return nil }
             let first = start.part != nil && start.part == end.part ? start.words : start.spoken
             return first + " to " + end.spoken
         }
-        let clocks = clockTime.replace(ranges) { g in time(g[1], g[2], g[3]).spoken }
+        let clocks = clockTime.rewrite(ranges) { m in time(m[1], m[2], m[3], morning: morning(m, before: before)).spoken }
         return hourAlone.replace(clocks) { g in time(g[1], "00", g[2]).spoken }
+    }
+
+    /// Evening or night said in words, or pm after a number ("8pm", "8 p.m."); never "midnight" or "nightly".
+    private static let eveningOrNight = Pattern(#"(?i)\b(?:tonight|tonite|evenings?|nights?|overnight)\b|[0-9]\s?[pP]\.?[mM]\b"#)
+    /// The rest of a sentence: up to its end (a full stop, a question or exclamation mark before a space, or the end).
+    private static let sentenceRest = Pattern(#"^.*?(?:[.!?](?=\s|$)|$)"#)
+
+    /// Whether a time matched at `m` may say "in the morning": nothing said before it, before it in its text or in the
+    /// rest of its sentence says evening or night.
+    private static func morning(_ m: Pattern.Match, before: String) -> Bool {
+        var rest = ""
+        _ = sentenceRest.rewrite(m.after) { found in rest = found[0]; return nil }
+        return !eveningOrNight.matches(before + " " + m.before + " " + rest)
     }
 
     private static let timeRange = Pattern(rangeEnd + #"(?:\s*[-–—]\s*|\s+to\s+)"# + rangeEnd)
@@ -88,7 +105,7 @@ public enum NumberNormalizer {
     /// A range's two times, or nil when it is no time range ("1-2 days": an hour alone needs am/pm). The first hour
     /// without am/pm takes the second's ("3-5pm"), or the other half of the day when it is later ("11-1pm" is eleven
     /// in the morning).
-    private static func range(_ g: [String]) -> (Spoken, Spoken)? {
+    private static func range(_ g: [String], morning: Bool) -> (Spoken, Spoken)? {
         let (startHour, startMinutes, endHour, endMinutes) = (Int(g[1]) ?? 0, g[2], Int(g[4]) ?? 0, g[5])
         var startMeridiem = g[3]
         let endMeridiem = g[6]
@@ -97,21 +114,26 @@ public enum NumberNormalizer {
             startMeridiem = sameHalf ? endMeridiem : (endMeridiem.lowercased() == "p" ? "a" : "p")
         }
         if (startMinutes.isEmpty && startMeridiem.isEmpty) || (endMinutes.isEmpty && endMeridiem.isEmpty) { return nil }
-        return (time(g[1], startMinutes.isEmpty ? "00" : startMinutes, startMeridiem),
-                time(g[4], endMinutes.isEmpty ? "00" : endMinutes, endMeridiem))
+        return (time(g[1], startMinutes.isEmpty ? "00" : startMinutes, startMeridiem, morning: morning),
+                time(g[4], endMinutes.isEmpty ? "00" : endMinutes, endMeridiem, morning: morning))
     }
 
     private typealias Spoken = (words: String, part: String?, spoken: String)
 
     /// A time's words and its part of the day (none for noon and midnight). With am/pm the hour is read on the
-    /// 12-hour clock (1 to 12; another hour keeps its 24-hour reading).
-    private static func time(_ hour: String, _ minutes: String, _ meridiem: String) -> Spoken {
+    /// 12-hour clock (1 to 12; another hour keeps its 24-hour reading). `morning` false: a morning hour without am/pm
+    /// has no part (evening or night was said around it), unless it is written with its leading zero ("07:00"): that
+    /// is the 24-hour clock, as code writes its own lines (a reminder's "07:00" after "tonight" stays the morning: its
+    /// spoken cue that the half of the day may be wrong; the review of 24 Oct).
+    private static func time(_ hour: String, _ minutes: String, _ meridiem: String, morning: Bool = true) -> Spoken {
         var h = Int(hour) ?? 0
         let m = Int(minutes) ?? 0
         if !meridiem.isEmpty, (1...12).contains(h) { h = h % 12 + (meridiem.lowercased() == "p" ? 12 : 0) }
         if m == 0, h == 0 || h == 12 { let name = h == 0 ? "midnight" : "noon"; return (name, nil, name) }
         let words = ones[h % 12 == 0 ? 12 : h % 12] + (m == 0 ? "" : m < 10 ? " oh " + ones[m] : " " + cardinal(m))
         let part = h < 5 ? "at night" : h < 12 ? "in the morning" : h < 18 ? "in the afternoon" : h < 22 ? "in the evening" : "at night"
+        let twentyFour = hour.count == 2 && hour.first == "0"
+        if part == "in the morning", meridiem.isEmpty, !morning, !twentyFour { return (words, nil, words) }
         return (words, part, words + " " + part)
     }
 

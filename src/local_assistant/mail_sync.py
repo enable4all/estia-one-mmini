@@ -9,6 +9,7 @@ period is pruned. An expired sign-in pauses that mailbox with one note until the
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import time
 from collections.abc import Awaitable, Callable
@@ -25,6 +26,16 @@ from local_assistant.store import MailFields, MailFolder, Store
 from local_assistant.timefmt import local_hhmm
 
 log = logging.getLogger(__name__)
+
+# a mailbox whose "needs a new sign-in" note was sent: a fingerprint of the sign-in it was about (never the token), so
+# a restart sends no second note, and a new sign-in that fails too gets one (review O7); cleared once a sync works
+SIGN_IN_NOTED_KEY = "mail:sign_in_noted:{name}"
+
+
+def sign_in_print(token: str | None) -> str:
+    """A short fingerprint of a refresh token: tells one sign-in from the next, says nothing of the token."""
+    return hashlib.sha256(token.encode()).hexdigest()[:16] if token else "none"
+
 
 SELECT = (
     "id,conversationId,internetMessageId,from,toRecipients,ccRecipients,subject,receivedDateTime,sentDateTime,"
@@ -143,14 +154,20 @@ class MailSync:
             self._last_ok[account.name] = self._clock()
             self._errors.pop(account.name, None)
             self._status.ok(mail_part(account.name))
+            if self._store.get_state(SIGN_IN_NOTED_KEY.format(name=account.name)) is not None:
+                self._store.delete_state(SIGN_IN_NOTED_KEY.format(name=account.name))  # works: a next expiry is new
             if changes:
                 log.info("mail: %s synced, %d changes", account.name, changes)
         except SignInExpired:
-            self._paused[account.name] = self._tokens.refresh_token(account.address)
+            token = self._tokens.refresh_token(account.address)
+            self._paused[account.name] = token
             self._errors.pop(account.name, None)
             self._status.failed(mail_part(account.name), "sign_in")
             log.warning("mail: %s needs a new sign-in; paused", account.name)
-            await self._notify(prompts.MAIL_SIGN_IN.format(name=account.name, address=account.address))
+            key, fingerprint = SIGN_IN_NOTED_KEY.format(name=account.name), sign_in_print(token)
+            if self._store.get_state(key) != fingerprint:  # told once per sign-in, also across restarts
+                await self._notify(prompts.MAIL_SIGN_IN.format(name=account.name, address=account.address))
+                self._store.set_state(key, fingerprint)
         except DeltaExpired:
             self._store.clear_mail_sync(account.name)
             log.warning("mail: %s delta link expired; the next round syncs afresh", account.name)

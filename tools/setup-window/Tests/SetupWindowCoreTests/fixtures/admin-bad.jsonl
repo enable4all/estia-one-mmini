@@ -1,0 +1,10 @@
+{"why": "an admin line without its id", "line": "{\"t\": \"admin_line\", \"line\": \"x\"}"}
+{"why": "an admin line with a NUL", "line": "{\"t\": \"admin_line\", \"id\": \"a1\", \"line\": \"a\\u0000b\"}"}
+{"why": "an admin line that is a list", "line": "{\"t\": \"admin_line\", \"id\": \"a1\", \"line\": [\"x\"]}"}
+{"why": "an admin result's code below 0", "line": "{\"t\": \"admin_done\", \"id\": \"a1\", \"code\": -1, \"refused\": false}"}
+{"why": "an admin result's code over 255", "line": "{\"t\": \"admin_done\", \"id\": \"a1\", \"code\": 256, \"refused\": false}"}
+{"why": "an admin result's code as text", "line": "{\"t\": \"admin_done\", \"id\": \"a1\", \"code\": \"0\", \"refused\": false}"}
+{"why": "an admin result without refused", "line": "{\"t\": \"admin_done\", \"id\": \"a1\", \"code\": 0}"}
+{"why": "an admin result with an id in capitals", "line": "{\"t\": \"admin_done\", \"id\": \"A1\", \"code\": 0, \"refused\": false}"}
+{"why": "a page's answer among the admin messages", "line": "{\"t\": \"answer\", \"id\": \"name\", \"value\": \"Maya\"}"}
+{"why": "an admin result whose unrun is text", "line": "{\"t\": \"admin_done\", \"id\": \"a1\", \"code\": 127, \"refused\": false, \"unrun\": \"yes\"}"}

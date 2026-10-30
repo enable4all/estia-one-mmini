@@ -65,6 +65,10 @@ ALLOWED = {
     ("ownuser.py", "/Library/LaunchDaemons"): "DAEMONS: read under the root (host.path, root /)",
     ("ownuser.py", "/var/log/estia"): "STREAM_LOGS: made and read under the root (host.path)",
     ("ownuser.py", "/etc/newsyslog.d/local-assistant.conf"): "NEWSYSLOG: looked at and removed through host.path()",
+    (
+        "prompts/setup_extras.py",
+        "/usr/local/estia/bin/estia check (log: /usr/bin/sudo /usr/local/estia/bin/estia logs voice)",
+    ): "SETUP_VOICE_STILL_LOADING: commands printed for the person to type, nothing read or run",
 }
 
 
@@ -96,3 +100,18 @@ def test_the_live_path_check_sees_a_path_and_lets_host_path_through() -> None:
     ]
     found = [path for line in lines if not UNDER_ROOT.search(line) for path in LIVE_PATH.findall(line)]
     assert found == ["/opt/homebrew/bin/thing"]
+
+
+def test_her_own_ollamas_paths_are_ownusers_and_read_under_the_root() -> None:
+    """Her own Ollama (0.9.8) adds no system path of its own: root's copy, her model folder and her log are built from
+    ownuser's constants (allowed above), and the Ollama step reads each under the root (_system), so the check above
+    lists nothing new for ollama_build and no test reaches the Mac's own /usr/local/estia/ollama or /var/estia."""
+    from local_assistant import ollama_build, ownuser
+
+    assert ollama_build.HER_FOLDER == ownuser.CODE / "ollama"
+    assert ollama_build.HER_PROGRAM == ownuser.CODE / "ollama" / "current" / "ollama"
+    assert ollama_build.HER_MODELS == ownuser.HOME / ".ollama" / "models"
+    assert ollama_build.LOG.parent == ownuser.STREAM_LOGS
+    assert not ollama_build.HER_CACHE.is_absolute()  # under your home, never a system path
+    ollama = {path for module, path in live_paths() if module == "ollama_build.py"}
+    assert ollama == {path for module, path in ALLOWED if module == "ollama_build.py"}

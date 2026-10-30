@@ -11,6 +11,7 @@ import pytest
 
 from local_assistant import prompts
 from local_assistant.fetcher import Fetcher, Page
+from local_assistant.profile import Op, Profile
 from local_assistant.store import Store
 from tests.conftest import ME as ME_APP
 from tests.conftest import TZ as TZ_APP
@@ -61,6 +62,43 @@ async def test_a_profile_change_reaches_her_next_request_as_codes_note(
         await stop(harness)
 
 
+async def test_the_quiet_time_note_and_profile_new_reach_her_next_request_as_codes_notes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """0.9.8: the note naming what learning noted, and /profile new's answer, are code's notes in her history, in the
+    words the user saw (rule 6), never her words; neither quotes outside text (learning reads only the user's words)."""
+
+    def prepare(store: Store) -> None:
+        profile = Profile(store)
+        profile.record_quiet(profile.apply([Op("add", text="Work: The user is a nurse.")], source_kind="chat"))
+
+    gemma = FakeGemma(text("Hi."), text("Sure."))
+    harness = await start(tmp_path, monkeypatch, gemma, prepare=prepare)
+    try:
+        deliver(harness.folder, "hello", T0)
+        await until(lambda: len(sent(harness.folder)) == 2)
+        deliver(harness.folder, "/profile new", T0 + 1)
+        await until(lambda: len(sent(harness.folder)) == 3)
+        deliver(harness.folder, "and now?", T0 + 2)
+        await until(lambda: len(sent(harness.folder)) == 4)
+        request = gemma.calls[-1]
+        [(told, note), (answered, listing)] = [note.split("\n", 1) for note in code_notes_in(request)]
+        assert note == f"Noted while we were quiet\nAdded #1: Work: The user is a nurse.\n{prompts.QUIET_CLOSING}"
+        assert "(its answer to /profile new)" in answered and "OUTSIDE TEXT" not in told + answered
+        assert (
+            listing
+            == f"Noted in the last quiet time\nAdded #1: Work: The user is a nurse.\n{prompts.PROFILE_NEW_FOOTER}"
+        )
+        assert "Noted while we were quiet" not in her_words(request)
+        assert "Noted in the last quiet time" not in her_words(request)
+        assert marks(harness.app.store) == [
+            ("**Noted while we were quiet**", "note"),
+            ("**Noted in the last quiet time**", "note"),
+        ]
+    finally:
+        await stop(harness)
+
+
 async def test_the_web_answers_sources_note_is_outside_text_in_her_history(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -81,6 +119,47 @@ async def test_the_web_answers_sources_note_is_outside_text_in_her_history(
         assert "OUTSIDE TEXT" in note.split("\n")[0] and note.endswith("Sources\n• nos.nl: https://nos.nl/1")
         assert "nos.nl/1" not in her_words(gemma.calls[-1])
         assert sent(harness.folder)[-1] == "Log in at nos[.]nl/1 for more."  # her copy of a note's link: defanged
+    finally:
+        await stop(harness)
+
+
+async def test_after_google_failed_codes_line_comes_after_her_answer_and_into_her_history(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Owner, 26 Oct: Google Maps set up but failing, OpenStreetMap answers: the user gets code's line in the Sources
+    note right after her answer, and her next request holds it as code's note (rule 6), never as her words."""
+    from local_assistant.maps import Place
+    from tests.fakes.fake_maps import FakeMaps
+
+    cafe = Place(
+        "Cafe Uno",
+        "5, Example Street, Town",
+        None,
+        None,
+        "",
+        True,
+        "",
+        "https://cafe-uno.example/",
+        source="OpenStreetMap",
+        instead="Google Maps did not answer",
+    )
+    gemma = FakeGemma(tool("places_search", what="cafe"), text("Cafe Uno on Example Street is open."), text("Sure."))
+    harness = await start(
+        tmp_path, monkeypatch, gemma, maps_enabled=True, maps_home="Home Street", web_keys_path=tmp_path / "web.env"
+    )
+    try:
+        harness.app.tools._maps = FakeMaps({"cafe": [cafe]})
+        deliver(harness.folder, "a cafe nearby?", T0)
+        await until(lambda: len(sent(harness.folder)) == 2)
+        answer, sources = sent(harness.folder)
+        assert answer == "Cafe Uno on Example Street is open."
+        assert sources.split("\n")[1] == "Google Maps did not answer; this is from OpenStreetMap."
+        deliver(harness.folder, "thanks", T0 + 1)
+        await until(lambda: len(sent(harness.folder)) == 3)
+        [note] = code_notes_in(gemma.calls[-1])
+        assert "OUTSIDE TEXT" in note.split("\n")[0]
+        assert "\nGoogle Maps did not answer; this is from OpenStreetMap.\n" in note
+        assert "this is from OpenStreetMap" not in her_words(gemma.calls[-1])
     finally:
         await stop(harness)
 

@@ -112,6 +112,26 @@ def test_a_part_with_levels_names_them_and_the_current_one(settings: dict[str, A
     assert any(words in line for line in lines), lines
 
 
+def test_with_wake_up_calls_the_calls_line_says_she_calls_too() -> None:
+    """26 Oct: with [chords] on, "can you call me?" got "I can't call you myself, but you can call me on Signal" 4 and
+    3 of 10 on main: the calls line named only the user's call ("Example: call me on Signal"), though she places
+    wake-up and reminder calls. Without wake-up calls a "call me" reminder is a text: the line as before."""
+    hers = prompts.capabilities(calls="only speech", reminders=True, wake_calls=True)
+    assert (
+        "• Calls: a spoken conversation on Signal: you call me, or I call you at a time you set (wake-up calls and "
+        "reminders). Interrupt: only speech or any sound (now: only speech). Example: call me on Signal and just talk"
+    ) in hers
+    for only_yours in (
+        prompts.capabilities(calls="only speech", reminders=True),
+        prompts.capabilities(calls="only speech"),
+    ):
+        calls = next(line for line in only_yours if line.startswith("• Calls: "))
+        assert calls == (
+            "• Calls: a spoken conversation on Signal. Interrupt: only speech or any sound (now: only speech). "
+            "Example: call me on Signal and just talk"
+        )
+
+
 def test_wake_up_calls_and_the_digest_follow_what_is_set_up() -> None:
     only_texts = prompts.capabilities(reminders=True)
     assert any(line.startswith("• Reminders: ") for line in only_texts)
@@ -135,8 +155,8 @@ def test_documents_say_what_they_answer_from_where_a_sent_pdf_goes_and_the_folde
     lines = prompts.capabilities(host="the Mini", documents="~/Estia-KB")
     line = next(line for line in lines if line.startswith("• Documents: "))
     assert line == (
-        "• Documents: answers from your PDFs that name the document and the page; PDFs sent on Signal are saved on the "
-        "Mini, and /docs lists them. On or off (now: on, folder ~/Estia-KB). "
+        "• Documents: answers from your PDFs and text files that name the document and the page; those sent on Signal "
+        "are saved on the Mini, and /docs lists them. On or off (now: on, folder ~/Estia-KB). "
         'Example: "what does the boiler manual say about the pressure?"'
     )
 
@@ -287,3 +307,14 @@ def test_the_lights_line_names_each_brand_once_as_the_calendar_line_its_services
     named = [line.split(", ", 1)[0] for line in lines if line.startswith(("• Calendar: ", "• Lights and plugs: "))]
     assert named == ["• Calendar: Google and iCloud", "• Lights and plugs: TP-Link"]
     assert not any("Kasa" in line or "Tapo" in line for line in both + lines)  # the maker, never one product line
+
+
+def test_the_places_line_names_the_map_she_has() -> None:
+    google = prompts.capabilities(maps=True)
+    free = prompts.capabilities(maps=True, maps_service="OpenStreetMap")
+    assert any(line.startswith("• Places and routes: Google Maps places,") for line in google)  # as before
+    assert any(
+        line
+        == '• Places and routes: OpenStreetMap places, travel times and directions. Example: "a good cafe near me?"'
+        for line in free
+    )

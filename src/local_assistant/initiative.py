@@ -173,8 +173,9 @@ _SOUTH: tuple[str, ...] = (  # zones in the southern hemisphere: the seasons tur
 
 _SCHEME = re.compile(r"(?:https?://|www\.)\S+", re.IGNORECASE)
 # a name with a dot on any ending of two letters or more ("evil.ch/x", "пример.рф", "xn--…"): no list of endings;
-# "_" may sit on either side (markdown) and dots before it ("Wait...evil.ch"), only not a dot right after a letter
-_HOST = re.compile(r"(?<![^\W_])(?<![@-])(?<![^\W_]\.)((?:[^\W_][\w-]*\.)+(?:[^\W\d_]{2,}|xn--[\w-]+))(?![^\W_]|-)(/?)")
+# "_" may sit on either side (markdown), dots before it ("Wait...evil.ch") and a hyphen ("-evil.com", review G10: Signal
+# may still link it; "my-evil.com" is matched whole from its first letter), only not a dot right after a letter
+_HOST = re.compile(r"(?<![^\W_])(?<!@)(?<![^\W_]\.)((?:[^\W_][\w-]*\.)+(?:[^\W\d_]{2,}|xn--[\w-]+))(?![^\W_]|-)(/?)")
 _FULL_STOPS = str.maketrans({"。": ".", "．": ".", "｡": "."})  # IDNA reads them as a dot
 _EMAIL = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
 _PHONE = re.compile(r"\+?\d(?:[\s().-]*\d){7,}")
@@ -606,7 +607,7 @@ class Initiative:
         store: Store,
         settings: Settings,
         writer: Writer,
-        send: Callable[[int], Awaitable[None]],
+        send: Callable[[int], Awaitable[object]],
         *,
         tz: ZoneInfo,
         acis: frozenset[str],

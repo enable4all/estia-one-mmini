@@ -59,10 +59,11 @@ class CommandError(Exception):
     """A fixed command exited with an error."""
 
 
-async def run_command(argv: list[str]) -> str:
-    """Run a fixed command (no shell) and return its output; raise on a failure or a timeout."""
+async def run_command(argv: list[str], env: dict[str, str] | None = None) -> str:
+    """Run a fixed command (no shell) and return its output; raise on a failure or a timeout. `env`: its whole
+    environment (None: the bridge's)."""
     proc = await asyncio.create_subprocess_exec(
-        *argv, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL
+        *argv, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL, env=env
     )
     try:
         out, _ = await asyncio.wait_for(proc.communicate(), COMMAND_TIMEOUT)
@@ -103,14 +104,21 @@ class _Row:
     problem: Problem | None = None
 
 
+_STATUS_WORD = re.compile(r"[\w .-]{1,40}", re.ASCII)  # a status word a service reports: "loading", "warming up"
+NOT_READY = "not ready"  # any other status: never shown (review G8: it reached Gemma whole)
+
+
 def _reported_status(body: str) -> str | None:
-    """The "status" of a JSON health answer, if the answer has one."""
+    """The "status" of a JSON health answer, if the answer has one: a short status word as it is, any other
+    (chat-template tokens, hidden characters, a sentence a service that echoes could carry) as `NOT_READY`."""
     try:
         data = json.loads(body)
     except ValueError:
         return None
     status = data.get("status") if isinstance(data, dict) else None
-    return status if isinstance(status, str) else None
+    if not isinstance(status, str):
+        return None
+    return status if _STATUS_WORD.fullmatch(status) else NOT_READY
 
 
 def _failed(exc: BaseException) -> str:

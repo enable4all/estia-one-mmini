@@ -61,12 +61,14 @@ public enum HTTP {
 
     static let reasons = [
         200: "OK", 400: "Bad Request", 403: "Forbidden", 404: "Not Found", 405: "Method Not Allowed",
-        408: "Request Timeout", 413: "Content Too Large", 415: "Unsupported Media Type", 422: "Unprocessable Content",
+        408: "Request Timeout", 409: "Conflict", 413: "Content Too Large", 415: "Unsupported Media Type", 422: "Unprocessable Content",
         431: "Request Header Fields Too Large", 500: "Internal Server Error", 503: "Service Unavailable",
     ]
 
-    public static func response(_ status: Int, contentType: String, body: Data) -> Data {
-        let head = "HTTP/1.1 \(status) \(reasons[status] ?? "Error")\r\nContent-Type: \(contentType)\r\n"
+    /// `headers`: extra ones, ours only (fixed names, values without line breaks: `SpokenLine.headers`).
+    public static func response(_ status: Int, contentType: String, body: Data, headers: [(String, String)] = []) -> Data {
+        let extra = headers.filter { !"\($0.0)\($0.1)".contains(where: \.isNewline) }.map { "\($0.0): \($0.1)\r\n" }.joined()
+        let head = "HTTP/1.1 \(status) \(reasons[status] ?? "Error")\r\nContent-Type: \(contentType)\r\n" + extra
             + "Content-Length: \(body.count)\r\nConnection: close\r\n\r\n"
         return Data(head.utf8) + body
     }

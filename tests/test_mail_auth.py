@@ -1,5 +1,8 @@
+import io
 import json
+import os
 import stat
+import sys
 from dataclasses import replace
 from pathlib import Path
 
@@ -56,6 +59,22 @@ def test_token_store_is_private_and_atomic(tmp_path: Path) -> None:
     assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
     assert set(json.loads(path.read_text())) == {"info@example.com", "contact@example.app"}
     assert not list(path.parent.glob("*.tmp"))
+
+
+def test_a_link_at_the_temporary_name_is_never_followed(tmp_path: Path) -> None:
+    """A link planted at mail-tokens.json.tmp (her account, after a PDF exploit) never makes the save write or chmod
+    the file it names: copied back into your home by a rollback, it would name one of your own (review I37)."""
+    path = tmp_path / "data" / "mail-tokens.json"
+    path.parent.mkdir(mode=0o700)
+    victim = tmp_path / "authorized_keys"
+    victim.write_text("ssh-ed25519 AAAA kept\n")
+    victim.chmod(0o644)
+    (path.parent / "mail-tokens.json.tmp").symlink_to("../authorized_keys")
+    TokenStore(path).save("info@example.com", "rt-1")
+    assert victim.read_text() == "ssh-ed25519 AAAA kept\n" and stat.S_IMODE(victim.stat().st_mode) == 0o644
+    assert not path.is_symlink() and stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert TokenStore(path).refresh_token("info@example.com") == "rt-1"
+    assert not os.path.lexists(path.parent / "mail-tokens.json.tmp")
 
 
 async def test_access_token_is_refreshed_cached_and_rotated(tmp_path: Path) -> None:
@@ -136,6 +155,37 @@ async def test_device_login_saves_the_token_of_the_right_account(tmp_path: Path)
     assert shown[0] == "Go to https://microsoft.com/devicelogin and enter ABC123"
     assert waits == [1, 1, 6]  # slow_down adds 5 seconds
     assert http.requests[-1][2]["authorization"] == "Bearer at"
+
+
+class Flushed(io.StringIO):
+    """stdout as a pipe or a file sees it: only what was flushed has left the program."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.out = ""
+
+    def flush(self) -> None:
+        self.out = self.getvalue()
+
+
+async def test_the_device_code_leaves_before_the_wait(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Off a terminal (the setup window reads `estia mail-login` from a file) Python buffers print: Microsoft's code
+    must leave the program before the first wait, never once the 15 minutes are over (review FRIEND-1)."""
+    store = TokenStore(tmp_path / "data" / "mail-tokens.json")
+    http = FakeHttp()
+    http.add(CODE_URL, 200, {"device_code": "dc", "user_code": "ABC123", "interval": 1, "expires_in": 900,
+                             "message": "Go to https://microsoft.com/devicelogin and enter ABC123"})  # fmt: skip
+    http.add(TOKEN_URL, 400, {"error": "expired_token"})
+    stdout = Flushed()
+    monkeypatch.setattr(sys, "stdout", stdout)
+    seen: list[str] = []
+
+    async def sleep(seconds: float) -> None:
+        seen.append(stdout.out)
+
+    with pytest.raises(MailAuthError):
+        await device_login(config(tmp_path), "info@example.com", store, http=http, sleep=sleep)
+    assert seen and "enter ABC123" in seen[0]
 
 
 async def test_device_login_refuses_another_account(tmp_path: Path) -> None:
@@ -350,3 +400,34 @@ async def test_a_mail_only_sign_in_keeps_the_calendars_sign_in_time(tmp_path: Pa
         clock.now += 60
     assert store.signed_in_at("info@example.com") == Clock().now + 60
     assert store.signed_in_at("info@example.com", calendar=True) == Clock().now  # consent, once given, stays
+
+
+@pytest.mark.parametrize("where", ["device code", "token"])
+async def test_an_invalid_client_sign_in_names_the_switch_to_turn_on(tmp_path: Path, where: str) -> None:
+    """The docs review (26 Oct): with Allow public client flows off, Microsoft answers only "invalid_client"; the
+    message says which switch, where, and what then."""
+    from local_assistant import prompts
+
+    store = TokenStore(tmp_path / "data" / "mail-tokens.json")
+    http = FakeHttp()
+    refused = {"error": "invalid_client", "error_description": "AADSTS7000218: client_assertion or client_secret"}
+    if where == "device code":
+        http.add(CODE_URL, 401, refused)
+    else:
+        code = {"device_code": "dc", "user_code": "X", "verification_uri": "u", "interval": 1, "expires_in": 900}
+        http.add(CODE_URL, 200, code | {"message": "m"})
+        http.add(TOKEN_URL, 401, refused)
+
+    async def sleep(seconds: float) -> None:
+        return None
+
+    with pytest.raises(MailAuthError) as stopped:
+        await device_login(config(tmp_path), "info@example.com", store, http=http, out=lambda _: None, sleep=sleep)
+    assert (
+        str(stopped.value)
+        == prompts.MAIL_INVALID_CLIENT
+        == (
+            "Microsoft refused the sign-in (invalid_client): turn on Allow public client flows, under Authentication, "
+            "Advanced settings, in the app's registration. Then sign in again."
+        )
+    )

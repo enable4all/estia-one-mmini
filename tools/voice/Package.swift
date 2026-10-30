@@ -41,6 +41,9 @@ let package = Package(
                 .product(name: "WhisperKit", package: "WhisperKit"),
                 .product(name: "FluidAudio", package: "FluidAudio"),
             ],
+            // heart's Pocket TTS voice files (owner, 27 Oct: the 100M's; 29 Oct: the 18M's), built into the voice
+            // service's own bundle beside its program (VoiceCore `PocketTTS.resources`), copied as they are: never fetched
+            resources: [.copy("Voices/heart.safetensors"), .copy("Voices/heart-18m.safetensors")],
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),
         // Swift Testing works with the Command Line Tools (XCTest does not); `testingMacros` above.

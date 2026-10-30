@@ -7,6 +7,11 @@ public enum VoiceError: Error, Equatable, Sendable {
     case badStream, badChunk, unavailable
     /// The turn detector's: a window the bridge got wrong (empty, an odd byte count, over 8 s).
     case badWindow
+    /// A transcription's hint that is no name (`Hint`).
+    case badHint
+    /// A call's line asked with no Kokoro stand-in (`SpeechRequest.kokoro` false: its turn had its one Kokoro line;
+    /// owner, 28 Oct, calls-03) that Pocket could not say: nothing said, never Kokoro.
+    case noStandIn
 
     public var status: Int {
         switch self {
@@ -16,8 +21,9 @@ public enum VoiceError: Error, Equatable, Sendable {
         case .notReady: 503
         case .failed: 500
         case .unsupportedLanguage: 400
-        case .badStream, .badChunk, .badWindow: 400
+        case .badStream, .badChunk, .badWindow, .badHint: 400
         case .unavailable: 503
+        case .noStandIn: 409
         }
     }
 
@@ -33,6 +39,8 @@ public enum VoiceError: Error, Equatable, Sendable {
         case .badChunk: "bad_chunk"
         case .unavailable: "unavailable"
         case .badWindow: "bad_window"
+        case .badHint: "bad_hint"
+        case .noStandIn: "no_stand_in"
         }
     }
 

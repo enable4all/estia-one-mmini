@@ -12,6 +12,7 @@ from local_assistant import prompts
 from local_assistant.brain import profile_notice
 from local_assistant.context import ContextBuilder
 from local_assistant.gemma import Completion
+from local_assistant.maps import home_area
 from local_assistant.profile import ApplyResult, Op, Profile
 from local_assistant.profiler import LAST_LEARNED_KEY, Profiler
 from local_assistant.store import SourceKind, Store
@@ -350,6 +351,45 @@ async def test_consolidation_that_does_not_save_the_fact_moves_nothing(store: St
     result = await profiler_for(store, profile, gemma).consolidate_for(NUTS, message, "remember", None)
     assert not result.added
     assert [fact.id for fact in profile.yours()] == [mine] and not result.moved
+
+
+BAD_HOME = "Home area: Bad Street, Othertown"
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        [op("replace", fact_id=1, text_=f"{BAD_HOME}; lives in Town"), op("add", text_=NUTS)],  # a page's words moved
+        [op("remove", fact_id=2), op("add", text_=f"{BAD_HOME}. {NUTS}")],  # added under the new fact
+    ],
+)
+async def test_consolidation_never_makes_a_pages_home_area_the_users(
+    store: Store, answer: list[dict[str, Any]]
+) -> None:
+    """The home area comes only from the user's own words (`maps.home_area`: a remember fact); consolidate_for shows
+    Gemma the user's part, link facts among them, and its replace keeps the target's kind: a merge may not carry a
+    learned page's "Home area:" into a remember fact."""
+    profile = two_part(store, max_chars=300)  # room for every op: only the home area check refuses
+    profile.add("Lives in Town.", source_kind="remember")
+    profile.add(BAD_HOME, source_kind="link")
+    message = user(store, "remember I'm allergic to nuts")
+    gemma = FakeGemma(ops(*answer))
+    await profiler_for(store, profile, gemma).consolidate_for(NUTS, message, "remember", None)
+    assert home_area(profile.facts()) == ""
+    assert profile.facts()[0].text == "Lives in Town."
+
+
+async def test_consolidation_keeps_the_users_own_home_area(store: Store) -> None:
+    """A merge that keeps the user's own home area, or adds the one they are saving now, goes through."""
+    profile = two_part(store, max_chars=300)
+    profile.add("Home area: Example Street, Town", source_kind="remember")
+    profile.add(MIA, source_kind="remember")
+    fact = "Home area: New Road, City"
+    message = user(store, f"remember {fact}")
+    answer = [op("replace", fact_id=1, text_="Home: Home area: Example Street, Town"), op("add", text_=fact)]
+    await profiler_for(store, profile, FakeGemma(ops(*answer))).consolidate_for(fact, message, "remember", None)
+    assert [fact_.text for fact_ in profile.yours()] == ["Home: Home area: Example Street, Town", MIA, fact]
+    assert home_area(profile.facts()) == "New Road, City"
 
 
 # the remember tool over the limit, end to end

@@ -39,6 +39,8 @@ from local_assistant.ollama_build import (
     problem,
     signature_problem,
 )
+from local_assistant.setup_progress import Watch
+from tests.setup_helpers import enter_but_signal
 
 MACHO = b"\xcf\xfa\xed\xfe" + b"\0" * 60  # a 64-bit Mach-O's magic number, then nothing
 NOTARIZED = "ollama: accepted\nsource=Notarized Developer ID\norigin=Developer ID Application: Example (3MU9H2V9Y9)\n"
@@ -117,6 +119,9 @@ class FakeTools(Tools):
     def live(self) -> bool:
         return True
 
+    def her_uid(self) -> int | None:
+        return None  # no _estia on the pretend Mac (never the one of the Mac the tests run on)
+
     def resolve(self, program: str) -> str:
         """Links resolved in this fake Mac, as if its tree were "/": a system path and every link's target, also an
         absolute one, in its tree (never the Mac the tests run on); a path of the test's own (a home, a folder of
@@ -143,10 +148,10 @@ class FakeTools(Tools):
                 todo = [*target.parts, *todo]
         return "/" + "/".join(done)
 
-    def version(self) -> str | None:
+    def version(self, port: int = ollama_build.PORT) -> str | None:
         return self.versions.pop(0) if len(self.versions) > 1 else self.versions[0]
 
-    def listener(self, port: int = ollama_build.PORT) -> Listener:
+    def listener(self, port: int = ollama_build.PORT, *, by_service: bool = True) -> Listener:
         program = self.programs.pop(0) if len(self.programs) > 1 else self.programs[0]
         if not program:
             return Listener("")
@@ -185,16 +190,31 @@ class FakeTools(Tools):
             shutil.copyfile(self.tarball, argv[argv.index("-o") + 1])
         elif argv[0] == TAR:
             return subprocess.run(list(argv), check=False).returncode
-        elif argv[0] != SUDO:
+        elif argv[0] not in (SUDO, ollama_build.OPEN):  # open -a: the Ollama app started, when it was chosen
             raise AssertionError(f"unexpected change: {argv}")
         return 0
 
     def sudo(self) -> list[tuple[str, ...]]:
         return [change for change in self.changes if change[0] == SUDO]
 
+    def fetch(self, argv: Sequence[str], path: Path, watch: Watch) -> int:
+        """setup's download with its dots: the test's tarball copied, never curl run."""
+        self.changes.append(tuple(argv))
+        assert self.tarball is not None
+        watch.start()
+        shutil.copyfile(self.tarball, path)
+        watch.finish()
+        return 0
+
 
 def install(
-    tools: FakeTools, home: Path, *, dry_run: bool = False, release: Release = RELEASE
+    tools: FakeTools,
+    home: Path,
+    *,
+    dry_run: bool = False,
+    release: Release = RELEASE,
+    watch: Callable[[str], Watch] | None = None,
+    command: Callable[[str], None] | None = None,
 ) -> tuple[Install, list[str]]:
     said: list[str] = []
     step = Install(
@@ -208,6 +228,8 @@ def install(
         profile=home / ".zprofile",
         clock=iter(range(0, 10_000)).__next__,
         sleep=lambda _seconds: None,
+        watch=watch,
+        command=command,
     )
     return step, said
 
@@ -439,6 +461,58 @@ def test_nothing_answering_means_the_pinned_release_downloaded_checked_installed
     assert "✓ Ollama: 0.40.4 checked and installed" in text and "✓ Ollama: 0.40.4 answers, always on" in text
 
 
+def test_setups_download_lights_five_dots_and_turns_curls_own_meter_off(tmp_path: Path, home: Path) -> None:
+    """Owner, 27 Oct ("no %"): setup's own download draws five dots by the file's size; curl's meter, with its
+    percent, stays off (-s, its errors still shown: -S). Without setup (scripts/install-ollama.sh) curl's own stays."""
+    tgz = tarball(tmp_path)
+    release = release_of(tgz)
+    folder = home / "opt/ollama/v0.40.4"
+    tools = FakeTools(tmp_path, versions=[None, None, "0.40.4"], program=str(folder / "ollama"))
+    tools.tarball = tgz
+    drawn: list[str] = []
+
+    class Face:
+        def progress(self, text: str) -> None:
+            drawn.append(text)
+
+        def progress_done(self) -> None:
+            drawn.append("done")
+
+    step, said = install(tools, home, release=release, watch=lambda label: Watch(Face(), label))
+    step.run(32_768)
+    curl = tools.changes[0]
+    assert curl[:2] == ("/usr/bin/curl", "-q") and "-fsSL" in curl and "-fL" not in curl
+    assert drawn == ["  Ollama 0.40.4 ○○○○○", "  Ollama 0.40.4 ●●●●●", "done"]
+    assert any(line.startswith("  $ /usr/bin/curl -q -fsSL") for line in said)
+
+
+def test_setups_download_line_is_a_command_that_asks_nothing_so_the_window_keeps_its_screen(
+    tmp_path: Path, home: Path
+) -> None:
+    """Review PROM-08: curl's input is empty and it asks nothing, so setup prints its line as a command (the setup
+    window keeps its screen and its dots), never as a line that sends the window to Terminal."""
+    tgz = tarball(tmp_path)
+    folder = home / "opt/ollama/v0.40.4"
+    tools = FakeTools(tmp_path, versions=[None, None, "0.40.4"], program=str(folder / "ollama"))
+    tools.tarball = tgz
+    commands: list[str] = []
+
+    class Face:
+        def progress(self, text: str) -> None:
+            return
+
+        def progress_done(self) -> None:
+            return
+
+    step, said = install(
+        tools, home, release=release_of(tgz), watch=lambda label: Watch(Face(), label), command=commands.append
+    )
+    step.run(32_768)
+    assert [line for line in commands if line.startswith("  $ /usr/bin/curl")]
+    assert not [line for line in said if line.startswith("  $ /usr/bin/curl")]
+    assert any(line.startswith("  $ /usr/bin/sudo") for line in said)  # sudo asks in Terminal: those stay lines
+
+
 def test_the_service_file_runs_it_as_you_on_this_mac_only(home: Path) -> None:
     plist = plistlib.loads(daemon_plist(user="alex", group="staff", home=home, num_ctx=16_384))
     assert plist["Label"] == LABEL == "com.local-assistant.ollama"
@@ -449,7 +523,7 @@ def test_the_service_file_runs_it_as_you_on_this_mac_only(home: Path) -> None:
     assert env["OLLAMA_MODELS"] == str(home / ".ollama/models") and env["OLLAMA_CONTEXT_LENGTH"] == "16384"
     assert (env["OLLAMA_MAX_LOADED_MODELS"], env["OLLAMA_NUM_PARALLEL"], env["OLLAMA_KEEP_ALIVE"]) == ("1", "1", "120m")
     assert plist["RunAtLoad"] is True and plist["KeepAlive"] is True
-    # launchd opens the log as root: in root's own folder, so no link of yours is ever followed there
+    # launchd opens the log as you (never as root): in root's own folder, so no link can be planted at its name
     assert plist["StandardOutPath"] == plist["StandardErrorPath"] == str(LOG) == "/var/log/estia/ollama.log"
 
 
@@ -589,6 +663,152 @@ def test_the_ollama_app_on_the_mac_stops_setup_before_the_service_is_installed(t
         step.run(32_768)
     assert "mv /Applications/Ollama.app ~/.Trash/" in str(stopped.value)
     assert not tools.changes
+
+
+# ------------------------------------------------------------------ the Ollama app, when the person chooses it (29 Oct)
+
+APP_PROGRAM = "/Applications/Ollama.app/Contents/Resources/ollama"
+
+
+def the_app(tools: FakeTools) -> Path:
+    """The Ollama app in the fake Mac's /Applications, the official files in its Resources folder."""
+    official_tree(tools.root / "Applications/Ollama.app/Contents/Resources")
+    return Path("/Applications/Ollama.app")
+
+
+def with_app(tools: FakeTools, home: Path, *, dry_run: bool = False) -> tuple[Install, list[str]]:
+    step, said = install(tools, home, dry_run=dry_run)
+    step.app = the_app(tools)
+    return step, said
+
+
+def test_the_app_is_found_in_applications_and_never_in_a_home_off_the_live_mac(tmp_path: Path, home: Path) -> None:
+    root = tmp_path / "root"
+    assert ollama_build.app_on_mac(root, home) is None
+    (home / "Applications/Ollama.app").mkdir(parents=True)
+    assert ollama_build.app_on_mac(root, home) == home / "Applications/Ollama.app"
+    assert ollama_build.app_on_mac(root, None) is None  # off the live Mac no home is read
+    (root / "Applications/Ollama.app").mkdir(parents=True)
+    assert ollama_build.app_on_mac(root, home) == Path("/Applications/Ollama.app")
+
+
+def test_the_chosen_app_that_answers_is_used_with_its_limits_and_nothing_is_installed(
+    tmp_path: Path, home: Path
+) -> None:
+    tools = FakeTools(tmp_path, versions=["0.41.0"], program=APP_PROGRAM)
+    step, said = with_app(tools, home)
+    assert step.run(32_768) == APP_PROGRAM  # its own ollama program, by its real path inside the app
+    assert not tools.changes and not (home / "opt").exists() and not (home / ".zprofile").exists()
+    text = "\n".join(said)
+    assert prompts.OLLAMA_APP_USED.format(version="0.41.0", program=APP_PROGRAM) in text
+    assert f"! Ollama: {prompts.OLLAMA_APP_LIMITS}" in text
+    assert "Trash" not in text and "0.40.4, the version she is tested with" not in text
+
+
+def test_the_chosen_app_not_running_is_started_and_waited_for(tmp_path: Path, home: Path) -> None:
+    """mac-ollama-app-first-open: an app installed and never opened has macOS's "Open?" question and its welcome
+    window first. Setup says to click Open, waits up to 3 minutes (a fixed 60 s stopped setup before), and says it is
+    still waiting every 15 s."""
+    tools = FakeTools(tmp_path, versions=[None] * 120 + ["0.41.0"], program=APP_PROGRAM)  # about 2 minutes
+    step, said = with_app(tools, home)
+    assert step.run(32_768) == APP_PROGRAM
+    assert tools.changes == [(ollama_build.OPEN, "-a", "/Applications/Ollama.app")]
+    text = "\n".join(said)
+    assert prompts.OLLAMA_APP_STARTING in text and "  $ /usr/bin/open -a /Applications/Ollama.app" in text
+    assert prompts.OLLAMA_APP_STARTING == (
+        "The Ollama app does not run: setup opens it and waits up to 3 minutes. "
+        "If macOS asks whether to open Ollama, click Open."
+    )
+    waiting = [line for line in said if line.startswith("  Still waiting for the Ollama app")]
+    assert len(waiting) in (7, 8) and waiting[0] == prompts.OLLAMA_APP_WAITING.format(seconds=15)
+    assert prompts.OLLAMA_APP_USED.format(version="0.41.0", program=APP_PROGRAM) in text
+
+
+def test_the_chosen_app_that_never_answers_stops_setup_with_a_clear_line(tmp_path: Path, home: Path) -> None:
+    tools = FakeTools(tmp_path, versions=[None], program=APP_PROGRAM)
+    step, _said = with_app(tools, home)
+    with pytest.raises(SystemExit) as stopped:
+        step.run(32_768)
+    assert str(stopped.value) == prompts.OLLAMA_APP_NOT_UP
+    assert ollama_build.APP_WAIT_SECONDS == 180 and "3 minutes" in prompts.OLLAMA_APP_NOT_UP
+    assert not isinstance(stopped.value, ollama_build.Refusal) or stopped.value.fatal
+
+
+def test_the_chosen_app_macos_does_not_open_stops_at_once(tmp_path: Path, home: Path) -> None:
+    """open -a's exit code is read: an app macOS does not open is said at once, never 3 minutes of waiting."""
+    tools = FakeTools(tmp_path, versions=[None], program=APP_PROGRAM)
+    tools.fail.add(ollama_build.OPEN)
+    step, said = with_app(tools, home)
+    with pytest.raises(SystemExit) as stopped:
+        step.run(32_768)
+    assert str(stopped.value) == prompts.OLLAMA_APP_NOT_OPENED.format(app="/Applications/Ollama.app", code=1)
+    assert not any(line.startswith("  Still waiting") for line in said)
+
+
+@pytest.mark.parametrize("why", ["another-ollama", "another-account", "second-listener", "other-machines", "unsigned"])
+def test_the_chosen_app_still_refuses_an_ollama_someone_else_may_control(tmp_path: Path, home: Path, why: str) -> None:
+    """The app runs as you: an Ollama another account runs, one that shares the port, one other machines reach, one
+    that is not the app's own, or an app whose program is not Ollama's stops every run, as before."""
+    program = "/opt/homebrew/Cellar/ollama/0.40.4/bin/ollama" if why == "another-ollama" else APP_PROGRAM
+    tools = FakeTools(
+        tmp_path, versions=["0.41.0"], program=program, addresses=("*.11434",) if why == "other-machines" else LOCAL
+    )
+    if why == "another-account":
+        tools.uid = os.getuid() + 1
+    elif why == "second-listener":
+        tools.others = (("/tmp/elsewhere/serve", os.getuid() + 1),)
+    elif why == "unsigned":
+        tools.unsigned.add("ollama")
+    step, _said = with_app(tools, home)
+    with pytest.raises(ollama_build.Refusal) as stopped:
+        step.run(32_768)
+    assert str(stopped.value).startswith("✗ Ollama:")
+    assert stopped.value.fatal is (why != "another-ollama") and not tools.changes
+
+
+def test_the_chosen_app_beside_setups_own_service_stops_with_how_to_remove_it(tmp_path: Path, home: Path) -> None:
+    """Two always-on Ollamas fight for the port, and the app stops any other when its own cannot start."""
+    job_file(tmp_path / "root/Library/LaunchDaemons", LABEL, str(home / "opt/ollama/current/ollama"))
+    tools = FakeTools(tmp_path, versions=["0.41.0"], program=APP_PROGRAM)
+    step, _said = with_app(tools, home)
+    with pytest.raises(ollama_build.Refusal) as stopped:
+        step.run(32_768)
+    assert prompts.OLLAMA_APP_OURS.format(daemon=DAEMON) in str(stopped.value)
+    assert f"/usr/bin/sudo /bin/launchctl bootout system/{LABEL}" in str(stopped.value)
+    assert not stopped.value.fatal and not tools.changes
+
+
+def test_the_chosen_app_beside_an_earlier_trys_service_removes_it_on_admin_rights(tmp_path: Path, home: Path) -> None:
+    """c-2 (round 3): setup's service file from an earlier try (no config, no move: `leftover`) beside the app chosen
+    stopped every run with two commands to type. Setup boots it out and removes it itself (admin rights: macOS's
+    box, or sudo in Terminal), then uses the app; an install's own service still stops, as before."""
+    job_file(tmp_path / "root/Library/LaunchDaemons", LABEL, str(home / "opt/ollama/current/ollama"))
+    tools = FakeTools(tmp_path, versions=["0.41.0"], program=APP_PROGRAM)
+    step, said = with_app(tools, home)
+    step.leftover = True
+    assert step.run(32_768) == APP_PROGRAM
+    assert tools.sudo() == [
+        (SUDO, "/bin/launchctl", "bootout", f"system/{LABEL}"),
+        (SUDO, "/bin/rm", "-f", str(DAEMON)),
+    ]
+    assert prompts.OLLAMA_APP_OURS_GOES.format(daemon=DAEMON) in said
+    assert prompts.OLLAMA_APP_USED.format(version="0.41.0", program=APP_PROGRAM) in "\n".join(said)
+
+
+def test_a_dry_run_with_the_chosen_app_starts_nothing(tmp_path: Path, home: Path) -> None:
+    tools = FakeTools(tmp_path, versions=[None], program=APP_PROGRAM)
+    step, said = with_app(tools, home, dry_run=True)
+    assert step.run(32_768) == APP_PROGRAM
+    assert not tools.changes and "  $ /usr/bin/open -a /Applications/Ollama.app" in said
+
+
+def test_the_app_is_kept_by_problem_only_when_chosen(tmp_path: Path) -> None:
+    resources = official_tree(tmp_path / "Applications/Ollama.app/Contents/Resources")
+    found = Found(str(resources / "ollama"), "0.41.0", signature="", addresses=LOCAL, uid=os.getuid())
+    assert problem(found, owner=os.getuid()) is not None  # the old wall: not chosen
+    assert problem(found, owner=os.getuid(), app_ok=True) is None
+    theirs = Found(found.program, "0.41.0", signature="", addresses=LOCAL, uid=os.getuid() + 1)
+    assert problem(theirs, owner=os.getuid(), app_ok=True) is not None  # another account's: still refused
 
 
 # ------------------------------------------------------------------ other background services that run Ollama
@@ -870,7 +1090,7 @@ def test_a_changed_service_file_is_replaced_and_loaded_again(tmp_path: Path, hom
 
 @pytest.mark.parametrize("state", ["roots", "linked", "shared"])
 def test_a_log_that_is_not_your_private_file_is_made_again(tmp_path: Path, home: Path, state: str) -> None:
-    """launchd made it as root (0644: every account, hers too, reads it), or it is a second name of another file."""
+    """An older log every account reads (0644, hers too), a link, or a second name of another file."""
     official_tree(home / "opt/ollama/v0.40.4")
     tools = FakeTools(tmp_path, versions=[None, "0.40.4"], program=str(home / "opt/ollama/v0.40.4/ollama"))
     daemon = tools.root / DAEMON.relative_to("/")
@@ -1055,8 +1275,8 @@ def test_the_service_file_check_names_one_that_differs_from_what_setup_writes(tm
 
 
 def test_setups_own_service_at_the_pin_gets_a_private_log_and_nothing_else(tmp_path: Path, home: Path) -> None:
-    """An install from before: launchd made the log as root, readable by every account. Made yours and private now;
-    Ollama writes to it from its next start."""
+    """An install from before: its log readable by every account (0644). Made yours and private now; Ollama writes to
+    it from its next start."""
     folder = ours_at(tmp_path, home)
     tools = FakeTools(tmp_path, versions=["0.40.4"], program=str(folder / "ollama"))
     private_log(tools).chmod(0o644)
@@ -1272,6 +1492,27 @@ def test_an_official_ollama_open_to_other_machines_stops_setup(tmp_path: Path, h
 # ------------------------------------------------------------------ setup's Ollama step and scripts/install-ollama.sh
 
 
+def test_install_ollama_with_no_terminal_names_where_it_runs_and_changes_nothing(
+    monkeypatch: pytest.MonkeyPatch, capfd: pytest.CaptureFixture[str]
+) -> None:
+    """scripts/install-ollama.sh started by an AI's command tool: no terminal for sudo, and no window of its own. One
+    line, on stderr, naming both places it runs (the person's own Terminal window, or setup's Ollama step in the
+    Estia Setup window at the Mac's own screen); nothing read from stdin, nothing changed."""
+    import io
+
+    from local_assistant import setup
+
+    monkeypatch.setattr(setup, "has_terminal", lambda: False)
+    monkeypatch.setattr(ollama_build, "Tools", lambda *args, **kwargs: pytest.fail("nothing is looked at"))
+    typed = io.StringIO("y\n" * 5)
+    monkeypatch.setattr("sys.stdin", typed)
+    assert ollama_build.main([]) == 1
+    out, err = capfd.readouterr()
+    assert (out, err) == ("", prompts.OLLAMA_NO_TERMINAL + "\n") and typed.read() == "y\n" * 5
+    assert err.startswith("✗ Ollama: ") and "your own Terminal window" in err
+    assert "scripts/setup.sh at the Mac's own screen" in err and "Estia Setup window" in err
+
+
 def test_homebrews_ollama_answering_stops_setup_before_the_model_is_pulled(
     tmp_path: Path, home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1283,6 +1524,7 @@ def test_homebrews_ollama_answering_stops_setup_before_the_model_is_pulled(
     monkeypatch.setattr(setup, "memory_gb", lambda: 32.0)
     monkeypatch.setattr(setup, "has_terminal", lambda: True)
     pulled: list[str] = []
+    monkeypatch.setattr("builtins.input", enter_but_signal)  # setup's plan asks first: Enter
     monkeypatch.setattr(setup.Wizard, "model", lambda self: pulled.append("model"))
     with pytest.raises(SystemExit, match="Homebrew's Ollama answers"):
         setup.main(["--config", str(tmp_path / "config.toml")])
@@ -1308,6 +1550,7 @@ def rerun_steps(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     monkeypatch.setattr(setup, "memory_gb", lambda: 32.0)
     monkeypatch.setattr(setup, "has_terminal", lambda: True)
     monkeypatch.setattr("time.sleep", lambda _seconds: None)
+    monkeypatch.setattr("builtins.input", lambda prompt="": "")  # setup's plan asks first: Enter
     return reached
 
 
@@ -1414,7 +1657,7 @@ def test_a_dry_run_of_setup_with_the_ollama_app_still_reaches_the_model_step(
     wizard.model()
     out = capsys.readouterr().out
     assert "✗ Ollama: the Ollama app is installed (/Applications/Ollama.app)" in out
-    assert f"caffeinate -i {home}/opt/ollama/current/ollama pull gemma4:26b-mlx" in out
+    assert "  Ollama's own pull, http://127.0.0.1:11434/api/pull: gemma4:26b-mlx" in out
 
 
 def wrapper(tmp_path: Path, *args: str, repo: Path | None = None) -> subprocess.CompletedProcess[str]:

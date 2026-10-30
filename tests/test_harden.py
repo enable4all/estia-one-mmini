@@ -3,17 +3,24 @@ counts, passwordless sudo removed only while password sudo works, the Registrati
 with the PIN only on stdin, and the phone checklist at the end. A fake Mac answers; nothing runs for real."""
 
 import fnmatch
+import io
 import json
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from local_assistant import harden, hostsec
+from local_assistant import harden, hostsec, ownuser
 from local_assistant.hostsec import FDESETUP, LAUNCHCTL, SOCKETFILTERFW, SSHD, SUDO, Host
 
 PIN = "731904"
+
+
+def refuse(*args: object, **kwargs: object) -> Any:
+    raise AssertionError("not to be called")
+
+
 KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExampleExampleExampleExampleExampleExample alex@example.com\n"
 
 
@@ -129,6 +136,51 @@ def test_only_what_was_said_yes_to_is_applied_after_one_sudo(tmp_path: Path) -> 
     assert not any("--remove" in argv for argv in host.asked)  # python3 stays: no yes for it
 
 
+def test_before_her_own_account_the_registration_lock_is_read_for_her_account(tmp_path: Path) -> None:
+    """Before the move, an account without a number beside another entry in signal-cli's list (her old number's
+    account): the Registration Lock is read for the account her config names, so the line is ✓ with no PIN offered;
+    without the number it said the file was unreadable and offered a PIN the helper then refused (review S11)."""
+    root, home = mac(tmp_path)
+    numberless = "99999999-8888-4777-8666-555555555555"  # made up
+    data = home / ".local/share/signal-cli/data"
+    data.mkdir(parents=True)
+    entries: list[dict[str, str | None]] = [
+        {"path": "111111", "number": "+306900000000"},
+        {"path": "222222", "number": None, "uuid": numberless},
+    ]
+    (data / "accounts.json").write_text(json.dumps({"accounts": entries, "version": 2}))
+    for entry in entries:
+        (data / str(entry["path"])).write_text(
+            json.dumps({"version": 9, "registered": True, "number": entry["number"]})
+        )
+    config = home / ".config/local-assistant/config.toml"
+    config.parent.mkdir(parents=True)
+    config.write_text(f'bot_number = "{numberless}"\nallowed_acis = ["11111111-2222-4333-8444-555555555555"]\n')
+    config.chmod(0o600)
+    said: list[str] = []
+    run = step(FakeMac(root, mac_state(root)), home, yes=["Registration Lock"], said=said)
+    run.run()
+    assert any(hostsec.NUMBERLESS_LOCK in line for line in said)
+    assert not any("Registration Lock" in question for question in run.questions)
+
+
+def test_her_number_is_empty_for_a_config_that_cannot_be_read(tmp_path: Path) -> None:
+    """A missing config, one macOS will not let the security step read, or one that does not load: no number, so
+    signal-cli's only account is read as before, never a crash of the security step (review S11)."""
+    config = tmp_path / "config.toml"
+    assert harden.her_number(config) == ""
+    config.write_text('bot_number = "+306900000000"\nallowed_acis = ["11111111-2222-4333-8444-555555555555"]\n')
+    config.chmod(0o600)
+    assert harden.her_number(config) == "+306900000000"
+    config.chmod(0o000)  # stat works, the read does not
+    try:
+        assert harden.her_number(config) == ""
+    finally:
+        config.chmod(0o600)
+    config.write_text("bot_number = ")
+    assert harden.her_number(config) == ""
+
+
 def test_stealth_mode_is_its_own_question_and_stays_off_without_a_yes(tmp_path: Path) -> None:
     root, home = mac(tmp_path)
     host = FakeMac(root, mac_state(root))
@@ -153,7 +205,10 @@ def test_without_nuclear_the_strict_settings_are_one_neutral_line(tmp_path: Path
     assert not any(SOCKETFILTERFW in argv or hostsec.SECURITY in argv for argv in host.asked if argv[0] == SUDO)
     assert not any(argv[:2] == (hostsec.SECURITY, "set-keychain-settings") for argv in host.asked)
     named = [line for line in said if "--nuclear" in line]
-    assert len(named) == 1 and named[0].startswith("○ ") and "other services on this Mac" in named[0]
+    assert len(named) == 1 and named[0].startswith("○ Nuclear level: only for deeply technical users")
+    words = " ".join(named[0].split())
+    assert hostsec.NUCLEAR_LINE.removeprefix("The nuclear level, ") in words and hostsec.NUCLEAR_HOW in words
+    assert all(len(shown) <= 135 for shown in named[0].splitlines())  # the terminal (owner, 20 Oct)
     marked = [line for line in said if line.startswith(("!", "✗"))]
     assert not any(word in line.casefold() for line in marked for word in strict), marked
 
@@ -330,6 +385,137 @@ def test_the_registration_lock_is_set_in_a_maintenance_window(tmp_path: Path) ->
     assert any("password manager" in line for line in said)
 
 
+@pytest.mark.parametrize("refused", [False, True], ids=["asked-again", "refused"])
+def test_admin_rights_run_out_during_the_pin_questions_are_asked_again_before_the_stop(
+    tmp_path: Path, refused: bool
+) -> None:
+    """Review host-harden-stale-sudo: after more than 5 minutes of questions, sudo's sign-in had run out, so the stop,
+    the PIN helper and the start (each `sudo -n`) all failed, and no line said to run it again. Right before the stop,
+    a sign-in that ran out is asked for again; a refusal stops nothing and says what to run."""
+    root, home = mac(tmp_path)
+    (root / "Library/LaunchDaemons").mkdir(parents=True)
+    (root / "Library/LaunchDaemons/com.local-assistant.bridge.plist").write_text("x")
+    her = {"data_modes": {"status": "ok"}, "registration_lock": {"status": "ok", "text": "on"}}
+    answers = {
+        f"{SUDO} -n -u _estia -H -- *--her-checks": (0, json.dumps(her)),
+        f"{SUDO} -n -u _estia -H -- *--set-pin": (0, "Registration Lock: on\n"),
+        f"{LAUNCHCTL} print system/com.local-assistant.bridge": (0, "pid = 77\n"),
+        f"{SUDO} -n -v": (1, "sudo: a password is required\n"),  # the sign-in ran out during the questions
+        f"{SUDO} -v": (1, "sudo: 3 incorrect password attempts\n") if refused else (0, ""),
+    }
+    host = FakeMac(root, mac_state(root, **answers))
+    said: list[str] = []
+    run = step(host, home, yes=["Registration Lock"], pins=[PIN, PIN], own_user=True, new_pin=True, said=said)
+    run.sudo_ready = True  # asked earlier in the run: a cached yes, more than 5 minutes ago
+    run.registration_lock()
+    assert (SUDO, "-n", "-v") in host.asked and (SUDO, "-v") in host.asked
+    stop = (SUDO, "-n", LAUNCHCTL, "bootout", "system/com.local-assistant.bridge")
+    if refused:
+        assert stop not in host.asked and not any(argv[-1] == "--set-pin" for argv in host.asked)
+        assert said[-1] == "  She was not stopped and no PIN was set: run scripts/harden.sh --new-pin again.", said
+    else:
+        assert host.asked.index((SUDO, "-v")) < host.asked.index(stop)
+        assert "✓ Registration Lock: on; she runs again." in said
+
+
+def test_a_stop_in_the_held_section_says_the_locks_result_before_setup_stops(tmp_path: Path) -> None:
+    """Round 2 (r2-window-stream-05): Stop here between her stop and her start waits for the section's end, then
+    setup stops; the stop was raised as the section ended, before "✓ Registration Lock: on; she runs again.", so the
+    friend never learnt whether the new PIN was set or whether she runs. The result line comes first."""
+    import contextlib
+
+    root, home = mac(tmp_path)
+    (root / "Library/LaunchDaemons").mkdir(parents=True)
+    (root / "Library/LaunchDaemons/com.local-assistant.bridge.plist").write_text("x")
+    answers = {
+        f"{SUDO} -n -u _estia -H -- *--set-pin": (0, "Registration Lock: on\n"),
+        f"{LAUNCHCTL} print system/com.local-assistant.bridge": (0, "pid = 77\n"),
+    }
+    host = FakeMac(root, mac_state(root, **answers))
+    said: list[str] = []
+    run = step(host, home, yes=["Registration Lock"], pins=[PIN, PIN], own_user=True, new_pin=True, said=said)
+    run.sudo_ready = True
+
+    @contextlib.contextmanager
+    def held() -> Iterator[None]:  # the window's Stop here, pressed inside the section: setup stops at its end
+        yield
+        raise KeyboardInterrupt
+
+    run.held = held
+    with pytest.raises(KeyboardInterrupt):
+        run.registration_lock()
+    assert "✓ Registration Lock: on; she runs again." in said
+
+
+RAN_OUT = {f"{SUDO} -n -v": (1, "sudo: a password is required\n")}  # the sign-in ran out during the questions
+
+
+@pytest.mark.parametrize("refused", [False, True], ids=["asked-again", "refused"])
+def test_a_rule_removed_after_the_questions_asks_for_admin_rights_again_when_they_ran_out(
+    tmp_path: Path, refused: bool
+) -> None:
+    """Second deep scan, macos-harden-stale-sudo-left: only the Registration Lock asked again; the sudo rule's removal
+    after more than 5 minutes of questions ran on a sign-in that had run out. Asked again right before; a refusal
+    changes nothing and names scripts/harden.sh."""
+    host, home = sudo_rule_mac(tmp_path, "alex ALL=(ALL) NOPASSWD: ALL\n")
+    host.answers.update(RAN_OUT)
+    if refused:
+        host.answers[f"{SUDO} -v"] = (1, "sudo: 3 incorrect password attempts\n")
+    said: list[str] = []
+    run = step(host, home, yes=["zz-rule"], said=said)
+    run.sudo_ready = True  # asked earlier in the run: a cached yes, more than 5 minutes ago
+    run.run()
+    removal = (SUDO, "-n", hostsec.RM, "-f", "/etc/sudoers.d/zz-rule")
+    assert (SUDO, "-n", "-v") in host.asked
+    if refused:
+        assert removal not in host.asked and "✓ sudo asks for your password now." not in said
+        assert harden.ADMIN_RAN_OUT.format(part="Passwordless sudo") in said, said
+    else:
+        assert host.asked.index((SUDO, "-v")) < host.asked.index(removal)
+
+
+def test_the_sudo_line_says_done_only_when_the_rule_went(tmp_path: Path) -> None:
+    """macos-harden-stale-sudo-left: "✓ sudo asks for your password now." was printed while the rule file stayed."""
+    host, home = sudo_rule_mac(tmp_path, "alex ALL=(ALL) NOPASSWD: ALL\n")
+    host.answers[f"{SUDO} -n {hostsec.RM} -f /etc/sudoers.d/zz-rule"] = (1, "rm: Operation not permitted\n")
+    said: list[str] = []
+    step(host, home, yes=["zz-rule"], said=said).run()
+    assert "✓ sudo asks for your password now." not in said and (SUDO, "-k") not in host.asked
+    assert any(line.startswith("✗ ") and "not changed" in line for line in said), said
+
+
+def test_keeping_a_program_reachable_after_its_question_asks_for_admin_rights_again(tmp_path: Path) -> None:
+    """macos-harden-stale-sudo-left: the keep-listening questions come after the firewall's apply; a sign-in that ran
+    out meanwhile is asked for again, and a refusal changes nothing and names scripts/harden.sh."""
+    root, home = mac(tmp_path)
+    host = FakeMac(root, mac_state(root, **RAN_OUT, **{f"{SUDO} -v": (1, "sudo: 3 incorrect password attempts\n")}))
+    said: list[str] = []
+    run = step(host, home, yes=["keep answering"], said=said, nuclear=True)
+    run.sudo_ready = True
+    run.keep_listening([("node", "3000", "/opt/homebrew/bin/node")])
+    assert not any(argv[:3] == (SUDO, "-n", SOCKETFILTERFW) for argv in host.asked)
+    assert harden.ADMIN_RAN_OUT.format(part="Firewall: node") in said, said
+
+
+def test_her_files_made_private_after_their_question_ask_for_admin_rights_again(tmp_path: Path) -> None:
+    """macos-harden-stale-sudo-left: in her own macOS account her file modes are read and fixed as her (sudo -n);
+    after the questions a sign-in that ran out is asked for again before each."""
+    root, home = mac(tmp_path)
+    her = {
+        "data_modes": {"status": "fail", "text": "1 folder others can read", "roots": [".config/local-assistant"]},
+        "registration_lock": {"status": "ok", "text": "on"},
+    }
+    answers = {**RAN_OUT, f"{SUDO} -n -u _estia -H -- *--her-checks": (0, json.dumps(her))}
+    host = FakeMac(root, mac_state(root, **answers))
+    run = step(host, home, yes=["private"], own_user=True)
+    run.sudo_ready = True
+    run.run()
+    chmod = next(i for i, argv in enumerate(host.asked) if hostsec.CHMOD in argv)
+    reads = next(i for i, argv in enumerate(host.asked) if argv[-1] == "--her-checks")
+    assert (SUDO, "-v") in host.asked[:reads], "her checks read on a sign-in that ran out"
+    assert (SUDO, "-v") in host.asked[reads:chmod], "her files fixed on a sign-in that ran out"
+
+
 def test_a_bridge_stopped_on_purpose_stays_stopped_after_a_new_pin(tmp_path: Path) -> None:
     """FULL3: after `/usr/bin/sudo /usr/local/estia/bin/estia stop` (step 1 of "If the Mac is compromised") her service
     file is still there, but launchd does not have her loaded. `--new-pin` (step 7) then neither stops nor starts her,
@@ -405,6 +591,45 @@ def test_a_new_pin_is_offered_with_the_lock_on_only_when_asked_for(tmp_path: Pat
     assert any(argv[-1] == "--set-pin" for argv in host.asked)
 
 
+def test_an_account_without_a_number_is_never_offered_a_pin(tmp_path: Path) -> None:
+    """Signal Login has no Signal PIN and no number to lock: her helper's ✓ line says so, and no PIN is offered or
+    set, --new-pin included; her helper refuses one too."""
+    root, home = mac(tmp_path)
+    (root / "Library/LaunchDaemons").mkdir(parents=True)
+    (root / "Library/LaunchDaemons/com.local-assistant.bridge.plist").write_text("x")
+    lock = {"status": "ok", "text": hostsec.NUMBERLESS_LOCK}
+    answers = {
+        f"{SUDO} -n -u _estia -H -- *--her-checks": (
+            0,
+            json.dumps({"data_modes": {"status": "ok"}, "registration_lock": lock}),
+        ),
+        f"{SUDO} -n -u _estia -H -- *--set-pin": (0, "Registration Lock: on\n"),
+        f"{LAUNCHCTL} print system/com.local-assistant.bridge": (0, "pid = 77\n"),
+    }
+    host = FakeMac(root, mac_state(root, **answers))
+    said: list[str] = []
+    run = step(host, home, yes=["Registration Lock"], pins=[PIN, PIN], own_user=True, new_pin=True, said=said)
+    assert run.run() == 0
+    assert not any("Registration Lock" in q for q in run.questions)
+    assert not any(argv[-1] == "--set-pin" for argv in host.asked)
+    assert any(hostsec.NUMBERLESS_LOCK in line for line in said)
+
+
+def test_her_pin_helper_refuses_an_account_without_a_number(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config = tmp_path / "config.toml"
+    config.write_text(
+        'bot_number = "99999999-8888-4777-8666-555555555555"\nallowed_acis = ["11111111-2222-4333-8444-555555555555"]\n'
+    )
+    config.chmod(0o600)
+    monkeypatch.setattr("local_assistant.config.DEFAULT_CONFIG_PATH", config)
+    monkeypatch.setattr("sys.stdin", io.StringIO(f"{PIN}\n"))
+    monkeypatch.setattr(harden, "set_pin", refuse)
+    assert harden._helper_set_pin() == 1
+    assert "no number" in capsys.readouterr().out
+
+
 def test_a_pin_typed_differently_twice_is_asked_again(tmp_path: Path) -> None:
     root, home = mac(tmp_path)
     run = step(FakeMac(root), home, pins=["1234", "1235", "q"])
@@ -426,6 +651,25 @@ def test_a_dry_run_shows_the_commands_and_asks_nothing(tmp_path: Path, nuclear: 
     assert (f"would run: {SUDO} -n {SOCKETFILTERFW} --setglobalstate on" in text) is nuclear
     assert (f"would run: {SUDO} -n {SOCKETFILTERFW} --setstealthmode on" in text) is nuclear
     assert "Signal → Settings → Linked devices" in text and "port-out" in text
+
+
+def test_her_own_users_dry_run_shows_the_pin_step_only_as_one_for_an_account_with_a_number(tmp_path: Path) -> None:
+    """Second deep scan, signal-08: in her own macOS account the dry run cannot read her Registration Lock (it is read
+    as her, with admin rights), and it listed a PIN and a stop of her bridge that the real run never does for an
+    account without a number. The step's lines now come after one that says when they apply."""
+    root, home = mac(tmp_path)
+    (root / "Library/LaunchDaemons").mkdir(parents=True)
+    (root / "Library/LaunchDaemons/com.local-assistant.bridge.plist").write_text("x")
+    host = FakeMac(root, mac_state(root), dry_run=True)
+    said: list[str] = []
+    run = step(host, home, said=said, own_user=True)
+    run.dry_run = True
+    assert run.run() == 0 and run.questions == []
+    text = "\n".join(said)
+    assert harden.DRY_RUN_LOCK_ONLY in said, text
+    first_pin_line = next(i for i, line in enumerate(said) if "Set a Registration Lock PIN" in line)
+    assert said.index(harden.DRY_RUN_LOCK_ONLY) < first_pin_line
+    assert "without a number" in harden.DRY_RUN_LOCK_ONLY
 
 
 class FakePipe:
@@ -467,12 +711,15 @@ class FakePipe:
         pass
 
 
-def test_set_pin_goes_over_json_rpc_on_stdin() -> None:
+def test_set_pin_goes_over_json_rpc_on_stdin(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path / "her"))
     pipe = FakePipe({"jsonrpc": "2.0", "result": {}, "id": 1})
     assert harden.set_pin("signal-cli", "+306900000000", PIN, popen=pipe) == (True, "")
     assert pipe.argv == [
         "signal-cli",
         "-Djava.net.preferIPv4Stack=true",  # one network path, as the bridge uses
+        "--config",  # her own data folder: her account record keeps /var/empty as home (review I39)
+        f"{tmp_path}/her/.local/share/signal-cli",
         "--trust-new-identities",
         "on-first-use",
         "-a",
@@ -507,6 +754,20 @@ def test_a_json_rpc_call_without_an_answer_says_so() -> None:
     assert not ok and "without an answer" in why
 
 
+def test_a_json_rpc_answer_keeps_the_errors_code() -> None:
+    """-5 is Signal's rate limit (review S8): the caller says so, never "check the key"; no answer has no code."""
+    limited = FakePipe({"jsonrpc": "2.0", "error": {"code": -5, "message": "Rate limit reached"}, "id": 1})
+    answer = harden.json_rpc_answer(["signal-cli", "jsonRpc"], "register", {"account": "x"}, popen=limited)
+    assert answer == harden.RpcAnswer(False, "Rate limit reached", -5)
+    fine = FakePipe({"jsonrpc": "2.0", "result": {}, "id": 1})
+    assert harden.json_rpc_answer(["signal-cli", "jsonRpc"], "register", {}, popen=fine) == harden.RpcAnswer(
+        True, "", None
+    )
+    silent = FakePipe({"jsonrpc": "2.0", "result": {}, "id": 1})
+    silent.stdout.readline = lambda: ""  # type: ignore[method-assign]
+    assert harden.json_rpc_answer(["signal-cli", "jsonRpc"], "register", {}, popen=silent).code is None
+
+
 @pytest.mark.parametrize("pin", ["123", "12 34", "x" * 65])
 def test_a_pin_must_be_4_to_64_characters_without_spaces(pin: str) -> None:
     assert harden.pin_problem(pin)
@@ -534,7 +795,9 @@ def test_her_helper_is_read_as_data_and_never_runs_what_it_names(tmp_path: Path)
     step(host, home, yes=["private"], own_user=True).run()
     assert not any("/bin/sh" in argv or "-c" in argv[2:3] for argv in host.asked)
     applied = [argv for argv in host.asked if "/bin/chmod" in argv]
-    assert applied == [(SUDO, "-n", "-u", "_estia", "/bin/chmod", "-R", "go-rwx", "/var/estia/.config/local-assistant")]
+    assert applied == [
+        (SUDO, "-n", "-u", "_estia", "-H", "--", "/bin/chmod", "-R", "go-rwx", "/var/estia/.config/local-assistant")
+    ]
 
 
 def test_her_files_are_asked_about_once(tmp_path: Path) -> None:
@@ -585,7 +848,31 @@ def test_she_is_started_again_when_the_pin_step_fails(tmp_path: Path) -> None:
     )
 
 
-def test_the_jvm_signal_cli_gets_ipv4_from_its_environment() -> None:
+def test_a_dropped_connection_during_the_pin_never_leaves_her_stopped(tmp_path: Path) -> None:
+    """From her bootout to her bootstrap, a hang-up, a TERM or a Ctrl-C is ignored (the PIN helper takes up to
+    180 s): the step that promises "she runs again" keeps it (review I30)."""
+    import signal
+
+    root, home = mac(tmp_path)
+    (root / "Library/LaunchDaemons").mkdir(parents=True)
+    (root / "Library/LaunchDaemons/com.local-assistant.bridge.plist").write_text("x")
+    seen: list[tuple[object, ...]] = []
+
+    class Watched(FakeMac):
+        def run(self, argv: Sequence[str], **kwargs: Any) -> tuple[int, str]:
+            if argv[-1] == "--set-pin" or "bootout" in argv or "bootstrap" in argv:
+                seen.append(tuple(signal.getsignal(n) for n in (signal.SIGHUP, signal.SIGTERM, signal.SIGINT)))
+            return super().run(argv, **kwargs)
+
+    host = Watched(root, mac_state(root))
+    run = step(host, home, yes=["Registration Lock"], pins=[PIN, PIN], own_user=True)
+    run.registration_lock()
+    assert len(seen) == 3 and all(handlers == (signal.SIG_IGN,) * 3 for handlers in seen), seen
+    assert signal.getsignal(signal.SIGINT) is not signal.SIG_IGN  # given back after
+
+
+def test_the_jvm_signal_cli_gets_ipv4_from_its_environment(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path / "her"))
     pipe = FakePipe({"jsonrpc": "2.0", "result": {}, "id": 1})
     seen: dict[str, Any] = {}
 
@@ -595,7 +882,9 @@ def test_the_jvm_signal_cli_gets_ipv4_from_its_environment() -> None:
 
     assert harden.set_pin("/x/jvm/bin/signal-cli", "+306900000000", PIN, popen=popen, jvm=True, java_home=Path("/j"))
     assert "-Djava.net.preferIPv4Stack=true" not in pipe.argv
-    assert seen["env"]["JAVA_OPTS"] == "-Djava.net.preferIPv4Stack=true" and seen["env"]["JAVA_HOME"] == "/j"
+    assert pipe.argv[1:3] == ["--config", f"{tmp_path}/her/.local/share/signal-cli"]
+    assert seen["env"]["JAVA_OPTS"] == f"-Djava.net.preferIPv4Stack=true -Duser.home={tmp_path}/her"
+    assert seen["env"]["JAVA_HOME"] == "/j"
 
 
 def test_the_firewall_question_names_what_would_stop_answering(tmp_path: Path) -> None:
@@ -1003,8 +1292,231 @@ def test_the_keys_only_question_says_what_a_no_keeps() -> None:
 
 
 def test_each_hardened_question_says_what_a_no_does() -> None:
-    """Enter takes yes at each of these (ENTER_YES): the question says what a no leaves, then the Recommendation."""
-    for key in sorted(harden.ENTER_YES):
+    """Enter takes yes at each of these (ENTER_YES): what a no leaves, then the recommendation on a line of its own
+    right before the question, never inside it (owner, 27 Oct: setup's own questions do the same)."""
+    for key in sorted(harden.ENTER_YES | {"sudoers_others"}):
         question = harden.QUESTIONS[key]
-        assert "No" in question.split("?")[-1] or "No:" in question, key
-        assert "Recommendation: yes" in question, key
+        lead, recommended, asked = question.rpartition("\nYes (recommended")  # as gum names it (owner, 29 Oct)
+        assert lead and recommended and "No" in lead, key
+        assert asked.startswith((").", ", ")) and "?" in asked, key
+        ask = asked.split("\n", 1)[1]  # the question itself, after the recommendation's line
+        assert "ecommend" not in ask and ask.rstrip().endswith("?"), key
+    assert "\nYes (recommended, then test a new login before you close this one).\n" in harden.QUESTIONS["ssh_password"]
+    assert "\nYes (recommended, unless something here needs them).\n" in harden.QUESTIONS["sudoers_others"]
+    assert harden.QUESTIONS["ssh_password"].endswith("\nAllow SSH with keys only?")
+
+
+# ------------------------------------------------------------------ in the setup window (owner, 29 Oct)
+
+
+def windowed(host: Host, home: Path, said: list[object], **kwargs: Any) -> harden.Harden:
+    """The step as setup's window runs it: admin rights from macOS's own box, never a password typed anywhere."""
+    return harden.Harden(
+        host,
+        owner="alex",
+        owner_home=home,
+        own_user=kwargs.pop("own_user", False),
+        ask=kwargs.pop("ask", lambda question, default: False),
+        hidden=kwargs.pop("hidden", lambda prompt: "q"),
+        say=said.append,
+        tailscale_tools=(),
+        window=kwargs.pop("window", True),
+        **kwargs,
+    )
+
+
+def test_in_the_window_no_line_asks_for_the_mac_password(tmp_path: Path) -> None:
+    """The window's step names macOS's own box where Terminal names the Mac password typed there."""
+    from local_assistant import prompts
+
+    root, home = mac(tmp_path)
+    host = FakeMac(root, mac_state(root))
+    said: list[object] = []
+    windowed(host, home, said, ask=lambda question, default: "firewall" in question, nuclear=True).run()
+    lines = [str(line) for line in said]
+    assert prompts.SETUP_WINDOW_ADMIN_BOX in lines and harden.PASSWORD_WHEN_WINDOW in " ".join(lines)
+    assert not any("mac password" in line.lower() or "nothing shows while you type" in line for line in lines)
+
+
+@pytest.mark.parametrize("own_user", [False, True])
+def test_admin_rights_not_given_in_the_security_step_are_said_and_end_it_with_its_cross(
+    tmp_path: Path, own_user: bool
+) -> None:
+    """Round 2 (words-16, r2-window-admin-security-refused-words): Cancel at macOS's box, then Not now, said "✗ sudo
+    did not work" (jargon), dropped her files' and Registration Lock's checks without a word, and the step ended 0, so
+    setup's closing read as complete. It says admin rights were not given, names what was not checked, and ends 1."""
+    root, home = mac(tmp_path)
+    host = FakeMac(root, mac_state(root, **{f"{SUDO} -v": (1, "Admin rights: not given")}))
+    said: list[object] = []
+    code = windowed(host, home, said, ask=lambda question, default: True, own_user=own_user).run()
+    lines = [str(line) for line in said]
+    assert harden.ADMIN_NOT_GIVEN in lines and not any("sudo did not work" in line for line in lines)
+    assert (harden.HER_NOT_CHECKED in lines) is own_user
+    assert code == 1
+
+
+def test_in_the_window_sudo_asking_again_is_read_as_you_never_typed(tmp_path: Path) -> None:
+    """After a rule that skips the password is removed, Terminal asks the password once more (sudo -k, sudo -v); the
+    window reads it as you instead (`sudo -n -k -l`: "a password is required" proves it), no password typed."""
+    host, home = sudo_rule_mac(tmp_path, "alex ALL=(ALL) NOPASSWD: ALL\n")
+    said: list[object] = []
+    windowed(host, home, said, ask=lambda question, default: "zz-rule" in question).run()
+    removed = next(i for i, argv in enumerate(host.asked) if argv[:3] == (SUDO, "-n", hostsec.RM))
+    after = host.asked[removed:]
+    assert (SUDO, "-n", "-k", "-l") in after and (SUDO, "-v") not in after and (SUDO, "-k") not in after
+    assert harden.PASSWORD_ONCE_MORE not in said
+
+
+def test_in_the_window_keys_only_says_how_to_take_it_back_with_copy(tmp_path: Path) -> None:
+    root, home = mac(tmp_path)
+    host = FakeMac(root, mac_state(root))
+    said: list[object] = []
+    windowed(host, home, said, ask=lambda question, default: "keys only" in question).run()
+    undo = f"{SUDO} {hostsec.RM} {hostsec.SSH_DROP_IN_PATH}"
+    assert harden.SSH_DONE_WINDOW.format(undo=undo) in said
+    assert f"\n  $ {undo}" in harden.SSH_DONE_WINDOW.format(undo=undo)  # its own line: the window draws Copy
+
+
+def test_her_start_refused_after_the_pin_says_she_stays_stopped(tmp_path: Path) -> None:
+    """Her start after the PIN may meet admin rights run out (the window's box refused, sudo's sign-in gone): it is
+    checked, and the line says she stays stopped and how to start her, never "she runs again"."""
+    root, home = mac(tmp_path)
+    (root / "Library/LaunchDaemons").mkdir(parents=True)
+    (root / "Library/LaunchDaemons/com.local-assistant.bridge.plist").write_text("x")
+    her = {"data_modes": {"status": "ok"}, "registration_lock": {"status": "warn"}}
+    answers = mac_state(
+        root,
+        **{
+            f"{SUDO} -n -u _estia -H -- *--her-checks": (0, json.dumps(her)),
+            f"{SUDO} -n -u _estia -H -- *--set-pin": (0, "Registration Lock: on\n"),
+            f"{LAUNCHCTL} print system/com.local-assistant.bridge": (0, "pid = 77\n"),
+            f"{SUDO} -n {LAUNCHCTL} bootstrap system *": (1, "admin rights not given"),
+        },
+    )
+    host = FakeMac(root, answers)
+    said: list[str] = []
+    run = step(host, home, yes=["Registration Lock"], pins=[PIN, PIN], own_user=True, said=said)
+    assert run.run() == 0
+    start = f"{ownuser.ESTIA} start"
+    assert f"✓ Registration Lock: on{harden.HER_NOT_STARTED.format(start=start)}" in said
+    assert "✓ Registration Lock: on; she runs again." not in said
+
+
+def test_in_the_window_admin_rights_are_asked_again_right_before_her_stop(tmp_path: Path) -> None:
+    """In the window `sudo_again` is a fresh authorize (`sudo -v`, macOS's box only when its 5 minutes ran out), never
+    the `sudo -n -v` the window maps to nothing: the plan's authorize before her stop (review ADM-3, FRIEND-5)."""
+    root, home = mac(tmp_path)
+    host = FakeMac(root, mac_state(root))
+    run = windowed(host, home, [])
+    run.sudo_ready = True
+    assert run.sudo_again()
+    assert host.asked[-1] == (SUDO, "-v") and (SUDO, "-n", "-v") not in host.asked
+    refused = FakeMac(root, mac_state(root, **{f"{SUDO} -v": (1, "Admin rights: not given")}))
+    run = windowed(refused, home, [])
+    run.sudo_ready = True
+    assert not run.sudo_again() and not run.sudo_ready
+
+
+def test_once_the_window_closed_sudo_asks_in_terminal_with_terminals_words(tmp_path: Path) -> None:
+    """The window closed during the step: the rest is harden.sh's, `sudo -n -v` run for real (no sign-in in
+    Terminal yet: it fails), then `sudo -v`, which asks there, with Terminal's words (review ADM-2, FRIEND-3)."""
+    from local_assistant import prompts
+
+    root, home = mac(tmp_path)
+    host = FakeMac(root, mac_state(root, **{f"{SUDO} -n -v": (1, "sudo: a password is required\n")}))
+    said: list[object] = []
+    is_open = [True]
+    run = windowed(host, home, said, window=lambda: is_open[0])
+    assert run.sudo() and prompts.SETUP_WINDOW_ADMIN_BOX in said
+    is_open[0] = False
+    said.clear()
+    assert run.sudo_again()
+    assert host.asked[-2:] == [(SUDO, "-n", "-v"), (SUDO, "-v")]
+    assert harden.PASSWORD_YOURS in said and prompts.SETUP_WINDOW_ADMIN_BOX not in said
+
+
+def test_her_stop_refused_sets_no_pin_and_starts_nothing(tmp_path: Path) -> None:
+    """Her bootout refused or failed while she runs (the window's box cancelled, then Not now): no PIN helper runs
+    against her live account and no start follows; the line says what to run (review ADM-3, FRIEND-5)."""
+    root, home = mac(tmp_path)
+    (root / "Library/LaunchDaemons").mkdir(parents=True)
+    (root / "Library/LaunchDaemons/com.local-assistant.bridge.plist").write_text("x")
+    her = {"data_modes": {"status": "ok"}, "registration_lock": {"status": "warn"}}
+    answers = mac_state(
+        root,
+        **{
+            f"{SUDO} -n -u _estia -H -- *--her-checks": (0, json.dumps(her)),
+            f"{LAUNCHCTL} print system/com.local-assistant.bridge": (0, "pid = 77\n"),
+            f"{SUDO} -n {LAUNCHCTL} bootout system/*": (1, "Admin rights: not given"),
+        },
+    )
+    host = FakeMac(root, answers)
+    said: list[str] = []
+    run = step(host, home, yes=["Registration Lock"], pins=[PIN, PIN], own_user=True, said=said)
+    assert run.run() == 0
+    assert not any(argv[-1] == "--set-pin" for argv in host.asked)
+    assert not any("bootstrap" in argv for argv in host.asked)
+    assert "  She was not stopped and no PIN was set: run scripts/harden.sh again." in said
+
+
+def test_her_stop_the_pin_and_her_start_run_inside_the_held_section(tmp_path: Path) -> None:
+    """From her stop to her start nothing interrupts the step (`held`: in Terminal hang-ups, TERMs and Ctrl-Cs ignored;
+    in the window a Stop here or a Ctrl-C waits for its end too): each of the three runs inside it (review FRIEND-5)."""
+    import contextlib
+
+    root, home = mac(tmp_path)
+    (root / "Library/LaunchDaemons").mkdir(parents=True)
+    (root / "Library/LaunchDaemons/com.local-assistant.bridge.plist").write_text("x")
+    her = {"data_modes": {"status": "ok"}, "registration_lock": {"status": "warn"}}
+    answers = mac_state(
+        root,
+        **{
+            f"{SUDO} -n -u _estia -H -- *--her-checks": (0, json.dumps(her)),
+            f"{SUDO} -n -u _estia -H -- *--set-pin": (0, "Registration Lock: on\n"),
+            f"{LAUNCHCTL} print system/com.local-assistant.bridge": (0, "pid = 77\n"),
+        },
+    )
+    inside: list[bool] = [False]
+    seen: list[tuple[tuple[str, ...], bool]] = []
+
+    class Recording(FakeMac):
+        def run(self, argv: Sequence[str], **kwargs: Any) -> tuple[int, str]:
+            seen.append((tuple(argv), inside[0]))
+            return super().run(argv, **kwargs)
+
+    @contextlib.contextmanager
+    def held() -> Iterator[None]:
+        inside[0] = True
+        try:
+            yield
+        finally:
+            inside[0] = False
+
+    host = Recording(root, answers)
+    run = step(host, home, yes=["Registration Lock"], pins=[PIN, PIN], own_user=True)
+    run.held = held
+    assert run.run() == 0
+    three = [held_now for argv, held_now in seen if "bootout" in argv or "bootstrap" in argv or argv[-1] == "--set-pin"]
+    assert three == [True, True, True]
+
+
+@pytest.mark.parametrize("left", ["    (ALL) ALL\n", ""], ids=["with-password", "none"])
+def test_in_the_window_the_removal_is_checked_by_roots_listing_of_your_rules(tmp_path: Path, left: str) -> None:
+    """In the window "a password is required" is said both by a working sudo and to an account with no rule left:
+    after the removal root lists your rules again (`sudo -n -l` → `-l -U`), and only a rule with your password left is
+    "asks for your password now" (review ADM-10)."""
+    host, home = sudo_rule_mac(tmp_path, "alex ALL=(ALL) NOPASSWD: ALL\n")
+
+    class After(FakeMac):
+        def run(self, argv: Sequence[str], **kwargs: Any) -> tuple[int, str]:
+            if tuple(argv[:3]) == (SUDO, "-n", hostsec.RM):
+                self.answers[f"{SUDO} -n -l"] = (0, f"User alex may run:\n{left}")
+                self.answers[f"{SUDO} -n -k -l"] = (1, "sudo: a password is required\n")
+            return super().run(argv, **kwargs)
+
+    after = After(host.root, host.answers)
+    said: list[object] = []
+    windowed(after, home, said, ask=lambda question, default: "zz-rule" in question).run()
+    assert any(argv[:3] == (SUDO, "-n", hostsec.RM) for argv in after.asked)
+    asks, check = "✓ sudo asks for your password now.", "! sudo: check it in a new terminal."
+    assert (asks in said, check in said) == ((True, False) if left else (False, True))

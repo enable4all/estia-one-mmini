@@ -2,18 +2,24 @@
 checked, rolled back on failure, old releases pruned. A fake runner stands in for sudo, uv and launchd; git, tar and cp
 run for real on a fake checkout in a temporary root."""
 
+import ast
+import contextlib
 import json
 import os
 import pwd
 import shutil
+import signal
 import sqlite3
 import subprocess
+import sys
+import time
 from collections.abc import Sequence
 from pathlib import Path
+from typing import Any
 
 import pytest
 
-from local_assistant import deploy, ownuser
+from local_assistant import deploy, ownuser, voice
 from local_assistant.deploy import ENV, Builder, Deploy, DeployError
 from local_assistant.hostsec import CHOWN, LAUNCHCTL, SUDO, Host
 
@@ -91,6 +97,14 @@ class FakeMac(Host):
         self.fails = fails  # a tool name whose command fails, with a message on stderr
         self.loaded = loaded  # the services launchd knows (None: every one); a bootstrap loads one
         self.built: list[str] = []  # the products swift built
+        # where the voice service's build puts heart's file in its own bundle: "deep" (Contents/Resources, Swift 6.4's
+        # default build, swiftbuild), "flat" (the bundle's top, the native build, Swift 6.2's default), "none" (not
+        # there) or "other" (other bytes than the commit's); `left_out`: heart's files the build leaves out all the same
+        self.heart = "deep"
+        self.left_out: set[str] = set()
+        self.fetched: list[str] = []  # the voice services that fetched Pocket TTS's program beside themselves
+        self.python = "3.13.9"  # the Python uv installs into a release
+        self.imports = (0, "")  # the new root-run tools' import check
         # what the release's documents helper says when it reads its check page
         self.documents_answer = (0, json.dumps({**CHECKED, "page_count": 1}) + "\n")
 
@@ -113,11 +127,17 @@ class FakeMac(Host):
             self.pid += 1
             if self.healthy and self.clock is not None:
                 self.alive = self.clock.now + 1  # the new bridge writes its sign of life
-        if tool in ("/usr/bin/git", "/usr/bin/tar", "/bin/rm", "/bin/mkdir", "/bin/cp"):
+        if tool in ("/usr/bin/git", "/usr/bin/tar", "/bin/rm", "/bin/mkdir", "/bin/cp") or inner[:2] == [
+            "/bin/bash",
+            "-n",
+        ]:
             done = subprocess.run(inner, capture_output=True, text=True, check=False)
             return done.returncode, done.stdout + done.stderr
         if tool == UV and inner[1:3] == ["python", "install"]:
-            interp = Path(inner[inner.index("--install-dir") + 1]) / "cpython-3.13.9-macos-aarch64-none/bin/python3.13"
+            series = ".".join(self.python.split(".")[:2])
+            interp = Path(inner[inner.index("--install-dir") + 1]) / (
+                f"cpython-{self.python}-macos-aarch64-none/bin/python{series}"
+            )
             interp.parent.mkdir(parents=True)
             interp.write_text("#!/bin/sh\n")
             return 0, ""
@@ -138,6 +158,20 @@ class FakeMac(Host):
                 (products / product).write_text(f"#!/bin/sh\n# built from: {source.read_text()}")
                 (products / "FluidAudio_FluidAudio.bundle").mkdir()
                 (products / "FluidAudio_FluidAudio.bundle" / "Info.plist").write_text("built")
+                # its own bundle: heart's voice files as the commit has them (Package.swift's resources: the 100M's,
+                # 27 Oct; the 18M's, 29 Oct); a commit without the 100M's still gets one, without the 18M's none
+                voices = Path(inner[inner.index("--package-path") + 1]) / "Sources/voice-service/Voices"
+                bundle = products / "voice-service_voice-service.bundle"
+                resources = bundle / "Contents" / "Resources" if self.heart != "flat" else bundle
+                resources.mkdir(parents=True)
+                for name in deploy.HEART_FILES:
+                    heart = voices / name
+                    if self.heart == "none" or name in self.left_out:
+                        continue
+                    if not heart.is_file() and name != "heart.safetensors":
+                        continue
+                    built = heart.read_bytes() if heart.is_file() else b"heart"
+                    (resources / name).write_bytes(built + (b" other" if self.heart == "other" else b""))
             else:
                 (products / product).write_text("#!/bin/sh\n")
             (products / product).chmod(0o755)
@@ -147,6 +181,17 @@ class FakeMac(Host):
             return 0, "Build complete!\n"
         if tool.endswith("/documents-helper"):
             return self.documents_answer
+        if tool.endswith("/voice-service") and inner[1:] == ["--fetch-pocket"]:  # the pinned program, beside it
+            self.fetched.append(tool)
+            folder = Path(tool).parent / "pocket-tts"
+            folder.mkdir()
+            (folder / "pocket-tts").write_text(f"pocket {len(self.fetched)}")
+            (folder / "pocket-tts").chmod(0o755)
+            (folder / "LICENSE").write_text("MIT")
+            return 0, "voice-service: Pocket TTS: its program fetched and checked\n"
+
+        if tool.endswith("/python3") and "local_assistant.deploy" in " ".join(inner):
+            return self.imports
         if tool.endswith(("/python", "/python3.13")):
             if "--read-alive" in inner:
                 return (0, f"{self.alive:.0f}\n") if self.healthy else (1, "")
@@ -291,6 +336,66 @@ def test_a_failed_health_check_switches_back(tmp_path: Path) -> None:
     assert any("switched back" in line for line in said)
 
 
+def test_a_check_window_ignores_a_dropped_connection(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Over SSH a dropped connection sends a hang-up: from the switch to the end of the check (and the switch back)
+    it is ignored, so an unchecked release never stays live and a bootout is always followed by its bootstrap
+    (review I30)."""
+    root, repo, clock = tmp_path / "root", checkout(tmp_path), Clock()
+    daemons(root)
+    assert deployment(root, repo, FakeMac(root), clock).run() == 0
+    clock.now += 3600
+    seen: dict[str, list[object]] = {"go": [], "health": [], "switch": []}
+    real_go, real_health, real_switch = Deploy.go, Deploy.health, Deploy.switch
+
+    def watched(name: str, real: Any) -> Any:
+        def call(self: Deploy, *args: Any) -> Any:
+            seen[name].append((signal.getsignal(signal.SIGHUP), signal.getsignal(signal.SIGINT)))
+            return real(self, *args)
+
+        return call
+
+    monkeypatch.setattr(Deploy, "go", watched("go", real_go))
+    monkeypatch.setattr(Deploy, "health", watched("health", real_health))
+    monkeypatch.setattr(Deploy, "switch", watched("switch", real_switch))
+    said: list[str] = []
+    assert deployment(root, repo, FakeMac(root, healthy=False), clock, said=said).run() == 1
+    ignored = (signal.SIG_IGN, signal.SIG_IGN)
+    assert seen["go"] == [ignored] and seen["health"] == [ignored] and seen["switch"] == [ignored, ignored]
+    assert signal.getsignal(signal.SIGHUP) is not signal.SIG_IGN  # given back after
+    assert any("a dropped connection or a Ctrl-C waits for it" in line for line in said), said
+
+
+def test_a_hang_up_while_the_release_builds_leaves_nothing(tmp_path: Path) -> None:
+    """A hang-up during the minutes the build takes: the half-built release is removed, `current` stays, and the
+    line says so (review I30)."""
+    root, repo, clock = tmp_path / "root", checkout(tmp_path), Clock()
+    daemons(root)
+    assert deployment(root, repo, FakeMac(root), clock).run() == 0
+    first = (root / "usr/local/estia/current").resolve()
+    clock.now += 3600
+
+    def unhandled(signum: int, _frame: object) -> None:  # the default would end the test run itself
+        raise AssertionError("the hang-up was not handled")
+
+    previous = signal.signal(signal.SIGHUP, unhandled)
+    try:
+
+        class HungUp(FakeMac):
+            def run(self, argv: Sequence[str], **kwargs: object) -> tuple[int, str]:
+                if UV in argv and "sync" in argv:
+                    os.kill(os.getpid(), signal.SIGHUP)
+                    time.sleep(0.5)
+                return super().run(argv, **kwargs)
+
+        said: list[str] = []
+        assert deployment(root, repo, HungUp(root), clock, said=said).run() == 1
+    finally:
+        signal.signal(signal.SIGHUP, previous)
+    assert (root / "usr/local/estia/current").resolve() == first
+    assert sorted(p.name for p in (root / "usr/local/estia/releases").iterdir()) == [first.name]
+    assert any(line.startswith("✗ deploy stopped, nothing switched") for line in said), said
+
+
 def test_old_releases_are_pruned(tmp_path: Path) -> None:
     root, repo, clock = tmp_path / "root", checkout(tmp_path), Clock()
     for _ in range(5):
@@ -379,6 +484,41 @@ def test_last_alive_is_read_read_only(tmp_path: Path) -> None:
     assert deploy.read_alive(db) == "1791000123"
     assert deploy.read_alive(tmp_path / "none.db") is None
     assert sorted(p.name for p in tmp_path.iterdir()) == ["assistant.db"]  # no -wal or -shm made
+
+
+def test_the_release_side_of_the_health_check_never_changes(tmp_path: Path) -> None:
+    """Older root-run tools drive a newer release until --update-tools (the update order: deploy, --update-tools,
+    deploy): the first deploy of every update calls the new release's `deploy --read-alive DB` and `--read-calls
+    CONFIG` and reads their output. Their flags and output stay as they are, or every update fails its health check
+    and switches back (review I17)."""
+    db = tmp_path / "assistant.db"
+    with sqlite3.connect(db) as conn:
+        conn.execute("CREATE TABLE state (key TEXT PRIMARY KEY, value TEXT)")
+        conn.execute("INSERT INTO state VALUES ('last_alive', '1791000123')")
+    config = tmp_path / "config.toml"
+    config.write_text("[voice]\n[calls]\n", encoding="utf-8")
+
+    def cli(*args: str) -> tuple[int, str]:
+        done = subprocess.run(
+            [sys.executable, "-I", "-m", "local_assistant.deploy", *args], capture_output=True, text=True, check=False
+        )
+        return done.returncode, done.stdout
+
+    assert cli("--read-alive", str(db)) == (0, "1791000123\n")
+    assert cli("--read-alive", str(tmp_path / "none.db")) == (1, "\n")
+    assert cli("--read-calls", str(config)) == (0, "on\n")
+    assert cli("--read-calls", str(tmp_path / "none.toml")) == (0, "off\n")
+    root, repo, clock = tmp_path / "root", checkout(tmp_path), Clock()
+    daemons(root)
+    mac = FakeMac(root)
+    run = deployment(root, repo, mac, clock)
+    assert run.run() == 0 and run.her_calls() is False
+    her = (SUDO, "-n", "-u", "_estia", "-H", "--", ENV, "-i", "HOME=/var/estia")
+    python = str(root / "usr/local/estia/current/.venv/bin/python")
+    db_path = "/var/estia/Library/Application Support/local-assistant/assistant.db"
+    assert (*her, python, "-I", "-m", "local_assistant.deploy", "--read-alive", db_path) in mac.asked
+    config_path = "/var/estia/.config/local-assistant/config.toml"
+    assert (*her, python, "-I", "-m", "local_assistant.deploy", "--read-calls", config_path) in mac.asked
 
 
 def test_the_owner_is_the_sudo_user(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -507,10 +647,16 @@ def homebrew(tmp_path: Path) -> Path:
     return brew
 
 
-def jvm_vendor(repo: Path) -> None:
+def jvm_vendor(repo: Path, *, jdk: bool = True) -> None:
+    """The JVM signal-cli in the checkout's vendor/, with a JDK next to it (`jdk`)."""
     launcher = repo / "vendor/signal-cli-0.14.9-jvm/signal-cli-0.14.9/bin/signal-cli"
     launcher.parent.mkdir(parents=True)
     launcher.write_text("#!/bin/sh\n")
+    if jdk:
+        java = repo / "vendor/openjdk.jdk/Contents/Home/bin/java"
+        java.parent.mkdir(parents=True)
+        java.write_text("java")
+        java.chmod(0o755)
 
 
 def test_her_signal_cli_and_java_are_copied_into_the_release(tmp_path: Path) -> None:
@@ -525,6 +671,111 @@ def test_her_signal_cli_and_java_are_copied_into_the_release(tmp_path: Path) -> 
     assert (release / "vendor/signal-cli-0.14.9-jvm/signal-cli-0.14.9/bin/signal-cli").is_file()
     meta = json.loads((release / "release.json").read_text())
     assert {"signal-cli-native", "openjdk.jdk", "signal-cli-0.14.9-jvm"} <= set(meta["vendor"])
+
+
+def older_jvm(repo: Path, version: str = "0.14.8") -> None:
+    """A second, older JVM signal-cli beside jvm_vendor's 0.14.9 (an update before kept it in vendor/)."""
+    launcher = repo / f"vendor/signal-cli-{version}-jvm/signal-cli-{version}/bin/signal-cli"
+    launcher.parent.mkdir(parents=True)
+    launcher.write_text("#!/bin/sh\n")
+
+
+def test_a_deploy_copies_only_the_java_build_she_runs_and_names_the_ones_left_out(tmp_path: Path) -> None:
+    """Second deep scan, signal-07: every deploy carried every older Java signal-cli forward (about 120 MB each, in
+    every release kept). Only the one she runs goes into the release: the newest (`config.jvm_signal_cli`), and the
+    one her config's [calls] signal_cli names, read as her; the review names each one left out."""
+    root, repo, clock = tmp_path / "root", checkout(tmp_path), Clock()
+    jvm_vendor(repo)
+    older_jvm(repo)
+    said: list[str] = []
+    assert deployment(root, repo, FakeMac(root), clock, health=False, said=said).run() == 0
+    release = (root / "usr/local/estia/current").resolve()
+    assert (release / "vendor/signal-cli-0.14.9-jvm/signal-cli-0.14.9/bin/signal-cli").is_file()
+    assert not (release / "vendor/signal-cli-0.14.8-jvm").exists()
+    assert "signal-cli-0.14.8-jvm" not in json.loads((release / "release.json").read_text())["vendor"]
+    shown = "\n".join(said)
+    assert "left out: vendor/signal-cli-0.14.8-jvm/signal-cli-0.14.8 (an older Java build" in shown, shown
+    clock.now += 60
+    named = deployment(root, repo, FakeMac(root), clock, health=False)
+    named.her_call_build = lambda: "signal-cli-0.14.8-jvm/signal-cli-0.14.8"  # her config names it: kept
+    assert named.run() == 0
+    release = (root / "usr/local/estia/current").resolve()
+    assert (release / "vendor/signal-cli-0.14.8-jvm/signal-cli-0.14.8/bin/signal-cli").is_file()
+    assert (release / "vendor/signal-cli-0.14.9-jvm/signal-cli-0.14.9/bin/signal-cli").is_file()
+    clock.now += 60
+    unread = deployment(root, repo, FakeMac(root), clock, health=False)
+    unread.her_call_build = lambda: None  # her config not read: every build stays, as before
+    assert unread.run() == 0
+    assert ((root / "usr/local/estia/current").resolve() / "vendor/signal-cli-0.14.8-jvm").is_dir()
+
+
+def test_an_older_java_build_in_the_live_release_is_not_carried_forward(tmp_path: Path) -> None:
+    """signal-07: the live release's vendor/ is one of the places a deploy takes her programs from; an older Java build
+    there stays behind once a newer one comes, and the review says it goes."""
+    root, repo, clock = tmp_path / "root", checkout(tmp_path), Clock()
+    older_jvm(repo)
+    java = repo / "vendor/openjdk.jdk/Contents/Home/bin/java"
+    java.parent.mkdir(parents=True)
+    java.write_text("java")
+    assert deployment(root, repo, FakeMac(root), clock, health=False).run() == 0
+    shutil.rmtree(repo / "vendor/signal-cli-0.14.8-jvm")  # the checkout's vendor/ moved on
+    launcher = repo / "vendor/signal-cli-0.14.9-jvm/signal-cli-0.14.9/bin/signal-cli"
+    launcher.parent.mkdir(parents=True)
+    launcher.write_text("#!/bin/sh\n")
+    clock.now += 60
+    said: list[str] = []
+    assert deployment(root, repo, FakeMac(root), clock, health=False, said=said).run() == 0
+    release = (root / "usr/local/estia/current").resolve()
+    assert not (release / "vendor/signal-cli-0.14.8-jvm").exists()
+    assert "left out: vendor/signal-cli-0.14.8-jvm/signal-cli-0.14.8" in "\n".join(said), said
+
+
+def test_the_call_helpers_stamp_goes_with_it_into_her_release(tmp_path: Path) -> None:
+    """signal-06: setup and doctor read the stamp build.sh writes beside the call helper (its sources), in her release
+    too: the deploy copies it from the place it takes the helper from."""
+    root, repo, clock = tmp_path / "root", checkout(tmp_path), Clock()
+    helper = repo / "vendor" / deploy.TUNNEL
+    helper.parent.mkdir(parents=True)
+    helper.write_text("helper")
+    helper.with_name(helper.name + ".stamp").write_text("pr5_head=new\n")
+    assert deployment(root, repo, FakeMac(root), clock, health=False).run() == 0
+    release = (root / "usr/local/estia/current").resolve()
+    copied = release / "vendor" / deploy.TUNNEL
+    assert copied.read_text() == "helper"
+    assert copied.with_name(copied.name + ".stamp").read_text() == "pr5_head=new\n"
+
+
+def test_her_configs_java_build_is_read_as_her_by_its_folder_name(tmp_path: Path) -> None:
+    """signal-07: root never reads her config; her release's Python reads [calls] signal_cli as her and names only a
+    Java build's folder in a vendor/ (or nothing: the newest runs). A config not read is None: every build stays."""
+    config = tmp_path / "config.toml"
+    built = "/usr/local/estia/current/vendor/signal-cli-0.14.8-jvm/signal-cli-0.14.8/bin/signal-cli"
+    config.write_text(f'[calls]\nsignal_cli = "{built}"\n', encoding="utf-8")
+    assert deploy.read_call_build(config) == "signal-cli-0.14.8-jvm/signal-cli-0.14.8"
+    config.write_text('[calls]\nsignal_cli = "/opt/homebrew/bin/signal-cli"\n', encoding="utf-8")
+    assert deploy.read_call_build(config) == ""
+    config.write_text("[calls]\n", encoding="utf-8")
+    assert deploy.read_call_build(config) == ""
+    assert deploy.read_call_build(tmp_path / "missing.toml") is None
+    config.write_text("[calls\n", encoding="utf-8")
+    assert deploy.read_call_build(config) is None
+    root, repo, clock = tmp_path / "root", checkout(tmp_path), Clock()
+    mac = FakeMac(root)
+    assert deployment(root, repo, mac, clock).her_call_build() == ""  # the fake release's Python says nothing
+    assert any("--read-call-build" in argv for argv in mac.asked)
+
+
+def test_a_jvm_signal_cli_without_a_java_to_copy_stops_the_deploy(tmp_path: Path) -> None:
+    """Without a JDK in the release, her JVM signal-cli would run the Java macOS picks, perhaps a Homebrew keg the
+    owner's account can change (review I32): the deploy stops before anything is built, with the fix."""
+    root, repo, clock = tmp_path / "root", checkout(tmp_path), Clock()
+    jvm_vendor(repo, jdk=False)
+    said: list[str] = []
+    mac = FakeMac(root)
+    assert deployment(root, repo, mac, clock, health=False, said=said).run() == 1
+    line = next(line for line in said if line.startswith("✗"))
+    assert "no Java to copy for the JVM signal-cli" in line and "brew install openjdk" in line, line
+    assert not (root / "usr/local/estia/current").exists() and not any(UV in argv for argv in mac.asked)
 
 
 def test_no_java_is_copied_without_the_jvm_signal_cli(tmp_path: Path) -> None:
@@ -557,6 +808,230 @@ def test_the_first_deploy_installs_the_root_run_tools(tmp_path: Path) -> None:
     assert (tools / "python3").resolve().is_relative_to(tools.resolve())  # its own copy, not the release's
     assert (code / "bin/estia").read_text() == (tools / "scripts/estia").read_text() == "#!/bin/bash\necho estia\n"
     assert json.loads((tools / "tools.json").read_text())["release"] == (code / "current").resolve().name
+
+
+def tool_modules() -> list[str]:
+    return [rel for rel in deploy.TOOL_FILES if rel.startswith("src/") and rel.endswith(".py")]
+
+
+@pytest.mark.parametrize("rel", tool_modules())
+def test_the_root_run_tools_import_only_themselves_and_the_standard_library(rel: str) -> None:
+    """Root runs /usr/local/estia/tools with only TOOL_FILES in it: an import of any other module of ours (inside a
+    function too) would break every estia-deploy, rollback, remove-old and account once --update-tools took it, with
+    no command left to repair it (review I16)."""
+    ours = {path.removeprefix("src/").removesuffix(".py").replace("/", ".") for path in tool_modules()}
+    ours = {name.removesuffix(".__init__") for name in ours}
+    names = {name.rsplit(".", 1)[-1] for name in ours if "." in name}
+    for node in ast.walk(ast.parse((ROOT / rel).read_text(encoding="utf-8"))):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                top = alias.name.split(".")[0]
+                assert alias.name in ours or top in sys.stdlib_module_names, (rel, alias.name)
+        elif isinstance(node, ast.ImportFrom):
+            assert node.level == 0 and node.module, (rel, ast.dump(node))
+            top = node.module.split(".")[0]
+            assert node.module in ours or top in sys.stdlib_module_names or top == "__future__", (rel, node.module)
+            if node.module == "local_assistant":
+                assert {alias.name for alias in node.names} <= names, (rel, [a.name for a in node.names])
+
+
+def test_tools_that_do_not_import_are_never_installed(tmp_path: Path) -> None:
+    """--update-tools checks the new tools with their own Python and only their own files before the swap; a
+    failure keeps the installed ones whole and says why (review I16)."""
+    root, repo, clock = tmp_path / "root", checkout(tmp_path), Clock()
+    assert deployment(root, repo, FakeMac(root), clock, health=False).run() == 0
+    commit(repo, "src/local_assistant/ownuser.py", "from local_assistant import config\n", "an import root lacks")
+    clock.now += 60
+    assert deployment(root, repo, FakeMac(root), clock, health=False).run() == 0
+    code = root / "usr/local/estia"
+    mac = FakeMac(root)
+    mac.imports = (1, "ImportError: cannot import name 'config' from 'local_assistant'\n")
+    said: list[str] = []
+    assert deployment(root, repo, mac, clock, health=False, said=said).update_tools() == 1
+    assert (code / "tools/src/local_assistant/ownuser.py").read_text() == "# ownuser\n"  # the installed ones stay
+    assert (code / "tools/python3").resolve().is_file()
+    assert not (code / ".tools.new").exists() and not (code / ".tools.old").exists()
+    assert any(line.startswith("✗") and "cannot import name 'config'" in line for line in said), said
+    check = next(argv for argv in mac.asked if argv[0].endswith("/python3"))
+    new = code / ".tools.new"
+    assert check[0] == str(new / "python3") and check[1:3] == ("-I", "-c") and check[-1] == str(new / "src")
+
+
+@pytest.mark.parametrize("name", ["scripts/estia", "scripts/estia-deploy"])
+def test_shell_tools_that_bash_cannot_read_are_never_installed(tmp_path: Path, name: str) -> None:
+    """A broken estia-deploy left no way to update, and a broken estia none to stop her: each shell tool is read by
+    bash (-n) before the swap, and one it cannot read keeps the installed tools (release review D5)."""
+    root, repo, clock = tmp_path / "root", checkout(tmp_path), Clock()
+    assert deployment(root, repo, FakeMac(root), clock, health=False).run() == 0
+    commit(repo, name, "#!/bin/bash\nif then fi\n", "a shell tool bash cannot read")
+    clock.now += 60
+    assert deployment(root, repo, FakeMac(root), clock, health=False).run() == 0
+    code = root / "usr/local/estia"
+    mac = FakeMac(root)
+    said: list[str] = []
+    assert deployment(root, repo, mac, clock, health=False, said=said).update_tools() == 1
+    assert (code / "tools" / name).read_text() == (code / "bin" / Path(name).name).read_text()
+    assert "if then fi" not in (code / "tools" / name).read_text()
+    assert not (code / ".tools.new").exists()
+    assert any(line.startswith("✗") and name in line and "bash" in line for line in said), said
+    assert (deploy.BASH, "-n", str(code / ".tools.new" / name)) in mac.asked
+
+
+def test_the_new_tools_take_the_old_ones_place_in_one_step(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Two renames (the old tools aside, the new ones in) left a moment with no tools at all: a stop there (a power
+    cut) left estia-deploy, rollback, remove-old and account with nothing to run, and no command to repair it. The
+    whole new tree swaps names with the old one in one step (review I16)."""
+    root, repo, clock = tmp_path / "root", checkout(tmp_path), Clock()
+    assert deployment(root, repo, FakeMac(root), clock, health=False).run() == 0
+    commit(repo, "scripts/estia", "# estia, changed\n", "a wrapper change")
+    clock.now += 60
+    assert deployment(root, repo, FakeMac(root), clock, health=False).run() == 0
+    code = root / "usr/local/estia"
+    rename = os.rename
+
+    def cut_after(source: str | Path, target: str | Path) -> None:
+        rename(source, target)
+        if Path(source) == code / "tools":
+            raise KeyboardInterrupt("power cut")
+
+    monkeypatch.setattr(os, "rename", cut_after)
+    with contextlib.suppress(KeyboardInterrupt):
+        deployment(root, repo, FakeMac(root), clock, health=False).update_tools()
+    assert (code / "tools/python3").resolve().is_file()
+    assert (code / "tools/scripts/estia").read_text() == "# estia, changed\n"
+    assert not (code / ".tools.new").exists() and not (code / ".tools.old").exists()
+
+
+def test_a_volume_that_cannot_swap_names_takes_the_new_tools_by_two_renames(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, repo, clock = tmp_path / "root", checkout(tmp_path), Clock()
+    assert deployment(root, repo, FakeMac(root), clock, health=False).run() == 0
+    commit(repo, "scripts/estia", "# estia, changed\n", "a wrapper change")
+    clock.now += 60
+    assert deployment(root, repo, FakeMac(root), clock, health=False).run() == 0
+
+    def cannot(first: Path, second: Path) -> None:
+        raise OSError(45, "Operation not supported", str(first))
+
+    monkeypatch.setattr(deploy, "swap_names", cannot)
+    assert deployment(root, repo, FakeMac(root), clock, health=False).update_tools() == 0
+    code = root / "usr/local/estia"
+    assert (code / "tools/scripts/estia").read_text() == "# estia, changed\n"
+    assert (code / "tools/python3").resolve().is_file()
+    assert not (code / ".tools.new").exists() and not (code / ".tools.old").exists()
+
+
+def test_swap_names_trades_two_folders_in_one_step(tmp_path: Path) -> None:
+    first, second = tmp_path / "first", tmp_path / "second"
+    for folder in (first, second):
+        folder.mkdir()
+        (folder / folder.name).write_text(folder.name)
+    deploy.swap_names(first, second)
+    assert [p.name for p in first.iterdir()] == ["second"] and [p.name for p in second.iterdir()] == ["first"]
+    with pytest.raises(FileNotFoundError):
+        deploy.swap_names(first, tmp_path / "none")
+
+
+def test_update_tools_takes_the_releases_python_when_it_changed(tmp_path: Path) -> None:
+    """The tools' Python was the first release's for good: a patch release of it is shown in the review and taken
+    with the files (review I22)."""
+    root, repo, clock = tmp_path / "root", checkout(tmp_path), Clock()
+    assert deployment(root, repo, FakeMac(root), clock, health=False).run() == 0
+    code = root / "usr/local/estia"
+    clock.now += 60
+    mac = FakeMac(root)
+    mac.python = "3.13.12"
+    said: list[str] = []
+    assert deployment(root, repo, mac, clock, health=False, said=said).run() == 0
+    assert any("--update-tools" in line and "Python 3.13.9 → 3.13.12" in line for line in said), said
+    said.clear()
+    assert deployment(root, repo, FakeMac(root), clock, health=False, said=said).update_tools() == 0
+    assert any(line.startswith("  Python: 3.13.9 → 3.13.12 (the live release's, which your account") for line in said)
+    assert [p.name for p in (code / "tools/python").iterdir()] == ["cpython-3.13.12-macos-aarch64-none"]
+    assert (code / "tools/python3").resolve().is_file() and "3.13.12" in str((code / "tools/python3").resolve())
+    said.clear()
+    assert deployment(root, repo, FakeMac(root), clock, health=False, said=said).update_tools() == 0
+    assert any(line.startswith("✓ The root-run tools are those of the live release") for line in said), said
+
+
+def site_packages(folder: Path, version: str = "3.13.9") -> Path:
+    """The site-packages of the Python in `folder`/python (a release's or the tools' own), made when missing."""
+    path = folder / f"python/cpython-{version}-macos-aarch64-none/lib/python3.13/site-packages"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def test_update_tools_keeps_their_own_python_while_its_version_is_the_same(tmp_path: Path) -> None:
+    """Your account builds each release's Python (uv as you): with the same version, --update-tools keeps the tools'
+    own copy, so a file added to the release's Python (a .pth, which Python runs at every start, -I too) never
+    reaches root unseen (release review D1)."""
+    root, repo, clock = tmp_path / "root", checkout(tmp_path), Clock()
+    assert deployment(root, repo, FakeMac(root), clock, health=False).run() == 0
+    code = root / "usr/local/estia"
+    (site_packages(code / "tools") / "kept.txt").write_text("the tools' own Python")
+    commit(repo, "scripts/estia", "#!/bin/bash\necho changed\n", "change the wrapper")
+    clock.now += 60
+    assert deployment(root, repo, FakeMac(root), clock, health=False).run() == 0
+    (site_packages((code / "current").resolve()) / "planted.pth").write_text("import os\n")
+    said: list[str] = []
+    assert deployment(root, repo, FakeMac(root), clock, health=False, said=said).update_tools() == 0
+    assert (code / "tools/scripts/estia").read_text() == "#!/bin/bash\necho changed\n"
+    assert (site_packages(code / "tools") / "kept.txt").is_file()
+    assert not (site_packages(code / "tools") / "planted.pth").exists()
+    assert (code / "tools/python3").resolve().is_file()
+    assert (code / "tools/python3").resolve().is_relative_to((code / "tools").resolve())
+    assert not any("Python" in line for line in said if line.startswith("  ")), said
+
+
+@pytest.mark.parametrize("name", ["planted.pth", "sitecustomize.py", "usercustomize.py"])
+def test_a_new_python_with_a_file_it_runs_at_every_start_is_never_taken(tmp_path: Path, name: str) -> None:
+    """A new version of the release's Python goes into the tools, which root runs: one holding a .pth file or a
+    sitecustomize or usercustomize module (Python runs each at every start, with -I too) is refused before the
+    question, and the installed tools stay (release review D1)."""
+    root, repo, clock = tmp_path / "root", checkout(tmp_path), Clock()
+    assert deployment(root, repo, FakeMac(root), clock, health=False).run() == 0
+    code = root / "usr/local/estia"
+    clock.now += 60
+    mac = FakeMac(root)
+    mac.python = "3.13.12"
+    assert deployment(root, repo, mac, clock, health=False).run() == 0
+    (site_packages((code / "current").resolve(), "3.13.12") / name).write_text("import os\n")
+    said: list[str] = []
+    asked: list[str] = []
+    update = deployment(root, repo, FakeMac(root), clock, health=False, said=said)
+
+    def yes(question: str) -> bool:
+        asked.append(question)
+        return True
+
+    update.confirm = yes
+    assert update.update_tools() == 1
+    assert asked == [], asked
+    assert "3.13.9" in str((code / "tools/python3").resolve())
+    assert any(line.startswith("✗") and f"site-packages/{name}" in line and "every start" in line for line in said)
+    with pytest.raises(DeployError, match="every start"):
+        update.install_tools((code / "current").resolve())
+    assert "3.13.9" in str((code / "tools/python3").resolve()) and not (code / ".tools.new").exists()
+
+
+def test_tools_without_a_python_of_their_series_are_never_installed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A deploy.py that moves to a new Python series runs as root from the tools: when the release holds no Python of
+    that series, the tools stay whole (they had no python3 left before: review I22)."""
+    root, repo, clock = tmp_path / "root", checkout(tmp_path), Clock()
+    assert deployment(root, repo, FakeMac(root), clock, health=False).run() == 0
+    code = root / "usr/local/estia"
+    before = (code / "tools/python3").resolve()
+    monkeypatch.setattr(deploy, "PYTHON_SERIES", "3.14")
+    said: list[str] = []
+    with pytest.raises(DeployError, match=r"no Python 3\.14"):
+        deployment(root, repo, FakeMac(root), clock, health=False, said=said).install_tools(
+            (code / "current").resolve()
+        )
+    assert (code / "tools/python3").resolve() == before and before.is_file()
+    assert not (code / ".tools.new").exists()
 
 
 def test_a_later_deploy_keeps_the_installed_tools_and_says_how_to_review_them(tmp_path: Path) -> None:
@@ -599,6 +1074,65 @@ def test_a_deploy_shows_the_new_commits_and_asks_first(tmp_path: Path) -> None:
     assert "feat: a new part" in text and "src/local_assistant/x.py" in text
     assert (root / "usr/local/estia/current").resolve() == live
     assert not any(argv[0] == UV or UV in argv for argv in mac.asked)  # nothing built
+
+
+def git(repo: Path, *argv: str) -> str:
+    done = subprocess.run(
+        ["git", "-c", "user.name=Alex Example", "-c", "user.email=alex@example.com", *argv],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return done.stdout.strip()
+
+
+def test_a_long_review_says_what_it_leaves_out(tmp_path: Path) -> None:
+    """The review showed 50 commits and 200 lines of files without a word about the rest, and git's own total line
+    was cut off with them (release review D8)."""
+    root, repo, clock = tmp_path / "root", checkout(tmp_path), Clock()
+    assert deployment(root, repo, FakeMac(root), clock, health=False).run() == 0
+    for n in range(60):
+        (repo / f"docs/many/{n:03}.md").parent.mkdir(parents=True, exist_ok=True)
+        (repo / f"docs/many/{n:03}.md").write_text(f"{n}\n")
+        if n < 59:
+            git(repo, "add", "-A")
+            git(repo, "commit", "-qm", f"docs: page {n}")
+    for n in range(150):
+        (repo / f"docs/more/{n:03}.md").parent.mkdir(parents=True, exist_ok=True)
+        (repo / f"docs/more/{n:03}.md").write_text(f"{n}\n")
+    commit(repo, "docs/last.md", "last\n", "docs: the last page")
+    clock.now += 60
+    said: list[str] = []
+    assert deployment(root, repo, FakeMac(root), clock, health=False, said=said, confirm=False).run() == 1
+    assert any(line.startswith("60 new commit(s) since the live") for line in said), said
+    assert "  … and 10 more commit(s)" in said, said
+    assert "  … and 11 more file(s)" in said, said
+    assert said[said.index("  … and 11 more file(s)") + 1].strip().startswith("211 files changed"), said
+
+
+def test_a_checkout_older_than_the_live_commit_is_named_a_downgrade(tmp_path: Path) -> None:
+    """A checkout behind the live commit showed "0 new commit(s)" and asked as usual (release review D8)."""
+    root, repo, clock = tmp_path / "root", checkout(tmp_path), Clock()
+    old = git(repo, "rev-parse", "HEAD")
+    commit(repo, "src/local_assistant/x.py", "x = 1\n", "feat: a new part")
+    assert deployment(root, repo, FakeMac(root), clock, health=False).run() == 0
+    git(repo, "reset", "-q", "--hard", old)
+    clock.now += 60
+    said: list[str] = []
+    asked: list[str] = []
+    deploying = deployment(root, repo, FakeMac(root), clock, health=False, said=said)
+
+    def no(question: str) -> bool:
+        asked.append(question)
+        return False
+
+    deploying.confirm = no
+    assert deploying.run() == 1
+    text = "\n".join(said)
+    assert "OLDER than the live commit (a downgrade)" in text and "0 new commit(s)" not in text, text
+    assert "feat: a new part" in text  # what goes away
+    assert asked and "older" in asked[0].lower(), asked
 
 
 def test_the_review_names_her_programs_from_outside_git_that_changed(tmp_path: Path) -> None:
@@ -841,7 +1375,13 @@ def test_the_voice_service_is_built_from_the_commits_own_sources(tmp_path: Path)
     )
     binary = release / "tools/voice/.build/release/voice-service"
     assert binary.read_text() == "#!/bin/sh\n# built from: // the voice service\n" and os.access(binary, os.X_OK)
-    assert sorted(p.name for p in binary.parent.iterdir()) == ["FluidAudio_FluidAudio.bundle", "voice-service"]
+    assert sorted(p.name for p in binary.parent.iterdir()) == [
+        "FluidAudio_FluidAudio.bundle",
+        "voice-service",
+        "voice-service_voice-service.bundle",  # its own: heart's voice file (owner, 27 Oct), never fetched
+    ]
+    shipped = next(iter(voice.POCKET_SHIPPED))  # where doctor and the voice service look for it (the default build's)
+    assert (release / shipped).read_bytes() == b"heart"
     assert not (release / ".voice-build").exists()
     meta = json.loads((release / "release.json").read_text())
     assert meta["voice"] is True and meta["voice_tree"] == voice_tree(repo)
@@ -879,6 +1419,251 @@ def test_a_changed_voice_tree_builds_it_again_and_restarts_the_voice_service(tmp
     binary = (root / "usr/local/estia/current").resolve() / "tools/voice/.build/release/voice-service"
     assert "voice-service" in mac.built and binary.read_text().endswith("// fixed\n")
     assert (LAUNCHCTL, "kickstart", "-k", "system/com.local-assistant.voice") in mac.asked
+
+
+@pytest.mark.skipif(not Path("/usr/bin/plutil").exists(), reason="plutil is macOS only")
+@pytest.mark.parametrize("layout", ["deep", "flat"])
+@pytest.mark.parametrize("standard", [True, False], ids=["100M", "18M"])
+def test_a_new_heart_file_restarts_the_voice_service(tmp_path: Path, layout: str, standard: bool) -> None:
+    """Heart's voice files ship in the voice service's own bundle (owner, 27 Oct: the 100M's; 29 Oct: the 18M's beside
+    it): a commit that changes only one (the program's bytes the same) still restarts the voice service, which copies
+    and checks it at its start; in either layout of the bundle (the review of 27 Oct, swift-voice-1: Contents/Resources,
+    or the bundle's top). The deploy copies the whole bundle, both files in it."""
+    root, repo, clock = tmp_path / "root", checkout(tmp_path), Clock()
+    installed_plists(root, voice=True)
+    commit(repo, "tools/voice/Sources/voice-service/Voices/heart-18m.safetensors", "a small heart", "voice: heart")
+    first = FakeMac(root)
+    first.heart = layout
+    assert deployment(root, repo, first, clock).run() == 0
+    before = (root / "usr/local/estia/current").resolve() / "tools/voice/.build/release/voice-service"
+    program = before.read_bytes()
+    places = voice.POCKET_SHIPPED if standard else voice.POCKET_SHIPPED_18M
+    name = "heart.safetensors" if standard else "heart-18m.safetensors"
+    commit(repo, f"tools/voice/Sources/voice-service/Voices/{name}", "another heart", "voice: heart")
+    clock.now += 60
+    mac = FakeMac(root)
+    mac.heart = layout
+    assert deployment(root, repo, mac, clock).run() == 0
+    release = (root / "usr/local/estia/current").resolve()
+    deep, flat = places
+    shipped = deep if layout == "deep" else flat
+    assert (release / shipped).read_text() == "another heart"
+    assert not (release / (flat if layout == "deep" else deep)).exists()
+    assert voice.pocket_shipped(release, standard) == {shipped: places[shipped]}  # where doctor reads it
+    other = voice.POCKET_SHIPPED_18M if standard else voice.POCKET_SHIPPED
+    assert voice.pocket_shipped(release, not standard) == {
+        path: sha for path, sha in other.items() if (release / path).exists()
+    }  # the other model's file copied too, as it was
+    assert (release / "tools/voice/.build/release/voice-service").read_bytes() == program
+    assert (LAUNCHCTL, "kickstart", "-k", "system/com.local-assistant.voice") in mac.asked
+
+
+def test_the_deploy_and_doctor_look_for_heart_in_the_same_places() -> None:
+    """The review of 27 Oct (swift-voice-1): the deploy (root's tools, without the bridge's modules) names heart's two
+    places as doctor does (`voice.POCKET_SHIPPED`), the default build's first; for each of its files (owner, 29 Oct:
+    the 18M's, `voice.POCKET_SHIPPED_18M`, beside the 100M's)."""
+    assert deploy.HEART_FILES == ("heart.safetensors", "heart-18m.safetensors")
+    assert [str(path) for path in deploy.heart_places("heart.safetensors")] == list(voice.POCKET_SHIPPED)
+    assert [str(path) for path in deploy.heart_places("heart-18m.safetensors")] == list(voice.POCKET_SHIPPED_18M)
+    assert str(deploy.HEART_VOICES) == "tools/voice/Sources/voice-service/Voices"
+    assert all((ROOT / deploy.HEART_VOICES / name).is_file() for name in deploy.HEART_FILES)
+
+
+@pytest.mark.skipif(not Path("/usr/bin/plutil").exists(), reason="plutil is macOS only")
+@pytest.mark.parametrize("built", ["none", "other", "no 18M"])
+def test_a_build_without_the_commits_heart_file_stops_the_deploy(tmp_path: Path, built: str) -> None:
+    """The review of 27 Oct (swift-voice-1): a commit with heart's file whose voice service's build has none in its
+    bundle (in neither place), or other bytes than the commit's, stops the deploy before anything goes live: never a
+    release whose heart is Kokoro's with nothing said; each of its files (owner, 29 Oct: the 18M's too), named. A
+    commit from before heart (no such file) is not asked."""
+    root, repo, clock = tmp_path / "root", checkout(tmp_path), Clock()
+    installed_plists(root, voice=True)
+    older = FakeMac(root)
+    older.heart = "none"
+    assert deployment(root, repo, older, clock).run() == 0  # no heart in the commit: nothing to look for
+    live = (root / "usr/local/estia/current").resolve()
+    commit(repo, "tools/voice/Sources/voice-service/Voices/heart.safetensors", "a heart", "voice: heart")
+    commit(repo, "tools/voice/Sources/voice-service/Voices/heart-18m.safetensors", "a small heart", "voice: heart")
+    clock.now += 60
+    mac = FakeMac(root)
+    if built == "no 18M":
+        mac.left_out = {"heart-18m.safetensors"}
+    else:
+        mac.heart = built
+    said: list[str] = []
+    assert deployment(root, repo, mac, clock, said=said).run() == 1
+    assert (root / "usr/local/estia/current").resolve() == live
+    named = "heart-18m.safetensors" if built == "no 18M" else "heart.safetensors"
+    assert any(
+        f"voice-service_voice-service.bundle: heart's voice file {named} is not in the build with the commit's bytes"
+        in line
+        for line in said
+    ), said
+
+
+POCKET = "tools/voice/.build/release/pocket-tts"
+
+
+def with_pocket(repo: Path) -> None:
+    """A commit whose voice service speaks with Pocket TTS (her voice eve)."""
+    commit(repo, "tools/voice/Sources/voice-service/Pocket.swift", "// eve\n", "voice: eve")
+
+
+@pytest.mark.skipif(not Path("/usr/bin/plutil").exists(), reason="plutil is macOS only")
+def test_pocket_tts_s_program_goes_into_the_release_beside_the_voice_service(tmp_path: Path) -> None:
+    """The review of 24 Oct: the voice service fetched Pocket TTS's program into her own home, where any program of
+    hers could change it ("everything she runs is root's"). The deploy has the new voice service fetch it beside
+    itself, as the owner (`--fetch-pocket`: the pinned release, checked), before root freezes the release; the same
+    voice tree takes the live release's copy, and a program that changed restarts the voice service."""
+    root, repo, clock = tmp_path / "root", checkout(tmp_path), Clock()
+    installed_plists(root, voice=True)
+    with_pocket(repo)
+    mac = FakeMac(root)
+    assert deployment(root, repo, mac, clock).run() == 0
+    release = (root / "usr/local/estia/current").resolve()
+    voice_service = release / "tools/voice/.build/release/voice-service"
+    fetch = [argv for argv in mac.asked if argv[-1] == "--fetch-pocket"]
+    assert mac.fetched == [str(voice_service)] and fetch[0][:5] == (SUDO, "-u", ME, "-H", "--")
+    program = release / POCKET / "pocket-tts"
+    assert program.read_text() == "pocket 1" and os.access(program, os.X_OK)
+    assert (release / POCKET / "LICENSE").read_text() == "MIT"
+    # the same voice tree: the live release's program, never fetched again, nothing restarted
+    commit(repo, "a.txt", "a", "not the voice")
+    clock.now += 60
+    again = FakeMac(root)
+    assert deployment(root, repo, again, clock).run() == 0
+    second = (root / "usr/local/estia/current").resolve()
+    assert second != release and again.fetched == [] and (second / POCKET / "pocket-tts").read_text() == "pocket 1"
+    assert not any(argv[-1] == "system/com.local-assistant.voice" for argv in again.asked)
+
+
+@pytest.mark.skipif(not Path("/usr/bin/plutil").exists(), reason="plutil is macOS only")
+def test_a_live_release_without_pocket_tts_s_program_gets_it_with_the_same_voice(tmp_path: Path) -> None:
+    """A release made by the root-run tools before this (no program beside the voice service): the next deploy has the
+    live voice service, the same build, fetch it, and restarts the voice service so eve speaks."""
+    root, repo, clock = tmp_path / "root", checkout(tmp_path), Clock()
+    installed_plists(root, voice=True)
+    with_pocket(repo)
+    assert deployment(root, repo, FakeMac(root), clock).run() == 0
+    first = (root / "usr/local/estia/current").resolve()
+    shutil.rmtree(first / POCKET)  # as the older tools left it
+    commit(repo, "a.txt", "a", "not the voice")
+    clock.now += 60
+    mac = FakeMac(root)
+    assert deployment(root, repo, mac, clock).run() == 0
+    second = (root / "usr/local/estia/current").resolve()
+    assert "voice-service" not in mac.built and mac.fetched == [
+        str(second / "tools/voice/.build/release/voice-service")
+    ]
+    assert (second / POCKET / "pocket-tts").is_file()
+    assert (LAUNCHCTL, "kickstart", "-k", "system/com.local-assistant.voice") in mac.asked
+
+
+@pytest.mark.skipif(not Path("/usr/bin/plutil").exists(), reason="plutil is macOS only")
+def test_a_failed_pocket_fetch_leaves_eve_to_af_heart_and_the_deploy_goes_on(tmp_path: Path) -> None:
+    """Pocket TTS is an extra: a fetch that fails (offline, GitHub down, other bytes) leaves its program out and says
+    so; Kokoro says her lines meanwhile (af_heart, or am_michael for alba and michael: the review of 26 Oct named
+    af_heart alone and eve, her voice before jane), on a call one line each time she answers (owner, 28 Oct, words-04).
+    A commit without Pocket TTS asks for none."""
+    root, repo, clock = tmp_path / "root", checkout(tmp_path), Clock()
+    installed_plists(root, voice=True)
+    assert deployment(root, repo, FakeMac(root), clock).run() == 0
+    assert not ((root / "usr/local/estia/current").resolve() / POCKET).exists()
+    with_pocket(repo)
+    clock.now += 60
+    said: list[str] = []
+    assert deployment(root, repo, FakeMac(root, fails="voice-service"), clock, said=said).run() == 0
+    release = (root / "usr/local/estia/current").resolve()
+    assert not (release / POCKET).exists() and (release / "tools/voice/.build/release/voice-service").is_file()
+    assert any(line.startswith("! Pocket TTS's program was not fetched: ") for line in said)
+    assert any(
+        line.endswith(
+            ". Kokoro says her lines meanwhile (on a call, one line each time she answers; the rest comes as a Signal"
+            " text); the next update fetches it again (doctor names it)."
+        )
+        for line in said
+    )
+
+
+@pytest.mark.skipif(not Path("/usr/bin/plutil").exists(), reason="plutil is macOS only")
+def test_a_failed_voice_install_is_undone_with_the_switch_back(tmp_path: Path) -> None:
+    """--voice on a release that fails its check: the switch back takes out the voice service it installed, so
+    launchd never starts a program that is gone (review I19)."""
+    root, repo, clock = tmp_path / "root", checkout(tmp_path), Clock()
+    daemons(root)
+    assert deployment(root, repo, FakeMac(root), clock).run() == 0
+    first = (root / "usr/local/estia/current").resolve()
+    assert not (first / deploy.VOICE_BINARY).exists()
+    clock.now += 3600
+    bad = FakeMac(root, healthy=False)
+    said: list[str] = []
+    assert deployment(root, repo, bad, clock, said=said, voice=True).run() == 1
+    assert (root / "usr/local/estia/current").resolve() == first
+    voice = "system/com.local-assistant.voice"
+    plist = root / "Library/LaunchDaemons/com.local-assistant.voice.plist"
+    assert bad.asked.index((LAUNCHCTL, "bootout", voice)) > bad.asked.index(
+        (LAUNCHCTL, "bootstrap", "system", "/Library/LaunchDaemons/com.local-assistant.voice.plist")
+    )
+    assert not plist.exists()
+    assert "voice: not installed (the update failed)" in said, said
+
+
+@pytest.mark.skipif(not Path("/usr/bin/plutil").exists(), reason="plutil is macOS only")
+def test_a_failed_check_puts_the_voice_service_back_on_the_previous_release(tmp_path: Path) -> None:
+    """A changed tools/voice restarted the voice service on the new release: after the switch back it is restarted
+    on the previous one's program, as the bridge is (review I19)."""
+    root, repo, clock = tmp_path / "root", checkout(tmp_path), Clock()
+    installed_plists(root, voice=True)
+    assert deployment(root, repo, FakeMac(root), clock).run() == 0
+    first = (root / "usr/local/estia/current").resolve()
+    commit(repo, "tools/voice/Sources/voice-service/main.swift", "// fixed\n", "voice: a fix")
+    clock.now += 3600
+    bad = FakeMac(root, healthy=False)
+    said: list[str] = []
+    assert deployment(root, repo, bad, clock, said=said).run() == 1
+    assert (root / "usr/local/estia/current").resolve() == first
+    starts = [argv[-1] for argv in bad.asked if argv[:2] == (LAUNCHCTL, "kickstart")]
+    voice, bridge = "system/com.local-assistant.voice", "system/com.local-assistant.bridge"
+    assert starts == [bridge, voice, bridge, voice], starts
+    assert f"voice: back on {first.name}" in said, said
+
+
+def test_a_failed_check_puts_back_the_service_file_it_replaced(tmp_path: Path) -> None:
+    """The switch back restarted the old release with the service file written for the new one: a file that suits
+    only the new release kept the old one failing while the message said it was back (release review D6)."""
+    root, repo, clock = tmp_path / "root", checkout(tmp_path), Clock()
+    folder = installed_plists(root)
+    assert deployment(root, repo, FakeMac(root), clock).run() == 0
+    first = (root / "usr/local/estia/current").resolve()
+    bridge = folder / "com.local-assistant.bridge.plist"
+    bridge.write_bytes(b"the file the live release runs with")
+    commit(repo, "a.txt", "a", "a change")
+    clock.now += 3600
+    bad = FakeMac(root, healthy=False)
+    said: list[str] = []
+    assert deployment(root, repo, bad, clock, said=said).run() == 1
+    assert (root / "usr/local/estia/current").resolve() == first
+    assert bridge.read_bytes() == b"the file the live release runs with"
+    assert bridge.stat().st_mode & 0o777 == 0o644
+    label = "system/com.local-assistant.bridge"
+    system = "/Library/LaunchDaemons/com.local-assistant.bridge.plist"
+    loads = [argv for argv in bad.asked if argv[:2] in ((LAUNCHCTL, "bootout"), (LAUNCHCTL, "bootstrap"))]
+    assert loads == [(LAUNCHCTL, "bootout", label), (LAUNCHCTL, "bootstrap", "system", system)] * 2, loads
+    assert "service file back as before: com.local-assistant.bridge" in said, said
+    assert not any(argv[:2] == (LAUNCHCTL, "kickstart") for argv in bad.asked)  # loaded again from its file
+
+
+def test_a_failed_check_leaves_a_voice_service_it_never_touched(tmp_path: Path) -> None:
+    root, repo, clock = tmp_path / "root", checkout(tmp_path), Clock()
+    installed_plists(root, voice=True)
+    assert deployment(root, repo, FakeMac(root), clock).run() == 0
+    commit(repo, "a.txt", "a", "not the voice")
+    clock.now += 3600
+    bad = FakeMac(root, healthy=False)
+    said: list[str] = []
+    assert deployment(root, repo, bad, clock, said=said).run() == 1
+    assert not any(argv[-1] == "system/com.local-assistant.voice" for argv in bad.asked)
+    assert not any(line.startswith("voice:") for line in said)
 
 
 def test_a_failed_voice_build_stops_the_deploy(tmp_path: Path) -> None:
@@ -936,6 +1721,16 @@ def test_a_deploy_with_a_new_voice_binary_says_when_calls_work(tmp_path: Path) -
     new.voice_health = lambda: {"stt": "ready", "tts": "ready"}
     assert new.run() == 0
     assert said[-1] == "voice: ready"
+
+
+def test_an_update_reads_her_voice_as_her(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Root's own read would be refused (her voice service answers only her own account): curl runs as her."""
+    asked: list[tuple[bool, bool]] = []
+    monkeypatch.setattr(ownuser, "voice_health", lambda live, *, as_her=False: asked.append((live, as_her)))
+    root = tmp_path / "root"
+    update = deployment(root, checkout(tmp_path), FakeMac(root), Clock())
+    update.voice_health()
+    assert asked == [(update.host.live, True)]
 
 
 def test_her_calls_setting_is_read_as_her_and_says_on_only_with_calls(tmp_path: Path) -> None:
@@ -1198,3 +1993,51 @@ def test_root_takes_uv_only_from_the_real_fixed_paths(monkeypatch: pytest.Monkey
     monkeypatch.delenv("ESTIA_TEST_ROOT")
     monkeypatch.setattr(os, "geteuid", lambda: 501)
     assert hostsec.tool_root() == Path("/")
+
+
+# ------------------------------------------------------------------ --ask-lines: its questions for setup's window
+
+
+@pytest.mark.parametrize(("typed", "yes"), [("y\n", True), ("yes\n", True), ("n\n", False), ("\n", False), ("", False)])
+def test_ask_lines_says_its_question_on_a_marked_line_and_reads_one_line(typed: str, yes: bool) -> None:
+    """--ask-lines (setup's window: no terminal there): the question on a line of its own after a marker the window
+    knows, one line read from stdin; y… is yes, anything else, the end of input or no line in time is no."""
+    import io
+
+    out = io.StringIO()
+    assert deploy.ask_lines("Deploy it?", stdin=io.StringIO(typed), out=out, seconds=1) is yes
+    assert out.getvalue() == "\x1f? Deploy it?\n"
+
+
+def test_ask_lines_without_an_answer_in_time_is_no() -> None:
+    import io
+    import os as _os
+
+    read, write = _os.pipe()
+    try:
+        with _os.fdopen(read, "r") as stdin:
+            assert deploy.ask_lines("Deploy it?", stdin=stdin, out=io.StringIO(), seconds=0.1) is False
+    finally:
+        _os.close(write)
+
+
+def test_ask_lines_is_a_flag_of_its_own_never_from_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The flag is an argument (root takes nothing from the environment); without it the terminal asks, as before."""
+    made: list[dict[str, Any]] = []
+
+    class Made(Exception):
+        pass
+
+    def deployed(*args: Any, **kwargs: Any) -> Any:
+        made.append(kwargs)
+        raise Made
+
+    monkeypatch.setattr(deploy, "Deploy", deployed)
+    monkeypatch.setattr(deploy, "builder", lambda: Builder("alex", Path("/Users/alex"), 501))
+    monkeypatch.setattr(deploy, "find_uv", lambda who: "/opt/homebrew/bin/uv")
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+    repo = ROOT
+    for argv, confirm in ((["--ask-lines", str(repo)], deploy.ask_lines), ([str(repo)], deploy.ask_terminal)):
+        with pytest.raises(Made):
+            deploy.main(argv)
+        assert made[-1]["confirm"] is confirm

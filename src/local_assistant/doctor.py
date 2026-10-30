@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import calendar
 import errno
 import json
 import os
@@ -46,13 +47,14 @@ import sys
 import time
 import urllib.parse
 import urllib.request
-from collections.abc import Collection
+from collections.abc import Collection, Mapping
 from contextlib import closing
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Literal
 
-from local_assistant import hostsec, ollama_build, ownuser, prompts, share
+from local_assistant import babble, hostsec, ollama_build, ownuser, prompts, share, voice
+from local_assistant.commands import VOICE_NAME_KEY, voices_here
 from local_assistant.config import (
     CODE_ROOT,
     DEFAULT_AVATAR,
@@ -60,16 +62,22 @@ from local_assistant.config import (
     DEFAULT_NAME,
     DEFAULT_STYLE,
     INTERRUPT_NEW,
-    LETTER_AVATARS,
     OWNER_HOME,
+    POCKET_ORDER,
+    SIGNAL_CLI_SERIES,
+    STANDARD_ONLY,
     AvatarError,
     CalendarSource,
     Config,
     ConfigError,
+    canonical_voice,
     find_java_home,
     is_estia_kb,
+    kokoro_stand_in,
     load_config,
     read_avatar,
+    signal_cli_series,
+    tunnel_stamp_differs,
 )
 from local_assistant.devices import helper_env
 from local_assistant.documents import SHARE_TOKEN
@@ -77,8 +85,9 @@ from local_assistant.gemma import is_remote
 from local_assistant.hostsec import Check
 from local_assistant.initiative import ENABLED_KEY, QUIET_KEY, Evening, Settings, clock_text, evening_of, saved_evening
 from local_assistant.keyfile import read_keys
-from local_assistant.language import CODES, ENGLISH, LANGUAGE_KEY
+from local_assistant.language import CODES, ENGLISH, LANGUAGE_KEY, LANGUAGES
 from local_assistant.mail_auth import TokenStore
+from local_assistant.osm import has_house_number
 from local_assistant.part_status import (
     Record,
     calendar_mailbox,
@@ -92,6 +101,7 @@ from local_assistant.part_status import (
 )
 from local_assistant.projects import Access, Projects
 from local_assistant.reminders import FAILED, PROBLEM_DAYS, STUCK_S, iso, summary
+from local_assistant.signal_io import jvm_opts
 from local_assistant.soul import has_parts, load_soul, soul_part
 from local_assistant.spotify_auth import SpotifyTokens
 from local_assistant.store import Store
@@ -106,11 +116,15 @@ PLACEHOLDER_NUMBER = "+300000000000"  # config.example.toml's values
 PLACEHOLDER_ACI = "00000000-0000-0000-0000-000000000000"
 ALIVE_KEY = "last_alive"  # app.ALIVE_KEY: the bridge writes it after signal-cli subscribed, then every 60 s
 ALIVE_SECONDS = 180  # a sign of life older than this (three missed beats) means it is not alive
+SIGNAL_DOWN_SECONDS = 180  # signal-cli not connected this long is a ✗ (shorter: a restart in progress)
 LAUNCHCTL = "/bin/launchctl"
 PMSET = "/usr/bin/pmset"  # read only: `pmset -g`
 HUE_CHECK_SECONDS = 20  # doctor's limit for the device helper's run (its own 12 s are checked between requests)
 _LAUNCHD_STATE = re.compile(r"^\s*state = (.+?)\s*$", re.MULTILINE)  # the first is the service's own
 _LAUNCHD_EXIT = re.compile(r"^\s*last exit code = (-?\d+)\b", re.MULTILINE)
+
+
+HISTORY_CONTEXT = 32_768  # what the history's own limits (12,000 and 20,000 tokens) count on (review I24)
 
 
 @dataclass(frozen=True)
@@ -157,10 +171,10 @@ class Probe:
         with opener.open(request, timeout=3) as response:
             return json.loads(response.read(1_000_000))
 
-    def security_checks(self, home: Path, bot_number: str) -> list[Check]:
-        """The Mac's checks around her (read-only, fixed tools, nothing applied; `home`: hers)."""
+    def security_checks(self, home: Path, bot_number: str, name: str = DEFAULT_NAME) -> list[Check]:
+        """The Mac's checks around her (read-only, fixed tools, nothing applied; `home`: hers; `name`: hers)."""
         host = hostsec.Host(hostsec.estia_root(), say=lambda _line: None)
-        return hostsec.doctor_checks(host, home, bot_number, sudo=self.sudo_check())
+        return hostsec.doctor_checks(host, home, bot_number, sudo=self.sudo_check(), name=name)
 
     def sudo_check(self) -> Check | None:
         """Passwordless sudo where doctor can read it: from root's listing of your rules (in her own user, estia doctor
@@ -234,14 +248,21 @@ class Probe:
             return None
         return data if isinstance(data, dict) else None
 
-    def signal_cli_version(self, program: str) -> str | None:
-        """`signal-cli --version` of the program the bridge runs (fixed argv, no shell); None when it cannot be asked:
-        never under a test's root."""
+    def signal_cli_version(self, program: str, env: Mapping[str, str] | None = None) -> str | None:
+        """`signal-cli --version` of a signal-cli build (fixed argv, no shell; `env` on top of doctor's own: the Java
+        build's JAVA_HOME and JAVA_OPTS); None when it cannot be asked: never under a test's root."""
         found = shutil.which(program)
         if hostsec.estia_root() != Path("/") or found is None:
             return None
         try:
-            done = subprocess.run([found, "--version"], capture_output=True, text=True, timeout=30, check=False)
+            done = subprocess.run(
+                [found, "--version"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+                env={**os.environ, **env} if env else None,
+            )
         except (OSError, subprocess.SubprocessError):
             return None
         return done.stdout.strip() if done.returncode == 0 else None
@@ -253,6 +274,17 @@ class Probe:
             return None
         try:
             done = subprocess.run([PMSET, "-g"], capture_output=True, text=True, timeout=5, check=False)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return done.stdout if done.returncode == 0 else None
+
+    def power_custom(self) -> str | None:
+        """`pmset -g custom`: each power source's settings (a laptop: the battery's and the power adapter's), read-only;
+        None when it cannot be asked: never under a test's root."""
+        if hostsec.estia_root() != Path("/"):
+            return None
+        try:
+            done = subprocess.run([PMSET, "-g", "custom"], capture_output=True, text=True, timeout=5, check=False)
         except (OSError, subprocess.SubprocessError):
             return None
         return done.stdout if done.returncode == 0 else None
@@ -293,7 +325,7 @@ class Probe:
     def program_checks(self, cfg: Config) -> list[Check]:
         """What she runs: root's alone (her signal-cli, the call helper's Java and tunnel, the folders on her PATH)."""
         root = hostsec.estia_root()
-        return [ownuser.program_check(ownuser.her_programs(cfg, root), root)]
+        return [ownuser.program_check(ownuser.her_programs(cfg, root, java=self.java_home), root)]
 
 
 def run(config_path: Path, probe: Probe) -> list[Finding]:
@@ -327,8 +359,13 @@ def run(config_path: Path, probe: Probe) -> list[Finding]:
         findings.append(
             Finding("ok", "Config", f"{config_path} reads fine, {len(cfg.allowed_acis)} allowed account(s)")
         )
+        if len(cfg.allowed_acis) > 1:
+            shared = f"{len(cfg.allowed_acis)} in the config. {prompts.SHARED_ACCOUNTS}"
+            line = hostsec.terminal_text(shared, len("! Allowed accounts: "))
+            findings.append(Finding("warn", "Allowed accounts", line, prompts.SHARED_ACCOUNTS_FIX))
     models = _models(cfg, probe)  # Ollama's list, read once
     own = probe.moved()
+    shown = _shown(cfg, models, probe)  # its Modelfile and parameters, read once
     findings += [
         _model(cfg, models, probe),
         *[
@@ -337,13 +374,16 @@ def run(config_path: Path, probe: Probe) -> list[Finding]:
                 _ollama_build(cfg, probe),
                 _ollama_service(),
                 _model_build(cfg, models),
-                _model_prompt(cfg, models, probe, own=own),
+                _model_prompt(cfg, models, shown, own=own),
+                _model_context(cfg, shown, own=own),
             )
             if line is not None
         ],
         _model_pin(cfg, models, config_path if own else None),
         _signal_number(cfg, probe),
-        *([] if (signal_cli := _signal_cli(cfg, probe)) is None else [signal_cli]),
+        *_signal_cli(cfg, probe),
+        *([] if (connection := _signal_connection(cfg, probe.now(), own)) is None else [connection]),
+        *([] if (limit := _signal_limit(cfg, probe.now())) is None else [limit]),
         _picture(cfg),
         _personality(
             config_path.parent, cfg.name, own=own, style=cfg.personality_style, calm=cfg.personality_calm_on_worry
@@ -396,24 +436,54 @@ def _home_open(cfg: Config, probe: Probe, *, own: bool) -> Finding | None:
     return Finding("warn", "Your home", text, share.OPEN_FIX.format(paths=shlex.join(str(path) for path in found)))
 
 
+def _profile_sleep(custom: str | None, source: str) -> str | None:
+    """One power source's sleep minutes from `pmset -g custom` ("Battery Power:", "AC Power:"); None: not there."""
+    found = re.search(rf"^{re.escape(source)}:\n((?:[ \t].*\n?)*)", custom or "", re.MULTILINE)
+    sleep = re.search(r"^\s*sleep\s+(\d+)", found.group(1), re.MULTILINE) if found else None
+    return sleep.group(1) if sleep else None
+
+
 def _power(probe: Probe) -> Finding | None:
     """Whether she keeps running: a Mac that sleeps stops her, and one without autorestart stays off after a power
-    cut (setup_assistant.md, 2.8). A laptop has no autorestart: there only sleep counts. Not read: no line."""
+    cut (setup_assistant.md, 2.8). A laptop has no autorestart: there only sleep counts, its line promises no start
+    after a power failure and names the closed lid, and its fix is the power adapter's setting. A laptop's sleep is the
+    power adapter's from `pmset -g custom`, never only the settings in use, and a battery that sleeps adds "keep it
+    plugged in" to the ✓ (second deep scan, macos-laptop-power-ac-only). Not read: no line."""
     text = probe.power()
     sleep = re.search(r"^\s*sleep\s+(\d+)", text or "", re.MULTILINE)
     restart = re.search(r"^\s*autorestart\s+(\d+)", text or "", re.MULTILINE)
     if sleep is None and restart is None:
         return None
+    if restart is None:  # a laptop: no start after a power failure to promise, and a closed lid sleeps
+        return _laptop_power(probe.power_custom(), sleep.group(1) if sleep else None)
     problems = []
     if sleep is not None and sleep.group(1) != "0":
         problems.append(prompts.DOCTOR_POWER_SLEEPS.format(minutes=sleep.group(1)))
-    if restart is not None and restart.group(1) != "1":
+    if restart.group(1) != "1":
         problems.append(prompts.DOCTOR_POWER_NO_RESTART)
     if not problems:
         return Finding("ok", "Power", prompts.DOCTOR_POWER_OK)
     return Finding(
         "warn", "Power", prompts.DOCTOR_POWER_OFF.format(problems="; ".join(problems)), prompts.DOCTOR_POWER_FIX
     )
+
+
+def _laptop_power(custom: str | None, in_use: str | None) -> Finding:
+    """A laptop's line (review docs-laptop-power): the power adapter's sleep when `pmset -g custom` names it, else the
+    settings in use; a ✓ with the power adapter's 0 says to keep it plugged in when the battery's sleeps."""
+    adapter = _profile_sleep(custom, "AC Power")
+    battery = _profile_sleep(custom, "Battery Power")
+    minutes = adapter if adapter is not None else in_use
+    if minutes is not None and minutes != "0":
+        sleeps = prompts.DOCTOR_POWER_SLEEPS.format(minutes=minutes)
+        text = f"{prompts.DOCTOR_POWER_OFF.format(problems=sleeps)}; {prompts.DOCTOR_POWER_LAPTOP}"
+        return Finding("warn", "Power", text, prompts.DOCTOR_POWER_LAPTOP_FIX)
+    if adapter is None:
+        return Finding("ok", "Power", prompts.DOCTOR_POWER_LAPTOP_OK)
+    parts = [prompts.DOCTOR_POWER_ADAPTER_OK]
+    if battery is not None and battery != "0":
+        parts.append(prompts.DOCTOR_POWER_BATTERY.format(minutes=battery))
+    return Finding("ok", "Power", "; ".join([*parts, prompts.DOCTOR_POWER_LAPTOP]))
 
 
 def _finding(check: Check) -> Finding:
@@ -425,7 +495,7 @@ def _host(probe: Probe, cfg: Config) -> list[Finding]:
     """The Mac's checks and her own user's, one finding each; one that cannot run is a warning, never a crash."""
     found: list[Finding] = []
     try:
-        found += [_finding(check) for check in probe.security_checks(probe.home, cfg.bot_number)]
+        found += [_finding(check) for check in probe.security_checks(probe.home, cfg.bot_number, cfg.name)]
     except (OSError, ValueError) as exc:
         found.append(Finding("warn", "Mac security", prompts.DOCTOR_HOST_FAILED.format(why=type(exc).__name__)))
     try:
@@ -433,7 +503,7 @@ def _host(probe: Probe, cfg: Config) -> list[Finding]:
         if probe.moved():
             found += [_finding(check) for check in probe.program_checks(cfg)]
     except (OSError, ValueError) as exc:
-        found.append(Finding("warn", "Own user", prompts.DOCTOR_HOST_FAILED.format(why=type(exc).__name__)))
+        found.append(Finding("warn", "Own macOS account", prompts.DOCTOR_HOST_FAILED.format(why=type(exc).__name__)))
     return found
 
 
@@ -481,6 +551,44 @@ def _signal_security(cfg: Config, now: float) -> list[Finding]:
             text = prompts.LINKED_MORE.format(count=count, when=when)
             devices = Finding("fail", prompts.LINKED_LABEL, text, prompts.LINKED_FIX)
     return [safety, devices]
+
+
+def _signal_connection(cfg: Config, now: float, own: bool) -> Finding | None:
+    """signal-cli not connected to Signal for `SIGNAL_DOWN_SECONDS` or longer, as the bridge last saw it (status.json):
+    logged out by Signal it ends at every start, and the bridge restarts it quietly while /status cannot be reached
+    (review S2). No line while it is connected, or for a restart still in progress."""
+    security = read_security(cfg.data_dir / "status.json")
+    down = security.signal_down
+    if down is None or now - down < SIGNAL_DOWN_SECONDS:
+        return None
+    minutes = max(0, int((now - down) // 60))
+    words = {
+        "restarts": security.signal_restarts or 0,
+        "failure": prompts.SIGNAL_FAILURE_WORDS.get(security.signal_failure, prompts.SIGNAL_FAILURE_WORDS["exited"]),
+    }
+    if minutes < 120:
+        text = prompts.DOCTOR_SIGNAL_DOWN.format(minutes=minutes, **words)
+    else:
+        text = prompts.DOCTOR_SIGNAL_DOWN_SINCE.format(when=local_when(down, now, cfg.timezone), **words)
+    logs = f"{ownuser.ESTIA} logs bridge" if own else f"tail -n 50 {cfg.log_dir / 'bridge.log'}"
+    fix = {
+        "not registered": prompts.DOCTOR_SIGNAL_LOGGED_OUT_FIX,
+        "authorization failed": prompts.DOCTOR_SIGNAL_LOGGED_OUT_FIX,
+        "client too old": prompts.DOCTOR_SIGNAL_TOO_OLD_FIX,
+    }.get(security.signal_failure, prompts.DOCTOR_SIGNAL_DOWN_FIX)
+    return Finding("fail", prompts.SIGNAL_DOWN_LABEL, text, fix.format(logs=logs))
+
+
+def _signal_limit(cfg: Config, now: float) -> Finding | None:
+    """Signal's wait, while it lasts: a captcha asked for or a long rate limit, as the bridge kept it (status.json);
+    no send or resend is tried until then (review S4)."""
+    security = read_security(cfg.data_dir / "status.json")
+    until = security.limited_until
+    if until is None or now >= until:
+        return None
+    words = prompts.DOCTOR_SIGNAL_LIMITED_CAPTCHA if security.limited_captcha else prompts.DOCTOR_SIGNAL_LIMITED
+    when = local_when(until, now, cfg.timezone)
+    return Finding("fail", prompts.SIGNAL_LIMIT_LABEL, words.format(when=when), prompts.DOCTOR_SIGNAL_LIMITED_FIX)
 
 
 def _model_pin(cfg: Config, models: list[dict[str, Any]] | None, her_config: Path | None = None) -> Finding:
@@ -564,9 +672,12 @@ def _ours() -> bool:
     return (hostsec.estia_root() / ollama_build.DAEMON.relative_to("/")).exists()
 
 
-def _ollama_down_fix(probe: Probe) -> str:
-    """How to bring Ollama back: setup's service started again (bootstrap when launchd does not have it loaded), or
-    the service that runs Ollama here (Homebrew's or the app's: their removal), else setup."""
+def _ollama_down_fix(probe: Probe, *, app: bool = False) -> str:
+    """How to bring Ollama back: the Ollama app opened, when the person chose it (`app`); setup's service started
+    again (bootstrap when launchd does not have it loaded), or the service that runs Ollama here (Homebrew's or the
+    app's: their removal), else setup."""
+    if app:
+        return prompts.DOCTOR_OLLAMA_APP_DOWN_FIX
     if _ours():
         shown = probe.ollama_launchd()
         if shown is not None and "Could not find service" in shown:
@@ -584,7 +695,9 @@ def _ollama_down_fix(probe: Probe) -> str:
 def _model(cfg: Config, models: list[dict[str, Any]] | None, probe: Probe) -> Finding:
     base = _ollama(cfg)
     if models is None:
-        return Finding("fail", "Model", f"Ollama does not answer at {base}", _ollama_down_fix(probe))
+        return Finding(
+            "fail", "Model", f"Ollama does not answer at {base}", _ollama_down_fix(probe, app=cfg.ollama == "app")
+        )
     wanted = cfg.model if ":" in cfg.model else f"{cfg.model}:latest"
     listed = next((item for item in models if item.get("name") == wanted), None)
     if listed is not None and is_remote(listed):  # the model runs only on this Mac
@@ -617,7 +730,8 @@ def _ollama_build(cfg: Config, probe: Probe) -> Finding | None:
         version: str | None = str(answer.get("version") or "") if isinstance(answer, dict) else None
     except (OSError, ValueError, AttributeError):
         version = None
-    heard = probe.ollama_listener(urllib.parse.urlsplit(base).port or ollama_build.PORT)
+    port = urllib.parse.urlsplit(base).port or ollama_build.PORT
+    heard = probe.ollama_listener(port)
     program = heard.program
     pin = ollama_build.RELEASE.version
     untested = (
@@ -638,9 +752,21 @@ def _ollama_build(cfg: Config, probe: Probe) -> Finding | None:
         return untested
     found = ollama_build.Found(program, version or None, addresses=heard.addresses, uid=heard.uid, others=heard.others)
     owner = probe.owner_uid()
-    wrong = ollama_build.problem(found, owner=owner)
+    chosen = cfg.ollama == "app"  # the Ollama app the person chose at setup (owner, 29 Oct)
+    root = hostsec.estia_root()
+    her_own = ollama_build.hers(found, root)  # her own Ollama: run as _estia from root's copy, its account counts
+    if her_own:
+        owner = found.uid
+    wrong = ollama_build.problem(found, owner=owner, app_ok=chosen, port=port, root=root if her_own else Path("/"))
     if wrong is not None:  # another account's: it controls her answers, a ✗ as setup's stop
         return Finding("fail" if ollama_build.someone_else_runs(found, owner) else "warn", "Ollama", *wrong)
+    if her_own:  # setup 0.9.8 keeps hers as it is: another version waits for a later release
+        if untested is not None:
+            return replace(untested, fix=prompts.OLLAMA_HER_UNTESTED_FIX)
+        text = prompts.DOCTOR_OLLAMA_HERS_OK.format(version=version, program=program, user=ownuser.ROLE_USER)
+        return Finding("ok", "Ollama", text) if version else None
+    if chosen and version and ollama_build.app_of(Path(program)) is not None:  # it updates itself: no pin to name
+        return Finding("warn", "Ollama", prompts.DOCTOR_OLLAMA_APP.format(version=version, program=program))
     if untested is not None:
         return untested
     _missing, unread = ollama_build.missing_libraries(program)
@@ -687,20 +813,47 @@ def _model_build(cfg: Config, models: list[dict[str, Any]] | None) -> Finding | 
     return Finding("warn", "Model build", text, prompts.model_build_fix(cfg.model, **tags))
 
 
-def _model_prompt(cfg: Config, models: list[dict[str, Any]] | None, probe: Probe, *, own: bool) -> Finding | None:
-    """Her model when it is Gemma 4 of 12B or more and Ollama gives it the prompt meant for the small models (an alias
-    made before 0.9.3: Ollama tells the sizes apart by the name, which local-worker does not have; empty answers, 17
-    Oct): ! with the step that makes it again. Read-only: its Modelfile and size from /api/show, metadata only. Nothing
-    when the model is not listed, Ollama does not show it, or it has Google's prompt for its size."""
+def _listed(cfg: Config, models: list[dict[str, Any]] | None) -> dict[str, Any] | None:
     wanted = cfg.model if ":" in cfg.model else f"{cfg.model}:latest"
-    listed = next((item for item in models or [] if item.get("name") == wanted), None)
-    if listed is None:
+    return next((item for item in models or [] if item.get("name") == wanted), None)
+
+
+def _shown(cfg: Config, models: list[dict[str, Any]] | None, probe: Probe) -> dict[str, Any] | None:
+    """Her model's /api/show answer (read-only: its Modelfile, parameters and size, metadata only); None when it is
+    not listed or Ollama does not show it."""
+    if _listed(cfg, models) is None:
         return None
     try:
         shown = probe.post_json(f"{_ollama(cfg)}/api/show", {"model": cfg.model})
     except (OSError, ValueError):
         return None
-    if not isinstance(shown, dict) or not ollama_build.gets_small_prompt(cfg.model, shown, listed):
+    return shown if isinstance(shown, dict) else None
+
+
+def _model_context(cfg: Config, shown: dict[str, Any] | None, *, own: bool) -> Finding | None:
+    """Her model's own context window against the config's `context_tokens`, or without it the 32,768 the history's
+    own limits count on (review I24): ! when the model's is smaller, as an alias of 16,384 tokens with a config from
+    before 0.9.7. Nothing when it names none (Ollama's own applies, not read here)."""
+    from local_assistant.setup import context_of  # setup imports this module: its reading of num_ctx, used here
+
+    model_tokens = context_of(str((shown or {}).get("parameters") or ""))
+    counted = cfg.context_tokens or HISTORY_CONTEXT
+    if model_tokens is None or model_tokens >= counted:
+        return None
+    text = prompts.DOCTOR_MODEL_CONTEXT.format(model=cfg.model, model_tokens=model_tokens, tokens=counted)
+    how = prompts.DOCTOR_OWN_EDIT if own else ""
+    return Finding("warn", "Model context", text, prompts.DOCTOR_MODEL_CONTEXT_FIX.format(tokens=model_tokens) + how)
+
+
+def _model_prompt(
+    cfg: Config, models: list[dict[str, Any]] | None, shown: dict[str, Any] | None, *, own: bool
+) -> Finding | None:
+    """Her model when it is Gemma 4 of 12B or more and Ollama gives it the prompt meant for the small models (an alias
+    made before 0.9.3: Ollama tells the sizes apart by the name, which local-worker does not have; empty answers, 17
+    Oct): ! with the step that makes it again. Read-only: its Modelfile and size from /api/show, metadata only. Nothing
+    when the model is not listed, Ollama does not show it, or it has Google's prompt for its size."""
+    listed = _listed(cfg, models)
+    if listed is None or shown is None or not ollama_build.gets_small_prompt(cfg.model, shown, listed):
         return None
     if cfg.model.removesuffix(":latest") == "local-worker":  # the same alias with its tag
         fix = prompts.DOCTOR_MODEL_PROMPT_FIX_HERS if own else prompts.DOCTOR_MODEL_PROMPT_FIX
@@ -713,34 +866,111 @@ def _signal_number(cfg: Config, probe: Probe) -> Finding:
     """The bot's number in signal-cli's list, and its own account file not saying the registration is unfinished:
     signal-cli lists a number as soon as register starts, before the SMS code (an unreadable file changes nothing)."""
     signal_data = probe.home / ".local/share/signal-cli"
+    numberless = hostsec.is_account_id(cfg.bot_number)  # Signal Login: found by its Account ID, never shown
+    part = "Signal account" if numberless else "Signal number"
     try:
         entry = next(iter(hostsec.signal_listed(signal_data, cfg.bot_number)), None) if cfg.bot_number else None
     except (OSError, ValueError):
         entry = None
+    # in her own macOS account signal-login moves it; before, setup skips its account step once configured (S10)
+    account_fix = prompts.DOCTOR_SIGNAL_ACCOUNT_FIX if probe.moved() else prompts.DOCTOR_SIGNAL_ACCOUNT_BY_HAND
+    if entry is None and numberless:
+        return Finding("fail", part, prompts.DOCTOR_SIGNAL_ACCOUNT_NONE, account_fix)
     if entry is None:
         return Finding(
             "fail",
-            "Signal number",
+            part,
             "signal-cli has no account for bot_number",
             "register the bot's number: setup_assistant.md, 2.3 (signal-cli ... register, then verify)",
         )
     account = hostsec.account_file(signal_data, entry)  # by signal-cli's own name only: never a path
     if account is not None and account.get("registered") is False:
-        return Finding("fail", "Signal number", prompts.DOCTOR_SIGNAL_UNFINISHED, prompts.DOCTOR_SIGNAL_UNFINISHED_FIX)
-    return Finding("ok", "Signal number", "the bot's number is registered with signal-cli")
+        if numberless:
+            return Finding("fail", part, prompts.DOCTOR_SIGNAL_ACCOUNT_UNFINISHED, account_fix)
+        return Finding("fail", part, prompts.DOCTOR_SIGNAL_UNFINISHED, prompts.DOCTOR_SIGNAL_UNFINISHED_FIX)
+    if numberless:
+        return Finding("ok", part, prompts.DOCTOR_SIGNAL_ACCOUNT_OK)
+    return Finding("ok", part, "the bot's number is registered with signal-cli")
 
 
-def _signal_cli(cfg: Config, probe: Probe) -> Finding | None:
-    """The version of the signal-cli the bridge runs: written for 0.14.x (its register, verify and receive requests);
-    not read, no line."""
-    text = probe.signal_cli_version(cfg.signal_cli)
-    if not text:
+# signal-cli's releases (GitHub, AsamK/signal-cli) by UTC day: its README says "signal-cli releases older than three
+# months may not work correctly" (Signal's own clients expire after three months, then its servers may change). A table,
+# so doctor needs no network; a newer version than these has no age line
+SIGNAL_CLI_RELEASED = {
+    "0.14.0": "2026-03-01",
+    "0.14.1": "2026-03-08",
+    "0.14.2": "2026-04-04",
+    "0.14.3": "2026-04-22",
+    "0.14.4": "2026-05-23",
+    "0.14.4.1": "2026-05-23",
+    "0.14.5": "2026-06-11",
+    "0.14.6": "2026-07-13",
+    "0.14.7": "2026-08-01",
+    "0.14.8": "2026-09-10",
+    "0.14.9": "2026-10-07",
+}
+SIGNAL_CLI_DAYS = 92  # three months
+
+
+def _signal_cli(cfg: Config, probe: Probe) -> list[Finding]:
+    """The signal-cli the bridge runs: Homebrew's, or with calls the Java build (its own pinned version), each by its
+    `--version` (the Java build's from its folder when it does not answer). Its version line, and a "!" when the two
+    builds differ (they share her one Signal data folder). Nothing read, no line."""
+    native = probe.signal_cli_version(cfg.signal_cli)
+    if not cfg.calls_enabled:
+        return [_signal_cli_line(native, probe)] if native else []
+    java = cfg.java_home or probe.java_home()
+    env = {**({"JAVA_HOME": str(java)} if java is not None else {}), "JAVA_OPTS": jvm_opts(Path.home())}
+    jvm = probe.signal_cli_version(str(cfg.call_signal_cli), env) or _folder_version(Path(cfg.call_signal_cli))
+    if not jvm:
+        return [_signal_cli_line(native, probe)] if native else []
+    lines = [_signal_cli_line(jvm, probe, java=True)]
+    if native and native.split()[-1] != jvm.split()[-1]:
+        two = prompts.DOCTOR_SIGNAL_CLI_TWO.format(jvm=jvm, native=native)
+        lines.append(Finding("warn", "signal-cli builds", two, prompts.DOCTOR_SIGNAL_CLI_TWO_FIX))
+    return lines
+
+
+def _folder_version(program: Path) -> str | None:
+    """The Java build's version from its folder (`signal-cli-<version>/bin/signal-cli`, the name an update checks);
+    None when the program is not there (the Calls line names it missing)."""
+    if not program.is_file():
         return None
+    found = re.fullmatch(r"signal-cli-(\d+(?:\.\d+){2,3})", program.parent.parent.name)
+    return f"signal-cli {found.group(1)}" if found else None
+
+
+def _signal_cli_line(text: str, probe: Probe, *, java: bool = False) -> Finding:
+    """One build's line: written for SIGNAL_CLI_SERIES (its register, verify and receive requests), with its release
+    day from the table and a "!" once that is over three months ago; a release day the table lacks is a "!" too (its
+    age cannot be told), as is another series."""
     version = text.split()[-1]
-    if version.startswith("0.14."):
-        return Finding("ok", "signal-cli", text)
+    series = SIGNAL_CLI_SERIES
+    named = prompts.DOCTOR_SIGNAL_CLI_JAVA.format(text=text) if java else text
+    if signal_cli_series(version) == 0:
+        day = SIGNAL_CLI_RELEASED.get(version)
+        if day is None:  # newer than this Estia's table
+            unknown = prompts.DOCTOR_SIGNAL_CLI_UNKNOWN.format(text=named)
+            return Finding("warn", "signal-cli", unknown, prompts.DOCTOR_SIGNAL_CLI_ESTIA_FIX)
+        released = calendar.timegm(time.strptime(day, "%Y-%m-%d"))
+        shown = prompts.DOCTOR_SIGNAL_CLI_RELEASED.format(text=named, day=day)
+        if (probe.now() - released) // 86400 <= SIGNAL_CLI_DAYS:  # whole days since its release day
+            return Finding("ok", "signal-cli", shown)
+        return Finding(
+            "warn",
+            "signal-cli",
+            prompts.DOCTOR_SIGNAL_CLI_OLD.format(text=shown),
+            prompts.DOCTOR_SIGNAL_CLI_UPDATE.format(series=series),
+        )
+    which = prompts.DOCTOR_SIGNAL_CLI_JAVA.format(text=version) if java else version
+    if signal_cli_series(version) > 0:  # Homebrew never brings an older one back: a newer Estia knows it
+        newer = prompts.DOCTOR_SIGNAL_CLI_NEWER.format(version=which, series=series)
+        return Finding("warn", "signal-cli", newer, prompts.DOCTOR_SIGNAL_CLI_ESTIA_FIX)
     return Finding(
-        "warn", "signal-cli", prompts.DOCTOR_SIGNAL_CLI_OTHER.format(version=version), prompts.DOCTOR_SIGNAL_CLI_FIX
+        "warn",
+        "signal-cli",
+        prompts.DOCTOR_SIGNAL_CLI_OTHER.format(version=which, series=series),
+        prompts.DOCTOR_SIGNAL_CLI_FIX.format(series=series),
     )
 
 
@@ -756,8 +986,6 @@ def _picture(cfg: Config) -> Finding:
         return Finding("warn", "Profile picture", text, prompts.DOCTOR_PICTURE_FIX)
     if path == DEFAULT_AVATAR:
         return Finding("ok", "Profile picture", prompts.DOCTOR_PICTURE_ESTIA)
-    if path.parent == LETTER_AVATARS:  # her name's first letter (owner, 15 Oct)
-        return Finding("ok", "Profile picture", prompts.DOCTOR_PICTURE_LETTER.format(letter=path.stem))
     return Finding("ok", "Profile picture", prompts.DOCTOR_PICTURE_OWN.format(file=path.name))
 
 
@@ -971,10 +1199,11 @@ def _voice_log(probe: Probe) -> str:
     return f"{ownuser.ESTIA} logs voice" if probe.moved() else prompts.DOCTOR_VOICE_LOG  # her output: /var/log/estia
 
 
-def _unavailable_fix(probe: Probe, fix: str, folder: str) -> str:
+def _unavailable_fix(probe: Probe, fix: str, folder: str, language: str = "") -> str:
     """A detector's fix when its model is unavailable: the log says why, the voice service started again tries a failed
     download again (her wrapper in her own user, else its install script), and the model's `folder` to delete when
-    the files are wrong (hers in her own user, which needs admin rights; the review of 17 Oct, I4)."""
+    the files are wrong (hers in her own user, which needs admin rights; the review of 17 Oct, I4). `language`: the
+    English name of a Pocket TTS language the fix names."""
     own = probe.moved()
     restart = prompts.DOCTOR_VOICE_RESTART_OWN.format(estia=ownuser.ESTIA) if own else prompts.DOCTOR_VOICE_REINSTALL
     home = str(ownuser.HOME) if own else "~"
@@ -983,6 +1212,7 @@ def _unavailable_fix(probe: Probe, fix: str, folder: str) -> str:
         restart=restart,
         folder=prompts.DOCTOR_VOICE_MODELS.format(home=home, folder=folder),
         rights=prompts.DOCTOR_ADMIN if own else "",
+        language=language,
     )
 
 
@@ -1021,6 +1251,147 @@ def _turn_detector(cfg: Config, probe: Probe) -> Finding:
         ),
     }.get(state, (prompts.DOCTOR_TURN_SILENT, prompts.DOCTOR_VOICE_REINSTALL))
     return Finding("warn", "Turn detector", text, fix)
+
+
+def _pocket(cfg: Config, probe: Probe) -> Finding:
+    """With [voice]: her English voices' files (Pocket TTS) against their pins (every sha256): the release program
+    beside the voice service in her release (root's: an update puts it there), and the Mac's model's heart file in the
+    voice service's own bundle there (owner, 27 Oct: the 100M's; 29 Oct: the 18M's), the Mac's model in the voice
+    service's models folder (owner, 26 Oct: the 100M beside Gemma 4 26B, the 18M beside 12B: `voice.pocket_standard`);
+    and Pocket's state in its health. Whatever stops them, Kokoro says her lines meanwhile, in the voice the line names
+    (`config.kokoro_stand_in`: am_michael for alba and michael, af_heart for the others); heart's file stops only heart
+    (the review of 27 Oct, swift-voice-2: its lines af_heart's). The voice judged is the one that speaks
+    (`_voice_in_use`): vera on a Mac with the 18M, which has none, is told (heart, the default, speaks there)."""
+    part = "Pocket TTS voices"
+    standard = voice.pocket_standard()
+    in_use = _voice_in_use(cfg, standard)
+    kokoro = {"stand_in": kokoro_stand_in(in_use)}
+    models = probe.home / "Library" / "Application Support" / "local-assistant" / "voice-models"
+    files = voice.pocket_files(models, voice.pocket_english_files(standard))
+    release = hostsec.estia_root() / ownuser.CURRENT.relative_to("/")
+    program = voice.pocket_files(release, voice.POCKET_PROGRAM)
+    # heart's file for the Mac's model, shipped in the voice service's own bundle in her release: the source of its
+    # copy, in either layout of the bundle (the review of 27 Oct, swift-voice-1); without it only heart's lines are
+    # Kokoro's
+    pins = voice.pocket_shipped(release, standard)
+    shipped = voice.pocket_files(release, pins)
+    hearts = {"stand_in": kokoro_stand_in("heart"), "file": next(iter(pins)).rsplit("/", 1)[-1]}
+    log = _voice_log(probe)
+    lead = len(f"{MARKS['warn']} {part}: ")  # the lines with Kokoro's limit on a call, split to fit the terminal
+    update = prompts.DOCTOR_POCKET_PROGRAM_FIX.format(deploy=ownuser.DEPLOY_CMD)
+    if program == "changed":
+        return Finding("fail", part, prompts.DOCTOR_POCKET_PROGRAM_CHANGED.format(**kokoro), update)
+    if program == "missing":
+        return Finding("warn", part, prompts.DOCTOR_POCKET_NO_PROGRAM.format(**kokoro), update)
+    if shipped == "changed":
+        return Finding("fail", part, prompts.DOCTOR_POCKET_SHIPPED_CHANGED.format(**hearts), update)
+    if shipped == "missing":
+        return Finding("warn", part, prompts.DOCTOR_POCKET_NO_SHIPPED.format(**hearts), update)
+    if files == "unread" or program == "unread" or shipped == "unread":
+        return Finding(
+            "warn", part, prompts.DOCTOR_POCKET_UNREAD, prompts.DOCTOR_POCKET_UNREAD_FIX.format(estia=ownuser.ESTIA)
+        )
+    try:
+        health = probe.get_json(f"{cfg.voice_url.rstrip('/')}/health")
+    except (OSError, ValueError):
+        health = None
+    state = health.get("pocket") if isinstance(health, dict) else None
+    if files == "changed" or state == "refused":
+        fix = _unavailable_fix(probe, prompts.DOCTOR_POCKET_CHANGED_FIX, "pocket-tts")
+        return Finding("fail", part, prompts.DOCTOR_POCKET_CHANGED.format(**kokoro), fix)
+    if files == "missing":
+        size = 250 if standard else 130
+        text = hostsec.terminal_text(prompts.DOCTOR_POCKET_MISSING.format(size=size, **kokoro), lead)
+        return Finding("warn", part, text, prompts.DOCTOR_POCKET_MISSING_FIX.format(log=log))
+    # vera beside the 18M is told (heart, the default, speaks there)
+    if not standard and in_use in STANDARD_ONLY:
+        return Finding("warn", part, prompts.DOCTOR_POCKET_NO_VERA, prompts.DOCTOR_POCKET_NO_VERA_FIX)
+    if state == "ready":
+        voices = ", ".join(name for name in POCKET_ORDER if standard or name not in STANDARD_ONLY)
+        size_name = "100M" if standard else "18M"
+        return Finding("ok", part, prompts.DOCTOR_POCKET_ENGLISH_OK.format(size=size_name, voices=voices))
+    if isinstance(health, dict) and "pocket" not in health:
+        return Finding("warn", part, prompts.DOCTOR_POCKET_OLD.format(**kokoro), prompts.DOCTOR_VOICE_REINSTALL)
+    text = prompts.DOCTOR_POCKET_LOADING if state == "loading" else prompts.DOCTOR_POCKET_UNAVAILABLE
+    shown = hostsec.terminal_text(text.format(**kokoro), lead)
+    return Finding("warn", part, shown, prompts.DOCTOR_POCKET_LOG_FIX.format(log=log))
+
+
+def _voice_in_use(cfg: Config, standard: bool) -> str:
+    """The English voice the bridge starts with (the review of 26 Oct, R1-F4: doctor read the config's alone): the one
+    chosen with /voice (the database's state table, read only) when this Mac offers it (`commands.voices_here`, as
+    `App` reads it at a start), else the config's. A database that is missing or cannot be read leaves the config's."""
+    try:
+        with closing(_read_only(cfg)) as conn:
+            row = conn.execute("SELECT value FROM state WHERE key = ?", (VOICE_NAME_KEY,)).fetchone()
+    except sqlite3.Error:
+        return cfg.voice_name
+    chosen = canonical_voice(row[0]) if row is not None and isinstance(row[0], str) else ""
+    return chosen if chosen in voices_here(standard) else cfg.voice_name
+
+
+def _practice_language(cfg: Config) -> str | None:
+    """The language of a running practice (/babble), read from the database only, or None."""
+    try:
+        with closing(_read_only(cfg)) as conn:
+            row = conn.execute("SELECT value FROM state WHERE key = ?", (babble.SESSION_KEY,)).fetchone()
+    except sqlite3.Error:
+        return None
+    return babble.running_language(row[0] if row is not None else None)
+
+
+def _spoken_languages(cfg: Config) -> list[str]:
+    """The languages jane speaks in Pocket TTS now (owner, 25 Oct): the one in use (set with /language, else the
+    config's) and a running practice's (/babble, which fetches and runs its model too; the review of 25 Oct), each
+    one of the six; none with `[voice] language_voice = ""` (Supertonic-3's F1 speaks them)."""
+    if not cfg.voice_language_voice:
+        return []
+    found = [_current_language(cfg), _practice_language(cfg)]
+    return [code for at, code in enumerate(found) if code in voice.POCKET_LANGUAGE_FILES and code not in found[:at]]
+
+
+def _pocket_language(cfg: Config, probe: Probe, language: str) -> Finding:
+    """With [voice] and one of the six languages jane speaks in use (`_spoken_languages`): that language's Pocket TTS
+    model against its own pins and its state in the health (`pocket_<code>`). It is fetched only once she speaks that
+    language, and checked again only then after a start, so not fetched yet and idle are no warning; for files that
+    are not the pinned ones, the first line she speaks in it fetches them again, and the folder to delete is the
+    language's own (the review of 25 Oct: eve's fix named a restart, which checks nothing of it, and the whole
+    pocket-tts folder). Its program is eve's (told on eve's line only)."""
+    pins = voice.POCKET_LANGUAGE_FILES[language]
+    name = LANGUAGES[language].english
+    part = f"Voice jane ({name})"
+    models = probe.home / "Library" / "Application Support" / "local-assistant" / "voice-models"
+    files = voice.pocket_files(models, pins)
+    log = _voice_log(probe)
+    if files == "unread":
+        return Finding(
+            "warn", part, prompts.DOCTOR_POCKET_UNREAD, prompts.DOCTOR_POCKET_UNREAD_FIX.format(estia=ownuser.ESTIA)
+        )
+    try:
+        health = probe.get_json(f"{cfg.voice_url.rstrip('/')}/health")
+    except (OSError, ValueError):
+        health = None
+    key = f"pocket_{language}"
+    state = health.get(key) if isinstance(health, dict) else None
+    if files == "changed" or state == "refused":
+        folder = "/".join(next(iter(pins)).split("/")[:2])  # the language's own: pocket-tts/german
+        fix = _unavailable_fix(probe, prompts.DOCTOR_POCKET_LANGUAGE_CHANGED_FIX, folder, language=name)
+        return Finding("fail", part, prompts.DOCTOR_POCKET_LANGUAGE_CHANGED.format(language=name), fix)
+    if state == "ready" and files == "ok":
+        return Finding("ok", part, prompts.DOCTOR_POCKET_OK)
+    if isinstance(health, dict) and key not in health:
+        return Finding(
+            "warn", part, prompts.DOCTOR_POCKET_LANGUAGE_OLD.format(language=name), prompts.DOCTOR_VOICE_REINSTALL
+        )
+    if files == "missing" and state == "loading":
+        text = prompts.DOCTOR_POCKET_LANGUAGE_FETCHING.format(language=name)
+        return Finding("warn", part, text, prompts.DOCTOR_POCKET_MISSING_FIX.format(log=log))
+    if state in (None, "idle"):
+        text = prompts.DOCTOR_POCKET_LANGUAGE_NOT_YET if files == "missing" else prompts.DOCTOR_POCKET_LANGUAGE_IDLE
+        return Finding("ok", part, text.format(language=name))
+    loading = state == "loading"
+    text = prompts.DOCTOR_POCKET_LANGUAGE_LOADING if loading else prompts.DOCTOR_POCKET_LANGUAGE_UNAVAILABLE
+    return Finding("warn", part, text.format(language=name), prompts.DOCTOR_POCKET_LOG_FIX.format(log=log))
 
 
 def _private_file(path: Path) -> bool:
@@ -1135,32 +1506,30 @@ def _optional_parts(cfg: Config, folder: Path, probe: Probe, states: _States) ->
             if _service(probe, f"{cfg.voice_url.rstrip('/')}/health")
             else Finding("fail", "Voice", f"no answer at {cfg.voice_url}", "scripts/install-voice-daemon.sh")
         )
+        found.append(_pocket(cfg, probe))
+        found.extend(_pocket_language(cfg, probe, language) for language in _spoken_languages(cfg))
     if cfg.calls_enabled:
         missing = [path.name for path in (cfg.call_signal_cli, cfg.call_tunnel) if not path.exists()]
         java = cfg.java_home or probe.java_home()
         if java is None or not (java / "bin" / "java").exists():
             missing.append("Java")
+        own = probe.moved()  # her own macOS account: the builds and Java reach her release only with the update
         if not missing:
             found.append(Finding("ok", "Calls", "the JVM signal-cli, the call helper and Java are in place"))
         elif missing == ["Java"]:
-            found.append(
-                Finding(
-                    "fail",
-                    "Calls",
-                    "no Java for the JVM signal-cli",
-                    "set [calls] java_home (setup_assistant.md, 3, Calls)",
-                )
-            )
+            fix = prompts.DOCTOR_CALLS_JAVA_FIX_OWN if own else "set [calls] java_home (setup_assistant.md, 3, Calls)"
+            found.append(Finding("fail", "Calls", "no Java for the JVM signal-cli", fix))
         else:
-            found.append(
-                Finding(
-                    "fail",
-                    "Calls",
-                    f"missing: {', '.join(missing)}",
-                    "tools/call-tunnel/install-signal-cli-jvm.sh and tools/call-tunnel/build.sh"
-                    + ("; set [calls] java_home" if "Java" in missing else ""),
-                )
+            fix = (
+                prompts.DOCTOR_CALLS_BUILDS_FIX_OWN.format(java="; brew install openjdk" if "Java" in missing else "")
+                if own
+                else "tools/call-tunnel/install-signal-cli-jvm.sh and tools/call-tunnel/build.sh"
+                + ("; set [calls] java_home" if "Java" in missing else "")
             )
+            found.append(Finding("fail", "Calls", f"missing: {', '.join(missing)}", fix))
+        if tunnel_stamp_differs(cfg.call_tunnel):  # build.sh's stamp names other sources (signal-06)
+            fix = prompts.DOCTOR_CALL_HELPER_OLD_FIX_OWN if own else "tools/call-tunnel/build.sh"
+            found.append(Finding("warn", "Call helper", prompts.DOCTOR_CALL_HELPER_OLD, fix))
         if cfg.calls_barge == "speech" or cfg.calls_pause == "speech":
             found.append(_speech_detector(cfg, probe))
         if cfg.calls_early_end:
@@ -1205,20 +1574,17 @@ def _optional_parts(cfg: Config, folder: Path, probe: Probe, states: _States) ->
             found.append(_hue(cfg, folder, probe))
     if cfg.web_enabled:
         keys = read_keys(folder / "web.env", ("OLLAMA_API_KEY", "BRAVE_API_KEY"))
+        # on by default, its key may be left for later at setup: a "!", with the way that asks for the key itself
+        fix = prompts.DOCTOR_WEB_KEY_FIX_OWN if probe.moved() else prompts.DOCTOR_WEB_KEY_FIX
         found.append(
             states.finding("web", f"keys: {', '.join(sorted(keys))}")
             if keys
-            else Finding("fail", "Web search", "no search key in a private web.env", "scripts/set-web-keys.sh")
+            else Finding("warn", "Web search", "no search key in a private web.env", fix)
         )
-    if cfg.maps_enabled:
-        has_key = bool(read_keys(folder / "web.env", ("GOOGLE_MAPS_API_KEY",)))
-        found.append(
-            states.finding("places", "" if cfg.maps_home else "no home address set")
-            if has_key
-            else Finding(
-                "fail", "Places", "no GOOGLE_MAPS_API_KEY in a private web.env", "scripts/setup-google-maps.sh"
-            )
-        )
+    if cfg.maps_enabled:  # OpenStreetMap needs nothing; Google Maps once its key is in web.env (asked first then)
+        found.append(states.finding("osm", prompts.DOCTOR_HOME_NUMBER if has_house_number(cfg.maps_home) else ""))
+        if read_keys(folder / "web.env", ("GOOGLE_MAPS_API_KEY",)):
+            found.append(states.finding("places"))
     if cfg.spotify_enabled:
         found.append(
             states.finding("spotify")

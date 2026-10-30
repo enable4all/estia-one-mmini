@@ -45,7 +45,7 @@ class Harness:
         self.tools = MailTools(store, graph, cfg, numbers, digest, clock=clock)
 
     def tools_number(self, mail_id: int) -> int:
-        return self.numbers.number(mail_id)
+        return self.numbers.number(self.store.mail(mail_id))
 
     def mail(self, graph_id: str, label: str, summary: str, subject: str = "Meeting") -> int:
         mail_id = self.store.upsert_mail(
@@ -133,6 +133,30 @@ async def test_search_falls_back_to_live_body_search(tmp_path: Path, store: Stor
     assert "- [family] Bob: Pallet quote 2025 (2 Nov 2025; older than 30 days, not readable here)" in text
 
 
+async def test_a_recent_mail_outside_the_inbox_is_never_called_old(tmp_path: Path, store: Store) -> None:
+    """Live search covers every folder; the local headers only the Inbox and Sent Items (review I29): a mail archived
+    yesterday is named as not in those folders, never as older than 30 days."""
+    h = Harness(tmp_path, store)
+    url = (
+        f"{GRAPH}/me/messages?$search=%22invoice%22&$top=10"
+        "&$select=id,conversationId,from,subject,receivedDateTime,parentFolderId"
+    )
+    archived = {
+        "id": "archived",
+        "subject": "Invoice October",
+        "from": {"emailAddress": {"name": "Anna", "address": "anna@example.com"}},
+        "receivedDateTime": "2026-10-07T09:00:00Z",
+    }
+    h.http.add(url, 200, {"value": [archived, {**archived, "id": "undated", "receivedDateTime": None}]})
+    text = await h.tools.search("invoice")
+    assert "older than" not in text
+    assert (
+        "- [family] Anna: Invoice October (7 Oct 2026; not in the Inbox or Sent Items here: archived, junk, deleted or"
+        " just arrived; not readable here)\n"
+    ) in text
+    assert text.endswith("- [family] Anna: Invoice October (date unknown; not readable here)")
+
+
 async def test_read_fetches_the_body_live(tmp_path: Path, store: Store) -> None:
     h = Harness(tmp_path, store)
     mail_id = h.mail("g1", "reply", "Anna asks to move the meeting.")
@@ -185,6 +209,32 @@ async def test_a_mail_that_is_gone_is_said_plainly(tmp_path: Path, store: Store)
     assert await h.tools.read(number) == (
         f"Error: mail {number} is no longer in the mailbox (archived, deleted or older than 30 days)."
     )
+
+
+async def test_a_number_never_reads_a_newer_mail_that_got_its_row(tmp_path: Path, store: Store) -> None:
+    """SQLite gives a removed row's id to the next mail (review I28): Bob's number stays Bob's, never Eve's."""
+    h = Harness(tmp_path, store)
+    h.mail("g1", "reply", "Anna asks about the harvest.")
+    bob = h.mail("g2", "reply", "Bob asks about the invoice.")
+    number = h.tools_number(bob)
+    store.remove_mail("family", "inbox", "g2")  # archived in Outlook, then the next sync
+    eve = h.mail("g3", "reply", "Eve's private news.")
+    assert eve == bob  # the same row
+    h.http.add(
+        f"{GRAPH}/me/messages/g3?$select=subject,from,toRecipients,receivedDateTime,body,internetMessageHeaders",
+        200,
+        {
+            "subject": "Eve's private news",
+            "from": {"emailAddress": {"name": "Eve", "address": "eve@example.com"}},
+            "receivedDateTime": "2026-10-08T07:00:00Z",
+            "body": {"contentType": "text", "content": "news"},
+        },
+    )
+    assert await h.tools.read(number) == (
+        f"Error: mail {number} is no longer in the mailbox (archived, deleted or older than 30 days)."
+    )
+    assert h.tools_number(eve) != number
+    assert (await h.tools.read(h.tools_number(eve))).startswith(f"Mail {h.tools_number(eve)} (data")
 
 
 async def test_chat_control_tokens_in_a_mail_never_reach_gemma(tmp_path: Path, store: Store) -> None:

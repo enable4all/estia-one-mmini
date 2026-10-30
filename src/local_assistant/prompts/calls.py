@@ -9,12 +9,24 @@ from local_assistant.language import ENGLISH
 
 # fmt: off
 __all__ = [
-    "CALL_ACKNOWLEDGE", "CALL_ACK_LINES", "CALL_BYE_LINES", "CALL_CHECKING_LINES", "CALL_DROPPED", "CALL_GLANCE",
-    "CALL_GREETINGS", "CALL_HEARING", "CALL_IDLE", "CALL_LOST", "CALL_MAX_BYE", "CALL_NOT_READY", "CALL_SPOKEN",
-    "CALL_STILL_HERE", "CALL_SUMMARY", "CALL_SUMMARY_RULES", "CALL_THINKING_LINES", "CALL_UNFINISHED", "CALL_UNHEARD",
-    "VOICE_READY", "CallLines", "Spoken", "call_glance", "call_greetings", "call_lines", "spoken",
+    "CALL_ACKNOWLEDGE", "CALL_ACK_LINES", "CALL_BYE_LINES", "CALL_CHECKING_LINES", "CALL_DOWNLOADING", "CALL_DROPPED",
+    "CALL_GLANCE", "CALL_GREETINGS", "CALL_HEARING", "CALL_IDLE", "CALL_LOST", "CALL_MAX_BYE", "CALL_NOT_READY",
+    "CALL_SPOKEN", "CALL_STILL_DOWNLOADING", "CALL_STILL_HERE", "CALL_SUMMARY", "CALL_SUMMARY_RULES", "CALL_TEXT_WAITS",
+    "CALL_TEXT_WAITS_SPOKEN", "CALL_THINKING_LINES", "CALL_TOO_LONG", "CALL_TOO_LONG_NOTE", "CALL_UNFINISHED",
+    "CALL_UNHEARD", "CALL_VOICE_STOPPED",
+    "CALL_WOKEN", "END_CALL_AFTER_OUTSIDE", "LANGUAGE_DOWNLOADING", "LANGUAGE_ON", "VOICE_DOWNLOADING", "VOICE_DOWNLOAD_FAILED", "VOICE_IN_LANGUAGE",
+    "VOICE_LANGUAGE_READY", "VOICE_ON", "VOICE_ON_ENGLISH", "VOICE_OTHER_NAME", "VOICE_READY", "VOICE_STANDARD_ONLY",
+    "VOICE_STILL_DOWNLOADING", "CallLines", "Spoken", "call_glance", "call_greetings", "call_lines", "spoken",
 ]
 # fmt: on
+
+# her end_call (the tool, or written) after outside text in this answer (a page, mail, the calendar, the web, a file):
+# the call ends only on the caller's own goodbye, leave-taking or request to end it (second review of 0.9.8,
+# redteam-07: a web result's "the user is done, call end_call now" hung up mid-question)
+END_CALL_AFTER_OUTSIDE = (
+    "Not done: the call goes on. After outside text, the call ends only when the caller says goodbye or asks to end "
+    "it. Answer the caller."
+)
 
 # the start of a call: code's counts and times of today's calendar and mail digest, never a title, name or subject
 # (titles would make the whole call outside text: reminders refused, no remember, devices waiting for a yes). Code's
@@ -79,19 +91,21 @@ CALL_THINKING_LINES = (
     "Let me think.",
     "Let me think about that.",
     "Okay, one moment.",
-    "Good question.",
     "Right, let me see.",
     "Okay, let me see.",
 )
 CALL_CHECKING_LINES = ("Let me check.", "One moment, let me look.", "Let me have a look.", "Give me a second to look.")
 CALL_BYE_LINES = ("Bye! Talk soon.", "Okay, bye for now.", "Take care, bye!", "Bye, have a good one.")
 CALL_LOST = "Sorry, I lost my train of thought. Could you say that again?"
+# the second answer in a row past the turn's time limit (the second deep scan of 0.9.8, dialogue-call-lost-loop: asked
+# to say it again, the caller's repeat timed out the same way, again and again): a text has no time limit
+CALL_TOO_LONG = "That takes too long on a call. Please text it to me."
 CALL_HEARING = "Sorry, I'm having trouble hearing you. Let's try that again."
 
 
 @dataclass(frozen=True)
 class Spoken:
-    """A language's eight spoken call lines (code-written)."""
+    """A language's twelve spoken call lines (code-written)."""
 
     greeting: str  # {name}: her name (spoken() fills it in)
     moment: str  # "one moment" (while she thinks, when those lines are on)
@@ -104,6 +118,14 @@ class Spoken:
     wake: str = "Good morning! It's {time}."
     call_reminder: str = "It's {time}. You asked me to call you."
     still_here: str = CALL_STILL_HERE  # every ten minutes in standby
+    # the call's length cap, and an answer that never came (review 0.9.7, C18: both were English, and "lost" was the
+    # "say that again?" line, as if she had not heard). Translations need a native speaker's check; Polish and Russian
+    # stay free of grammatical gender
+    max_bye: str = CALL_MAX_BYE
+    lost: str = CALL_LOST
+    # the second answer in a row past the time limit (CALL_TOO_LONG); translations need a native speaker's check, Polish
+    # and Russian free of grammatical gender
+    too_long: str = CALL_TOO_LONG
 
 
 # Calls in one language: these six lines, and its "got it" below. English calls keep the richer lines above;
@@ -131,6 +153,9 @@ CALL_SPOKEN: dict[str, Spoken] = {
         "¡Buenos días! Son las {time}.",
         "Son las {time}. Me pediste que te llamara.",
         still_here="Sigo aquí.",
+        max_bye="Llevamos mucho rato hablando, así que voy a colgar. Llámame cuando quieras.",
+        lost="Perdona, he perdido el hilo. ¿Puedes repetirlo?",
+        too_long="Eso tarda demasiado en una llamada. Escríbemelo, por favor.",
     ),
     "it": Spoken(
         "Ciao, sono {name}. Cosa posso fare per te?",
@@ -142,6 +167,9 @@ CALL_SPOKEN: dict[str, Spoken] = {
         "Buongiorno! Sono le {time}.",
         "Sono le {time}. Mi avevi chiesto di chiamarti.",
         still_here="Sono ancora qui.",
+        max_bye="Parliamo da molto tempo, quindi ora riattacco. Richiamami quando vuoi.",
+        lost="Scusa, ho perso il filo. Puoi ripetere?",
+        too_long="In una chiamata ci vuole troppo tempo. Scrivimelo, per favore.",
     ),
     "ko": Spoken(
         "안녕하세요! 무엇을 도와드릴까요?",
@@ -153,17 +181,23 @@ CALL_SPOKEN: dict[str, Spoken] = {
         "좋은 아침이에요! 지금 {time}이에요.",
         "지금 {time}이에요. 전화해 달라고 하셨죠.",
         still_here="아직 여기 있어요.",
+        max_bye="오래 통화했네요. 이제 끊을게요. 언제든 다시 전화 주세요.",
+        lost="죄송해요, 잠깐 생각을 놓쳤어요. 다시 한 번 말씀해 주시겠어요?",
+        too_long="통화로는 시간이 너무 오래 걸려요. 메시지로 보내 주세요.",
     ),
     "pt": Spoken(
-        "Olá, é a {name}. Em que posso ajudar?",
+        "Olá, aqui é {name}. Em que posso ajudar?",  # review 0.9.7, C18: "é a" is feminine, setup offers male names
         "Um momento.",
         "Desculpe, pode repetir?",
         "Sem pressa, estou aqui. Diga {name} quando precisar de mim.",
-        "Até breve! Tchau.",
+        "Até breve, tchau!",  # owner, 25 Oct: jane dropped the "Tchau." of "Até breve! Tchau."
         "A partir de agora falo português.",
         "Bom dia! São {time}.",
         "São {time}. Você me pediu para ligar.",
         still_here="Continuo aqui.",
+        max_bye="Já falamos há bastante tempo, então vou desligar agora. Ligue de novo quando quiser.",
+        lost="Desculpe, perdi o fio da meada. Pode repetir?",
+        too_long="Isso demora demais numa chamada. Por favor, mande por mensagem.",
     ),
     "nl": Spoken(
         "Hoi, met {name}. Wat kan ik voor je doen?",
@@ -175,6 +209,9 @@ CALL_SPOKEN: dict[str, Spoken] = {
         "Goedemorgen! Het is {time}.",
         "Het is {time}. Je vroeg me om je te bellen.",
         still_here="Ik ben er nog.",
+        max_bye="We praten al een hele tijd, dus ik hang nu op. Bel me gerust terug.",
+        lost="Sorry, ik ben de draad kwijt. Wil je dat nog een keer zeggen?",
+        too_long="Dat duurt te lang voor een gesprek. Stuur het me maar als bericht.",
     ),
     "pl": Spoken(
         "Cześć, tu {name}. W czym mogę pomóc?",
@@ -186,6 +223,9 @@ CALL_SPOKEN: dict[str, Spoken] = {
         "Dzień dobry! Jest {time}.",
         "Jest {time}. Dzwonię, tak jak było umówione.",
         still_here="Wciąż tu jestem.",
+        max_bye="Rozmawiamy już długo, więc teraz się rozłączam. Zadzwoń, kiedy zechcesz.",
+        lost="Przepraszam, wątek mi uciekł. Możesz powtórzyć?",
+        too_long="To trwa za długo jak na rozmowę. Napisz mi to, proszę.",
     ),
     "de": Spoken(
         "Hallo, hier ist {name}. Was kann ich für dich tun?",
@@ -197,6 +237,9 @@ CALL_SPOKEN: dict[str, Spoken] = {
         "Guten Morgen! Es ist {time}.",
         "Es ist {time}. Du wolltest, dass ich dich anrufe.",
         still_here="Ich bin noch da.",
+        max_bye="Wir reden schon eine ganze Weile, deshalb lege ich jetzt auf. Ruf mich gern wieder an.",
+        lost="Entschuldige, ich habe den Faden verloren. Kannst du das noch mal sagen?",
+        too_long="Das dauert am Telefon zu lange. Schreib es mir bitte.",
     ),
     "ja": Spoken(
         "もしもし！どうしましたか？",
@@ -208,6 +251,9 @@ CALL_SPOKEN: dict[str, Spoken] = {
         "おはようございます！{time}です。",
         "{time}です。お電話するように頼まれていました。",
         still_here="まだここにいますよ。",
+        max_bye="長くお話ししましたので、そろそろ切りますね。いつでもまたお電話ください。",
+        lost="すみません、考えがまとまりませんでした。もう一度言っていただけますか？",
+        too_long="電話では時間がかかりすぎます。メッセージで送ってください。",
     ),
     "ru": Spoken(
         "Привет! Чем могу помочь?",
@@ -219,6 +265,9 @@ CALL_SPOKEN: dict[str, Spoken] = {
         "Доброе утро! Сейчас {time}.",
         "Сейчас {time}. Звоню, как договаривались.",
         still_here="Я всё ещё здесь.",
+        max_bye="Мы говорим уже долго, поэтому сейчас я положу трубку. Звони в любое время.",
+        lost="Извини, мысль ускользнула. Можешь повторить?",
+        too_long="По телефону это занимает слишком много времени. Напиши мне, пожалуйста.",
     ),
     "fr": Spoken(
         "Salut, c'est {name}. Qu'est-ce que je peux faire pour toi?",
@@ -230,6 +279,9 @@ CALL_SPOKEN: dict[str, Spoken] = {
         "Bonjour! Il est {time}.",
         "Il est {time}. Tu m'as demandé de t'appeler.",
         still_here="Je suis toujours là.",
+        max_bye="On parle depuis un bon moment, alors je vais raccrocher. Rappelle-moi quand tu veux.",
+        lost="Pardon, j'ai perdu le fil. Tu peux répéter?",
+        too_long="Ça prend trop de temps au téléphone. Écris-le-moi, s'il te plaît.",
     ),
 }
 
@@ -242,6 +294,41 @@ def spoken(language: str, *, name: str) -> Spoken:
     )
 
 
+# Her wake line when her name ends standby (owner, 22 Oct: "nothing was happening" after her name): her name alone gets
+# it as her whole answer, and a turn with more gets it while the answer is worked out (unless a "got it" comes or the
+# answer is ready by then). Each language's own short "yes?" and "I'm here"; translations need a native speaker's check
+CALL_WOKEN: dict[str, tuple[str, ...]] = {
+    "en": ("Yes?", "I'm here.", "Yes, I'm here.", "I'm listening."),
+    "es": ("¿Sí?", "Aquí estoy."),
+    "it": ("Sì?", "Sono qui."),
+    "ko": ("네?", "네, 여기 있어요."),
+    "pt": ("Sim?", "Estou aqui."),
+    "nl": ("Ja?", "Ik ben er."),
+    "pl": ("Tak?", "Jestem."),
+    "de": ("Ja?", "Ich bin da."),
+    "ja": ("はい？", "はい、ここにいますよ。"),
+    "ru": ("Да?", "Я здесь."),
+    "fr": ("Oui?", "Je suis là."),
+}
+
+# Her line on a call when the caller's text, voice note, photo or document waits for the call's end (owner, 23 Oct: he
+# typed the same text three times during a call, as nothing said it waits): said by code once a call, at the next quiet
+# moment, never over the caller's speech or inside her answer; the call's language, as her wake line (English the
+# fallback). Translations need a native speaker's check; Polish and Russian stay free of grammatical gender
+CALL_TEXT_WAITS_SPOKEN: dict[str, str] = {
+    "en": "I got your message. I'll answer it after the call.",  # a photo, a voice note or a document too
+    "es": "Recibí tu mensaje. Te respondo después de la llamada.",
+    "it": "Ho ricevuto il tuo messaggio. Ti rispondo dopo la chiamata.",
+    "ko": "메시지 받았어요. 통화가 끝나면 답할게요.",
+    "pt": "Recebi sua mensagem. Respondo depois da chamada.",
+    "nl": "Ik heb je bericht gekregen. Ik antwoord na het gesprek.",
+    "pl": "Twoja wiadomość dotarła. Odpowiem na nią po rozmowie.",
+    "de": "Ich habe deine Nachricht bekommen. Ich antworte nach dem Anruf.",
+    "ja": "メッセージを受け取りました。電話のあとで返信しますね。",
+    "ru": "Твоё сообщение пришло. Отвечу на него после звонка.",
+    "fr": "J'ai bien reçu ton message. Je te réponds après l'appel.",
+}
+
 # Each language's natural short "got it", said as soon as a request of a few words is taken in: words, never a hum
 CALL_ACKNOWLEDGE: dict[str, tuple[str, ...]] = {
     "en": CALL_ACK_LINES,
@@ -249,7 +336,7 @@ CALL_ACKNOWLEDGE: dict[str, tuple[str, ...]] = {
     "it": ("Capito.", "Va bene, capito."),
     "ko": ("알겠어요.",),
     "pt": ("Entendi.", "Certo, entendi."),
-    "nl": ("Begrepen.", "Oké, begrepen."),
+    "nl": ("Oké, begrepen.",),  # owner, 25 Oct: a lone "Begrepen." was heard as "Wefrijbe." in Pocket's jane
     "pl": ("Rozumiem.", "Jasne, rozumiem."),
     "de": ("Verstanden.", "Alles klar."),
     "ja": ("わかりました。",),
@@ -273,6 +360,10 @@ class CallLines:
     wake: str = Spoken.wake  # the opening of a wake-up call she places ({time})
     call_reminder: str = Spoken.call_reminder  # the opening of another call reminder ({time})
     still_here: str = CALL_STILL_HERE  # every ten minutes in standby
+    woken: tuple[str, ...] = CALL_WOKEN[ENGLISH]  # when her name ends standby
+    text_waits: str = CALL_TEXT_WAITS_SPOKEN[ENGLISH]  # the caller's text waits for the call's end (once a call)
+    max_bye: str = CALL_MAX_BYE  # the call's length cap
+    too_long: str = CALL_TOO_LONG  # the second answer in a row past the time limit
 
 
 def call_lines(language: str, *, name: str) -> CallLines:
@@ -290,6 +381,7 @@ def call_lines(language: str, *, name: str) -> CallLines:
             CALL_BYE_LINES,
             CALL_SPOKEN[ENGLISH].wake,
             CALL_SPOKEN[ENGLISH].call_reminder,
+            woken=CALL_WOKEN[ENGLISH],
         )
     own = spoken(language, name=name)
     return CallLines(
@@ -298,12 +390,16 @@ def call_lines(language: str, *, name: str) -> CallLines:
         (own.moment,),
         (own.moment,),
         own.take_your_time,
-        own.again,
+        own.lost,
         own.again,
         (own.bye,),
         own.wake,
         own.call_reminder,
         own.still_here,
+        CALL_WOKEN[language],
+        CALL_TEXT_WAITS_SPOKEN[language],
+        own.max_bye,
+        own.too_long,
     )
 
 
@@ -314,10 +410,63 @@ CALL_NOT_READY = (
 )
 # code's note once the voice is ready after a long load or a missed call (voice_ready.ReadyNote)
 VOICE_READY = "My voice is ready: you can call me now."
+# /voice eve-full's reply, after its usual line (owner, 26 Oct): eve-full was eve on Pocket TTS's 100M model beside the
+# 18M's eve, and is another name for eve now, whichever model the Mac speaks ({typed}: the name as typed, {name}: the
+# voice's)
+VOICE_OTHER_NAME = "{typed} is another name for {name}."
+# /voice vera's reply beside Gemma 4 12B (owner, 26 Oct: "vera stays on the 100M only"): Pocket TTS's 18M model there
+# has no vera, and nothing changes ({voice}: the label); setup gives Gemma 4 26B and the 100M from 32 GB of memory
+VOICE_STANDARD_ONLY = (
+    "{voice} speaks only on a Mac with 32 GB of memory or more, where Pocket TTS runs its larger model. "
+    "/voice voices lists the voices on this one."
+)
+# /voice <voice>'s reply ({voice}: the label, {pronoun}: her or his); while Spanish, Italian, Portuguese, Dutch, German or
+# French is in use (jane speaks them, owner, 25 Oct), the English one, then VOICE_IN_LANGUAGE (also /voices' last line)
+VOICE_ON = "{voice} is on: calls and voice notes use {pronoun} voice now."
+VOICE_ON_ENGLISH = "{voice} is on: calls and voice notes in English use {pronoun} voice now."
+VOICE_IN_LANGUAGE = "{language} is spoken in {voice}'s voice (Pocket TTS); /voice sets the English voice."
+# while jane's model of a language downloads (voice_download; owner, 25 Oct: "why use supersonic while downloading
+# pocket? lets make it clear via a msg, that language is downloading, we need 3 minutes"): no Supertonic-3 stand-in for
+# that language's lines. {language}: its English name; {minutes}: what is left of the 3 ("3 minutes", "1 minute"), the
+# STILL lines past them. /language's reply (his words), /babble's line and a voice note's note, then one note when ready
+VOICE_DOWNLOADING = "Her {language} voice is downloading: about {minutes}. Until then, her answers come as text."
+LANGUAGE_ON = "{language} is on. "
+LANGUAGE_DOWNLOADING = LANGUAGE_ON + VOICE_DOWNLOADING
+VOICE_STILL_DOWNLOADING = "Her {language} voice is still downloading. Until it is ready, her answers come as text."
+VOICE_LANGUAGE_READY = "Her {language} voice is ready."
+# a call meanwhile rings out (never rejected): code's text says when to call again
+CALL_DOWNLOADING = (
+    "Her {language} voice is downloading, so calls are not picked up yet. Call again in about {minutes}, after "
+    '"Her {language} voice is ready."'
+)
+CALL_STILL_DOWNLOADING = (
+    'Her {language} voice is still downloading, so calls are not picked up yet. Call again after "Her {language} '
+    'voice is ready."'
+)
+# the download failed: Supertonic-3's F1 speaks that language as before, and a later try that works gets the ready note
+VOICE_DOWNLOAD_FAILED = (
+    "Her {language} voice could not be downloaded. Voice notes and calls in {language} use Supertonic-3's voice until "
+    "a later try works."
+)
 CALL_DROPPED = "The call dropped on my side. Call me again if you like."
+# code's line in the chat when a text, voice note, photo or document (or a command that waits) waits for the call's end
+# (owner, 23 Oct: "ok, we do that for next release"; he typed the same text three times, as nothing said it waits): at
+# once, once a call to each account; sent, never stored (never in her history), none for a practice call's own turns
+CALL_TEXT_WAITS = "Got it: I'll answer this after the call."
 CALL_UNFINISHED = (
     "The call ended before I finished your last request, so I stopped working on it. Ask me again if you still want it."
 )
+# after a call whose last request was stopped by the turn's time limit, not by the call's end (the second deep scan of
+# 0.9.8, dialogue-call-lost-loop: CALL_UNFINISHED blamed the hang-up)
+CALL_TOO_LONG_NOTE = (
+    "Your last request on the call took too long, so I stopped working on it. "
+    "Ask me again by text if you still want it."
+)
+# Kokoro, the English stand-in for her Pocket voice, says at most one line of a call's turn (owner, 28 Oct: "great
+# stuff, do it"; the review of 28 Oct, calls-03: it can crash the voice service and the call): when a second would need
+# it, she says nothing more in that turn and the rest of her answer goes to the caller as a text, after this line
+# (code's note: in her history as code_notes, in these words); the call stays up
+CALL_VOICE_STOPPED = "My voice stopped working on this call. The rest of my answer:"
 CALL_SUMMARY = "📞 **Call summary** ({minutes} min)\n{summary}"  # Gemma's "- " lines: "•" in Signal
 CALL_SUMMARY_RULES = """You write a short summary of a phone call between the user and their assistant {name}, for \
 the user to read afterwards. Give the main points, ideas worth keeping and any follow-ups, as at most six short lines \

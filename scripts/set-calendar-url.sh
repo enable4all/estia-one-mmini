@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash
 # Save one Google calendar's iCal address in ~/.config/local-assistant/calendar.env (0600), read only by the calendar
 # helper (tools/ical), never by the bridge. Google Calendar → Settings → the calendar → Integrate calendar → "Secret
 # address in iCal format" (or "Public address in iCal format" for a calendar that is public anyway).
@@ -9,6 +9,7 @@
 # Once she runs as her own user _estia, the address goes through a pipe into
 # /usr/bin/sudo /usr/local/estia/bin/estia secret set calendar.env <KEY>, which writes her calendar.env the same way.
 set -euo pipefail
+PATH=/usr/bin:/bin:/usr/sbin:/sbin  # the Mac's own tools only: a key passes through them
 name_rule='^[a-z0-9][a-z0-9_-]{0,19}$'
 name="${1:-calendar}"
 if [[ $# -gt 1 ]] || ! [[ $name =~ $name_rule ]]; then

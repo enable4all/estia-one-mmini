@@ -151,6 +151,60 @@ async def test_no_speech_returns_nothing_after_the_wait() -> None:
     pump.cancel()
 
 
+async def test_a_line_that_waits_gives_way_after_a_quiet_second() -> None:
+    """A line of hers that waits (calls.py: the caller's text waits for the call's end; owner, 23 Oct): the listen gives
+    way once nobody started to speak and LINE_QUIET_FRAMES frames in a row were quiet, long before no_speech_s."""
+    _tunnel, audio, pump = await call(noise(5.0, 40))
+    clip, info = await audio.listen(no_speech_s=4.0, line=lambda: True)
+    assert clip == b"" and info["line"] and not info["speech"]
+    assert call_audio.LINE_QUIET_FRAMES == 100  # 1 s
+    assert call_audio.LINE_QUIET_FRAMES <= audio.frames_in < call_audio.LINE_QUIET_FRAMES + 30
+    pump.cancel()
+
+
+async def test_a_line_that_waits_never_cuts_in_on_the_callers_speech() -> None:
+    """The caller talks at once, and again after a pause shorter than the quiet second: the listen hears the turn, and
+    a line still waiting gives way only in the quiet after it."""
+    caller = speech(1.0) + noise(0.5, 20) + speech(1.0) + noise(5.0, 20)
+    _tunnel, audio, pump = await call(caller)
+    clip, info = await audio.listen(end_silence_s=0.9, line=lambda: True)
+    assert clip and info["speech"] and "line" not in info and info["speech_s"] >= 2.0  # both halves, one turn
+    clip, info = await audio.listen(no_speech_s=4.0, line=lambda: True)
+    assert clip == b"" and info["line"]
+    pump.cancel()
+
+
+async def test_a_sound_resets_the_quiet_second_a_line_waits_for() -> None:
+    """A click is no speech, yet the quiet second counts again from it: a line never starts on a sound."""
+    caller = noise(0.8, 20) + noise(0.05, 6000) + noise(5.0, 20)
+    _tunnel, audio, pump = await call(caller)
+    clip, info = await audio.listen(no_speech_s=4.0, line=lambda: True)
+    assert clip == b"" and info["line"]
+    assert audio.frames_in >= 85 + call_audio.LINE_QUIET_FRAMES  # a second of quiet after the click
+    pump.cancel()
+
+
+async def test_a_line_gives_way_only_once_the_listen_is_caught_up() -> None:
+    """Frames still waiting to be heard (after speech recognition on a noise, a hold, a turn without her name in
+    standby) are no quiet moment yet (review, 23 Oct): the caller's words queued after an old quiet second are a turn,
+    and over a backlog of quiet the line gives way at its end, never inside it."""
+    audio = await listening_to(noise(1.2, 20) + speech(1.0) + noise(3.0, 20))
+    clip, info = await audio.listen(end_silence_s=0.9, line=lambda: True)
+    assert clip and info["speech"] and "line" not in info and info["speech_s"] >= 1.0
+    audio.close()
+    audio = await listening_to(noise(2.0, 20))
+    clip, info = await audio.listen(no_speech_s=10.0, line=lambda: True)
+    assert clip == b"" and info["line"] and audio.incoming.empty()
+    audio.close()
+
+
+async def test_without_a_line_waiting_the_listen_is_todays() -> None:
+    _tunnel, audio, pump = await call(noise(3.0, 40))
+    clip, info = await audio.listen(no_speech_s=1.5, line=lambda: False)
+    assert clip == b"" and "line" not in info and audio.frames_in >= 150
+    pump.cancel()
+
+
 async def test_talking_over_her_stops_her_fast_and_keeps_the_first_words() -> None:
     caller = noise(1.5, 30) + speech(1.5) + noise(3.0, 30)
     tunnel, audio, pump = await call(caller)
@@ -859,6 +913,16 @@ async def test_with_a_full_pause_of_1_5_s_or_less_probably_ends_as_the_full_paus
     assert turn.ends[-1].kind == "full" and turn.ends[-1].saved_s == 0.0
 
 
+async def test_a_listen_without_the_early_end_never_asks_smart_turn() -> None:
+    """The review of 28 Oct (calls-02): standby's listens wait the full pause (the wake harness, "Estia": 18 items
+    woke only with the full pause, 4 only with the early end, p = 0.004). `early=False` asks Smart Turn nothing, so a
+    sure answer cannot end the turn at the short pause; the call's rules still keep the end."""
+    clip, info, end, judge, turn = await judged(TURN, (0.92, None), early=False)
+    assert end == LAST_SOUND + 230 and info["ended"] == "full" and info["p"] is None
+    assert judge.windows == [] and clip == kept(scripted(*TURN), LAST_SOUND)
+    assert turn.asks == {} and turn.ends[-1].kind == "full"
+
+
 async def test_unsure_waits_the_full_pause() -> None:
     clip, info, end, _judge, _turn = await judged(TURN, (0.3, None))
     assert end == LAST_SOUND + 230 and info["ended"] == "full" and info["p"] == 0.3
@@ -1449,3 +1513,19 @@ async def test_after_a_barge_in_the_listen_never_uses_the_turn_rules() -> None:
     audio.close()
     assert (len(clip), hashlib.sha256(clip).hexdigest()) == (length, digest) and info == {"speech": True, **expected}
     assert judge.windows == [] and detector.chunks == [] and turn.ends == []
+
+
+async def test_the_callers_sound_dropped_as_her_answer_starts_is_logged(caplog: pytest.LogCaptureFixture) -> None:
+    """Review of 26 Oct (rtcall-2): a new answer drops what came in while she was thinking (say(fresh=True)); words
+    said into a long wait went with it, unlogged. The seconds of sound dropped are a metadata line now; quiet frames
+    are dropped as before, with no line, and so is the next sentence of the same answer (fresh=False keeps them)."""
+    caplog.set_level(logging.INFO, logger="local_assistant.call_audio")
+    _tunnel, audio, pump = await call(noise(0.3, 20) + tone(0.8) + noise(6.0, 20))  # 0.8 s of sound
+    while audio.frames_in < 120:  # the caller spoke while she was thinking
+        await asyncio.sleep(0.01)
+    await audio.say(tone(0.2))
+    lines = [record.getMessage() for record in caplog.records if "dropped" in record.getMessage()]
+    assert lines == ["calls: 0.8 s of the caller's sound dropped as her answer started"], lines
+    await audio.say(tone(0.2))  # only quiet came in meanwhile: no line
+    assert [record.getMessage() for record in caplog.records if "dropped" in record.getMessage()] == lines
+    pump.cancel()

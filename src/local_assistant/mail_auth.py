@@ -104,11 +104,12 @@ class TokenStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.parent.chmod(0o700)
         tmp = self.path.with_name(self.path.name + ".tmp")
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        tmp.unlink(missing_ok=True)  # a leftover, or a link put there: removed, never followed
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            os.fchmod(handle.fileno(), 0o600)
             json.dump(data, handle)
         os.replace(tmp, self.path)
-        self.path.chmod(0o600)
 
     def _load(self) -> dict[str, Any]:
         try:
@@ -170,13 +171,19 @@ class AccessTokens:
         self._cache.pop((address.lower(), scope), None)
 
 
+def said(line: str) -> None:
+    """A line out at once: off a terminal (setup's window reads `estia mail-login` from a file) Python would hold the
+    device code until the sign-in's end, up to 15 minutes later (review FRIEND-1)."""
+    print(line, flush=True)
+
+
 async def device_login(
     config: Config,
     address: str,
     store: TokenStore,
     *,
     http: Http = http,
-    out: Callable[[str], None] = print,
+    out: Callable[[str], None] = said,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     mail_only: bool = False,
 ) -> str:
@@ -196,6 +203,8 @@ async def device_login(
     base = f"{AUTHORITY}/{config.mail_tenant_id}/oauth2/v2.0"
     code = await _post_form(http, f"{base}/devicecode", {"client_id": config.mail_client_id, "scope": scope})
     body = code.body if isinstance(code.body, dict) else {}
+    if body.get("error") == "invalid_client":  # Allow public client flows is off in the app's registration
+        raise MailAuthError(prompts.MAIL_INVALID_CLIENT)
     if code.status != 200 or "device_code" not in body:
         raise MailAuthError(f"device code request failed: HTTP {code.status} {body.get('error', '')}".strip())
     out(str(body.get("message") or f"Go to {body.get('verification_uri')} and enter {body.get('user_code')}"))
@@ -223,6 +232,8 @@ async def device_login(
             return wanted
         if error == "slow_down":
             interval += 5
+        elif error == "invalid_client":  # the device code flow is refused: public client flows are off
+            raise MailAuthError(prompts.MAIL_INVALID_CLIENT)
         elif error != "authorization_pending":
             raise MailAuthError(f"sign-in stopped: {error or f'HTTP {result.status}'}")
     raise MailAuthError("the sign-in code expired; run the command again")

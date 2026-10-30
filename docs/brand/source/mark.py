@@ -1,8 +1,9 @@
-"""The e. mark: a lower-case e in ink and an orange full stop inside a white circle (on a 100 x 100 grid).
+"""The Hearth mark: a silver ring with a white centre and an orange rounded square (on a 100 x 100 grid).
 
-It is enable4all's own mark, Estia's too: `../estia-mark.svg` is enable4all's file byte for byte (enable4all-hub,
-public/brand/enable4all-mark.svg). This script draws nothing itself: it takes the circle and the letters from that
-file, for the Signal avatar here and for the lockup (lockup.py). Standard library only.
+It is Estia's own mark: `../estia-mark.svg` is the canonical file, 249 bytes, byte for byte. Its centre is a Mac mini
+seen from above, like a stone in a Japanese garden (the owner's pick, 28 Oct; it was an orange dot). This script draws
+nothing itself: it takes the ring and the square from that file, for the Signal avatar here and for the lockup
+(lockup.py). Standard library only.
 """
 
 from __future__ import annotations
@@ -16,10 +17,11 @@ sys.path.insert(0, str(Path(__file__).parent))
 from palette import WHITE
 
 MARK = Path(__file__).resolve().parent.parent / "estia-mark.svg"
+AVATAR_SCALE = 0.9  # the ring's outer radius is 45.75 of 50: at 0.9 it clears the edge of Signal's round crop
 
 
 def _inner() -> str:
-    """Everything inside the mark's <svg> element: the circle, its hairline edge, the e and the full stop."""
+    """Everything inside the mark's <svg> element: the ring and the square."""
     found = re.fullmatch(r"\s*<svg\b[^>]*>(.*)</svg>\s*", MARK.read_text(encoding="utf-8"), re.DOTALL)
     if found is None:
         raise SystemExit(f"{MARK.name} is not a single <svg> element")
@@ -27,25 +29,22 @@ def _inner() -> str:
 
 
 def mark_group() -> str:
-    """The circle (r 46), its hairline edge and the e., as SVG elements on the 100 grid."""
+    """The ring (centre white, stroke 7, silver) and the orange rounded square, as SVG elements on the 100 grid."""
     return _inner()
 
 
-def letters() -> str:
-    """The e and the full stop alone (their paths), centred on (50, 50)."""
-    return "".join(re.findall(r"<path\b[^>]*/>", _inner()))
-
-
 def mark_svg() -> str:
-    """The mark itself: enable4all's file as it is."""
+    """The mark itself: the canonical file as it is."""
     return MARK.read_text(encoding="utf-8")
 
 
 def avatar_svg(size: int = 512) -> str:
-    """The Signal avatar: full-bleed white (Signal crops it round) with the e. in the middle, as big as in the mark."""
+    """The Signal avatar: full-bleed white (Signal crops it round) with the mark centred, at 0.9 of its size."""
+    shift = 50 * (1 - AVATAR_SCALE)
     return (
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{size}" height="{size}" viewBox="0 0 100 100">'
-        f'<rect width="100" height="100" fill="{WHITE}"/>{letters()}</svg>'
+        f'<rect width="100" height="100" fill="{WHITE}"/>'
+        f'<g transform="translate({shift:g} {shift:g}) scale({AVATAR_SCALE:g})">{_inner()}</g></svg>'
     )
 
 

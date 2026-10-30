@@ -1,5 +1,6 @@
 import array
 import asyncio
+import hashlib
 import http.client
 import json
 import math
@@ -14,18 +15,32 @@ from typing import Any
 import pytest
 
 from local_assistant import prompts, voice
+from local_assistant.config import (
+    LANGUAGE_VOICES,
+    MALE_POCKET_VOICES,
+    POCKET_LANGUAGES,
+    POCKET_ORDER,
+    POCKET_VOICES,
+    kokoro_stand_in,
+)
 from local_assistant.part_status import PartStatus, Record
 from local_assistant.voice import (
     COMMANDS,
+    POCKET_FILES,
+    POCKET_FILES_100M,
+    POCKET_PROGRAM,
     VAD_TIMEOUT,
+    SpokenClip,
     Transcript,
     VoiceClient,
     VoiceError,
+    VoiceNoStandInError,
     VoiceTooLongError,
     VoiceUnavailableError,
     VoiceUnreadableError,
     detector_state,
     peer_is_ours,
+    pocket_files,
     sentences,
     sniff,
     spoken_text,
@@ -466,6 +481,121 @@ async def test_english_requests_are_exactly_as_before_the_languages() -> None:
         assert service.request_languages == ["en", "en"]
 
 
+async def test_what_she_said_before_goes_with_english_speech_for_the_times() -> None:
+    """The Pocket TTS spike, 24 Oct: "Shall I remind you at 7:30?" after "closes at 8 tonight" was said "in the
+    morning". On a call each sentence is its own request, so her answer's sentences before it go along (`context`, the
+    last 1,000 characters), read only for a time's part of the day; never in another language, never empty, so every
+    other request stays byte for byte as before."""
+    with FakeVoiceService() as service:
+        client = VoiceClient(service.url, voice="eve", speed=1.05, language="en")
+        await client.speak("Shall I remind you at 7:30?", context="It closes at 8 tonight.")
+        await client.speak("Hi.", context="")
+        await client.speak("Om half acht?", language="nl", context="Het sluit vanavond.")
+        await client.speak("Then?", context="x" * 1500)
+        bodies = [json.loads(request[3]) for request in service.requests]
+        assert bodies[0] == {
+            "input": "Shall I remind you at 7:30?",
+            "voice": "eve",
+            "speed": 1.05,
+            "context": "It closes at 8 tonight.",
+        }
+        assert service.requests[1][3] == json.dumps({"input": "Hi.", "voice": "eve", "speed": 1.05}).encode()
+        assert "context" not in bodies[2] and bodies[2]["language"] == "nl"
+        assert bodies[3]["context"] == "x" * 1000
+
+
+async def test_a_calls_line_says_it_is_a_calls() -> None:
+    """The review of 28 Oct (calls-03): on a call, a Pocket TTS voice resting after failed runs is tried again for each
+    line, so that Kokoro, which an Apple bug can crash with the voice service and the call, says fewer of them. The
+    request says it is a call's (`"call": true`); every other request stays byte for byte as before."""
+    with FakeVoiceService() as service:
+        client = VoiceClient(service.url, voice="heart", speed=1.05, language="en")
+        await client.speak("Two meetings.", call=True)
+        await client.speak("Hi.")
+        bodies = [json.loads(request[3]) for request in service.requests]
+        assert bodies[0] == {"input": "Two meetings.", "voice": "heart", "speed": 1.05, "call": True}
+        assert service.requests[1][3] == json.dumps({"input": "Hi.", "voice": "heart", "speed": 1.05}).encode()
+
+
+async def test_a_calls_line_after_its_turns_kokoro_line_asks_for_no_kokoro(tmp_path: Path) -> None:
+    """Owner, 28 Oct (calls-03): on a call Kokoro says at most one line of a turn. A later line of that turn asks for
+    no Kokoro stand-in ("kokoro": false): when Pocket TTS cannot say it, the voice service says nothing (409,
+    "no_stand_in"), a VoiceNoStandInError, and the voice service stays ok in the status (it did as asked). Every other
+    request is byte for byte as before."""
+    status = recorder(tmp_path)
+    with FakeVoiceService() as service:
+        client = VoiceClient(service.url, voice="heart", speed=1.05, language="en", status=status)
+        await client.speak("Two meetings.", call=True, kokoro=False)  # Pocket TTS said it
+        await client.speak("Hi.", call=True)
+        bodies = [json.loads(request[3]) for request in service.requests]
+        assert bodies[0] == {"input": "Two meetings.", "voice": "heart", "speed": 1.05, "call": True, "kokoro": False}
+        assert (
+            service.requests[1][3]
+            == json.dumps({"input": "Hi.", "voice": "heart", "speed": 1.05, "call": True}).encode()
+        )
+        service.stand_in = "af_heart"  # Pocket TTS cannot say it now: Kokoro would
+        with pytest.raises(VoiceNoStandInError):
+            await client.speak("One at nine.", call=True, kokoro=False)
+        assert status.snapshot()["voice"] == Record(ok=NOW)
+        assert (await client.speak("One at nine.", call=True)).stand_in == "af_heart"  # asked as before: Kokoro's
+
+
+async def test_a_line_another_voice_said_in_her_voices_place_says_so() -> None:
+    """The review of 24 Oct: what Pocket TTS cannot say (still fetching, resting, a failed run) Kokoro's af_heart says,
+    and the voice service marks it (X-Voice-Stand-In), so a call never keeps that clip of a canned line. A value that is
+    no voice's name is "another voice"; none: the asked voice said it."""
+    with FakeVoiceService() as service:
+        client = VoiceClient(service.url, voice="eve", speed=1.05)
+        clip = await client.speak("Got it.")
+        assert clip == service.speech and isinstance(clip, SpokenClip) and clip.stand_in == ""
+        service.stand_in = "af_heart"
+        clip = await client.speak("Got it.")
+        assert clip == service.speech and isinstance(clip, SpokenClip) and clip.stand_in == "af_heart"
+        service.stand_in = "../not a voice"
+        assert (await client.speak("Got it.")).stand_in == "another voice"
+
+
+async def test_her_name_goes_as_whispers_hint_only_when_given() -> None:
+    """On a call in standby the bridge sends her name, so Whisper writes it when it is said (owner, 22 Oct); an older
+    voice service reads only the language and ignores it. Never the hint without being asked: voice notes go as before."""
+    with FakeVoiceService() as service:
+        client = VoiceClient(service.url, voice="af_heart", speed=1.1, language="en")
+        await client.transcribe(M4A, hint="Estia")
+        await client.transcribe(M4A, language="nl", hint="Mary Jane")
+        await client.transcribe(M4A, language="ja", hint="エスティア")
+        await client.transcribe(M4A)
+        assert service.paths() == [
+            "/v1/audio/transcriptions?hint=Estia",
+            "/v1/audio/transcriptions?language=nl&hint=Mary%20Jane",
+            "/v1/audio/transcriptions?language=ja&hint=%E3%82%A8%E3%82%B9%E3%83%86%E3%82%A3%E3%82%A2",
+            "/v1/audio/transcriptions",
+        ]
+        assert service.request_languages == ["en", "nl", "ja", "en"]
+
+
+async def test_a_calls_turn_goes_with_the_call_flag() -> None:
+    """A call's turn says so (`call=1`): the voice service keeps a bare "Bye." or "Thank you." it erases from a voice
+    note (review I23); an older service reads only the language and the hint and ignores it."""
+    with FakeVoiceService() as service:
+        client = VoiceClient(service.url, voice="af_heart", speed=1.1, language="en")
+        await client.transcribe(M4A, call=True)
+        await client.transcribe(M4A, language="nl", hint="Estia", call=True)
+        await client.transcribe(M4A)
+        assert service.paths() == [
+            "/v1/audio/transcriptions?call=1",
+            "/v1/audio/transcriptions?language=nl&hint=Estia&call=1",
+            "/v1/audio/transcriptions",
+        ]
+
+
+async def test_the_fake_service_erases_a_bare_bye_as_the_real_one_does() -> None:
+    with FakeVoiceService() as service:
+        service.transcript = "Bye."
+        client = VoiceClient(service.url, voice="af_heart", speed=1.1, language="en")
+        assert (await client.transcribe(M4A)).text == ""
+        assert (await client.transcribe(M4A, call=True)).text == "Bye."
+
+
 async def test_another_language_goes_with_every_request() -> None:
     with FakeVoiceService() as service:
         client = VoiceClient(service.url, voice="af_heart", speed=1.1, language="nl")
@@ -838,3 +968,261 @@ async def test_localhost_is_reached_at_127_0_0_1_where_her_service_listens() -> 
     with FakeVoiceService() as service:
         client = VoiceClient(service.url.replace("127.0.0.1", "localhost"), voice="af_heart", speed=1.1)
         assert await client.transcribe(M4A) == Transcript("Turn off the lamp.", 2.4)
+
+
+SWIFT_POCKET = Path(__file__).resolve().parents[1] / "tools/voice/Sources/VoiceCore/Pocket.swift"
+
+
+def test_pocket_pins_are_the_voice_services() -> None:
+    """Doctor checks the English voices' files against the voice service's own pins (VoiceCore `PocketTTS`): the
+    release program beside the voice service in her release (the review of 24 Oct: never in her home) and the Mac's
+    English model in its models folder (owner, 26 Oct: the 100M beside Gemma 4 26B, the 18M beside 12B), each file's
+    folder and sha256 the same in both; the voices the same five in the same order."""
+    swift = SWIFT_POCKET.read_text(encoding="utf-8")
+    order = re.search(r"public static let order = \[([^\]]*)\]", swift)
+    assert order is not None
+    assert re.findall(r'"([a-z]+)"', order.group(1)) == list(POCKET_ORDER)
+    assert POCKET_ORDER == ("heart", "jane", "eve", "vera", "alba", "michael")  # owner, 27 Oct: heart first
+    assert set(POCKET_ORDER) == POCKET_VOICES and "eve-full" not in POCKET_VOICES  # the bridge's other name for eve
+    assert "public static let standardMemoryGiB: UInt64 = 30\n" in swift and voice.POCKET_STANDARD_GB == 30
+    assert set(POCKET_PROGRAM) == {
+        "tools/voice/.build/release/pocket-tts/pocket-tts",
+        "tools/voice/.build/release/pocket-tts/LICENSE",
+    }
+    assert "        path: PocketTTS.folder,\n" in swift and 'public static let folder = "pocket-tts"\n' in swift
+    for path, sha in POCKET_PROGRAM.items():
+        assert re.fullmatch(r"[0-9a-f]{64}", sha) and f'"{path.rsplit("/", 1)[1]}": "{sha}"' in swift
+    assert set(POCKET_FILES) == {
+        "pocket-tts/english_18m_refl/weights/model.safetensors",
+        "pocket-tts/english_18m_refl/tokenizer/tokenizer.model",  # sentencepiece, not the 100M's tokenizer.json
+        "pocket-tts/english_18m_refl/eve/eve.safetensors",
+        "pocket-tts/english_18m_refl/jane/jane.safetensors",  # owner, 25 Oct: "could I try Jane also for a bit?"
+        "pocket-tts/english_18m_refl/alba/alba.safetensors",  # owner, 26 Oct: "alba & michael for males, both on
+        "pocket-tts/english_18m_refl/michael/michael.safetensors",  # small and big"
+        # owner, 29 Oct: "just make the small heart"; copied from beside the voice service, never fetched
+        "pocket-tts/english_18m_refl/heart/heart-18m.safetensors",
+    }
+    for pins in (POCKET_FILES, POCKET_FILES_100M):  # the 18M's, the 100M's
+        for path, sha in pins.items():
+            folder, name = path.removeprefix("pocket-tts/").rsplit("/", 1)
+            if name in ("heart.safetensors", "heart-18m.safetensors"):  # heart's: no repository, no commit (bundled)
+                assert f'sha256: ["{name}": "{sha}"]' in swift and f'local: "\\(PocketTTS.folder)/{folder}"' in swift
+                continue
+            assert re.fullmatch(r"[0-9a-f]{64}", sha)
+            assert re.search(rf'"{re.escape(name)}",\s*"{sha}",\s*"{re.escape(folder)}"\)', swift), path
+    assert set(POCKET_FILES_100M) == {
+        "pocket-tts/english/weights/model.safetensors",
+        "pocket-tts/english/tokenizer/tokenizer.json",
+        "pocket-tts/english/eve/eve.safetensors",
+        "pocket-tts/english/jane/jane.safetensors",
+        "pocket-tts/english/vera/vera.safetensors",  # the 100M only: no vera on the 18M
+        "pocket-tts/english/alba/alba.safetensors",
+        "pocket-tts/english/michael/michael.safetensors",
+        "pocket-tts/english/heart/heart.safetensors",  # copied from beside the voice service, never fetched
+    }
+    # jane's two states, as the official download at the weights' own revision (a7056f5, whose commit recomputed the
+    # voice states with the weights; eve's are the release program's older ones), sha256 computed from that download
+    # (25 Oct); vera's, alba's and michael's the same way (25-26 Oct)
+    assert POCKET_FILES["pocket-tts/english_18m_refl/jane/jane.safetensors"] == (
+        "796f7860a0a2a0ca0b57fda2c7fa7a4cb1e5cd77517ced8c35177b5686f15af3"
+    )
+    assert POCKET_FILES_100M["pocket-tts/english/jane/jane.safetensors"] == (
+        "f802b7b0ce91578dc5448e1cdf4827695e64a34cc6b2f95989dc335082522887"
+    )
+    assert POCKET_FILES_100M["pocket-tts/english/vera/vera.safetensors"] == (
+        "fe136ebb9c88b65803e73ab8fc04fcc7faaa5aa790559bdab3d2382826eea44a"
+    )
+    assert POCKET_FILES_100M["pocket-tts/english/alba/alba.safetensors"] == (
+        "5850f417028fb2bf6de31e5e395e56ee7a21ac0e52ef31aebd4a6a2847d72e9c"
+    )
+    assert POCKET_FILES_100M["pocket-tts/english/michael/michael.safetensors"] == (
+        "9f6538650ed3b664ab847d05244f51f04db22ce7ea00e2b285f51d91d6308ce0"
+    )
+    assert POCKET_FILES["pocket-tts/english_18m_refl/alba/alba.safetensors"] == (
+        "e1aa12e17245952e044853867deef5e77ec4474df119cbeefa4ed2a3d878a7b1"
+    )
+    assert POCKET_FILES["pocket-tts/english_18m_refl/michael/michael.safetensors"] == (
+        "0c2ce79817211a343f784db121570e66e658f146eabc4ccd68fcdbb01b4556e3"
+    )
+    revision = "a7056f505a4a8ca72d8b5fb1440071d6f1a35739"  # the weights' own, as jane's
+    at_revision = [("english", name) for name in ("vera", "alba", "michael")]
+    at_revision += [("english_18m_refl_2026-10", name) for name in ("jane", "alba", "michael")]
+    for model, name in at_revision:
+        pin = rf'pin\("{revision}", "languages/{model}/embeddings",\s*"{name}\.safetensors"'
+        assert re.search(pin, swift), (model, name)
+    assert voice.pocket_english_files(True) is POCKET_FILES_100M and voice.pocket_english_files(False) is POCKET_FILES
+    # heart's file (owner, 27 Oct: "call the voice Heart"; in the public repository: "yes"), as the voice service
+    # ships it: in its own bundle beside its program in her release (the deploy copies the build's bundles), and as
+    # the repository has it; the models folder's copy is checked against the same sha256
+    heart = "60e5e6cbcac2f61554adcfc1ffd9830308802a3685db49489f5a14e8e65b5425"
+    assert POCKET_FILES_100M["pocket-tts/english/heart/heart.safetensors"] == heart
+    # both places a build puts it (the review of 27 Oct, swift-voice-1): Contents/Resources with Swift 6.4's default
+    # build (swiftbuild), the bundle's top with the native build (Swift 6.2's default); the first that is there counts
+    assert {
+        "tools/voice/.build/release/voice-service_voice-service.bundle/Contents/Resources/heart.safetensors": heart,
+        "tools/voice/.build/release/voice-service_voice-service.bundle/heart.safetensors": heart,
+    } == voice.POCKET_SHIPPED
+    # the 18M's heart (owner, 29 Oct: "just make the small heart and we test it later"), its own clone of af_heart
+    # (27 Oct), shipped beside the 100M's under its own name, in the same two places
+    small = "0d9e5334433271a849bfa97b1a8626cb690446a98ea3008ba016704bc51cd2bb"
+    assert POCKET_FILES["pocket-tts/english_18m_refl/heart/heart-18m.safetensors"] == small
+    assert {
+        "tools/voice/.build/release/voice-service_voice-service.bundle/Contents/Resources/heart-18m.safetensors": small,
+        "tools/voice/.build/release/voice-service_voice-service.bundle/heart-18m.safetensors": small,
+    } == voice.POCKET_SHIPPED_18M
+    assert 'public static let bundle = "voice-service_voice-service.bundle"\n' in swift
+    voices = Path(__file__).resolve().parents[1] / "tools/voice/Sources/voice-service/Voices"
+    for name, sha, size in (("heart.safetensors", heart, 8_652_024), ("heart-18m.safetensors", small, 5_768_848)):
+        assert (
+            hashlib.sha256((voices / name).read_bytes()).hexdigest() == sha and (voices / name).stat().st_size == size
+        )
+    package = (Path(__file__).resolve().parents[1] / "tools/voice/Package.swift").read_text(encoding="utf-8")
+    assert 'resources: [.copy("Voices/heart.safetensors"), .copy("Voices/heart-18m.safetensors")]' in package
+
+
+@pytest.mark.parametrize("standard", [True, False], ids=["100M", "18M"])
+def test_hearts_file_is_read_where_the_build_put_it(tmp_path: Path, standard: bool) -> None:
+    """The review of 27 Oct (swift-voice-1): the voice service's bundle holds heart's file in Contents/Resources (Swift
+    6.4's default build, swiftbuild) or at its top (the native build, Swift 6.2's default, which Package.swift
+    accepts). Doctor reads the first that is there in her release (`voice.pocket_shipped`), the default build's when
+    neither is, so a flat bundle is never "missing"; the file of the Mac's own model (owner, 29 Oct: the 18M's
+    beside the 100M's), never the other model's."""
+    places = voice.POCKET_SHIPPED if standard else voice.POCKET_SHIPPED_18M
+    deep, flat = places
+    sha = places[deep]
+    other = voice.POCKET_SHIPPED_18M if standard else voice.POCKET_SHIPPED
+    for path in other:  # the other model's file, in both places: never read for this one
+        (tmp_path / path).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / path).write_bytes(b"the other model's")
+    assert voice.pocket_shipped(tmp_path, standard) == {deep: sha}  # none there: the default build's place, missing
+    assert voice.pocket_files(tmp_path, voice.pocket_shipped(tmp_path, standard)) == "missing"
+    (tmp_path / flat).write_bytes(b"not heart")
+    assert voice.pocket_shipped(tmp_path, standard) == {flat: sha}
+    assert voice.pocket_files(tmp_path, voice.pocket_shipped(tmp_path, standard)) == "changed"
+    (tmp_path / deep).symlink_to(tmp_path / flat)  # a link there is there (and never the pinned file)
+    assert voice.pocket_shipped(tmp_path, standard) == {deep: sha}
+    assert voice.pocket_files(tmp_path, voice.pocket_shipped(tmp_path, standard)) == "changed"
+
+
+@pytest.mark.parametrize("memory", [8.0, 16.0, 18.0, 24.0, 29.9, 30.0, 32.0, 36.0, 64.0])
+def test_the_pocket_model_follows_the_macs_gemma(memory: float) -> None:
+    """Owner, 26 Oct: "the Pocket model follows the Gemma tier": a Mac setup gives Gemma 4 26B speaks the 100M model,
+    one it gives 12B (or none: under 16 GB) the 18M, as the voice service decides it (VoiceCore `PocketTTS.english`)."""
+    from local_assistant.setup import GEMMA_26B, choose_model
+
+    choice = choose_model(memory)
+    assert voice.pocket_standard(memory) is (choice is not None and choice.tag == GEMMA_26B)
+
+
+def test_the_macs_memory_is_pinned_in_tests(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The tests pin the Mac's memory at 32 GB (conftest: never the Mac's own), so the suite passes the same on a 16 GB
+    Mac; without a figure, the bridge reads it."""
+    assert voice.memory_gb() == 32.0 and voice.pocket_standard() is True
+    monkeypatch.setattr(voice, "memory_gb", lambda: 16.0)
+    assert voice.pocket_standard() is False
+
+
+def test_pocket_files_are_checked_against_their_pins(tmp_path: Path) -> None:
+    """Every pinned file there with its bytes: "ok"; one not there yet: "missing"; other bytes, a link or a folder in
+    its place: "changed" (never run); a folder this user cannot read: "unread"."""
+    pins = {
+        "pocket-tts/a/x.bin": hashlib.sha256(b"x").hexdigest(),
+        "pocket-tts/b/y.bin": hashlib.sha256(b"y").hexdigest(),
+    }
+    assert pocket_files(tmp_path, pins) == "missing"
+    (tmp_path / "pocket-tts/a").mkdir(parents=True)
+    (tmp_path / "pocket-tts/a/x.bin").write_bytes(b"x")
+    assert pocket_files(tmp_path, pins) == "missing"
+    (tmp_path / "pocket-tts/b").mkdir(parents=True)
+    (tmp_path / "pocket-tts/b/y.bin").write_bytes(b"Y")
+    assert pocket_files(tmp_path, pins) == "changed"
+    (tmp_path / "pocket-tts/b/y.bin").write_bytes(b"y")
+    assert pocket_files(tmp_path, pins) == "ok"
+    (tmp_path / "pocket-tts/b/y.bin").unlink()
+    (tmp_path / "pocket-tts/b/y.bin").symlink_to(tmp_path / "pocket-tts/a/x.bin")
+    assert pocket_files(tmp_path, pins) == "changed"
+    (tmp_path / "pocket-tts/b/y.bin").unlink()
+    (tmp_path / "pocket-tts/b/y.bin").mkdir()
+    assert pocket_files(tmp_path, pins) == "changed"
+    (tmp_path / "pocket-tts/a").chmod(0)
+    try:
+        assert pocket_files(tmp_path, pins) == "unread"
+    finally:
+        (tmp_path / "pocket-tts/a").chmod(0o700)
+
+
+SWIFT_LANGUAGES = Path(__file__).resolve().parents[1] / "tools/voice/Sources/VoiceCore/PocketLanguages.swift"
+
+
+def test_pocket_languages_are_the_voice_services() -> None:
+    """Owner, 25 Oct ("jane jane, lets have her as default for those languages"): jane in Spanish, Italian, Portuguese,
+    Dutch, German and French is Pocket TTS's, each language's full model, the same six in both (VoiceCore
+    `PocketTTS.languages`); doctor checks the language in use against the voice service's own pins (each file's folder
+    and sha256 the same in both), every one at its revision, sha256 computed from the official download."""
+    swift = SWIFT_LANGUAGES.read_text(encoding="utf-8")
+    spoken = re.findall(
+        r'PocketSpeech\(voice: languageVoice, model: \.([a-z]+), speaks: languageVoice, health: "pocket_([a-z]{2})"',
+        swift,
+    )
+    assert [code for _, code in spoken] == list(POCKET_LANGUAGES) == ["es", "it", "pt", "nl", "de", "fr"]
+    assert frozenset({"jane"}) == LANGUAGE_VOICES and 'public static let languageVoice = "jane"' in swift
+    # the review of 26 Oct (R1-F1): Kokoro's am_michael says what alba and michael cannot, in both (doctor names him)
+    males = re.search(r"public static let maleVoices: Set<String> = \[([^\]]*)\]", swift)
+    assert males is not None and frozenset(re.findall(r'"([a-z]+)"', males.group(1))) == MALE_POCKET_VOICES
+    assert 'public static let maleStandIn = "am_michael"' in swift
+    # heart's is af_heart, the voice it was cloned from (owner, 27 Oct)
+    assert [kokoro_stand_in(v) for v in ("heart", "jane", "eve", "vera", "alba", "michael", "af_heart", "am_puck")] == [
+        "af_heart",
+        "af_heart",
+        "af_heart",
+        "af_heart",
+        "am_michael",
+        "am_michael",
+        "af_heart",
+        "am_puck",
+    ]
+    names = dict((code, name) for name, code in spoken)
+    assert set(voice.POCKET_LANGUAGE_FILES) == set(POCKET_LANGUAGES)
+    for code, pins in voice.POCKET_LANGUAGE_FILES.items():
+        name = names[code]
+        assert set(pins) == {
+            f"pocket-tts/{name}/weights/model.safetensors",
+            f"pocket-tts/{name}/tokenizer/tokenizer.json",
+            f"pocket-tts/{name}/jane/jane.safetensors",
+        }
+        block = swift.split(f"public static let {name} = language(\n", 1)[1].split("head:", 1)[0]
+        for path, sha in pins.items():
+            assert re.fullmatch(r"[0-9a-f]{64}", sha) and f'"{sha}"' in block, path
+    assert voice.POCKET_LANGUAGE_FILES["de"]["pocket-tts/german/jane/jane.safetensors"] == (
+        "bd1bc91fd38a724b14f5c9cb4d67327f968568beb28d72fe7bb81f0fba75b685"
+    )
+
+
+async def test_jane_speaks_the_six_languages_and_the_english_voice_stays_englishs() -> None:
+    """The language voice (`[voice] language_voice`, jane) goes with every request in Spanish, Italian, Portuguese, Dutch,
+    German and French; English keeps her voice of now, and Korean, Polish, Japanese and Russian, which Pocket TTS has no
+    model for, keep the request as before (Supertonic-3 speaks them in its F1 whatever the voice)."""
+    with FakeVoiceService() as service:
+        client = VoiceClient(service.url, voice="eve", speed=1.05, language="de", language_voice="jane")
+        await client.speak("Hallo.")
+        await client.speak("Shall I switch heater off?", language="en")  # code's own words: English, in eve
+        await client.speak("Hoi.", language="nl")
+        client.set_language("ko")
+        await client.speak("네.")
+        bodies = [json.loads(request[3]) for request in service.requests]
+        assert [body["voice"] for body in bodies] == ["jane", "eve", "jane", "eve"]
+        assert [client.voice_for(code) for code in ("en", "fr", "pl", "ja")] == ["eve", "jane", "eve", "eve"]
+        client.set_voice("af_heart")  # /voice sets the English voice only
+        assert client.voice_for("de") == "jane" and client.voice_for("en") == "af_heart"
+    # without a language voice (an older config's client), every language as before
+    plain = VoiceClient("http://127.0.0.1:8150", voice="eve", speed=1.05)
+    assert plain.voice_for("de") == "eve"
+
+
+async def test_supertonics_f1_standing_in_for_jane_says_so() -> None:
+    """What jane cannot say in a language (still fetching, resting, a failed run) Supertonic-3's F1 says, marked
+    `X-Voice-Stand-In: F1`, so a call never keeps that clip of a canned line."""
+    with FakeVoiceService() as service:
+        client = VoiceClient(service.url, voice="eve", speed=1.05, language="de", language_voice="jane")
+        service.stand_in = "F1"
+        assert (await client.speak("Einen Moment.")).stand_in == "F1"

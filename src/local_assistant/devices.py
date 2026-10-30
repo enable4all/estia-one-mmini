@@ -45,6 +45,14 @@ COLOURS: dict[str, tuple[str, int]] = {
     "pink": ("hue", 320),
 }
 _YES = {"yes", "y", "ok", "okay", "ja", "ναι", "do it", "yes please", "👍"} | YES_WORDS  # the 11 languages' yes words
+# the start of code's note while a device waits for the yes: typed, or said on a call (where a typed yes waits for the
+# call's end, and the question ends with the call)
+_ASK_TYPED = "reply yes within"
+_ASK_SPOKEN = "say yes on the call within"
+_ASKS = (_ASK_TYPED, _ASK_SPOKEN)
+# why a call's standby dropped a waiting change, in code's note ("heater not switched off: …"; the second deep scan of
+# 0.9.8, dialogue-standby-drops-yes-silently: a yes after the pause switched nothing, and nothing said why)
+LAPSED_IN_STANDBY = "no yes came before the call went quiet"
 _LOGIN = "The TP-Link login failed: run scripts/set-tapo-credentials.sh on the Mac."
 _NOT_ANSWERING = "isn't answering (switched off at the wall, or a new address?)"
 _HELPER_FAILED = "The device helper failed."
@@ -273,6 +281,12 @@ class Devices:
     def pending(self) -> bool:
         return self._pending is not None
 
+    def of_pending(self, sentence: str) -> bool:
+        """Whether a sentence is about the change that waits for the yes: it names that change's device, or no device
+        (`named_in`; tools.Tools.unscheduled; fix review of 0.9.8, guards-G03-any-waiting-device); False when none waits."""
+        pending = self._pending
+        return pending is not None and self.named_in(sentence) <= {pending.spec.name}
+
     def names_a_device(self, text: str) -> bool:
         """Whether the text has a device word or a word of a device's name ("hallLight" counts as hall and light)."""
         names = {word for spec in self._specs for word in _words(_split_camel(spec.name)) if len(word) >= 3}
@@ -294,6 +308,18 @@ class Devices:
             return False
         own = {word for word in _words(_split_camel(spec.name)) if len(word) >= 3} - _DEVICE_WORDS
         return spec.name in self.named(text) or bool(own & _words(text))
+
+    def named_in(self, text: str) -> set[str]:
+        """The devices a sentence names for the set-for-later guard (tools.Tools.unscheduled): those `named_by` names,
+        and the one device whose name holds a device word of the sentence when no other device's does (second review
+        of 0.9.8, guards-3: "the lamp is scheduled to be switched off" with a "living room lamp"); a plural ("the
+        lights") is no one device, and a word two devices hold names neither."""
+        found = {spec.name for spec in self._specs if self.named_by(text, spec.name)}
+        for word in _words(text) & _DEVICE_WORDS:
+            holders = [spec.name for spec in self._specs if word in _words(_split_camel(spec.name))]
+            if len(holders) == 1:
+                found.add(holders[0])
+        return found
 
     def recently_switched(self) -> set[str]:
         """The devices a confirmed change reached within `RECENT_SWITCH_SECONDS` (an answer's, or a yes's)."""
@@ -368,11 +394,13 @@ class Devices:
         unasked: bool = False,
         aci: str = "",
         spoken: bool = False,
+        held: str = "",
     ) -> str:
         """Switch or set one device, after its rule; the answer is a tool result for Gemma. `confirm_first`: the
         request came in an answer that read outside text (a mail, page or file), so even a normal device waits
-        for the user's yes; `unasked`: the user's message is not about devices (see `about_devices`), likewise.
-        `spoken`: the request came on a call, so the user is asked to say yes."""
+        for the user's yes; `held`: that hold's reason when it is another ("a photo is shown with this message");
+        `unasked`: the user's message is not about devices (see `about_devices`), likewise. `spoken`: the request came
+        on a call, so the user is asked to say yes."""
         spec = self.find(name)
         if power not in (None, "on", "off"):
             return 'Power must be "on" or "off".'
@@ -403,11 +431,17 @@ class Devices:
             self._pending = _Pending(spec, change, self._clock(), aci)
             minutes = round(self._confirm_seconds / 60)
             within = f"{minutes} minute{'s' if minutes != 1 else ''}"
-            # the user reads in the bridge's own note exactly what their yes will do
-            self._done.append(f"reply yes within {within} to switch {spec.name} {change.text()}")
+            # the user reads in the bridge's own note exactly what their yes will do: one question, the one waiting
+            # now (a change that replaced an earlier one drops its line; review O6); on a call it is said there (a
+            # typed yes waits for the call's end, and the question ends with the call)
+            ask = _ASK_SPOKEN if spoken else _ASK_TYPED
+            self._done = [line for line in self._done if not line.startswith(_ASKS)]
+            self._done.append(f"{ask} {within} to switch {spec.name} {change.text()}")
             why = (
                 ""
                 if spec.rule == "ask first"
+                else f", because {held}"
+                if confirm_first and held
                 else ", because the request came while reading a mail, page or file"
                 if confirm_first
                 else ", because the user's message did not ask for a device change"
@@ -419,12 +453,20 @@ class Devices:
             )
         return await self._execute(spec, change)
 
-    def cancel(self) -> None:
-        """Any message other than the yes, or a failed answer, drops the waiting action."""
-        if self._pending is not None:
-            log.info("device action for %s cancelled", self._pending.spec.name)
+    def cancel(self, *, lapsed: str = "") -> None:
+        """Any message other than the yes, or a failed answer, drops the waiting action. `lapsed`: why it lapsed, for
+        code's next note ("heater not switched off: no yes came before the call went quiet"), when one still waited."""
+        pending = self._pending
+        if pending is not None:
+            log.info("device action for %s cancelled", pending.spec.name)
         self._pending = None
-        self._done = [line for line in self._done if not line.startswith("reply yes within")]
+        self._done = [line for line in self._done if not line.startswith(_ASKS)]
+        if lapsed and pending is not None and not self._expired(pending):
+            self._done.append(f"{pending.spec.name} not switched {pending.change.text()}: {lapsed}")
+
+    def standby(self) -> None:
+        """A call's standby starts: a waiting action is dropped, and code's next note says why (LAPSED_IN_STANDBY)."""
+        self.cancel(lapsed=LAPSED_IN_STANDBY)
 
     def _expired(self, pending: _Pending) -> bool:
         return self._clock() - pending.at > self._confirm_seconds
@@ -435,7 +477,7 @@ class Devices:
         pending, self._pending = self._pending, None
         if pending is None:
             return None
-        self._done = [line for line in self._done if not line.startswith("reply yes within")]  # answered now
+        self._done = [line for line in self._done if not line.startswith(_ASKS)]  # answered now
         if self._expired(pending) or not _is_yes(text) or (pending.aci and aci and aci != pending.aci):
             log.info("device action for %s cancelled", pending.spec.name)
             return None
@@ -462,7 +504,19 @@ class Devices:
         return f"Devices: {answering} of {len(self._specs)} answer ({', '.join(silent)} not)"
 
     async def _execute(self, spec: DeviceSpec, change: Change) -> str:
-        data = await self._helper([*_target(spec, "set"), *change.arguments()])
+        """Make the change; one already on its way when its task is cancelled (a call hung up meanwhile) is finished,
+        within the helper's time limit, and recorded like any (the note, `recently_switched`) before the cancel goes
+        on: a light never switches with no word (review I13)."""
+        run = asyncio.ensure_future(self._helper([*_target(spec, "set"), *change.arguments()]))
+        try:
+            data = await asyncio.shield(run)
+        except asyncio.CancelledError:
+            self._outcome(spec, await run)
+            raise
+        return self._outcome(spec, data)
+
+    def _outcome(self, spec: DeviceSpec, data: dict[str, Any]) -> str:
+        """What a change's helper answer did: the note's line, the switch's time, and the answer's words."""
         if data.get("ok"):
             state = _state(data)
             self._done.append(f"{spec.name} {state}")
@@ -565,6 +619,11 @@ class Devices:
             await proc.wait()
             log.warning("device helper %s timed out", args[0])
             return {"ok": False, "error": "unreachable"}
+        except BaseException:  # cancelled (a read the call no longer needs): the helper never runs on alone
+            if proc.returncode is None:
+                proc.kill()
+                await asyncio.shield(proc.wait())
+            raise
         try:
             data = json.loads(out.decode("utf-8", "replace").strip().splitlines()[-1])
         except (ValueError, IndexError):

@@ -71,13 +71,12 @@ class MailTools:
         return "".join(f"{line}\n" for line in self._digest.stale_lines())
 
     async def _read(self, number: int) -> str:
-        mail_id = self._numbers.mail_id(number)
-        if mail_id is None:
+        key = self._numbers.mail_key(number)
+        if key is None:
             return f"Error: there is no mail number {number} today; use mail_digest or mail_search first."
         gone = f"Error: mail {number} is no longer in the mailbox (archived, deleted or older than 30 days)."
-        try:
-            header = self._store.mail(mail_id)
-        except KeyError:  # archived or deleted since it got its number (the sync removed it)
+        header = self._store.mail_by_graph_id(*key)
+        if header is None:  # archived or deleted since it got its number (the sync removed it)
             return gone
         address = self._accounts.get(header.account)
         if address is None:
@@ -131,15 +130,26 @@ class MailTools:
                     lines.append(self._line(known))
                     continue
                 sender = (item.get("from") or {}).get("emailAddress") or {}
-                when = str(item.get("receivedDateTime") or "")
-                date = _day(when, self._tz, year=True) if when else "date unknown"
                 lines.append(
                     f"- [{name}] {sender.get('name') or sender.get('address') or 'unknown'}: "
-                    f"{item.get('subject') or '(no subject)'} ({date}; older than {self._keep_days} days, not readable here)"
+                    f"{item.get('subject') or '(no subject)'} ({self._why_unread(str(item.get('receivedDateTime') or ''))})"
                 )
         return lines
+
+    def _why_unread(self, when: str) -> str:
+        """A live hit not in the local headers: older than they keep, else in another folder (live search covers
+        every folder, the headers only the Inbox and Sent Items) or newer than the last sync."""
+        if not when:
+            return "date unknown; not readable here"
+        date = _day(when, self._tz, year=True)
+        received = datetime.fromisoformat(when.replace("Z", "+00:00")).timestamp()
+        if received < self._clock() - self._keep_days * 86_400:
+            return f"{date}; older than {self._keep_days} days, not readable here"
+        return (
+            f"{date}; not in the Inbox or Sent Items here: archived, junk, deleted or just arrived; not readable here"
+        )
 
     def _line(self, mail: MailHeader) -> str:
         who = mail.sender_name or mail.sender_address
         what = mail.summary or mail.subject or "(no subject)"
-        return f"{self._numbers.number(mail.id)}. [{mail.account}] {who}: {what} ({_day(mail.received_at, self._tz)})"
+        return f"{self._numbers.number(mail)}. [{mail.account}] {who}: {what} ({_day(mail.received_at, self._tz)})"

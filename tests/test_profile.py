@@ -2,7 +2,7 @@ import pytest
 
 from local_assistant import prompts
 from local_assistant.config import DEFAULT_NAME
-from local_assistant.profile import Op, Profile, check_fact
+from local_assistant.profile import Op, Profile, check_fact, shown_link_fact
 from local_assistant.store import SourceKind, Store
 from tests.conftest import ME, T0
 
@@ -72,6 +72,7 @@ def test_near_duplicate_is_skipped(store: Store) -> None:
     profile.add("The user likes tea.", source_kind="chat")
     result = profile.add("  the user LIKES tea ", source_kind="chat")
     assert result.duplicates == ["the user LIKES tea"] and not result.changed
+    assert result.repeated == [(1, "The user likes tea.")]  # the fact kept, in its kept words
     assert len(profile.facts()) == 1
 
 
@@ -170,6 +171,32 @@ def test_strict_mode_accepts_plain_facts_and_the_page_itself() -> None:
     assert check_fact("The user is a product manager at Acme.", strict=True, allowed_url=PAGE) is None
     assert check_fact(f"The user's LinkedIn profile is {PAGE}", strict=True, allowed_url=PAGE) is None
     assert check_fact("The user works as an AI engineer on YouTube tools.", strict=True, allowed_url=PAGE) is None
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Alex's bank login page is www.evil.example.test/login",  # second review of 0.9.8, redteam-02: no scheme
+        "Alex banks at evil-bank.com",  # a bare name on a real ending
+        "Alex's bank login page is ｅｖｉｌ.ｃｏｍ/login",  # as the phone reads it (NFKC)
+        "Alex's profile is https://www.linkedin.com/in/alex-example and login at evil.com",  # the page's link and one more
+    ],
+)
+def test_strict_mode_refuses_every_other_link_a_phone_could_tap(text: str) -> None:
+    result = check_fact(text, strict=True, allowed_url=PAGE)
+    assert result is not None and "link not from the learned page" in result
+
+
+def test_strict_mode_accepts_the_sent_link_without_its_scheme_too() -> None:
+    assert check_fact("Alex's profile is www.linkedin.com/in/alex-example.", strict=True, allowed_url=PAGE) is None
+    assert check_fact("Alex's profile: www.linkedin.com/in/alex-example/", strict=True, allowed_url=PAGE) is None
+
+
+def test_a_link_facts_other_links_are_never_shown() -> None:
+    """Defence in depth for the /learn reply and code's profile note: only the link the user sent stays."""
+    assert shown_link_fact(f"Alex is at {PAGE}, pay at evil.com now", PAGE) == f"Alex is at {PAGE}, pay at now"
+    assert shown_link_fact("Alex lives in Utrecht.", PAGE) == "Alex lives in Utrecht."
+    assert shown_link_fact("see evil.com", None) == "see"
 
 
 def test_link_facts_use_strict_mode_and_chat_facts_do_not(store: Store) -> None:

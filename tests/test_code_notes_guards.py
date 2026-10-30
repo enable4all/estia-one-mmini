@@ -379,6 +379,28 @@ async def test_a_device_the_users_message_does_not_name_waits_for_the_yes(
     assert len(home.sets()) == 1
 
 
+async def test_after_outside_text_a_device_the_users_message_does_not_name_waits_for_the_yes(
+    store: Store, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review G2: after outside text in an earlier answer (an audio file still in her window), a device change ran at
+    once whenever the message was about any device: "no, turn off the bedroom light" switched the lamp the audio file
+    asked for. It waits for the yes now, unless the message names that device, and her waiting call keeps none of its
+    words (replayed later, it would read as her own)."""
+    from local_assistant.tools import REFUSED_ARGUMENTS
+    from tests.test_devices import Home
+
+    home = Home(tmp_path, monkeypatch)
+    tools = Tools(store, Profile(store), TZ, FakeFetch(), devices=home.make())
+    conv = store.current_conversation()
+    turn = Turn(message=say(store, conv, "no, turn off the bedroom light", T0), after_outside=True)
+    waits = await tools.call(turn, "device_set", '{"device": "living room lamp", "power": "off"}')
+    assert waits.startswith("Not done: living room lamp needs the user's yes first") and home.sets() == []
+    assert store.tool_calls(turn.message.id)[-1].arguments == REFUSED_ARGUMENTS
+    named = await tools.call(turn, "device_set", '{"device": "bedroom light", "power": "off"}')
+    assert named.startswith("Done") and len(home.sets()) == 1
+    assert "bedroom light" in store.tool_calls(turn.message.id)[-1].arguments  # a call that ran keeps its words
+
+
 # ---- L3: a note after an answer with an outside note in her input is marked outside ----
 
 
@@ -392,3 +414,73 @@ async def test_an_answer_with_an_outside_note_in_her_input_read_outside_text(sto
     asked = say(store, conv, "remember that I like tea", T0 + 1_000)
     answer = await brain.answer(store.current_conversation(), asked)
     assert answer.notice and answer.read_outside
+
+
+# second review of 0.9.8, redteam-06: the word guards in Japanese (no spaces) and Korean (particles joined to a word)
+
+
+@pytest.mark.parametrize(
+    ("argument", "said", "texts", "taken"),
+    [
+        ("山田クリニック", "how do I get there?", ["山田クリニックで診察"], True),  # a calendar title to Maps
+        ("山田クリニック", "山田クリニックへの行き方は?", ["山田クリニックで診察"], False),  # the user's own words
+        ("東京駅", "東京駅までの道は?", ["東京駅で会議"], False),
+        ("김내과", "가는 길 알려줘", ["김내과에서 진료"], True),
+        ("김내과", "김내과 가는 길", ["김내과에서 진료"], False),
+        # release review of 0.9.8, G04: a word from inside a Korean title, not only its start
+        ("연세치과", "거기 가는 길 알려줘", ["강남연세치과 검진"], True),
+        ("연세치과", "연세치과 가는 길 알려줘", ["강남연세치과 검진"], False),
+        ("Example Clinic", "how do I get there?", ["Checkup at Example Clinic"], True),  # as before
+    ],
+)
+def test_taken_words_read_japanese_and_korean(argument: str, said: str, texts: list[str], taken: bool) -> None:
+    assert bool(code_notes.taken_words(argument, said, texts)) is taken
+
+
+KOREAN_TITLE = ("Digest\nToday\n• 10:00 강남연세치과 검진",)
+
+
+def test_a_korean_word_from_inside_a_notes_word_is_drawn_from_it() -> None:
+    """Release review of 0.9.8, G04: a Korean run gave only its starts, so "연세치과" from "강남연세치과" passed."""
+    assert code_notes.drawn_from_notes("연세치과", "거기 가는 길 알려줘", KOREAN_TITLE)
+    assert not code_notes.drawn_from_notes("연세치과", "연세치과 가는 길 알려줘", KOREAN_TITLE)
+
+
+async def test_maps_never_gets_a_korean_word_from_inside_a_private_notes_or_a_calendar_title(
+    store: Store, tmp_path: Path
+) -> None:
+    from tests.test_calendar_tools import Home as CalendarHome
+
+    fake = FakeMaps(routes={"치과": TO_AIRPORT})
+    route = '{"to": "연세치과", "mode": "walk"}'
+    tools = Tools(store, Profile(store), TZ, FakeFetch(), maps=fake)
+    noted = private_turn(store, "거기 가는 길 알려줘", KOREAN_TITLE)
+    assert await tools.call(noted, "route", route) == prompts.MAPS_FROM_NOTES and fake.asked == []
+    home = CalendarHome(tmp_path)  # Friday 9 Oct 2026 09:15
+    home.add("강남연세치과 검진", "2026-10-09 10:00", "2026-10-09 10:30")
+    tools = Tools(store, Profile(store), TZ, FakeFetch(), maps=fake, calendar=home.tools)
+    read = private_turn(store, "오늘 일정 알려주고 거기 가는 길 알려줘", ())
+    await tools.call(read, "calendar_agenda", '{"start": "today"}')
+    assert await tools.call(read, "route", route) == prompts.MAPS_FROM_CALENDAR and fake.asked == []
+    own = private_turn(store, "연세치과 가는 길 알려줘", KOREAN_TITLE)
+    assert (await tools.call(own, "route", route)).startswith("Route by")  # the user's own words
+
+
+def test_a_japanese_fact_drawn_from_a_note_is_seen() -> None:
+    assert code_notes.drawn_from_notes("山田銀行に送金", "ありがとう", ["山田銀行に送金してください"])
+    assert not code_notes.drawn_from_notes(
+        "山田銀行に送金", "山田銀行に送金するのを覚えて", ["山田銀行に送金してください"]
+    )
+
+
+@pytest.mark.parametrize(
+    ("said", "words", "named"),
+    [
+        ("歯医者の予約をキャンセルして", "歯医者の予約", True),
+        ("ありがとうございます", "薬をのみます", False),  # hiragana pairs are grammar: never a name
+        ("치과 예약 취소해줘", "치과에서 검진", True),
+        ("집에서 쉴래", "회사에서 회의", False),  # a shared particle names nothing
+    ],
+)
+def test_a_reminder_is_named_in_japanese_and_korean(said: str, words: str, named: bool) -> None:
+    assert code_notes.names_reminder(said, "", words) is named

@@ -262,12 +262,19 @@ private func answer(_ response: Data) -> (status: String, body: String) {
     }
 
     @Test func theDetectorIsBesideTheSpeechDetectorAndInHealth() async throws {
-        let engines = Engines(models: URL(fileURLWithPath: "/models"), temp: URL(fileURLWithPath: "/tmp"))
-        #expect(await engines.turn.state == .loading)
-        let reply = answer(await engines.health())
-        #expect(reply.status == "HTTP/1.1 200")
-        let health = try #require(try JSONSerialization.jsonObject(with: Data(reply.body.utf8)) as? [String: Any])
-        #expect(health["turn"] as? String == "loading" && health["vad"] as? String == "loading")
+        for english in [PocketModel.english, .english18M] {  // either Mac's (owner, 26 Oct: by its Gemma)
+            let engines = Engines(models: URL(fileURLWithPath: "/models"), temp: URL(fileURLWithPath: "/tmp"),
+                                  programs: URL(fileURLWithPath: "/programs"), pocket: PocketVoices(english: english))
+            #expect(await engines.turn.state == .loading)
+            let reply = answer(await engines.health())
+            #expect(reply.status == "HTTP/1.1 200")
+            let health = try #require(try JSONSerialization.jsonObject(with: Data(reply.body.utf8)) as? [String: Any])
+            #expect(health["turn"] as? String == "loading" && health["vad"] as? String == "loading")
+            // English's one Pocket state, whichever model the Mac speaks, and one for each of the six languages
+            #expect(health["pocket"] as? String == "loading" && health["pocket_full"] == nil)
+            #expect(health["pocket_de"] as? String == "idle")
+            #expect(Set(health.keys.filter { $0.hasPrefix("pocket") }).count == 7)
+        }
     }
 
     // MARK: - The real model

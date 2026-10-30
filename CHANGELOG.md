@@ -7,6 +7,279 @@ to 0.9.3 were written on GitHub and say more (security, requirements, install, t
 
 ## [Unreleased]
 
+## [0.9.8] - 2026-10-30
+
+No 0.9.7 was published: its work is in 0.9.8.
+
+### Added
+
+- **The Estia Setup window, at the desk:** every step in a window of its own, after her spoken intro, Google Maps alone
+  in Terminal; no network, no open port. Over a remote login (SSH) or inside screen, tmux or herdr, setup stays in
+  Terminal.
+- **The setup window never asks for the Mac password:** macOS's own box does, for admin rights and for a locked login
+  keychain; Terminal keeps its own password prompt.
+- **Setup started by your AI:** at the Mac's own screen, an AI coding assistant such as Claude Code starts
+  `scripts/setup.sh` and follows its step lines; every answer is typed in the Estia Setup window, the Mac password only
+  in macOS's own box, and setup shows the AI none of them; closing the window stops setup, every answer kept.
+- **Setup asks first, then installs:** every question that needs no code from Signal comes first, and each answer is
+  kept (never a captcha link, code, PIN, key or password), so a run that stops goes on where it was.
+- **Checked before anything installs:** an admin account, Terminal not opened using Rosetta and 16 GB of memory; the
+  free disk right after the questions, before any download.
+- **Back and Stop here:** b (or Back) goes back one question until setup starts installing, every answer kept; at
+  Signal's questions, q (or Stop here) stops setup, its answers kept.
+- **A stop has its own screen:** what was found, why it matters, the fix and the command to run setup again, with Copy
+  in the window.
+- **Menus in Terminal:** gum 2.0.2, checked by its fingerprint before every run; plain lines with `--plain` or
+  VoiceOver. Codes, PINs and keys never go through it.
+- **Five dots for her model and Ollama's download:** ○○○○○ to ●●●●●, never a percent; each step says its place.
+- **Her own Ollama:** a new install with her own macOS account runs Ollama's official build as `_estia`, from a copy
+  only admin rights can change, on port 8151 (never 11434), her model in her own folder; any other Ollama on the Mac
+  stays as it is, beside hers. An older install keeps its Ollama as it is.
+- **The Ollama app, when chosen:** with the app on the Mac, setup asks first: use it (nothing to install) or the
+  background build, recommended on a new install and over a remote login. With the app, she answers only while someone
+  is logged in and the Ollama app runs, and her prompts pass through a program your account can change; the choice
+  holds after the move into her own macOS account.
+- **Four names, or your own:** Estia (recommended), Maya, Melina or Socrates; a name you type asks for a female or male
+  voice.
+- **Calls first, recommended:** "Set up calls?" comes before the other extras, its yes recommended; a yes installs
+  everything calls need.
+- **Extra Features as switches:** web search and places and routes on, the others off; each one's guide shows when it is
+  picked, and each is set up in turn.
+- **Each key's own screen:** 3 to 5 numbered steps, the site's link and Later.
+- **The extras' sign-ins on your yes:** mail, Spotify, a Google calendar and lights; Google Maps (gcloud too) in
+  Terminal.
+- **Web search's keys, pasted once:** typed hidden, tested with one search, kept for her with a copy in your login
+  keychain.
+- **Your home area, as street and city:** one lookup at OpenStreetMap, shown back for a yes; a house number stays out
+  of it, except a number of 4 or 5 digits after the first comma, or one joined to letters there (known gaps).
+- **About you, optional:** five short lines in your own words, links, phone numbers and email addresses refused; at her
+  first start they become your facts in `/profile`.
+- **Setup's last step names her voices and commands,** and how to get them again in Signal: `/voices`, `/tools`,
+  `/help`.
+- **A Signal account without a number:** a Signal Account (Signal for Android calls it Signal Login, $2.99 or EUR 3.49
+  once); setup moves it to the Mac, and `estia signal-login` moves an install with a number to one.
+- **The key card:** the Recovery key and the Account ID typed on a screen laid out as Signal shows them, each group
+  checked as it is typed; the screen is cleared after.
+- **Signal's Recovery key and Account ID: in your login keychain on this Mac.** Every read of them asks first, in a
+  macOS dialog, unless that program was given Always Allow there. Over a remote login (SSH), that dialog cannot show, so
+  a read there fails: they are read only on the Mac's own screen (Keychain Access, or Screen Sharing). The Account ID
+  also stays in setup's answers file, which programs you run can read.
+- **Pocket TTS voices, made on the Mac's processor:** heart (the new default), jane, eve, alba and michael, and vera on
+  32 GB or more; `/voice <name>` switches at once.
+- **Heart, the new default voice, on every Mac:** on a 16 GB or 24 GB Mac it runs on the small model: its questions do
+  not rise at the end, and its volume and long answers are not yet tested there.
+- **jane in six more languages:** Spanish, Italian, Portuguese, Dutch, German and French, each downloaded only when in
+  use; until it is ready, answers come as text.
+- **If her voice fails on a call, Kokoro says at most one line of each answer** and the rest comes as a text; the call
+  stays up.
+- **A call wakes with a word:** after the check-in, her name gets "Yes?" or "I'm here." Measured in English only: the
+  name "Estia" said alone woke her 35 times in 72.
+- **A text during a call is confirmed at once:** "Got it: I'll answer this after the call.", in the chat and on the
+  call.
+- **`/tools`:** every tool she has in this install, one line each. Her instructions carry the same list on texts, for
+  questions about what she can do; calls leave it out.
+- **Places and routes with nothing to install and no account:** from OpenStreetMap; Google Maps, once set up, is asked
+  first, and an answer from OpenStreetMap in its place says so.
+- **Text files beside PDFs:** `.txt` and `.md` files in `~/Estia-KB` and sent on Signal, up to 1 MB each.
+- **`/profile new`:** what she noted in the last quiet time.
+- **Doctor names a signal-cli over three months old, and several allowed accounts:** those share one chat history, the
+  profile, mail, calendars and documents.
+
+### Changed
+
+- **Estia needs macOS 27 or later:** setup refuses an older macOS at once, before anything is installed.
+- **Enter takes the recommended answer, listed first,** wherever setup says it is recommended; the Mac's region picks
+  the language. A name that does not fit is refused in one sentence, "1 to 20 letters, spaces or hyphens."
+- **A recommendation is a mark on its answer:** a small "Recommended" on the option in the setup window, its reason in
+  the small line under it; in Terminal, "Yes (recommended)" in setup's menus or on a line of its own right before the
+  question, the security step and the home share too; never a "Recommended:" line.
+- **Setup's screens, shorter:** key words in bold; each command is shown before it runs, and s (or Skip) skips it.
+- **The smaller model's screen, in fewer words:** what it may do, the safeguards in code, then Gemma 26B.
+- **The Signal step asks again instead of stopping:** a number, captcha link, code or PIN that does not fit is refused
+  in one sentence; the one-time word needs no Enter and ignores accents and case; her username starts from her name,
+  and one Signal does not take for a reason other than "taken" can be tried again.
+- **The Signal step says what happened:** Signal's limit with its time, no answer from Signal (only on a network
+  failure), Signal's refusal of a code or a Recovery key, or a refused registration, each with its fix; no SMS names
+  the way without a number.
+- **Calls need no GitHub account:** signal-cli's Java build and its maintainer's key are public downloads, fetched with
+  the Mac's own `curl`.
+- **A Recovery key pasted with extra characters is read:** spaces and invisible characters are left out; any other
+  symbol is refused and named, never guessed.
+- **Longer answers on a call:** the full answer to a deep question (the main views, where they clash, then, often, her
+  own view), up to 500 tokens, an estimated 2 to 3 minutes of speech, with no question back after it; 300 tokens on a
+  Mac under 32 GB, not measured there yet.
+- **Her own view on a call:** after the main views of a question people disagree on, the view she finds strongest and
+  why: in about 4 of 10 such answers on Gemma 4 26B, on some questions rarely.
+- **Estia's mark is Hearth,** in place of the "e.". Her Signal picture is Estia's mark, whatever her name: a silver ring
+  around an orange rounded square. The letter pictures are gone.
+- **Setup picks a Pocket TTS voice:** heart for a female name, alba for a male one; a config that names `af_heart` keeps
+  it.
+- **`/voice` answers in plain words,** in any case, names a voice she does not have, and switches a call's set lines at
+  once.
+- **Her note after learning names up to three notes** she added or updated; an empty `/profile` shows what is worth
+  telling her, and the welcome invites "remember that …".
+- **Project summaries come from the README,** in plain words, without file names or code unless asked; a README of only
+  a title, links or commands counts as none.
+- **After the check-in, a "yes" starts nothing.**
+- **Brave Search stops at 900 searches a month,** below its $5 monthly credit; a key other programs also use can still
+  go over it.
+- **"Her own macOS account"** for "her own user" and "her user", everywhere.
+- **The nuclear level in one sentence, the same everywhere:** best on a Mac used for her alone; outgoing connections and
+  remote login (SSH) are never blocked, nor are signed programs while macOS lets signed software through.
+- **The setup guide, one shape per extra:** before you start, the steps with the day they were checked, how you know it
+  worked, and the common errors. "Outlook.com: not supported."; forwarding Gmail to a mailbox she reads works.
+- **Her log says why an answer was slow,** and how far a missed name was from hers: counts and times, never a word.
+- **For contributors:** a stricter real-model test set (10 tries a safety case, all must pass, in both of a release's
+  two runs, but 0.9.8 passed one run and its second was stopped; `--compare`;
+  `EVAL_TIER=small` for some of a 16 GB Mac's limits), ShellCheck in `scripts/verify.sh`, and tests that never run
+  setup's real commands.
+- **The first deploy of this update may end with the voice loading line:** the older admin tools cannot read her voice
+  any more. `/usr/bin/sudo /usr/local/estia/bin/estia check` shows her voice's real state.
+
+### Fixed
+
+- **Short words on a call are heard:** "yes", "stop" or her name alone, also with an "h" in front ("Hestia"); a bare
+  "Bye." ends the call.
+- **Only goodbyes end a call:** the caller's own after hers, in every language; never a sentence that starts like her
+  closing wish.
+- **A pause after "and", "the" or "because" is waited out,** and so is the rest of a cut-in that ends open.
+- **Call answers start sooner:** the Sources, device and reminder notes go out beside her answer.
+- **A device question is her last sentence on a call, and her hang-up waits for your answer;** one dropped when the
+  call goes quiet is said so, and a light switched as a call ends is told.
+- **A request that only sounds like a wrap-up no longer ends a call:** "Make sure that all the lights are off" or
+  "That's all right."; a wrap-up alone, or with closing words or a thanks, does ("That's all, thanks!", "That'll do.").
+- **"I'm here" no longer ends a call in Spanish, Portuguese or Russian:** only her offer to wait does ("Aquí estoy si me
+  necesitas.", "Estou aqui se precisar.", "Я всегда на связи.").
+- **A call turn that runs out of time is told;** after two in a row, she asks for a text.
+- **Her call lines are in the call's language,** said whole, and a cut answer ends at a whole sentence, in Japanese too.
+- **A wake-up call's opening goes on over "Hello?",** and one answered over "Good morning!" gets the check-in after a
+  silence.
+- **Her voice's warm-up runs the whole listening model;** a chord-like letter before a long number never stalls it.
+- **A repeat-back asked over her answer reaches her;** a yes over the end of her rundown offer reads the day.
+- **A lookup promised and left undone:** she is asked once more to search, else the bridge says "I didn't look that up.
+  Ask me again and I'll search." An answer that also asks a question is never caught; on a call, one ready only after 15
+  seconds (beside Gemma 4 26B) gets that line without the second try.
+- **"Can you call me?" gets a yes** with wake-up calls on.
+- **Reminders:** one held by `/lock` or a call says it is late, a cancelled one stays cancelled, one asked twice is set
+  once, and one set before the model failed is told.
+- **After a photo, a reminder in your own words is set,** never one in words only the photo holds.
+- **"Remember that …" of a fact she keeps gets "Already kept #N",** and one that saves nothing gets "Nothing was saved."
+  with no "try again".
+- **A fact saved earlier in a long chat stays in what she sees.**
+- **"I've noted that …" with nothing saved is corrected,** in English so far.
+- **Notes from before the update are named once** at the first start.
+- **"At 7:30" after "tonight" is no morning.**
+- **A long chat fits a 16 GB Mac's model:** the oldest messages leave first, and a long read is cut to fit with her
+  told, never lost unseen.
+- **The morning digest waits for `/unlock` and a call's end,** until noon.
+- **Mail:** mail not sorted yet is counted, archived mail is never called old, and "read 2" never opens a newer mail.
+- **"Needs a new sign-in" and "address no longer works" come once,** not again after a restart.
+- **Sign-in errors say what to do:** mail's invalid_client names the switch to turn on; a CalDAV calendar's fix names
+  where her config is.
+- **Doctor names a lost connection to Signal;** it stayed green while she reached nobody.
+- **Signal's limits are named and kept:** nothing is sent or tried again before Signal's time, and doctor shows it.
+- **A message that could not be sent is tried again,** every minute for 10 minutes, and a wake-up text every 5 minutes
+  for an hour.
+- **A large PDF from `/docs send` gets time to upload,** and sent PDFs are saved once, also across a restart.
+- **A call or `/lock` stops a PDF being read.**
+- **Chords from a web page no longer stop her,** and an answer of only "---" or "…" is never sent.
+- **A slow site is cut off at 30 s.**
+- **One database error no longer restarts her.**
+- **`[privacy] keep_days` deletes her own messages too.**
+- **She never names a model size the Mac does not run,** and a copy of her own code in the projects folder is read only
+  when you name that project.
+- **The busy note says what is known:** "Estia is still working on your answer; this one takes a while."
+- **The welcome names all that goes out:** links you send and, with mail, mail search, beside web search, places and
+  music.
+- **Places:** a network error no longer blocks "near me" for the day, places within about 1 km come first, and "home"
+  and "near me" work in her 11 languages.
+- **A search with a long number is refused only for an IBAN whose check digits add up.**
+- **The move into her own macOS account checks what macOS made:** her account and her own group, never your staff group;
+  only macOS 27 is tested.
+- **A failed move shows her logs before her old setup comes back,** and a second Ctrl-C no longer stops that.
+- **A Ctrl-C lets a running step end first:** the security step, the move and an update never leave her stopped.
+- **Closing Terminal during setup ends it as Ctrl-C does,** with the command it was running.
+- **Setup keeps the Mac awake for the whole run,** the voice and calls builds too.
+- **Admin rights that ran out during the questions are asked for again** in the security step and at the Registration
+  Lock; they failed after 5 minutes.
+- **Updates and the move never leave her half done:** a cut power or connection keeps the move's record, a failed update
+  puts the voice service back, and a rollback removes services set up after the move.
+- **An update's list of changes says what it leaves out,** and names a downgrade.
+- **After `estia stop`, she stays stopped;** a config she cannot start with is named, and `estia restart` refuses it.
+- **`estia signal` and the new PIN work in her own macOS account.**
+- **Calls run the Java build of signal-cli at Homebrew's version;** an update copies only that build, about 120 MB less
+  for each older one.
+- **The call helper is built again when Estia changes its sources;** a re-run of the calls step goes on where it
+  stopped.
+- **On a MacBook, doctor's Power line reads the power adapter and the battery apart,** and says a closed lid without an
+  external display still stops her.
+- **Kokoro can crash on macOS 27.0.x (an Apple bug):** the voice install, its log and the docs say what to do.
+- **Setup's smaller fixes:** "~dev" as the projects folder is refused in one sentence, `./setup.sh` from `scripts/`
+  starts again, a yes or no in Greek is taken, a file setup cannot use is a stop with its fix, a full disk says to free
+  space (System Settings → General → Storage), and the one-time word is found after another message.
+
+### Security
+
+- **After outside text, a sentence that tells a light or plug change as set for later is left out (English only for now,
+  in the wordings SECURITY.md lists):** a planted calendar title can no longer say a lamp is scheduled off, also while
+  a change waits for your yes. Only a sentence that ties that same change to your yes, with no time of day, stays;
+  never "no need for your confirmation".
+- **A light or plug your message does not name waits for your yes after outside text;** while it waits, the bridge's
+  question comes last, so a yes answers only the switch.
+- **After a page, a mail or a web result, her hang-up needs your own closing:** it counts only when you say goodbye
+  ("Danke, tschüss!", "Grazie, ciao!"), take leave, ask to end the call or wrap up in English ("Thanks, that's all.");
+  "Okay." or "Thanks." alone never does, and "Ciao!" (also a hello) only after a thanks. Her own goodbye still ends the
+  call after 3 seconds of quiet, as on any call but a practice call.
+- **After a photo, music and lights wait and say why;** a call or a repeat comes only from your own words.
+- **After outside text, nothing changes without your own words:** a profile word alone saves nothing, a later "thanks"
+  cannot act on a planted line, and the checks last until `/new`.
+- **A sent file's name and a sent audio file are never your words:** no reminder, fact or device change comes from them.
+- **A hidden part of your message is never your words:** a spoiler reaches her as "(hidden part left out)".
+- **The word checks after outside text read Japanese, Chinese and Korean.**
+- **No planted links:** a fact from a page holds only the link you sent, a message she starts never holds a web address
+  after a hyphen, and links from outside text arrive defanged in more places.
+- **Learning a page saves only that page's facts.**
+- **Less goes out after mail or a calendar:** an answer that read the chat history sends nothing to a search engine or
+  Google Maps, and after a calendar read only an event's place goes to Google Maps.
+- **More house numbers stay out of OpenStreetMap:** "123-H", "12/A", "12bis", "nº12", "A-12 Example Road" and "Example
+  Loop No12", in any script, and a floor with its door.
+- **After the first comma, a number of 4 or 5 digits stays out of OpenStreetMap** right after a flat's or a building's
+  word ("Suite 1200", "Bldg 1234"), in the part right after one that is only a flat's, a building's or a floor's word
+  with its number, a letter label or a digit ordinal ("Apt 4B", "3rd Floor", "#4"), or before an English street word
+  ("1234 Main St"); any other such number there, or one joined to letters there, goes (known gaps).
+- **Captions, documents and project files are cleaned** of hidden turn markers, and a health check's status is shown
+  only as a short word.
+- **Outside text never skips a track.**
+- **`/lock` ends her own calls too,** and stops an answer already on its way.
+- **An account taken out of `allowed_acis` is never answered again,** and an account she answers can never be moved in
+  as hers.
+- **Her log never holds signal-cli's words,** and her tool log never keeps a project file's text.
+- **No program from a project's git settings.**
+- **Call audio never touches the disk.**
+- **Her voice service answers only programs running as her own macOS account.**
+- **Pocket TTS's program cannot stop or signal her other programs.**
+- **signal-cli's Java build for calls is checked by its fingerprint (sha256),** beside its signature.
+- **The tools that run as root stay current and whole,** and calls use root's own copy of Java.
+- **The rollback refuses a link that leaves its folder.**
+- **The scripts that save keys or run admin commands use only the Mac's own programs.**
+- **Doctor and the security step name a shared admin sign-in (`timestamp_type=ppid`).**
+- **Known security holes in the Python packages are checked** every week and at every push on GitHub, and before each
+  release on the Mac; a release with one is not published.
+- **SECURITY.md says what an AI tool that gives its commands a terminal sees:** setup's lines, with her number, the
+  one-time word and, without the window, the key card's Account ID and Recovery key; never the captcha link, the SMS
+  code, a PIN, a password or a web key.
+- **Three more known gaps, in SECURITY.md:** after a crash of the window, Spotify's sign-in can wait until the Mac
+  restarts, a typed Recovery key is held by the window's page through Signal's limit and code screens, and where
+  macOS's list of network connections shows none, setup and doctor cannot see a program another account runs beside
+  her Ollama on the same port.
+- **Known gaps, now in SECURITY.md:** an admin sign-in's 5 minutes give every program in that Terminal window root, and
+  any voice on a call counts as the caller's.
+- **Her own Ollama's known gaps, in SECURITY.md:** any program on the Mac can send it input, and a flaw in Ollama itself
+  would run code as her account, with her Signal keys.
+- **The smaller model's limits, in setup and SECURITY.md:** on 16 or 24 GB, with Gemma 4 12B, forwarded audio, mail or
+  calendar may steer her, and she may say a reminder is set when it is not; in her mail and calendar test (28 Oct)
+  nothing was set, saved or switched. Generally, Gemma 26B (32 GB or more) keeps her rules better.
+
 ## [0.9.6] - 2026-10-22
 
 ### Added
@@ -250,7 +523,8 @@ The first public release.
   code-level rules, not eliminated; signal-cli is an unofficial Signal client; on 16 or 24 GB the smaller model,
   Gemma 4 12B, failed some of her safety tests.
 
-[Unreleased]: https://github.com/enable4all/estia-one-mmini/compare/v0.9.6...HEAD
+[Unreleased]: https://github.com/enable4all/estia-one-mmini/compare/v0.9.8...HEAD
+[0.9.8]: https://github.com/enable4all/estia-one-mmini/compare/v0.9.6...v0.9.8
 [0.9.6]: https://github.com/enable4all/estia-one-mmini/compare/v0.9.5...v0.9.6
 [0.9.5]: https://github.com/enable4all/estia-one-mmini/compare/v0.9.4...v0.9.5
 [0.9.4]: https://github.com/enable4all/estia-one-mmini/compare/v0.9.3...v0.9.4

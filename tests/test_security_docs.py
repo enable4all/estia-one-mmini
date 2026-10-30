@@ -93,16 +93,19 @@ def test_the_live_checklist_has_the_hardening_steps() -> None:
 def test_the_review_limits_are_inside_the_claims() -> None:
     protects = section(SECURITY, "What the project tries to protect")
     assert "/devices forget N" in protects and "14 days" in protects  # a device number is reused by Signal
-    assert "before every chat" in protects and "your own account, which runs Ollama" in protects  # the model pin
+    assert "before every chat" in protects and "your own account when it runs Ollama" in protects  # the model pin
+    assert "reaches her own Ollama's address, which has no login" in protects  # her own Ollama's limit (0.9.8)
     assert "/new" in protects  # retention: the current conversation's summary stays until /new or /forget
     assert "--update-tools" in protects and "asks first" in protects  # what root runs, and the deploy's review
     gaps = section(SECURITY, "Known accepted gaps")
     for words in (
-        "Ollama and AgentJev run as you",  # every prompt passes through a program your account can change
+        # every prompt passes through a program your account can change, unless Ollama is her own (0.9.8)
+        "or without her own account, and AgentJev run as you",
+        "Her own Ollama's address (127.0.0.1:8151) has no login",
         "safe.directory",  # on her git's command line only: the race between the config check and git
         "before the move",  # a copy taken before it still works
         "sudo's log",  # a value typed on a sudo command line
-        "launchd.log",  # opened by launchd as root in her folder: untested
+        "launchd.log",  # opened by launchd as her account (M01, 30 Oct); in her folder on an install from before
         "an admin rule skips the password",
         "AuthenticationAuthority",  # her account has no password: set and checked, untested on the real Mac
     ):

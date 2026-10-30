@@ -586,13 +586,19 @@ def _config_lines(found: list[dict[str, str]]) -> list[str]:
     return lines
 
 
+def said(line: str) -> None:
+    """A line out at once: off a terminal (setup's window reads a file or a pipe) Python would hold it until the end,
+    and the prompt to press the button would come after its 60 seconds (review FRIEND-1)."""
+    print(line, flush=True)
+
+
 def pair(
     address: str | None,
     *,
     path: Path = HUE_FILE,
     open: Open = tls,
     find: Callable[[], list[str]] = find_bridges,
-    say: Callable[[str], None] = print,
+    say: Callable[[str], None] = said,
     sleep: Callable[[float], None] = time.sleep,
     clock: Callable[[], float] = time.monotonic,
 ) -> int:
@@ -688,7 +694,7 @@ _PROBLEMS = {
 }
 
 
-def show_lights(*, path: Path = HUE_FILE, open: Open = tls, say: Callable[[str], None] = print) -> int:
+def show_lights(*, path: Path = HUE_FILE, open: Open = tls, say: Callable[[str], None] = said) -> int:
     """The paired bridge's lights as lines for [[tapo.devices]] (read only, through the pinned certificate)."""
     try:
         pairing = load(path)

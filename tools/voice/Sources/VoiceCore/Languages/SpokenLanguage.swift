@@ -20,7 +20,7 @@ public enum SpokenLanguage {
     /// `text` as Supertonic-3 is to read it in `language`; a language without a pack keeps its text.
     public static func spoken(_ text: String, language: String) -> String {
         guard let reader = readers[language] else { return text }
-        return reader.passes.reduce(text) { text, pass in pass.run(text) }
+        return reader.passes.reduce(text) { text, pass in pass.run(text, "") }
     }
 }
 

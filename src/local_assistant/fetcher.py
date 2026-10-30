@@ -4,12 +4,14 @@ Guards (spec section 7): http(s) only; hosts are resolved to IPv4 only (the home
 IPv6 addresses that would pass a "public" check) and every address must be public (no loopback,
 private, link-local, CGNAT/Tailscale, multicast); the connection goes to the checked address, so
 DNS cannot change the answer in between; the same checks after every redirect; at most
-3 redirects, 2 MB, 15 s per network step and 30 s in total.
+3 redirects, 2 MB, 15 s per network step and 30 s in total (each connection is shut down at that deadline, also
+mid-handshake or mid-header).
 """
 
 from __future__ import annotations
 
 import codecs
+import contextlib
 import html
 import http.client
 import ipaddress
@@ -17,6 +19,7 @@ import json
 import re
 import socket
 import ssl
+import threading
 import time
 import unicodedata
 from collections.abc import Callable
@@ -93,23 +96,71 @@ def system_resolver(host: str, port: int) -> list[str]:
     return sorted({str(info[4][0]) for info in infos})
 
 
+class _Cut:
+    """The fetch's deadline over one connection: a socket timeout bounds each read, never a site that drips its TLS
+    handshake, status line, headers or chunk lines a byte at a time (review I36). At the deadline the connection is shut
+    down, so whatever read waits ends, and the thread with it (a caller's wait_for alone leaves it running). It shuts a
+    second handle of the connection: TLS takes the first one over."""
+
+    def __init__(self, deadline: float) -> None:
+        self.deadline = deadline
+        self.handle: socket.socket | None = None
+        self.passed = threading.Event()
+
+    def connect(self, ip: str, port: int, timeout: float) -> socket.socket:
+        """The raw connection, its connect within the time left."""
+        raw = socket.create_connection((ip, port), max(0.001, min(timeout, self.deadline - time.monotonic())))
+        raw.settimeout(timeout)
+        self.handle = raw.dup()
+        if self.passed.is_set():  # the deadline came while connecting
+            raw.close()
+            self.close()
+            raise TimeoutError("the deadline passed")
+        return raw
+
+    def cut(self) -> None:
+        self.passed.set()
+        handle = self.handle
+        if handle is not None:
+            with contextlib.suppress(OSError):
+                handle.shutdown(socket.SHUT_RDWR)
+
+    def close(self) -> None:
+        handle, self.handle = self.handle, None
+        if handle is not None:
+            handle.close()
+
+
 class _PinnedHTTPConnection(http.client.HTTPConnection):
-    def __init__(self, host: str, port: int, *, ip: str, timeout: float) -> None:
+    def __init__(self, host: str, port: int, *, ip: str, timeout: float, cut: _Cut | None = None) -> None:
         super().__init__(host, port, timeout=timeout)
         self._pinned_ip = ip
+        self._seconds = timeout
+        self._cut = cut or _Cut(float("inf"))
 
     def connect(self) -> None:
-        self.sock = socket.create_connection((self._pinned_ip, self.port), self.timeout)
+        self.sock = self._cut.connect(self._pinned_ip, self.port, self._seconds)
 
 
 class _PinnedHTTPSConnection(http.client.HTTPSConnection):
-    def __init__(self, host: str, port: int, *, ip: str, timeout: float, context: ssl.SSLContext | None = None) -> None:
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        *,
+        ip: str,
+        timeout: float,
+        context: ssl.SSLContext | None = None,
+        cut: _Cut | None = None,
+    ) -> None:
         self._tls = context or ssl.create_default_context()
         super().__init__(host, port, timeout=timeout, context=self._tls)
         self._pinned_ip = ip
+        self._seconds = timeout
+        self._cut = cut or _Cut(float("inf"))
 
     def connect(self) -> None:
-        raw = socket.create_connection((self._pinned_ip, self.port), self.timeout)
+        raw = self._cut.connect(self._pinned_ip, self.port, self._seconds)
         self.sock = self._tls.wrap_socket(raw, server_hostname=self.host)
 
 
@@ -366,11 +417,16 @@ class Fetcher:
     def _get(self, parts: SplitResult, ip: str, port: int, deadline: float) -> tuple[int, dict[str, str], bytes]:
         host = parts.hostname or ""
         path = (parts.path or "/") + (f"?{parts.query}" if parts.query else "")
+        cut = _Cut(deadline)
         conn: http.client.HTTPConnection
         if parts.scheme == "https":
-            conn = _PinnedHTTPSConnection(host, port, ip=ip, timeout=self._timeout)
+            conn = _PinnedHTTPSConnection(host, port, ip=ip, timeout=self._timeout, cut=cut)
         else:
-            conn = _PinnedHTTPConnection(host, port, ip=ip, timeout=self._timeout)
+            conn = _PinnedHTTPConnection(host, port, ip=ip, timeout=self._timeout, cut=cut)
+        too_slow = f"the site was too slow (over {self._total_timeout:.0f} s)"
+        timer = threading.Timer(max(0.0, deadline - time.monotonic()), cut.cut)
+        timer.daemon = True
+        timer.start()
         try:
             conn.request(
                 "GET",
@@ -388,7 +444,7 @@ class Fetcher:
             size = 0
             while size <= self._max_bytes:
                 if time.monotonic() > deadline:
-                    raise FetchError(f"the site was too slow (over {self._total_timeout:.0f} s)")
+                    raise FetchError(too_slow)
                 chunk = response.read1(64 * 1024)
                 if not chunk:
                     break
@@ -396,9 +452,13 @@ class Fetcher:
                 size += len(chunk)
             body = b"".join(chunks)
         except (OSError, http.client.HTTPException) as exc:
-            raise FetchError(f"download failed: {exc}") from exc
+            raise FetchError(too_slow if cut.passed.is_set() else f"download failed: {exc}") from exc
         finally:
+            timer.cancel()
             conn.close()
+            cut.close()
+        if cut.passed.is_set():  # cut off mid-way: a shut socket can read as the end of the headers or the page
+            raise FetchError(too_slow)
         if len(body) > self._max_bytes:
             raise FetchError(f"the page is too big (over {self._max_bytes:,} bytes)")
         return response.status, headers, body

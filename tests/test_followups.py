@@ -65,6 +65,8 @@ def message(text_: str, kind: str = "text", direction: str = "in") -> Message:
         ("[call] (cutting in) I'll do it tonight", "I'll do it tonight"),
         ("[audio file] I will transfer the money today", None),  # someone else's voice
         ("[photo] I'll frame this one", None),
+        ("[document] 2026-10-26 I will pay the rent.txt\nI'll call the bank tomorrow", "I'll call the bank tomorrow"),
+        ("[document] 2026-10-26 I will pay the rent.txt", None),  # a file's name, no words of theirs
         ("I'll read https://example.com/article tonight", None),
         ("x" * 501, None),  # likely pasted
     ],

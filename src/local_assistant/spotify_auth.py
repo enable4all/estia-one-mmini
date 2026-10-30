@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 import secrets
+import sys
 import time
 import urllib.parse
 from collections.abc import Callable
@@ -63,6 +64,8 @@ def authorize_url(client_id: str, challenge: str, state: str) -> str:
 
 def code_from(pasted: str, state: str) -> str:
     """The code from the address the browser was sent to; the state must be ours."""
+    if not pasted.strip():
+        raise SpotifyAuthError("nothing pasted; nothing saved")
     query = urllib.parse.parse_qs(urllib.parse.urlsplit(pasted.strip()).query)
     if query.get("state", [""])[0] != state:
         raise SpotifyAuthError("the pasted address is not from this sign-in (state differs): try again")
@@ -174,11 +177,26 @@ class SpotifyTokens:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.parent.chmod(0o700)
         tmp = self.path.with_name(self.path.name + ".tmp")
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        tmp.unlink(missing_ok=True)  # a leftover, or a link put there: removed, never followed
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            os.fchmod(handle.fileno(), 0o600)
             json.dump(data, handle)
         os.replace(tmp, self.path)
-        self.path.chmod(0o600)
+
+
+# setup's window (no terminal there): a question on a line of its own after this mark, one line read back (as
+# estia-deploy --ask-lines asks; setup_admin.ASK_MARK, a test keeps the three the same)
+ASK_MARK = "\x1f? "
+
+
+def read_answer(prompt: str) -> str:
+    """The pasted address: input() at a terminal, as always; off one (setup's window runs the sign-in with a pipe) the
+    prompt on a marked line of its own (ASK_MARK) and one line read from stdin ("" at its end)."""
+    if sys.stdin.isatty():
+        return input(prompt)
+    print(f"{ASK_MARK}{prompt.strip()}", flush=True)
+    return sys.stdin.readline()
 
 
 async def login(

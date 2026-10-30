@@ -1,10 +1,10 @@
 {
   "width": 1732,
-  "height": 1272,
+  "height": 1408,
   "spots": [
     {
       "name": "signal-cli",
-      "group": "Messages and calls",
+      "group": "Messages, calls and tools",
       "x": 554,
       "y": 345,
       "w": 256,
@@ -13,7 +13,7 @@
     },
     {
       "name": "Call helper",
-      "group": "Messages and calls",
+      "group": "Messages, calls and tools",
       "x": 554,
       "y": 417,
       "w": 256,
@@ -22,7 +22,7 @@
     },
     {
       "name": "Bridge",
-      "group": "Messages and calls",
+      "group": "Messages, calls and tools",
       "x": 554,
       "y": 477,
       "w": 256,
@@ -30,10 +30,19 @@
       "inventory": "Bridge"
     },
     {
+      "name": "Her tools",
+      "group": "Messages, calls and tools",
+      "x": 554,
+      "y": 537,
+      "w": 256,
+      "h": 64,
+      "inventory": "Her tools (/tools)"
+    },
+    {
       "name": "Ollama",
       "group": "Thinking",
       "x": 554,
-      "y": 577,
+      "y": 649,
       "w": 256,
       "h": 64,
       "inventory": "Ollama (official build)"
@@ -42,7 +51,7 @@
       "name": "Gemma 4",
       "group": "Thinking",
       "x": 554,
-      "y": 649,
+      "y": 721,
       "w": 256,
       "h": 64,
       "inventory": "Gemma"
@@ -51,9 +60,9 @@
       "name": "AgentJev",
       "group": "Thinking",
       "x": 554,
-      "y": 721,
+      "y": 793,
       "w": 256,
-      "h": 52,
+      "h": 64,
       "inventory": "AgentJev (mail pre-filter)"
     },
     {
@@ -75,40 +84,49 @@
       "inventory": "Whisper (WhisperKit)"
     },
     {
-      "name": "Kokoro",
+      "name": "Speech detector",
       "group": "Voice",
       "x": 826,
       "y": 477,
       "w": 256,
       "h": 52,
-      "inventory": "Kokoro"
-    },
-    {
-      "name": "Supertonic-3",
-      "group": "Languages and calls",
-      "x": 826,
-      "y": 577,
-      "w": 256,
-      "h": 64,
-      "inventory": "Supertonic-3 (FluidAudio)"
-    },
-    {
-      "name": "Speech detector",
-      "group": "Languages and calls",
-      "x": 826,
-      "y": 649,
-      "w": 256,
-      "h": 64,
       "inventory": "Speech detector (Silero VAD)"
     },
     {
       "name": "Turn detector",
-      "group": "Languages and calls",
+      "group": "Voice",
+      "x": 826,
+      "y": 537,
+      "w": 256,
+      "h": 64,
+      "inventory": "Turn detector (Smart Turn v3.2)"
+    },
+    {
+      "name": "Pocket TTS",
+      "group": "Her voices",
+      "x": 826,
+      "y": 649,
+      "w": 256,
+      "h": 64,
+      "inventory": "Pocket TTS (Kyutai)"
+    },
+    {
+      "name": "Kokoro",
+      "group": "Her voices",
       "x": 826,
       "y": 721,
       "w": 256,
-      "h": 52,
-      "inventory": "Turn detector (Smart Turn v3.2)"
+      "h": 64,
+      "inventory": "Kokoro"
+    },
+    {
+      "name": "Supertonic-3",
+      "group": "Her voices",
+      "x": 826,
+      "y": 793,
+      "w": 256,
+      "h": 64,
+      "inventory": "Supertonic-3 (FluidAudio)"
     },
     {
       "name": "Calendar helper",
@@ -138,10 +156,19 @@
       "inventory": "YouTube helper"
     },
     {
+      "name": "Setup window",
+      "group": "Helpers",
+      "x": 1098,
+      "y": 537,
+      "w": 256,
+      "h": 64,
+      "inventory": "Setup window (Estia Setup)"
+    },
+    {
       "name": "Memory (SQLite)",
       "group": "Memory and files",
       "x": 1098,
-      "y": 577,
+      "y": 649,
       "w": 256,
       "h": 64,
       "inventory": "Database (SQLite)"
@@ -150,7 +177,7 @@
       "name": "Documents helper",
       "group": "Memory and files",
       "x": 1098,
-      "y": 649,
+      "y": 721,
       "w": 256,
       "h": 64,
       "inventory": "Documents helper (Apple PDFKit and Vision)"
@@ -159,9 +186,9 @@
       "name": "Project tools",
       "group": "Memory and files",
       "x": 1098,
-      "y": 721,
+      "y": 793,
       "w": 256,
-      "h": 52,
+      "h": 64,
       "inventory": "Project tools (read-only)"
     },
     {
@@ -282,10 +309,19 @@
       "inventory": "YouTube"
     },
     {
-      "name": "Google Maps",
+      "name": "OpenStreetMap",
       "group": "Questions out",
       "x": 1462,
       "y": 755,
+      "w": 232,
+      "h": 64,
+      "inventory": "OpenStreetMap (Nominatim, FOSSGIS, Transitous)"
+    },
+    {
+      "name": "Google Maps",
+      "group": "Questions out",
+      "x": 1462,
+      "y": 827,
       "w": 232,
       "h": 52,
       "inventory": "Google Maps (Places API, Routes API)"
@@ -339,7 +375,7 @@
       "name": "Spotify",
       "group": "Music: commands out",
       "x": 554,
-      "y": 985,
+      "y": 1121,
       "w": 232,
       "h": 52,
       "inventory": "Spotify"
@@ -348,7 +384,7 @@
       "name": "Philips Hue",
       "group": "Home network only",
       "x": 838,
-      "y": 985,
+      "y": 1121,
       "w": 232,
       "h": 52,
       "inventory": "Philips Hue (Hue Bridge)"
@@ -357,7 +393,7 @@
       "name": "Kasa and Tapo",
       "group": "Home network only",
       "x": 1078,
-      "y": 985,
+      "y": 1121,
       "w": 232,
       "h": 52,
       "inventory": "TP-Link Kasa and Tapo"
@@ -366,7 +402,7 @@
       "name": "Bose SoundTouch",
       "group": "Home network only",
       "x": 1318,
-      "y": 985,
+      "y": 1121,
       "w": 232,
       "h": 52,
       "inventory": "Bose SoundTouch"

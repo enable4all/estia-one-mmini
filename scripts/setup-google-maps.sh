@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash
 # Set up Google for her places and routes with the gcloud CLI: a project, its billing link, Places API (New)
 # and Routes API switched on, and an API key that may call only those two. The key goes into the login keychain
 # (service google-maps) and her key file (scripts/set-web-keys.sh); it is never printed or logged.
@@ -8,8 +8,10 @@
 # second guard in case the key ever leaks (recommended; the console page is printed at the end).
 set +x  # never trace: the key passes through a variable
 set -euo pipefail
+PATH="/usr/bin:/bin:/usr/sbin:/sbin:$PATH"  # the Mac's own tools first, then your PATH's (uv, Homebrew's)
 name="${1:-Estia AI}"
 key_id="${3:-estia-maps}"  # an existing key by its id: the third argument
+source "$(dirname "$0")/own-user.sh"  # security by its full path ($security)
 cd "$(dirname "$0")/.."
 
 command -v gcloud >/dev/null \
@@ -52,12 +54,12 @@ key="$(gcloud services api-keys get-key-string "$key_id" --project="$project" --
 
 kc="$HOME/Library/Keychains/login.keychain-db"
 save_key() {  # through security's own input (printf is a shell builtin): the key never shows up in `ps`
-  printf 'add-generic-password -U -a %s -s google-maps -w %s %s\n' "$USER" "$key" "$kc" | security -i >/dev/null 2>&1
-  [[ "$(security find-generic-password -a "$USER" -s google-maps -w "$kc" 2>/dev/null)" == "$key" ]]  # compared, never shown
+  printf 'add-generic-password -U -a %s -s google-maps -w %s %s\n' "$USER" "$key" "$kc" | "$security" -i >/dev/null 2>&1
+  [[ "$("$security" find-generic-password -a "$USER" -s google-maps -w "$kc" 2>/dev/null)" == "$key" ]]  # compared, never shown
 }
 save_key || {
   echo "The login keychain is locked: unlocking it."
-  security unlock-keychain "$kc"
+  "$security" unlock-keychain "$kc"
   save_key || { echo "Could not save the key in the login keychain." >&2; exit 1; }
 }
 echo "key saved in the login keychain (service google-maps, ${#key} characters)"

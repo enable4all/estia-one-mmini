@@ -13,15 +13,21 @@ import pytest
 from local_assistant import config as config_module
 from local_assistant.app import signal_client
 from local_assistant.config import (
+    DEFAULT_VOICE,
+    STANDARD_ONLY,
+    VOICE_ALIASES,
     AvatarError,
     Config,
     ConfigError,
     DeviceSpec,
     ExtraCheck,
+    canonical_voice,
+    default_voice,
     find_java_home,
     load_config,
     parse_config,
     read_avatar,
+    voice_here,
 )
 from local_assistant.signal_io import call_env
 
@@ -121,6 +127,31 @@ def test_broken_toml_is_reported(tmp_path: Path) -> None:
 def test_rejects_invalid_values(raw: dict[str, object], message: str) -> None:
     with pytest.raises(ConfigError, match=message):
         parse_config(raw)
+
+
+@pytest.mark.parametrize(
+    "account", ["11111111-2222-4333-8444-555555555555", "11111111-2222-4333-8444-555555555555".upper()]
+)
+def test_her_account_may_be_an_account_id_without_a_number(account: str) -> None:
+    """Signal Login: `bot_number` takes her account's Account ID (its ACI, a UUID) in place of a number, kept in
+    signal-cli's lower case; every install with a number reads as before."""
+    cfg = parse_config({"bot_number": account, "allowed_acis": [ACI]})
+    assert cfg.bot_number == "11111111-2222-4333-8444-555555555555"
+    assert parse_config({"bot_number": "+306900000000", "allowed_acis": [ACI]}).bot_number == "+306900000000"
+
+
+def test_her_account_is_never_one_of_the_allowed_accounts() -> None:
+    """She would take an allowed person's own account (review S9): refused at load, whatever its case."""
+    with pytest.raises(ConfigError, match="bot_number is one of allowed_acis"):
+        parse_config({"bot_number": ACI.upper(), "allowed_acis": [ACI]})
+
+
+@pytest.mark.parametrize(
+    "account", ["111111112222433384445555555555555", "11111111-2222-4333-8444-55555555555", "her-account", ""]
+)
+def test_anything_else_is_neither_a_number_nor_an_account_id(account: str) -> None:
+    with pytest.raises(ConfigError, match="bot_number must be her Signal number, like \\+306900000000, or"):
+        parse_config({"bot_number": account, "allowed_acis": [ACI]})
 
 
 def test_health_and_projects_sections(tmp_path: Path) -> None:
@@ -286,9 +317,39 @@ def test_invalid_mail_values(change: dict[str, object], message: str) -> None:
 def test_voice_section_with_defaults() -> None:
     cfg = parse_config({"bot_number": "+306900000000", "allowed_acis": [ACI], "voice": {}})
     assert cfg.voice_enabled
-    assert (cfg.voice_url, cfg.voice_name, cfg.voice_speed) == ("http://127.0.0.1:8150", "af_heart", 1.05)
+    # the default English voice: Pocket TTS's heart (owner, 27 Oct: "not af_heart, do heart, and make it default"),
+    # on either model (owner, 29 Oct: "on 16gb make Heart the default as well"); vera, the 100M's only, speaks as heart
+    # on a Mac with the 18M model (`voice_here`); Kokoro's af_heart and am_michael stay a choice
+    assert (cfg.voice_url, cfg.voice_name, cfg.voice_speed) == ("http://127.0.0.1:8150", "heart", 1.05)
+    assert DEFAULT_VOICE == "heart" and not hasattr(config_module, "SMALL_VOICE")
+    assert voice_here(cfg.voice_name, True) == "heart" and voice_here(cfg.voice_name, False) == "heart"
+    assert default_voice(True) == "heart" and default_voice(False) == "heart"
+    assert {"vera"} == STANDARD_ONLY
+    assert voice_here("vera", True) == "vera" and voice_here("vera", False) == "heart"
+    assert voice_here("jane", False) == "jane" and voice_here("af_heart", False) == "af_heart"
+    for name in ("heart", "jane", "eve", "vera", "alba", "michael", "af_heart", "am_michael"):
+        voice = {"voice": name}
+        assert parse_config({"bot_number": "+306900000000", "allowed_acis": [ACI], "voice": voice}).voice_name == name
+    # eve-full, eve's name on the 100M beside the 18M's eve before (owner, 26 Oct), is another name for eve
+    full = parse_config({"bot_number": "+306900000000", "allowed_acis": [ACI], "voice": {"voice": "eve-full"}})
+    assert full.voice_name == "eve" and canonical_voice("eve-full") == "eve" and canonical_voice("jane") == "jane"
+    assert VOICE_ALIASES == {"eve-full": "eve"}
     assert (cfg.voice_max_spoken_chars, cfg.voice_max_audio_bytes) == (1500, 10_000_000)
     assert cfg.voice_dir == cfg.data_dir / "voice"
+
+
+def test_the_six_languages_speak_in_jane_and_no_other_voice_is_taken() -> None:
+    """Owner, 25 Oct: "jane jane, lets have her as default for those languages": `[voice] language_voice`, the voice of
+    Spanish, Italian, Portuguese, Dutch, German and French (Pocket TTS, each language's full model), is jane by default,
+    the only voice whose files are pinned for them; "" gives them back to Supertonic-3's F1, as before jane (the review
+    of 25 Oct: "as default" had no way back but a code change); any other name is refused with a clear message."""
+    base = {"bot_number": "+306900000000", "allowed_acis": [ACI]}
+    assert parse_config(base | {"voice": {}}).voice_language_voice == "jane"
+    assert parse_config(base | {"voice": {"language_voice": "jane"}}).voice_language_voice == "jane"
+    assert parse_config(base | {"voice": {"language_voice": ""}}).voice_language_voice == ""
+    for other in ("eve", "Jane", "vera", "af_heart", "F1", " ", 3):
+        with pytest.raises(ConfigError, match=r"voice\.language_voice must be jane"):
+            parse_config(base | {"voice": {"language_voice": other}})
 
 
 def test_voice_is_off_without_the_section() -> None:
@@ -302,6 +363,13 @@ def test_voice_is_off_without_the_section() -> None:
         ({"url": "http://example.com:8150"}, "voice.url"),
         ({"url": "http://127.0.0.1"}, "voice.url"),
         ({"voice": "../af_heart"}, "voice.voice"),
+        ({"voice": "Eve"}, "voice.voice"),
+        ({"voice": "Jane"}, "voice.voice"),
+        ({"voice": "jane2"}, "voice.voice"),
+        ({"voice": "Alba"}, "voice.voice"),
+        ({"voice": "Michael"}, "voice.voice"),
+        ({"voice": "eve_full"}, "voice.voice"),
+        ({"voice": "marius"}, "voice.voice"),
         ({"speed": 3}, "voice.speed"),
         ({"max_spoken_chars": 50}, "voice.max_spoken_chars"),
         ({"max_audio_bytes": 20_000_000}, "voice.max_audio_bytes"),
@@ -591,6 +659,7 @@ def test_calls_section_with_defaults(tmp_path: Path, monkeypatch: pytest.MonkeyP
     )  # owner, 17 Oct: 0.5 s less than 2.8 ("2.8 is a lot right...?")
     assert (cfg.calls_idle_prompt_seconds, cfg.calls_max_minutes) == (90, 60)
     assert cfg.calls_summary
+    assert cfg.calls_turn_timeout_seconds is None  # the Mac's tier decides (app: 45 s beside 26B, 60 s beside 12B)
 
 
 def test_calls_settings() -> None:
@@ -610,6 +679,7 @@ def test_calls_settings() -> None:
                 "idle_hangup_seconds": 300,
                 "max_call_minutes": 30,
                 "summary": False,
+                "turn_timeout_seconds": 90,
             },
         }
     )
@@ -621,6 +691,7 @@ def test_calls_settings() -> None:
     # a config from before keeps working: silence never ends a call now (owner, 18 Oct), so the old key does nothing
     assert not hasattr(cfg, "calls_idle_hangup_seconds")
     assert not cfg.calls_summary
+    assert cfg.calls_turn_timeout_seconds == 90.0
 
 
 LONGEST_SOCKET = len("/signal-call-18446744073709551615.sock")  # the call helper's socket name, a u64 call id
@@ -664,6 +735,9 @@ def test_calls_are_off_without_the_section() -> None:
         ({"idle_prompt_seconds": 0}, "calls.idle_prompt_seconds"),
         ({"max_call_minutes": 500}, "calls.max_call_minutes"),
         ({"summary": "yes"}, "calls.summary"),
+        ({"turn_timeout_seconds": 10}, "calls.turn_timeout_seconds must be from 15 to 180"),
+        ({"turn_timeout_seconds": 200}, "calls.turn_timeout_seconds"),
+        ({"turn_timeout_seconds": True}, "calls.turn_timeout_seconds"),
         ({"tunnel": ""}, "calls.tunnel"),
         ({"socket_dir": "/" + "x" * 80}, "calls.socket_dir is too long"),
     ],
@@ -734,9 +808,12 @@ def test_web_section() -> None:
     off = parse_config(base)
     assert not off.web_enabled and off.web_keys_path.name == "web.env"
     on = parse_config(base | {"web": {}})
-    assert on.web_enabled and (on.web_country, on.web_brave_monthly_cap) == ("ALL", 2000)
+    assert on.web_enabled and (on.web_country, on.web_brave_monthly_cap) == ("ALL", 900)
     nl = parse_config(base | {"web": {"country": "nl", "brave_monthly_cap": 0}})
     assert (nl.web_country, nl.web_brave_monthly_cap) == ("NL", 0)
+    # a higher number from an older config still loads: web search stops at 900 a month in code (BRAVE_MONTHLY_MAX)
+    assert parse_config(base | {"web": {"brave_monthly_cap": 2000}}).web_brave_monthly_cap == 2000
+    assert Config(bot_number="+306900000000", allowed_acis=frozenset({ACI})).web_brave_monthly_cap == 900
 
 
 @pytest.mark.parametrize(
@@ -959,47 +1036,51 @@ JPEG = b"\xff\xd8\xff\xe0" + b"\0" * 64
 REPO_AVATAR = Path(__file__).resolve().parents[1] / "docs" / "brand" / "estia-avatar.png"
 
 
-def test_the_signal_avatar_is_estias_e_until_set() -> None:
-    """A new install shows the e. (the repo's avatar); a Config built in code has none."""
+def test_the_signal_avatar_is_estias_mark_until_set() -> None:
+    """A new install shows the mark (the repo's avatar); a Config built in code has none."""
     assert REPO_AVATAR.is_file()
     assert parse_config(BASE).avatar == REPO_AVATAR
     assert Config("+306900000000", frozenset({ACI})).avatar is None
 
 
-LETTERS = REPO_AVATAR.parent / "letters"
+@pytest.mark.parametrize("name", ["Tiffany", "maya", "ESTIA", "Élodie", "Ángela", "Øyvind", "Σωκράτης", "李"])
+def test_every_name_gets_estias_mark(name: str) -> None:
+    """Owner, 25 Oct: "just the mark, no letters at all": one picture for everyone, whatever her name (the letter
+    pictures a to z, 15 to 25 Oct, are gone). A picture the user set replaces it (an old letter's path apart), and ""
+    still means none."""
+    assert parse_config(BASE | {"name": name}).avatar == REPO_AVATAR
+    assert parse_config(BASE | {"name": name, "avatar": ""}).avatar is None
+    assert parse_config(BASE | {"name": name, "avatar": "/Users/alex/me.png"}).avatar == Path("/Users/alex/me.png")
 
 
-def test_a_name_other_than_estia_gets_its_letter_with_the_orange_stop() -> None:
-    """Owner, 15 Oct: a name other than Estia shows its first letter, a to z, with Estia's orange full stop ("t." for
-    Tiffany); an accented letter shows its base letter (Á, É, Ñ, Ö: review, 15 Oct); a picture the user set always
-    wins, "" still means none, and any other first letter (another script, or Ø and Ł, which have no base letter)
-    keeps the e."""
-    assert parse_config(BASE | {"name": "Tiffany"}).avatar == LETTERS / "t.png"
-    assert parse_config(BASE | {"name": "maya"}).avatar == LETTERS / "m.png"
-    assert parse_config(BASE | {"name": "ESTIA"}).avatar == REPO_AVATAR
-    for name, letter in (("Élodie", "e"), ("Ángela", "a"), ("Ñandú", "n"), ("Zoë", "z")):
-        assert parse_config(BASE | {"name": name}).avatar == LETTERS / f"{letter}.png", name
-    for name in ("Øyvind", "Łucja", "Σωκράτης", "Ωmega", "李"):  # no base letter a to z: Estia's e.
-        assert parse_config(BASE | {"name": name}).avatar == REPO_AVATAR, name
-    assert parse_config(BASE | {"name": "Tiffany", "avatar": ""}).avatar is None
-    assert parse_config(BASE | {"name": "Tiffany", "avatar": "/Users/alex/me.png"}).avatar == Path("/Users/alex/me.png")
-
-
-def test_every_letter_is_there_in_ink_with_an_orange_stop() -> None:
-    """docs/brand/source/letters.py drew them: the letter in ink, the stop in enable4all's orange, 512 px."""
-    import string
-    import struct
-
-    for letter in string.ascii_lowercase:
-        svg = (LETTERS / f"{letter}.svg").read_text(encoding="utf-8")
-        assert svg.count("<path ") == 2 and 'fill="#1c1a17"' in svg and 'fill="#ff5c35"' in svg, letter
-        png = (LETTERS / f"{letter}.png").read_bytes()
-        assert png[:8] == b"\x89PNG\r\n\x1a\n" and struct.unpack(">II", png[16:24]) == (512, 512), letter
+@pytest.mark.parametrize(
+    "value",
+    [
+        "/usr/local/estia/current/docs/brand/letters/t.png",  # her own macOS account's release
+        "/usr/local/estia/releases/20261020T101010Z-abc1234/docs/brand/letters/a.png",  # an older release kept
+        "~/estia/docs/brand/letters/z.png",  # a checkout in the owner's home
+        str(REPO_AVATAR.parent / "letters" / "m.png"),  # this checkout's, gone
+    ],
+)
+def test_an_avatar_that_names_an_old_letter_picture_gets_the_mark(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    """An install set up while the letters were there may name one in its config: it gets the mark, never a missing
+    file (the bridge would skip it and Signal keep the letter). Only a to z PNGs in a docs/brand/letters folder."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    assert parse_config(BASE | {"name": "Tiffany", "avatar": value}).avatar == REPO_AVATAR
+    for own in (
+        "/Users/alex/letters/t.png",
+        "/Users/alex/docs/brand/letters/tt.png",
+        "/Users/alex/brand/letters/t.png",
+    ):
+        assert parse_config(BASE | {"avatar": own}).avatar == Path(own), own
 
 
 def test_without_the_repos_avatar_there_is_none(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(config_module, "DEFAULT_AVATAR", tmp_path / "gone.png")
     assert parse_config(BASE).avatar is None
+    assert parse_config(BASE | {"avatar": "/usr/local/estia/current/docs/brand/letters/t.png"}).avatar is None
 
 
 @pytest.mark.parametrize("value", ["", "  "])
@@ -1417,6 +1498,45 @@ def test_the_call_helpers_come_from_the_codes_vendor_folder_when_it_has_one(
     assert (chosen.call_signal_cli, chosen.call_tunnel) == (Path("/opt/sc"), Path("/opt/sct"))  # the config wins
 
 
+def jvm_build(vendor: Path, version: str, inner: str = "") -> Path:
+    """A JVM signal-cli as install-signal-cli-jvm.sh leaves it: signal-cli-<v>-jvm/signal-cli-<v>/bin/signal-cli."""
+    program = vendor / f"signal-cli-{version}-jvm" / f"signal-cli-{inner or version}" / "bin" / "signal-cli"
+    program.parent.mkdir(parents=True)
+    program.write_text("#!/bin/sh\n")
+    return program
+
+
+def test_the_jvm_signal_cli_is_the_one_installed_not_only_the_pinned_version(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review host-jvm-version: setup installs the JVM build at Homebrew's version, so after a Homebrew 0.14.10 the
+    pinned 0.14.9 path named a program that is not there. The newest JVM build in the vendor folder is the one (Homebrew
+    never goes back, and a release keeps the builds before it); none: the pinned path, as before."""
+    code = tmp_path / "release"
+    (code / "vendor").mkdir(parents=True)
+    monkeypatch.setattr(config_module, "CODE_ROOT", code)
+    cfg = Config(bot_number="+306900000000", allowed_acis=frozenset({ACI}), data_dir=tmp_path / "data")
+    pinned = code / "vendor" / "signal-cli-0.14.9-jvm/signal-cli-0.14.9/bin/signal-cli"
+    assert cfg.call_signal_cli == pinned  # nothing installed: the pin
+    newer = jvm_build(code / "vendor", "0.14.10")
+    assert cfg.call_signal_cli == newer  # the only one: Homebrew's 0.14.10, not the pinned 0.14.9
+    jvm_build(code / "vendor", "0.14.9")
+    assert cfg.call_signal_cli == newer  # by number, never by name: 0.14.10 is newer than 0.14.9
+    four = jvm_build(code / "vendor", "0.14.10.1")
+    assert cfg.call_signal_cli == four  # a four-part release (0.14.4.1) is newer than its three-part one
+    jvm_build(code / "vendor", "0.15.0", inner="0.14.9")  # the two folders' versions differ: not the installer's
+    (code / "vendor" / "signal-cli-0.16.0-jvm/signal-cli-0.16.0/bin").mkdir(parents=True)  # no program in it
+    assert cfg.call_signal_cli == four
+    chosen = dataclasses.replace(cfg, calls_signal_cli=Path("/opt/sc"))
+    assert chosen.call_signal_cli == Path("/opt/sc")  # [calls] signal_cli wins
+
+
+def test_the_jvm_installers_default_version_is_the_configs_pin() -> None:
+    """tools/call-tunnel/install-signal-cli-jvm.sh installs CALLS_SIGNAL_CLI_VERSION when Homebrew names none."""
+    script = (config_module.CODE_ROOT / "tools/call-tunnel/install-signal-cli-jvm.sh").read_text()
+    assert f"VERSION=${{1:-{config_module.CALLS_SIGNAL_CLI_VERSION}}}" in script
+
+
 def test_every_user_path_follows_home(tmp_path: Path) -> None:
     """Run as another user (HOME=/var/estia under launchd), every default path is under that HOME, never a path
     fixed in the code: checked in a fresh interpreter, since some defaults are read when the module is imported."""
@@ -1482,6 +1602,36 @@ def test_the_model_digest_is_optional_and_kept_as_64_hex_digits() -> None:
     assert parse_config(BASE | {"model_digest": DIGEST}).model_digest == DIGEST
     assert parse_config(BASE | {"model_digest": f"sha256:{DIGEST.upper()}"}).model_digest == DIGEST
     assert parse_config(BASE | {"model_digest": f"  {DIGEST}  "}).model_digest == DIGEST
+
+
+def test_ollama_is_its_official_build_unless_the_person_chose_the_app() -> None:
+    """Owner, 29 Oct: setup asks when the Ollama app is on the Mac; ollama = "app" records the yes, so doctor knows."""
+    assert parse_config(BASE).ollama == "build"
+    assert parse_config(BASE | {"ollama": "app"}).ollama == "app"
+    assert parse_config(BASE | {"ollama": "build"}).ollama == "build"
+    for wrong in ("brew", "", 1):
+        with pytest.raises(ConfigError, match='ollama must be "build" or "app"'):
+            parse_config(BASE | {"ollama": wrong})
+
+
+def test_the_models_context_window_is_the_one_named() -> None:
+    """The window local-worker was made with (setup writes it; review I24: the 16 GB tier's is 16,384). Left out: none,
+    and the history keeps its own limits only, as before (an install of 64 GB has 65,536)."""
+    assert parse_config(BASE).context_tokens is None
+    assert parse_config(BASE | {"context_tokens": 16_384}).context_tokens == 16_384
+
+
+def test_a_context_under_32k_makes_her_reads_smaller() -> None:
+    """Review of 0.9.8, guards-2: under 32,768 tokens a document read gives one page and a search half as much."""
+    assert parse_config(BASE | {"context_tokens": 16_384}).small_context
+    assert not parse_config(BASE | {"context_tokens": 32_768}).small_context
+    assert not parse_config(BASE).small_context  # none named: sized for 32,768 or more, as before
+
+
+@pytest.mark.parametrize("value", [0, 4_095, 2_000_000, "16384", 16_384.0, True])
+def test_a_context_window_that_is_no_whole_number_of_tokens_is_refused(value: object) -> None:
+    with pytest.raises(ConfigError, match="context_tokens"):
+        parse_config(BASE | {"context_tokens": value})
 
 
 @pytest.mark.parametrize(

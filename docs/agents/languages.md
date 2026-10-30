@@ -11,12 +11,12 @@ paths:
 
 ## Layout
 
-- `language` (the 11 languages: codes, names, yes and stop words, a call's "but", acknowledgement and leave-taking words and the words that go on from them ("to", "naar"), the reasons for leaving that also complain (`LEAVING_UNCLEAR`), a caller's thanks (`THANKS`), the requests to end a call (`ENDING`, `ENDING_SOFT`), the words that say more is coming (`MORE_COMING`), her plain goodbyes (`GOODBYES`, `GOODBYES_UNTIL`), the stage directions never spoken or sent (`STAGE_DIRECTIONS`, `STAGE_STARRED`, `STAGE_SOFT`; `made_of`, the phrase check calls shares), the function words and negations her own voice is told by, the negations also guarding the practice recap, and the words that ask for a code or a password, `SECRET_WORDS`; one at a time)
+- `language` (the 11 languages: codes, names, yes and stop words, a call's "but", acknowledgement and leave-taking words and the words that go on from them ("to", "naar"), the words a turn never ends on (`LEFT_OPEN`: "and", "the"), the reasons for leaving that also complain (`LEAVING_UNCLEAR`), a caller's thanks (`THANKS`), the requests to end a call (`ENDING`, `ENDING_SOFT`), the words that say more is coming (`MORE_COMING`), her plain goodbyes (`GOODBYES`, `GOODBYES_UNTIL`), the stage directions never spoken or sent (`STAGE_DIRECTIONS`, `STAGE_STARRED`, `STAGE_SOFT`; `made_of`, the phrase check calls shares), the function words and negations her own voice is told by, the negations also guarding the practice recap, and the words that ask for a code or a password, `SECRET_WORDS`; one at a time)
 - `babble` (language practice, /babble: the session in the state table, its own conversation, the practice turn's broken-reply guard and tidy reply, the recap's call and its checks in code, the idle loop with the quiet-hours hold and the lock's)
 
 ## Commands
 
-- Language-practice cases (real model, only by name): `uv run python -m evals.gemma_suite practice` (all 18) or `practice_nl` (one language's two), from the tutor test's sets in `evals/practice/`; run it twice and read each language's numbers
+- Language-practice cases (real model, only by name): `uv run python -m evals.gemma_suite practice` (all 16: two per offered language) or `practice_nl` (one language's two), from the tutor test's sets in `evals/practice/`; run it twice and read each language's numbers
 
 ## Rules
 

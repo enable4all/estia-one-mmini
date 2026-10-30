@@ -27,6 +27,37 @@ class PhotoError(Exception):
     """The photo cannot be used; the message says why (for the log, never the image data)."""
 
 
+class ShownPhoto:
+    """The last photo, in memory only (its files are deleted), shown again for follow-ups in its conversation for
+    `seconds` from the start of its answer (`photo_follow_up_seconds`)."""
+
+    def __init__(self, seconds: float) -> None:
+        self.seconds = seconds
+        self._last: tuple[int, int, list[str], float] | None = None  # (conversation, message, images, answer's start)
+
+    def recent(self, conversation_id: int, now: float) -> dict[int, list[str]] | None:
+        """The last photo while it is shown in this conversation; None, and forgotten, once it is not."""
+        if self._last is None:
+            return None
+        conversation, photo_id, images, began = self._last
+        if conversation != conversation_id or now - began > self.seconds:
+            self._last = None
+            return None
+        return {photo_id: images}
+
+    def left(self, conversation_id: int, now: float, *, new: bool = False) -> float:
+        """The seconds the last photo is still shown in this conversation (0 once it is not); `new`: a photo of this
+        message, shown for all of `seconds`. A hold for it says when it ends (second review of 0.9.8, guards-4)."""
+        if new:
+            return self.seconds
+        if self._last is None or self._last[0] != conversation_id:
+            return 0.0
+        return max(0.0, self._last[3] + self.seconds - now)
+
+    def keep(self, conversation_id: int, photo_id: int, images: list[str], began: float) -> None:
+        self._last = (conversation_id, photo_id, images, began)
+
+
 def sniff(data: bytes) -> str | None:
     """'jpeg', 'png', 'gif', 'webp' or 'heic' from the first bytes; None for anything else."""
     if data.startswith(b"\xff\xd8\xff"):

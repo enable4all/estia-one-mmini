@@ -1,10 +1,12 @@
+import calendar
 import errno
+import hashlib
 import io
 import json
 import os
 import re
 import tempfile
-from collections.abc import Collection
+from collections.abc import Collection, Mapping
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -13,9 +15,9 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
+from local_assistant import babble, doctor, hostsec, ownuser, prompts, voice
 from local_assistant import config as config_module
-from local_assistant import doctor, ownuser, prompts
-from local_assistant.config import Config, load_config
+from local_assistant.config import SIGNAL_CLI_SERIES, Config, load_config
 from local_assistant.doctor import Finding, Probe, exit_code, render, run
 from local_assistant.hostsec import Check
 from local_assistant.language import LANGUAGE_KEY
@@ -51,6 +53,7 @@ class FakeProbe(Probe):
         self.install: list[Check] = []  # her own user's checks (ownuser)
         self.homes: list[Path] = []
         self.numbers: list[str] = []
+        self.names: list[str] = []
         self.own = False  # she runs as her own user here
         self.her = False  # this doctor runs as her (_estia)
         self.programs: list[Check] = []
@@ -58,8 +61,11 @@ class FakeProbe(Probe):
         self.hue: dict[str, Any] | None = None  # the device helper's hue-check answer; None: not checked
         self.hue_asked: list[list[str]] = []
         self.pmset: str | None = None  # `pmset -g`; None: could not be read
+        self.pmset_custom: str | None = None  # `pmset -g custom` (each power source's settings); None: not read
         self.signal_version: str | None = "signal-cli 0.14.9"  # `signal-cli --version`; None: could not be read
         self.versions_asked: list[str] = []
+        self.version_envs: list[dict[str, str]] = []  # the environment each was asked with (the JVM build's Java)
+        self.signal_versions: dict[str, str | None] = {}  # per program; else signal_version
         self.home_open: tuple[list[Path], bool] = ([], True)  # what in your home every account may open; all read
         self.homes_opened: list[tuple[Path, set[Path]]] = []
         self.ollama_at = ""  # the program listening on Ollama's port; "": none found
@@ -83,13 +89,17 @@ class FakeProbe(Probe):
     def power(self) -> str | None:
         return self.pmset
 
+    def power_custom(self) -> str | None:
+        return self.pmset_custom
+
     def open_home(self, home: Path, shared: Collection[Path]) -> tuple[list[Path], bool]:
         self.homes_opened.append((home, set(shared)))
         return self.home_open
 
-    def signal_cli_version(self, program: str) -> str | None:
+    def signal_cli_version(self, program: str, env: Mapping[str, str] | None = None) -> str | None:
         self.versions_asked.append(program)
-        return self.signal_version
+        self.version_envs.append(dict(env or {}))
+        return self.signal_versions.get(program, self.signal_version)
 
     def bridge_launchd(self) -> str | None:
         return self.launchd
@@ -107,7 +117,8 @@ class FakeProbe(Probe):
     def program_checks(self, cfg: Any) -> list[Check]:
         return list(self.programs)
 
-    def security_checks(self, home: Path, bot_number: str) -> list[Check]:
+    def security_checks(self, home: Path, bot_number: str, name: str = "Estia") -> list[Check]:
+        self.names.append(name)  # hers, for the firewall's nuclear line
         self.homes.append(home)
         self.numbers.append(bot_number)  # used to find her account, never shown
         return list(self.security)
@@ -349,6 +360,47 @@ def test_a_second_program_on_ollamas_port_is_a_failure(home: Path) -> None:
     assert line.status == "fail" and "also listens on its port" in line.text
 
 
+def test_the_ollama_app_chosen_at_setup_is_a_warning_with_its_limits(home: Path) -> None:
+    """Owner, 29 Oct: the app the person chose (ollama = "app") is a "!", never a ✗, its limits in one line, whatever
+    its version (it updates itself); not chosen, it is named with the fix, as before."""
+    from local_assistant import prompts
+
+    probe = FakeProbe(home)
+    probe.ollama_at = official(home / "Applications/Ollama.app/Contents/Resources")
+    probe.ollama_uid = os.getuid()
+    probe.answers["http://127.0.0.1:11434/api/version"] = {"version": "0.41.0"}
+    line = by_part(run(write_config(home, MINIMAL + 'ollama = "app"\n'), probe))["Ollama"]
+    assert line.status == "warn" and not line.fix and "\n" not in line.text
+    assert line.text == prompts.DOCTOR_OLLAMA_APP.format(version="0.41.0", program=probe.ollama_at)
+    assert prompts.OLLAMA_APP_LIMITS in line.text
+    unchosen = by_part(run(write_config(home, MINIMAL), probe))["Ollama"]
+    app = home / "Applications/Ollama.app"
+    assert unchosen.status == "warn" and unchosen.text == prompts.OLLAMA_APP.format(state="answers", path=app)
+
+
+@pytest.mark.parametrize("why", ["another-account", "other-machines", "second-listener"])
+def test_the_chosen_ollama_app_that_someone_else_may_control_is_still_named(home: Path, why: str) -> None:
+    probe = FakeProbe(home)
+    probe.ollama_at = official(home / "Applications/Ollama.app/Contents/Resources")
+    probe.ollama_uid = os.getuid() + 1 if why == "another-account" else os.getuid()
+    if why == "other-machines":
+        probe.ollama_addresses = ("*.11434",)
+    if why == "second-listener":
+        probe.ollama_others = (("/tmp/elsewhere/serve", os.getuid() + 1),)
+    probe.answers["http://127.0.0.1:11434/api/version"] = {"version": "0.41.0"}
+    line = by_part(run(write_config(home, MINIMAL + 'ollama = "app"\n'), probe))["Ollama"]
+    assert line.status == ("warn" if why == "other-machines" else "fail") and line.fix
+
+
+def test_the_chosen_ollama_app_down_names_opening_it(home: Path) -> None:
+    from local_assistant import prompts
+
+    probe = FakeProbe(home)
+    del probe.answers["http://127.0.0.1:11434/api/tags"]
+    down = by_part(run(write_config(home, MINIMAL + 'ollama = "app"\n'), probe))["Model"]
+    assert down.status == "fail" and down.fix == prompts.DOCTOR_OLLAMA_APP_DOWN_FIX
+
+
 def test_as_her_an_ollama_that_another_account_runs_is_named_too(home: Path, tmp_path: Path) -> None:
     """As her, your folders are closed (no library line, no tick): the account is still read (ps names any user's
     process), and the owner is the one the move's record names."""
@@ -510,6 +562,23 @@ def test_no_prompt_line_with_googles_large_prompt_or_another_renderer(home: Path
     assert "Model prompt" not in by_part(run(write_config(home, MINIMAL), probe))
 
 
+def test_a_model_context_smaller_than_the_configs_is_a_warning_with_the_line_to_put_in(home: Path) -> None:
+    """Review I24: local-worker made with 16,384 tokens (the 16 GB tier) and a config without context_tokens (as
+    before 0.9.7), whose history's own limits count on 32,768: Ollama cuts a long chat's request without a word. One
+    /api/show read serves both lines."""
+    probe = FakeProbe(home)
+    probe.shown["local-worker"] = show_answer("gemma4-large") | {"parameters": "num_ctx                        16384"}
+    line = by_part(run(write_config(home, MINIMAL), probe))["Model context"]
+    assert line.status == "warn"
+    assert line.text == prompts.DOCTOR_MODEL_CONTEXT.format(model="local-worker", model_tokens=16_384, tokens=32_768)
+    assert line.fix == prompts.DOCTOR_MODEL_CONTEXT_FIX.format(tokens=16_384) and "context_tokens = 16384" in line.fix
+    assert probe.posted == [("http://127.0.0.1:11434/api/show", {"model": "local-worker"})]
+    fitting = write_config(home, MINIMAL + "context_tokens = 16384\n")
+    assert "Model context" not in by_part(run(fitting, probe))
+    probe.shown["local-worker"] = show_answer("gemma4-large")  # no num_ctx of its own: Ollama's, not read here
+    assert "Model context" not in by_part(run(write_config(home, MINIMAL), probe))
+
+
 def test_no_prompt_line_when_ollama_does_not_show_the_model(home: Path) -> None:
     """Ollama silent on /api/show (or an older one): no claim either way; no request without the model listed."""
     probe = FakeProbe(home)
@@ -547,15 +616,105 @@ def test_a_number_whose_registration_did_not_finish_is_named(home: Path) -> None
     assert NUMBER not in signal.text + signal.fix
 
 
-@pytest.mark.parametrize(("version", "status"), [("signal-cli 0.14.9", "ok"), ("signal-cli 0.15.0", "warn")])
+@pytest.mark.parametrize(
+    ("days", "status"), [(10, "ok"), (92, "ok"), (93, "warn"), (200, "warn")], ids=lambda value: str(value)
+)
+def test_doctor_names_a_signal_cli_release_over_three_months_old(home: Path, days: int, status: str) -> None:
+    """signal-cli's own README: "signal-cli releases older than three months may not work correctly" (Signal's
+    official clients expire after three months, then Signal's servers may change). Its release date comes from a
+    table in the code: no network at doctor time."""
+    probe = FakeProbe(home)
+    probe.signal_version = "signal-cli 0.14.9"
+    released = calendar.timegm((2026, 10, 7, 11, 15, 44, 0, 0, 0))  # v0.14.9 on GitHub
+    probe.clock = released + days * 86400
+    found = by_part(run(write_config(home, MINIMAL), probe))["signal-cli"]
+    assert found.status == status and "0.14.9" in found.text and "released 2026-10-07" in found.text, found
+    if status == "warn":
+        assert "over three months old" in found.text and "may not work" in found.text
+        assert "brew upgrade signal-cli" in found.fix and "estia-deploy" in found.fix
+        assert found.fix.index("brew unpin signal-cli") < found.fix.index("brew upgrade signal-cli")  # signal-02
+    probe.signal_version = "signal-cli 0.14.99"  # newer than the table: its age cannot be told (release review D2)
+    found = by_part(run(write_config(home, MINIMAL), probe))["signal-cli"]
+    assert found.status == "warn" and "released" not in found.text, found
+    assert "release day unknown" in found.text and "update Estia" in found.fix
+
+
+def calls_config(home: Path) -> Path:
+    short = tempfile.mkdtemp(prefix="c", dir="/tmp")  # socket paths are at most 104 bytes
+    return write_config(home, MINIMAL + f'[voice]\nurl = "http://127.0.0.1:8150"\n[calls]\nsocket_dir = "{short}"\n')
+
+
+def test_with_calls_the_signal_cli_line_is_the_java_build_she_runs(home: Path) -> None:
+    """With calls the bridge runs the Java build (pinned at its own version), never Homebrew's: the age line read
+    Homebrew's, so it never warned about the program that talks to Signal (release review D2)."""
+    path = calls_config(home)
+    cfg = load_config(path)
+    probe = FakeProbe(home)
+    probe.java = home / "jdk"
+    probe.signal_versions = {"signal-cli": "signal-cli 0.14.9", str(cfg.call_signal_cli): "signal-cli 0.14.4"}
+    parts = by_part(run(path, probe))
+    found = parts["signal-cli"]
+    assert found.status == "warn" and "0.14.4" in found.text and "over three months old" in found.text, found
+    assert "Java build" in found.text and "0.14.9" not in found.text
+    env = probe.version_envs[probe.versions_asked.index(str(cfg.call_signal_cli))]
+    assert env["JAVA_HOME"] == str(home / "jdk") and "-Djava.net.preferIPv4Stack=true" in env["JAVA_OPTS"]
+    builds = parts["signal-cli builds"]
+    assert builds.status == "warn" and "0.14.4" in builds.text and "0.14.9" in builds.text, builds
+    assert "brew pin signal-cli" in builds.fix and "estia-deploy" in builds.fix
+    probe.signal_versions[str(cfg.call_signal_cli)] = "signal-cli 0.14.9"  # one version: no second line
+    parts = by_part(run(path, probe))
+    assert parts["signal-cli"].status == "ok" and "signal-cli builds" not in parts
+
+
+def test_a_java_build_that_does_not_answer_is_named_by_its_folder(home: Path) -> None:
+    """The Java build's folder carries its version (signal-cli-<version>-jvm/signal-cli-<version>, which the update
+    checks): read from there when it cannot be asked (no Java)."""
+    path = calls_config(home)
+    cfg = load_config(path)
+    probe = FakeProbe(home)
+    program = Path(cfg.call_signal_cli)
+    program.parent.mkdir(parents=True)
+    program.write_text("#!/bin/sh\n")
+    probe.signal_versions = {"signal-cli": "signal-cli 0.14.9", str(cfg.call_signal_cli): None}
+    found = by_part(run(path, probe))["signal-cli"]
+    assert "signal-cli 0.14.9" in found.text and "Java build" in found.text, found
+
+
+def test_a_java_build_that_is_not_there_has_no_version(home: Path) -> None:
+    """Review host-jvm-version: doctor named a version for a path that does not exist (the folder's name alone). With
+    no Java build, the line is Homebrew's, and the Calls line names what is missing."""
+    path = calls_config(home)
+    cfg = load_config(path)
+    assert not Path(cfg.call_signal_cli).exists()
+    probe = FakeProbe(home)
+    probe.signal_versions = {"signal-cli": "signal-cli 0.14.9", str(cfg.call_signal_cli): None}
+    parts = by_part(run(path, probe))
+    assert "Java build" not in parts["signal-cli"].text and "signal-cli builds" not in parts, parts["signal-cli"]
+    assert parts["Calls"].status == "fail" and "signal-cli" in parts["Calls"].text
+
+
+def test_the_signal_cli_release_table_holds_the_versions_estia_installs() -> None:
+    from local_assistant import doctor
+
+    assert "0.14.9" in doctor.SIGNAL_CLI_RELEASED  # the JVM build's default (tools/call-tunnel)
+    assert all(version.startswith(f"{SIGNAL_CLI_SERIES}.") for version in doctor.SIGNAL_CLI_RELEASED)
+
+
+@pytest.mark.parametrize(
+    ("version", "status"), [("signal-cli 0.14.9", "ok"), ("signal-cli 0.13.24", "warn"), ("signal-cli 0.15.0", "warn")]
+)
 def test_doctor_names_a_signal_cli_of_another_version(home: Path, version: str, status: str) -> None:
-    """Registration and the bridge use signal-cli 0.14's requests (finding 20)."""
+    """Registration and the bridge use signal-cli 0.14's requests (finding 20). One newer than Estia supports asks
+    for a newer Estia: Homebrew never brings an older one back (release review D10)."""
     probe = FakeProbe(home)
     probe.signal_version = version
     found = by_part(run(write_config(home, MINIMAL), probe))["signal-cli"]
     assert found.status == status and version.split()[1] in found.text
-    if status == "warn":
-        assert "0.14" in found.text and "brew install signal-cli" in found.fix
+    if version.endswith("0.13.24"):
+        assert "0.14" in found.text and "brew upgrade signal-cli" in found.fix
+    if version.endswith("0.15.0"):
+        assert "newer than Estia supports" in found.text and "git pull" in found.fix, found
+        assert "next Estia release" in found.fix and "brew" not in found.fix
     probe.signal_version = None  # not read: no line
     assert "signal-cli" not in by_part(run(write_config(home, MINIMAL), probe))
 
@@ -566,17 +725,65 @@ def test_the_bot_number_must_be_registered(home: Path) -> None:
     assert signal.status == "fail" and "register" in signal.fix and NUMBER not in signal.text + signal.fix
 
 
+BOT_ACI = "99999999-8888-4777-8666-555555555555"  # her account without a number (made up)
+
+
+def test_her_account_without_a_number_is_checked_by_its_account_id(home: Path) -> None:
+    """Signal Login (23 Oct): signal-cli lists the account with no number and its Account ID as uuid; doctor's line is
+    "Signal account" then, ✓ once registered, ✗ when signal-cli has none, and never names the ID."""
+    accounts = home / ".local/share/signal-cli/data/accounts.json"
+    old_number = {"number": NUMBER, "path": "123456", "uuid": ACI}  # her old number's account stays as it is
+    accounts.write_text(json.dumps({"accounts": [old_number, {"number": None, "path": "654321", "uuid": BOT_ACI}]}))
+    (accounts.parent / "654321").write_text(json.dumps({"version": 8, "registered": True}))
+    text = f'bot_number = "{BOT_ACI}"\nallowed_acis = ["{ACI}"]\n'
+    findings = run(write_config(home, text), FakeProbe(home))
+    line = by_part(findings)["Signal account"]
+    assert line.status == "ok" and "without a number" in line.text and "registered" in line.text
+    assert "Signal number" not in by_part(findings) and BOT_ACI not in render(findings)
+    accounts.write_text(json.dumps({"accounts": [old_number]}))  # only the old number: not taken over yet
+    moved = FakeProbe(home)
+    moved.own = True
+    line = by_part(run(write_config(home, text), moved))["Signal account"]
+    assert line.status == "fail" and "signal-login" in line.fix and BOT_ACI not in line.text + line.fix
+
+
+def test_before_her_own_account_the_fix_for_an_account_not_moved_here_is_the_by_hand_steps(home: Path) -> None:
+    """Setup skips the account step once a config is set up, and `estia signal-login` refuses before the move
+    (review S10): the fix names the by-hand steps of setup_assistant.md 2.3 B, never scripts/setup.sh."""
+    accounts = home / ".local/share/signal-cli/data/accounts.json"
+    accounts.write_text(json.dumps({"accounts": []}))
+    text = f'bot_number = "{BOT_ACI}"\nallowed_acis = ["{ACI}"]\n'
+    line = by_part(run(write_config(home, text), FakeProbe(home)))["Signal account"]
+    assert line.status == "fail" and line.fix == prompts.DOCTOR_SIGNAL_ACCOUNT_BY_HAND
+    assert "by hand" in line.fix and "2.3, B" in line.fix
+    assert "scripts/setup.sh" not in line.fix and "signal-login" not in line.fix
+
+
 def test_optional_parts_are_checked_only_when_turned_on(home: Path) -> None:
     probe = FakeProbe(home)
     parts = by_part(run(write_config(home, MINIMAL), probe))
-    assert not {"Web search", "Places", "Mail", "Calendar", "Voice", "Calls", "Spotify"} & set(parts)
+    assert not {"Web search", "Google Maps", "OpenStreetMap", "Mail", "Calendar", "Voice", "Calls", "Spotify"} & set(
+        parts
+    )
     assert probe.asked == ["http://127.0.0.1:11434/api/tags", "http://127.0.0.1:11434/api/version"]  # Ollama only
 
 
 def test_web_search_needs_a_private_key_file_and_never_shows_a_key(home: Path) -> None:
+    """Review docs-default-web-pick-leaves-x: web search is on by default and its key may be left for later, so no key
+    is a "!", never a ✗ (doctor reached no "no ✗" on the recommended path), and its fix asks for the key itself:
+    scripts/set-web-keys.sh worked only with a key in the login keychain."""
     path = write_config(home, MINIMAL + "[web]\n")
     web = by_part(run(path, FakeProbe(home)))["Web search"]
-    assert web.status == "fail" and "set-web-keys.sh" in web.fix
+    assert web.status == "warn" and web.fix == (
+        "scripts/setup.sh --extras, then Web search: it asks for Ollama's key (ollama.com/settings/keys), hidden"
+    )
+    moved = FakeProbe(home)
+    moved.own = True
+    web = by_part(run(path, moved))["Web search"]
+    assert web.status == "warn" and web.fix == (
+        "/usr/bin/sudo /usr/local/estia/bin/estia secret set web.env OLLAMA_API_KEY "
+        "(Ollama's key from ollama.com/settings/keys, at a hidden prompt)"
+    )
     keys = home / ".config/local-assistant/web.env"
     keys.write_text("OLLAMA_API_KEY=secret-value-123\n")
     keys.chmod(0o600)
@@ -658,17 +865,24 @@ def test_a_soul_with_a_problem_is_a_warning(home: Path) -> None:
     assert by_part(findings)["Personality"].status == "warn" and exit_code(findings) == 0
 
 
-def test_the_profile_picture_is_estias_e_your_own_or_none(home: Path) -> None:
+def test_the_profile_picture_is_estias_mark_your_own_or_none(home: Path) -> None:
     probe = FakeProbe(home)
     estia = by_part(run(write_config(home, MINIMAL), probe))["Profile picture"]
-    assert estia == Finding("ok", "Profile picture", "Estia's e. (docs/brand/estia-avatar.png)")
+    assert estia == Finding("ok", "Profile picture", "Estia's mark (docs/brand/estia-avatar.png)")
     (home / "her.png").write_bytes(b"\x89PNG\r\n\x1a\n" + b"\0" * 64)
     own = by_part(run(write_config(home, MINIMAL + 'avatar = "~/her.png"\n'), probe))["Profile picture"]
     assert own == Finding("ok", "Profile picture", "her.png")
     none = by_part(run(write_config(home, MINIMAL + 'avatar = ""\n'), probe))["Profile picture"]
     assert none.status == "ok" and none.text.startswith("none")
-    letter = by_part(run(write_config(home, MINIMAL + 'name = "Tiffany"\n'), probe))["Profile picture"]
-    assert letter == Finding("ok", "Profile picture", "her letter, t. (docs/brand/letters/t.png)")  # owner, 15 Oct
+    tiffany = by_part(run(write_config(home, MINIMAL + 'name = "Tiffany"\n'), probe))["Profile picture"]
+    assert tiffany == estia  # owner, 25 Oct: the mark whatever her name, no letters
+
+
+def test_an_old_letter_picture_in_the_config_shows_the_mark_not_a_missing_file(home: Path) -> None:
+    """Setup's doctor after the update: a config that names one of the letter pictures (gone) gets the mark."""
+    old = 'avatar = "/usr/local/estia/current/docs/brand/letters/t.png"\n'
+    picture = by_part(run(write_config(home, MINIMAL + 'name = "Tiffany"\n' + old), FakeProbe(home)))["Profile picture"]
+    assert picture == Finding("ok", "Profile picture", "Estia's mark (docs/brand/estia-avatar.png)")
 
 
 def test_a_picture_that_cannot_be_used_is_a_warning_not_a_failure(home: Path) -> None:
@@ -714,6 +928,30 @@ def test_the_signal_number_line_reads_only_signal_clis_own_account_file(home: Pa
     assert line.status == "fail"
 
 
+def test_the_mac_checks_get_her_name_for_the_nuclear_line(home: Path) -> None:
+    """The firewall's neutral line names the Mac "used for <her name> alone" (owner's words, 20 Oct), the config's."""
+    probe = FakeProbe(home)
+    run(write_config(home, MINIMAL + 'name = "Tiffany"\n'), probe)
+    assert probe.names == ["Tiffany"]
+
+
+def test_several_allowed_accounts_are_told_what_they_share(home: Path) -> None:
+    """Review I3 (owner, 21 Oct: warn now, separate per account later): every allowed account shares one chat history,
+    the profile, mail, calendars, documents, the digest and the location; doctor says so in the docs' words, in lines
+    that fit the terminal (hostsec.TERMINAL, owner, 20 Oct)."""
+    partner = "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff"
+    two = f'bot_number = "{NUMBER}"\nallowed_acis = ["{ACI}", "{partner}"]\n'
+    findings = run(write_config(home, two), FakeProbe(home))
+    shared = [finding for finding in findings if finding.part == "Allowed accounts"]
+    assert [(finding.status, finding.fix) for finding in shared] == [("warn", prompts.SHARED_ACCOUNTS_FIX)]
+    assert " ".join(shared[0].text.split()) == f"2 in the config. {prompts.SHARED_ACCOUNTS}"
+    assert all(len(shown) <= hostsec.TERMINAL for shown in render(shared).splitlines())
+    assert exit_code(findings) == 0  # a warning, never a failure: a household may choose it
+    assert ACI not in render(findings) and partner not in render(findings)
+    one = run(write_config(home, MINIMAL), FakeProbe(home))
+    assert not [finding for finding in one if finding.part == "Allowed accounts"]
+
+
 def test_the_example_placeholders_must_be_replaced(home: Path) -> None:
     accounts = home / ".local/share/signal-cli/data/accounts.json"
     accounts.write_text(json.dumps({"accounts": [{"number": "+300000000000"}]}))
@@ -740,6 +978,53 @@ def test_calls_need_java_as_well_as_their_two_programs(home: Path) -> None:
     (java / "bin/java").write_text("#!/bin/sh\n")
     probe.java = java
     assert by_part(run(path, probe))["Calls"].status == "ok"
+
+
+def test_doctor_names_a_call_helper_built_from_other_sources(home: Path) -> None:
+    """Second deep scan, signal-06: build.sh writes a stamp beside the call helper (its sources by their pins and
+    local.patch's sha256); a helper whose stamp is missing or names other sources than this Estia's is a "!", with
+    the build again (and in her own macOS account the update)."""
+    from local_assistant import config
+
+    probe = FakeProbe(home)
+    path = calls_config(home)
+    cfg = load_config(path)
+    for program in (cfg.call_signal_cli, cfg.call_tunnel):
+        program.parent.mkdir(parents=True, exist_ok=True)
+        program.write_text("#!/bin/sh\n")
+    stamp = cfg.call_tunnel.with_name(cfg.call_tunnel.name + ".stamp")
+    stamp.write_text("pr5_head=old\n")
+    helper = by_part(run(path, probe))["Call helper"]
+    assert helper.status == "warn" and helper.fix == "tools/call-tunnel/build.sh", helper
+    assert helper.text == prompts.DOCTOR_CALL_HELPER_OLD
+    probe.own = True
+    assert by_part(run(path, probe))["Call helper"].fix == prompts.DOCTOR_CALL_HELPER_OLD_FIX_OWN
+    stamp.write_text(str(config.tunnel_stamp()))
+    assert "Call helper" not in by_part(run(path, probe))
+
+
+def test_in_her_own_account_the_calls_fix_ends_with_the_update_never_java_home(home: Path) -> None:
+    """Review host-doctor-calls-fix: in her own macOS account the fix named the checkout's builds and "set [calls]
+    java_home", which never reach her release (a Homebrew java_home fails her programs' check). There the builds go in
+    with the update, and Java is Homebrew's openjdk, which the update copies."""
+    probe = FakeProbe(home)
+    probe.own = True
+    short = tempfile.mkdtemp(prefix="c", dir="/tmp")  # socket paths are at most 104 bytes
+    path = write_config(home, MINIMAL + f'[voice]\nurl = "http://127.0.0.1:8150"\n[calls]\nsocket_dir = "{short}"\n')
+    cfg = load_config(path)
+    calls = by_part(run(path, probe))["Calls"]  # nothing there: the two builds and Java
+    assert calls.status == "fail" and "java_home" not in calls.fix, calls
+    assert "install-signal-cli-jvm.sh" in calls.fix and "brew install openjdk" in calls.fix
+    assert calls.fix.endswith("then /usr/bin/sudo /usr/local/estia/bin/estia-deploy (it copies them into her release)")
+    for program in (cfg.call_signal_cli, cfg.call_tunnel):
+        program.parent.mkdir(parents=True, exist_ok=True)
+        program.write_text("#!/bin/sh\n")
+    calls = by_part(run(path, probe))["Calls"]  # Java alone
+    assert calls.text == "no Java for the JVM signal-cli" and "java_home" not in calls.fix, calls
+    assert (
+        calls.fix
+        == "brew install openjdk, then /usr/bin/sudo /usr/local/estia/bin/estia-deploy (it copies it into her release)"
+    )
 
 
 def web_keys(home: Path, at: float = OLD) -> None:
@@ -774,7 +1059,8 @@ def test_a_part_that_is_set_up_but_never_used_is_not_tested_yet(home: Path) -> N
     web = by_part(findings)["Web search"]
     assert (web.status, web.text) == ("untested", "set up, not tested yet (keys: OLLAMA_API_KEY)")
     assert "○ Web search: set up, not tested yet (keys: OLLAMA_API_KEY)" in render(findings).splitlines()
-    assert by_part(findings)["Places"].text == "set up, not tested yet (no home address set)"
+    assert by_part(findings)["OpenStreetMap"].text == "set up, not tested yet"
+    assert by_part(findings)["Google Maps"].text == "set up, not tested yet"  # its key is in web.env
     assert exit_code(findings) == 0  # a fresh install can reach "no ✗"
 
 
@@ -978,6 +1264,14 @@ def test_a_saved_login_address_or_helper_counts_only_for_the_failure_it_fixes(
 
 VOICE = '[voice]\nurl = "http://127.0.0.1:8150"\n'
 HEALTH = "http://127.0.0.1:8150/health"
+# Kokoro's limit on a call while it stands in for Pocket TTS, in the docs' words (owner, 28 Oct: "yes to both",
+# words-04; tests/test_docs.py's KOKORO_ON_A_CALL)
+KOKORO_ON_A_CALL = "(on a call, one line each time she answers; the rest comes as a Signal text)"
+
+
+def pocket_line(text: str) -> str:
+    """Doctor's Pocket TTS voices line as it shows it: split to fit the terminal (hostsec.TERMINAL) after its mark."""
+    return hostsec.terminal_text(text, len("! Pocket TTS voices: "))
 
 
 def test_english_needs_nothing_more_from_the_voice_service(home: Path) -> None:
@@ -1558,6 +1852,52 @@ def test_a_changed_safety_number_is_red_with_the_compare_then_trust_steps(home: 
     assert changed.fix == prompts.SAFETY_NUMBER_FIX and ACI not in render(findings)
 
 
+def test_signal_cli_not_connected_for_minutes_is_red_with_what_it_said_and_the_steps(home: Path) -> None:
+    """Logged out by Signal (another device took her account over, or her signal-cli is too old), the bridge restarts
+    signal-cli quietly and /status cannot be reached (review S2): doctor reads status.json and says so, with the log
+    to read and the steps; a restart still in progress (under 3 minutes) is no line."""
+    path = write_config(home, MINIMAL)
+    assert "Signal connection" not in by_part(run(path, FakeProbe(home)))
+    recorded(path, at=NOW - 7200).signal_ready()
+    recorded(path, at=NOW - 60).signal_failed("exited")
+    assert "Signal connection" not in by_part(run(path, FakeProbe(home)))  # a minute: a restart, no line
+    recorded(path, at=NOW).signal_failed("not registered")
+    later = FakeProbe(home)
+    later.clock = NOW + 600
+    findings = run(path, later)
+    down = by_part(findings)["Signal connection"]
+    assert down.status == "fail" and exit_code(findings) == 1
+    assert down.text == prompts.DOCTOR_SIGNAL_DOWN.format(
+        minutes=11, restarts=2, failure=prompts.SIGNAL_FAILURE_WORDS["not registered"]
+    )
+    assert "Signal logged her out" in down.fix and "bridge.log" in down.fix
+    recorded(path, at=NOW + 600).signal_failed("client too old")
+    old = by_part(run(path, later))["Signal connection"]
+    assert "Upgrade signal-cli" in old.fix
+    recorded(path, at=NOW + 700).signal_ready()
+    assert "Signal connection" not in by_part(run(path, later))
+
+
+def test_signals_wait_is_red_until_it_is_over_with_the_steps(home: Path) -> None:
+    """A captcha asked for or a long rate limit: nothing is sent until Signal's time (review S4). Never "her messages
+    wait": a reply is tried again only within 10 minutes of being written, so one from early in a long wait is lost."""
+    path = write_config(home, MINIMAL)
+    assert "Signal limit" not in by_part(run(path, FakeProbe(home)))
+    recorded(path).signal_limited(NOW + 3600, captcha=True)
+    findings = run(path, FakeProbe(home))
+    limit = by_part(findings)["Signal limit"]
+    assert limit.status == "fail" and limit.text == prompts.DOCTOR_SIGNAL_LIMITED_CAPTCHA.format(when="12:40")
+    assert "Signal limits her messages" in limit.fix
+    assert "nothing is sent until then" in limit.text and "messages wait" not in limit.text
+    recorded(path).signal_limited(NOW + 600, captcha=False)
+    assert by_part(run(path, FakeProbe(home)))["Signal limit"].text == prompts.DOCTOR_SIGNAL_LIMITED.format(
+        when="11:50"
+    )
+    later = FakeProbe(home)
+    later.clock = NOW + 601
+    assert "Signal limit" not in by_part(run(path, later))  # over
+
+
 def test_without_a_pin_the_model_line_says_how_to_pin_it(home: Path) -> None:
     probe = FakeProbe(home)
     probe.answers["http://127.0.0.1:11434/api/tags"] = {"models": [{"name": "local-worker:latest", "digest": DIGEST}]}
@@ -1618,7 +1958,7 @@ def test_the_macs_and_her_own_users_checks_follow_the_daemon_line_one_to_one(hom
 
 
 def test_a_mac_check_that_cannot_run_is_a_warning(home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    def broken(self: Probe, home: Path, bot_number: str) -> list[Check]:
+    def broken(self: Probe, home: Path, bot_number: str, name: str = "Estia") -> list[Check]:
         raise OSError("no such tool")
 
     monkeypatch.setattr(FakeProbe, "security_checks", broken)
@@ -1634,7 +1974,7 @@ def test_with_her_own_user_installed_a_missing_config_points_to_her_doctor(
     config = by_part(run(home / ".config/local-assistant/config.toml", probe))["Config"]
     assert (
         config.status == "fail"
-        and config.fix == "she runs as her own user: /usr/bin/sudo /usr/local/estia/bin/estia doctor"
+        and config.fix == "she runs as her own macOS account: /usr/bin/sudo /usr/local/estia/bin/estia doctor"
     )
     probe.own = False  # rolled back, or never moved: your own config is missing
     config = by_part(run(home / ".config/local-assistant/config.toml", probe))["Config"]
@@ -2365,7 +2705,7 @@ def test_a_caldav_calendar_needs_its_password(home: Path, monkeypatch: pytest.Mo
             "user name or password refused",
             "a new app-specific password, then scripts/set-calendar-password.sh family",
         ),
-        ("no_calendar", "no calendar by that name", "check caldav and calendar in config.toml"),
+        ("no_calendar", "no calendar by that name", "check caldav and calendar, the server's address"),
         ("no_answer", "no answer", "check the service and the Mac's internet connection"),
     ],
 )
@@ -2550,6 +2890,581 @@ def test_doctor_warns_when_the_mac_sleeps_or_stays_off_after_a_power_failure(
 
 def test_power_settings_that_cannot_be_read_add_no_line(home: Path) -> None:
     assert "Power" not in by_part(run(write_config(home, MINIMAL), FakeProbe(home)))
+
+
+@pytest.mark.parametrize("sleep", ["0", "1"])
+def test_on_a_laptop_the_power_line_never_promises_a_start_after_a_power_failure(home: Path, sleep: str) -> None:
+    """Review docs-laptop-power: on the friends' MacBook (no autorestart setting: a laptop has none), doctor said "the
+    Mac starts again after a power failure", which is false, and nothing said that a closed lid stops her."""
     probe = FakeProbe(home)
-    probe.pmset = PMSET.format(sleep="0", restart="1").replace(" autorestart          1\n", "")  # a laptop has none
+    probe.pmset = PMSET.format(sleep=sleep, restart="1").replace(" autorestart          1\n", "")
+    power = by_part(run(write_config(home, MINIMAL), probe))["Power"]
+    assert "power failure" not in power.text and "a closed lid" in power.text, power
+    if sleep == "0":
+        assert power.status == "ok" and power.text == (
+            "no sleep in the settings in use; on a laptop, a closed lid without an external display still stops her"
+        )
+    else:
+        assert power.status == "warn" and "the Mac sleeps after 1 min without use" in power.text
+        assert power.fix == (
+            "/usr/bin/sudo /usr/bin/pmset -c sleep 0 (plugged in), or System Settings → Battery → Options; "
+            "keep it plugged in, the lid open (setup_assistant.md, 2.8)"
+        )
+        assert "autorestart" not in power.fix
+
+
+CUSTOM = """Battery Power:
+ Sleep On Power Button 1
+ displaysleep         2
+ sleep                {battery}
+ disksleep            10
+AC Power:
+ Sleep On Power Button 1
+ displaysleep         10
+ sleep                {ac}
+ disksleep            10
+"""
+
+
+def test_on_a_laptop_the_power_line_reads_the_power_adapters_and_the_batterys_sleep(home: Path) -> None:
+    """Second deep scan, macos-laptop-power-ac-only: doctor read only the settings in use, so plugged in with sleep 0
+    it showed ✓ while the battery's own sleep timer would still put the MacBook to sleep, and nothing said to keep it
+    plugged in. Each power source's sleep is read (`pmset -g custom`): the power adapter's counts, and the ✓ says to
+    keep it plugged in when the battery's sleeps."""
+    probe = FakeProbe(home)
+    laptop = PMSET.replace(" autorestart          {restart}\n", "")
+    probe.pmset = laptop.format(sleep="0")
+    probe.pmset_custom = CUSTOM.format(battery="1", ac="0")
+    power = by_part(run(write_config(home, MINIMAL), probe))["Power"]
+    assert power.status == "ok" and power.text == (
+        "no sleep on the power adapter; on battery the Mac sleeps after 1 min: keep it plugged in; on a laptop, a "
+        "closed lid without an external display still stops her"
+    ), power
+    probe.pmset = laptop.format(sleep="1")  # on battery now: the power adapter's setting still counts
     assert by_part(run(write_config(home, MINIMAL), probe))["Power"].status == "ok"
+    probe.pmset_custom = CUSTOM.format(battery="0", ac="0")
+    power = by_part(run(write_config(home, MINIMAL), probe))["Power"]
+    assert power.status == "ok" and "keep it plugged in" not in power.text and "power adapter" in power.text
+    probe.pmset_custom = CUSTOM.format(battery="1", ac="10")
+    power = by_part(run(write_config(home, MINIMAL), probe))["Power"]
+    assert power.status == "warn" and "the Mac sleeps after 10 min without use" in power.text, power
+    assert power.fix == prompts.DOCTOR_POWER_LAPTOP_FIX
+
+
+def test_places_and_routes_need_no_key(home: Path) -> None:
+    """OpenStreetMap is the free default: [maps] without a Google Maps key is fine, and there is no Google line."""
+    findings = by_part(run(write_config(home, MINIMAL + "[maps]\n"), FakeProbe(home)))
+    assert findings["OpenStreetMap"].status == "untested" and "Google Maps" not in findings
+
+
+def test_a_house_number_in_the_home_area_gets_advice_and_is_kept(home: Path) -> None:
+    text = MINIMAL + '[maps]\nhome = "Example Street 12, Town"\n'
+    found = by_part(run(write_config(home, text), FakeProbe(home)))["OpenStreetMap"]
+    assert found.text == "set up, not tested yet (the home area needs only the street and the city)"
+    plain = by_part(run(write_config(home, MINIMAL + '[maps]\nhome = "Example Street, Town"\n'), FakeProbe(home)))
+    assert plain["OpenStreetMap"].text == "set up, not tested yet"
+
+
+def test_the_english_voices_are_checked_on_the_macs_own_model(home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Owner, 26 Oct: one Pocket TTS model speaks every English voice, by the Mac's Gemma: doctor's one line checks the
+    100M's pins beside Gemma 4 26B (32 GB here) and the 18M's beside 12B, names the model and its voices, and the
+    health's one state ("pocket"); vera in the config of a Mac with the 18M is told, as heart, the default, says her
+    lines there (owner, 29 Oct)."""
+    monkeypatch.setattr(voice, "POCKET_FILES", {"pocket-tts/a/x.bin": hashlib.sha256(b"x").hexdigest()})
+    monkeypatch.setattr(voice, "POCKET_FILES_100M", {"pocket-tts/b/y.bin": hashlib.sha256(b"y").hexdigest()})
+    monkeypatch.setattr(voice, "POCKET_PROGRAM", {"tools/p/pocket-tts": hashlib.sha256(b"p").hexdigest()})
+    monkeypatch.setattr(voice, "POCKET_SHIPPED", {"tools/p/heart.safetensors": hashlib.sha256(b"h").hexdigest()})
+    monkeypatch.setattr(
+        voice, "POCKET_SHIPPED_18M", {"tools/p/heart-18m.safetensors": hashlib.sha256(b"s").hexdigest()}
+    )
+    from local_assistant import hostsec
+
+    program = hostsec.estia_root() / "usr/local/estia/current/tools/p/pocket-tts"
+    program.parent.mkdir(parents=True)
+    program.write_bytes(b"p")
+    (program.parent / "heart.safetensors").write_bytes(b"h")
+    (program.parent / "heart-18m.safetensors").write_bytes(b"s")
+    probe = FakeProbe(home)
+    path = write_config(home, MINIMAL + VOICE)
+    models = home / "Library/Application Support/local-assistant/voice-models"
+    log = "~/Library/Logs/local-assistant/voice.log"
+    part = "Pocket TTS voices"
+    probe.answers[HEALTH] = {"stt": "ready", "tts": "ready", "pocket": "loading"}
+    found = by_part(run(path, probe))
+    assert "Voice eve-full" not in found and "Voice eve" not in found  # one line for the one model
+    assert found[part] == Finding(
+        "warn",
+        part,
+        pocket_line(prompts.DOCTOR_POCKET_MISSING.format(size=250, stand_in="af_heart")),
+        prompts.DOCTOR_POCKET_MISSING_FIX.format(log=log),
+    )
+    assert prompts.DOCTOR_POCKET_MISSING.format(size=250, stand_in="af_heart") == (
+        "not fetched yet (about 250 MB, at the voice service's start): Kokoro's af_heart says her lines meanwhile"
+        f" {KOKORO_ON_A_CALL}"
+    )
+    assert all(len(shown) <= hostsec.TERMINAL for shown in render([found[part]]).splitlines())
+    (models / "pocket-tts/b").mkdir(parents=True)
+    (models / "pocket-tts/b/y.bin").write_bytes(b"y")
+    probe.answers[HEALTH] = {"stt": "ready", "tts": "ready", "pocket": "ready"}
+    ready = by_part(run(path, probe))[part]
+    assert ready.status == "ok" and ready.text == (
+        "Pocket TTS ready on its 100M model (heart, jane, eve, vera, alba, michael); its files are the pinned ones"
+    )
+    # a Mac with Gemma 4 12B: the 18M's pins, about 130 MB, no vera, its own heart (owner, 29 Oct)
+    monkeypatch.setattr(voice, "memory_gb", lambda: 16.0)
+    probe.answers[HEALTH] = {"stt": "ready", "tts": "ready", "pocket": "loading"}
+    small_missing = prompts.DOCTOR_POCKET_MISSING.format(size=130, stand_in="af_heart")
+    assert by_part(run(path, probe))[part].text == pocket_line(small_missing)
+    (models / "pocket-tts/a").mkdir(parents=True)
+    (models / "pocket-tts/a/x.bin").write_bytes(b"x")
+    probe.answers[HEALTH] = {"stt": "ready", "tts": "ready", "pocket": "ready"}
+    small = by_part(run(path, probe))[part]
+    assert small.status == "ok" and small.text == (
+        "Pocket TTS ready on its 18M model (heart, jane, eve, alba, michael); its files are the pinned ones"
+    )
+    vera = write_config(home, MINIMAL + VOICE + 'voice = "vera"\n')
+    told = by_part(run(vera, probe))[part]
+    assert told == Finding("warn", part, prompts.DOCTOR_POCKET_NO_VERA, prompts.DOCTOR_POCKET_NO_VERA_FIX)
+    assert told.text == "the config's voice vera speaks only on a Mac with 32 GB of memory or more: heart speaks here"
+    assert told.fix == 'pick another with /voice (/voices lists them), or set [voice] voice = "heart"'
+    # heart, the default on either model (owner, 29 Oct: "on 16gb make Heart the default as well"), speaks as heart
+    # beside the 18M, as an empty [voice] does: no warning; the 18M's own file in her release is the one asked for
+    (program.parent / "heart.safetensors").unlink()
+    for heart in (write_config(home, MINIMAL + VOICE + 'voice = "heart"\n'), write_config(home, MINIMAL + VOICE)):
+        assert by_part(run(heart, probe))[part] == small
+    (program.parent / "heart.safetensors").write_bytes(b"h")
+    (program.parent / "heart-18m.safetensors").unlink()
+    no_small = prompts.DOCTOR_POCKET_NO_SHIPPED.format(stand_in="af_heart", file="heart-18m.safetensors")
+    assert by_part(run(write_config(home, MINIMAL + VOICE), probe))[part].text == no_small
+    (program.parent / "heart-18m.safetensors").write_bytes(b"s")
+    vera = write_config(home, MINIMAL + VOICE + 'voice = "vera"\n')
+    # the review of 26 Oct (R1-F4): the voice that speaks is judged, the one chosen with /voice first (read only); its
+    # own fix, /voice jane, leaves no warning
+    database = load_config(vera).db_path
+    database.parent.mkdir(parents=True, exist_ok=True)
+    store = Store.open(database)
+    store.set_state("voice_name", "jane")
+    store.close()
+    assert by_part(run(vera, probe))[part] == small
+    for kept in ("vera", "af_sky"):  # not used at a start here (vera) or not a voice of the list: the config's is
+        store = Store.open(database)
+        store.set_state("voice_name", kept)
+        store.close()
+        assert by_part(run(vera, probe))[part] == told, kept
+    store = Store.open(database)
+    store.set_state("voice_name", "eve-full")  # another name for eve
+    store.close()
+    assert by_part(run(vera, probe))[part] == small
+    store = Store.open(database)
+    store.set_state("voice_name", "am_puck")  # a Kokoro voice of the list
+    store.close()
+    assert by_part(run(vera, probe))[part] == small
+
+
+def test_hearts_file_is_checked_in_her_release(home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Owner, 27 Oct ("call the voice Heart"; its file in the public repository: "yes"): heart's file ships with the
+    voice service, in its own bundle beside its program in her release (`voice.POCKET_SHIPPED`), where the voice
+    service copies it from; doctor names it when it is not there or not the pinned one (the review of 27 Oct,
+    swift-voice-2: the voice service then leaves only heart's lines to Kokoro, its other voices Pocket's), and checks
+    the models folder's copy with the other files. Beside the 18M its own file is the one asked for (owner, 29 Oct:
+    `voice.POCKET_SHIPPED_18M`, heart-18m.safetensors), never the 100M's. A bundle laid out flat (the native build,
+    Swift 6.2's default: swift-voice-1) is read there too."""
+    real_shipped, real_small, real_100m = voice.POCKET_SHIPPED, voice.POCKET_SHIPPED_18M, voice.POCKET_FILES_100M
+    monkeypatch.setattr(voice, "POCKET_FILES_100M", {"pocket-tts/b/y.bin": hashlib.sha256(b"y").hexdigest()})
+    monkeypatch.setattr(voice, "POCKET_FILES", {"pocket-tts/a/x.bin": hashlib.sha256(b"x").hexdigest()})
+    monkeypatch.setattr(voice, "POCKET_PROGRAM", {"tools/p/pocket-tts": hashlib.sha256(b"p").hexdigest()})
+    monkeypatch.setattr(voice, "POCKET_SHIPPED", {"tools/p/heart.safetensors": hashlib.sha256(b"h").hexdigest()})
+    monkeypatch.setattr(
+        voice, "POCKET_SHIPPED_18M", {"tools/p/heart-18m.safetensors": hashlib.sha256(b"s").hexdigest()}
+    )
+    from local_assistant import hostsec
+
+    program = hostsec.estia_root() / "usr/local/estia/current/tools/p/pocket-tts"
+    program.parent.mkdir(parents=True)
+    program.write_bytes(b"p")
+    models = home / "Library/Application Support/local-assistant/voice-models"
+    (models / "pocket-tts/b").mkdir(parents=True)
+    (models / "pocket-tts/b/y.bin").write_bytes(b"y")
+    (models / "pocket-tts/a").mkdir(parents=True)
+    (models / "pocket-tts/a/x.bin").write_bytes(b"x")
+    probe = FakeProbe(home)
+    probe.answers[HEALTH] = {"stt": "ready", "tts": "ready", "pocket": "unavailable"}
+    path = write_config(home, MINIMAL + VOICE)
+    part = "Pocket TTS voices"
+    update = prompts.DOCTOR_POCKET_PROGRAM_FIX.format(deploy=ownuser.DEPLOY_CMD)
+    big = {"stand_in": "af_heart", "file": "heart.safetensors"}
+    assert by_part(run(path, probe))[part] == Finding(
+        "warn", part, prompts.DOCTOR_POCKET_NO_SHIPPED.format(**big), update
+    )
+    assert prompts.DOCTOR_POCKET_NO_SHIPPED.format(**big) == (
+        "Heart's voice file (heart.safetensors) is not in her release yet: Kokoro's af_heart says only heart's lines"
+        " meanwhile"
+    )
+    # heart's stand-in names it, whichever voice speaks (alba's own is am_michael)
+    alba = write_config(home, MINIMAL + VOICE + 'voice = "alba"\n')
+    assert by_part(run(alba, probe))[part].text == prompts.DOCTOR_POCKET_NO_SHIPPED.format(**big)
+    (program.parent / "heart.safetensors").write_bytes(b"H")
+    probe.answers[HEALTH] = {"stt": "ready", "tts": "ready", "pocket": "refused"}
+    assert by_part(run(path, probe))[part] == Finding(
+        "fail", part, prompts.DOCTOR_POCKET_SHIPPED_CHANGED.format(**big), update
+    )
+    assert prompts.DOCTOR_POCKET_SHIPPED_CHANGED.format(**big) == (
+        "Heart's voice file (heart.safetensors) in her release is not the pinned one: never run; Kokoro's af_heart"
+        " says only heart's lines"
+    )
+    (program.parent / "heart.safetensors").write_bytes(b"h")
+    probe.answers[HEALTH] = {"stt": "ready", "tts": "ready", "pocket": "ready"}
+    assert by_part(run(path, probe))[part].status == "ok"
+    # a 16 GB Mac (the 18M): its own file, heart-18m.safetensors, never the 100M's
+    monkeypatch.setattr(voice, "memory_gb", lambda: 16.0)
+    small = {"stand_in": "af_heart", "file": "heart-18m.safetensors"}
+    probe.answers[HEALTH] = {"stt": "ready", "tts": "ready", "pocket": "unavailable"}
+    assert by_part(run(path, probe))[part] == Finding(
+        "warn", part, prompts.DOCTOR_POCKET_NO_SHIPPED.format(**small), update
+    )
+    (program.parent / "heart-18m.safetensors").write_bytes(b"S")
+    assert by_part(run(path, probe))[part] == Finding(
+        "fail", part, prompts.DOCTOR_POCKET_SHIPPED_CHANGED.format(**small), update
+    )
+    (program.parent / "heart-18m.safetensors").write_bytes(b"s")
+    (program.parent / "heart.safetensors").unlink()  # the 100M's: not asked for here
+    probe.answers[HEALTH] = {"stt": "ready", "tts": "ready", "pocket": "ready"}
+    assert by_part(run(path, probe))[part].status == "ok"
+    (program.parent / "heart.safetensors").write_bytes(b"h")
+    monkeypatch.setattr(voice, "memory_gb", lambda: 32.0)
+    # the real pins: the voice service's own bundle beside its program, the sha256 of the repository's files, in
+    # Contents/Resources (swiftbuild) or at the bundle's top (the native build)
+    heart = "60e5e6cbcac2f61554adcfc1ffd9830308802a3685db49489f5a14e8e65b5425"
+    heart18 = "0d9e5334433271a849bfa97b1a8626cb690446a98ea3008ba016704bc51cd2bb"
+    bundle = "tools/voice/.build/release/voice-service_voice-service.bundle"
+    assert real_shipped == {
+        f"{bundle}/Contents/Resources/heart.safetensors": heart,
+        f"{bundle}/heart.safetensors": heart,
+    }
+    assert real_small == {
+        f"{bundle}/Contents/Resources/heart-18m.safetensors": heart18,
+        f"{bundle}/heart-18m.safetensors": heart18,
+    }
+    assert real_100m["pocket-tts/english/heart/heart.safetensors"] == heart
+    # a flat bundle in her release: found, so no warning
+    flat = {"tools/p/Contents/Resources/heart.safetensors": hashlib.sha256(b"h").hexdigest()}
+    flat["tools/p/heart.safetensors"] = flat["tools/p/Contents/Resources/heart.safetensors"]
+    monkeypatch.setattr(voice, "POCKET_SHIPPED", flat)
+    assert not (program.parent / "Contents").exists() and (program.parent / "heart.safetensors").read_bytes() == b"h"
+    assert by_part(run(path, probe))[part].status == "ok"
+    (program.parent / "heart.safetensors").unlink()
+    assert by_part(run(path, probe))[part].text == prompts.DOCTOR_POCKET_NO_SHIPPED.format(**big)
+
+
+def test_janes_model_for_the_language_in_use_is_checked(home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Owner, 25 Oct: jane speaks Spanish, Italian, Portuguese, Dutch, German and French in Pocket TTS, each language's
+    model fetched only for the language in use. Doctor's voice line covers that language (the one set with /language,
+    else the config's): its files against its pins and its state in the health (`pocket_<code>`); not fetched yet, or
+    fetched and not checked since a start, is no warning; being fetched, other bytes, refused and a voice service from
+    before it are told. English, and the four languages Supertonic-3 speaks, get no such line."""
+    pins = {"de": {"pocket-tts/g/z.bin": hashlib.sha256(b"z").hexdigest()}, "nl": {"pocket-tts/n/y.bin": "0" * 64}}
+    monkeypatch.setattr(voice, "POCKET_LANGUAGE_FILES", pins)
+    probe = FakeProbe(home)
+    part = "Voice jane (German)"
+    assert part not in by_part(run(write_config(home, MINIMAL + VOICE), probe))  # English: no line
+    assert not [
+        p for p in by_part(run(write_config(home, 'language = "ko"\n' + MINIMAL + VOICE), probe)) if "jane (" in p
+    ]
+    assert part not in by_part(run(write_config(home, 'language = "de"\n' + MINIMAL), probe))  # no voice: no line
+    path = write_config(home, 'language = "de"\n' + MINIMAL + VOICE)
+    models = home / "Library/Application Support/local-assistant/voice-models"
+    log = "~/Library/Logs/local-assistant/voice.log"
+    probe.answers[HEALTH] = {"stt": "ready", "tts": "ready", "pocket": "ready", "pocket_de": "idle"}
+    found = by_part(run(path, probe))
+    assert found[part] == Finding("ok", part, prompts.DOCTOR_POCKET_LANGUAGE_NOT_YET.format(language="German"))
+    assert prompts.DOCTOR_POCKET_LANGUAGE_NOT_YET.format(language="German") == (
+        "not fetched yet: fetched the first time she speaks German (about 227 MB); until then Supertonic-3's F1 speaks it"
+    )
+    probe.answers[HEALTH] = {"stt": "ready", "tts": "ready", "pocket_de": "loading"}
+    assert by_part(run(path, probe))[part] == Finding(
+        "warn",
+        part,
+        prompts.DOCTOR_POCKET_LANGUAGE_FETCHING.format(language="German"),
+        prompts.DOCTOR_POCKET_MISSING_FIX.format(log=log),
+    )
+    (models / "pocket-tts/g").mkdir(parents=True)
+    (models / "pocket-tts/g/z.bin").write_bytes(b"z")
+    probe.answers[HEALTH] = {"stt": "ready", "tts": "ready", "pocket_de": "ready"}
+    assert by_part(run(path, probe))[part] == Finding("ok", part, prompts.DOCTOR_POCKET_OK)
+    probe.answers[HEALTH] = {"stt": "ready", "tts": "ready", "pocket_de": "idle"}  # fetched, not checked since a start
+    assert by_part(run(path, probe))[part] == Finding(
+        "ok", part, prompts.DOCTOR_POCKET_LANGUAGE_IDLE.format(language="German")
+    )
+    probe.answers[HEALTH] = {"stt": "ready", "tts": "ready", "pocket_de": "unavailable"}
+    assert by_part(run(path, probe))[part] == Finding(
+        "warn",
+        part,
+        prompts.DOCTOR_POCKET_LANGUAGE_UNAVAILABLE.format(language="German"),
+        prompts.DOCTOR_POCKET_LOG_FIX.format(log=log),
+    )
+    probe.answers[HEALTH] = {"stt": "ready", "tts": "ready", "pocket": "ready"}  # a voice service from before it
+    assert by_part(run(path, probe))[part] == Finding(
+        "warn", part, prompts.DOCTOR_POCKET_LANGUAGE_OLD.format(language="German"), prompts.DOCTOR_VOICE_REINSTALL
+    )
+    (models / "pocket-tts/g/z.bin").write_bytes(b"Z")  # other bytes: never run
+    probe.answers[HEALTH] = {"stt": "ready", "tts": "ready", "pocket_de": "refused"}
+    changed = by_part(run(path, probe))[part]
+    assert (changed.status, changed.text) == ("fail", prompts.DOCTOR_POCKET_LANGUAGE_CHANGED.format(language="German"))
+    dutch = by_part(run(write_config(home, 'language = "nl"\n' + MINIMAL + VOICE), probe))  # the line follows it
+    assert part not in dutch and "Voice jane (Dutch)" in dutch
+
+
+def test_without_a_language_voice_no_jane_line(home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """`[voice] language_voice = ""` gives the six languages back to Supertonic-3's F1 (the review of 25 Oct): nothing of
+    jane's models is fetched or run, so doctor shows no "Voice jane" line."""
+    monkeypatch.setattr(voice, "POCKET_LANGUAGE_FILES", {"de": {"pocket-tts/g/z.bin": "0" * 64}})
+    probe = FakeProbe(home)
+    probe.answers[HEALTH] = {"stt": "ready", "tts": "ready", "pocket_de": "idle"}
+    on = by_part(run(write_config(home, 'language = "de"\n' + MINIMAL + VOICE), probe))
+    assert "Voice jane (German)" in on
+    off = by_part(run(write_config(home, 'language = "de"\n' + MINIMAL + VOICE + 'language_voice = ""\n'), probe))
+    assert off["Config"].status == "ok" and not [part for part in off if "jane (" in part]
+
+
+def test_a_language_models_changed_files_have_their_own_fix(home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The review of 25 Oct: a language's model whose files changed or were refused got eve's fix ("fetches them again
+    when it starts again"), but a language's speaker is idle at every start and checks nothing until a line is asked in
+    it, and its next step deleted the whole pocket-tts folder (eve's, the standard model's and every other language's).
+    Its own fix: the first line she speaks in the language sets the files aside and fetches them again; the folder to
+    delete is the language's own."""
+    pins = {"de": {"pocket-tts/german/weights/z.bin": hashlib.sha256(b"z").hexdigest()}}
+    monkeypatch.setattr(voice, "POCKET_LANGUAGE_FILES", pins)
+    probe = FakeProbe(home)
+    path = write_config(home, 'language = "de"\n' + MINIMAL + VOICE)
+    models = home / "Library/Application Support/local-assistant/voice-models"
+    (models / "pocket-tts/german/weights").mkdir(parents=True)
+    (models / "pocket-tts/german/weights/z.bin").write_bytes(b"Z")  # other bytes
+    probe.answers[HEALTH] = {"stt": "ready", "tts": "ready", "pocket_de": "idle"}
+    changed = by_part(run(path, probe))["Voice jane (German)"]
+    assert changed.status == "fail"
+    assert changed.fix == prompts.DOCTOR_POCKET_LANGUAGE_CHANGED_FIX.format(
+        log="~/Library/Logs/local-assistant/voice.log",
+        restart=prompts.DOCTOR_VOICE_REINSTALL,
+        language="German",
+        folder="~/Library/Application Support/local-assistant/voice-models/pocket-tts/german",
+        rights="",
+    )
+    assert changed.fix == (
+        "see ~/Library/Logs/local-assistant/voice.log for why; after "
+        + prompts.DOCTOR_VOICE_REINSTALL
+        + ", the first line she speaks in German (a voice note or a call; she asks one herself when she starts) sets"
+        " the changed files aside and fetches them again; files that could not be set aside: delete"
+        " ~/Library/Application Support/local-assistant/voice-models/pocket-tts/german first"
+    )
+    assert "pocket-tts first" not in changed.fix  # never the whole folder: eve's and the other languages' too
+
+
+def test_a_practice_language_gets_its_own_line(home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The review of 25 Oct: practice in another language (`/babble de`) fetches and runs that language's model too, but
+    doctor checked only the /language one. A running practice in one of the six gets its own line beside it; an ended
+    one, or one in the language in use, none more."""
+    pins = {"de": {"pocket-tts/g/z.bin": "0" * 64}, "fr": {"pocket-tts/f/y.bin": "0" * 64}}
+    monkeypatch.setattr(voice, "POCKET_LANGUAGE_FILES", pins)
+    probe = FakeProbe(home)
+    probe.answers[HEALTH] = {"stt": "ready", "tts": "ready", "pocket_de": "idle", "pocket_fr": "idle"}
+    path = write_config(home, 'language = "fr"\n' + MINIMAL + VOICE)
+    database = load_config(path).db_path
+    database.parent.mkdir(parents=True)
+    store = Store.open(database)
+    session = {"code": "de", "level": "A2", "aci": ACI, "started": 1.0, "conversation": 2, "ended": 0.0, "due": 0.0}
+    store.set_state(babble.SESSION_KEY, json.dumps(session))
+    found = by_part(run(path, probe))
+    assert "Voice jane (French)" in found and "Voice jane (German)" in found
+    store.set_state(babble.SESSION_KEY, json.dumps(session | {"ended": 5.0, "due": 9.0, "reason": "off"}))
+    assert "Voice jane (German)" not in by_part(run(path, probe))  # ended: not in use
+    store.set_state(babble.SESSION_KEY, json.dumps(session | {"code": "fr"}))
+    assert [part for part in by_part(run(path, probe)) if "jane (" in part] == ["Voice jane (French)"]
+    store.close()
+
+
+def test_the_english_voices_files_are_checked_against_their_pins(home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """With [voice]: the English voices' files (Pocket TTS: the release program beside the voice service in her
+    release, the Mac's model in the voice service's models folder, every sha256), and its state in the health; whatever
+    stops them, Kokoro's af_heart says their lines meanwhile."""
+    pins = {"pocket-tts/a/x.bin": hashlib.sha256(b"x").hexdigest()}
+    monkeypatch.setattr(voice, "POCKET_FILES_100M", pins)  # the 100M's: 32 GB in the tests
+    monkeypatch.setattr(voice, "POCKET_PROGRAM", {"tools/p/pocket-tts": hashlib.sha256(b"p").hexdigest()})
+    monkeypatch.setattr(voice, "POCKET_SHIPPED", {"tools/p/heart.safetensors": hashlib.sha256(b"h").hexdigest()})
+    from local_assistant import hostsec
+
+    program = hostsec.estia_root() / "usr/local/estia/current/tools/p/pocket-tts"
+    program.parent.mkdir(parents=True)
+    program.write_bytes(b"p")
+    (program.parent / "heart.safetensors").write_bytes(b"h")
+    probe = FakeProbe(home)
+    path = write_config(home, MINIMAL + VOICE)
+    part = "Pocket TTS voices"
+    assert part not in by_part(run(write_config(home, MINIMAL), probe))  # no voice: no line
+    path = write_config(home, MINIMAL + VOICE)
+    models = home / "Library/Application Support/local-assistant/voice-models"
+    log = "~/Library/Logs/local-assistant/voice.log"
+    probe.answers[HEALTH] = {"stt": "ready", "tts": "ready", "pocket": "loading"}
+    assert by_part(run(path, probe))[part] == Finding(
+        "warn",
+        part,
+        pocket_line(prompts.DOCTOR_POCKET_MISSING.format(size=250, stand_in="af_heart")),
+        prompts.DOCTOR_POCKET_MISSING_FIX.format(log=log),
+    )
+    (models / "pocket-tts/a").mkdir(parents=True)
+    (models / "pocket-tts/a/x.bin").write_bytes(b"x")
+    probe.answers[HEALTH] = {"stt": "ready", "tts": "ready", "pocket": "ready"}
+    assert by_part(run(path, probe))[part].status == "ok"
+    for state, text in (("loading", prompts.DOCTOR_POCKET_LOADING), ("unavailable", prompts.DOCTOR_POCKET_UNAVAILABLE)):
+        probe.answers[HEALTH] = {"stt": "ready", "tts": "ready", "pocket": state}
+        found = by_part(run(path, probe))[part]
+        assert found == Finding(
+            "warn", part, pocket_line(text.format(stand_in="af_heart")), prompts.DOCTOR_POCKET_LOG_FIX.format(log=log)
+        )
+        assert all(len(shown) <= hostsec.TERMINAL for shown in render([found]).splitlines()), state
+    assert prompts.DOCTOR_POCKET_LOADING.format(stand_in="am_michael") == (
+        f"loading: Kokoro's am_michael says her lines until it is ready {KOKORO_ON_A_CALL}"
+    )
+    assert prompts.DOCTOR_POCKET_UNAVAILABLE.format(stand_in="am_michael") == (
+        "unavailable (a download or a run failed; tried again by itself): Kokoro's am_michael says her lines meanwhile"
+        f" {KOKORO_ON_A_CALL}"
+    )
+    probe.answers[HEALTH] = {"stt": "ready", "tts": "ready"}  # a voice service from before Pocket TTS
+    assert by_part(run(path, probe))[part] == Finding(
+        "warn", part, prompts.DOCTOR_POCKET_OLD.format(stand_in="af_heart"), prompts.DOCTOR_VOICE_REINSTALL
+    )
+    (models / "pocket-tts/a/x.bin").write_bytes(b"X")  # other bytes: never run
+    probe.answers[HEALTH] = {"stt": "ready", "tts": "ready", "pocket": "refused"}
+    changed = by_part(run(path, probe))[part]
+    assert (changed.status, changed.text) == ("fail", prompts.DOCTOR_POCKET_CHANGED.format(stand_in="af_heart"))
+    assert changed.fix == (
+        f"see {log} for why; the voice service sets them aside and fetches them again when it starts again:"
+        " scripts/install-voice-daemon.sh (asks for your Mac password: run it yourself); files that could not be set"
+        " aside: delete ~/Library/Application Support/local-assistant/voice-models/pocket-tts first"
+    )
+    (models / "pocket-tts/a/x.bin").write_bytes(b"x")
+    probe.answers[HEALTH] = {"stt": "ready", "tts": "ready", "pocket": "refused"}  # refused, files right again
+    assert by_part(run(path, probe))[part].text == prompts.DOCTOR_POCKET_CHANGED.format(stand_in="af_heart")
+    (models / "pocket-tts/a").chmod(0)
+    try:
+        unread = by_part(run(path, probe))[part]
+    finally:
+        (models / "pocket-tts/a").chmod(0o700)
+    assert (unread.status, unread.text) == ("warn", prompts.DOCTOR_POCKET_UNREAD)
+    # the program in her release (the review of 24 Oct: never in her home): not there yet, or other bytes
+    deploy = ownuser.DEPLOY_CMD
+    probe.answers[HEALTH] = {"stt": "ready", "tts": "ready", "pocket": "unavailable"}
+    program.unlink()
+    assert by_part(run(path, probe))[part] == Finding(
+        "warn",
+        part,
+        prompts.DOCTOR_POCKET_NO_PROGRAM.format(stand_in="af_heart"),
+        prompts.DOCTOR_POCKET_PROGRAM_FIX.format(deploy=deploy),
+    )
+    assert prompts.DOCTOR_POCKET_NO_PROGRAM.format(stand_in="af_heart") == (
+        "its program is not in her release yet: Kokoro's af_heart says her lines meanwhile"
+    )
+    # the review of 26 Oct (R1-F1): alba's and michael's lines Kokoro's am_michael says, so doctor names him (the voice
+    # in use: the config's, or the one chosen with /voice); a Kokoro voice says its own
+    for config, stored, stand_in in (
+        ("alba", None, "am_michael"),
+        ("jane", "michael", "am_michael"),
+        ("michael", "jane", "af_heart"),
+        ("am_puck", None, "am_puck"),
+    ):
+        chosen = write_config(home, MINIMAL + VOICE + f'voice = "{config}"\n')
+        database = load_config(chosen).db_path
+        database.parent.mkdir(parents=True, exist_ok=True)
+        store = Store.open(database)
+        store.set_state("voice_name", stored or "")
+        store.close()
+        assert by_part(run(chosen, probe))[part].text == (
+            f"its program is not in her release yet: Kokoro's {stand_in} says her lines meanwhile"
+        ), (config, stored)
+    path = write_config(home, MINIMAL + VOICE)
+    assert prompts.DOCTOR_POCKET_PROGRAM_FIX.format(deploy=deploy) == (
+        f"an update puts the pinned one there: {deploy} (if it says the root-run tools differ: read the diff, run "
+        f"{deploy} --update-tools, then {deploy} again)"
+    )
+    program.write_bytes(b"P")
+    probe.answers[HEALTH] = {"stt": "ready", "tts": "ready", "pocket": "refused"}
+    assert by_part(run(path, probe))[part] == Finding(
+        "fail",
+        part,
+        prompts.DOCTOR_POCKET_PROGRAM_CHANGED.format(stand_in="af_heart"),
+        prompts.DOCTOR_POCKET_PROGRAM_FIX.format(deploy=deploy),
+    )
+
+
+# ------------------------------------------------------------------ her own Ollama (as _estia, on her own address)
+
+HERS = 'ollama_base_url = "http://127.0.0.1:8151/v1"\n'
+HER_UID = 4242
+
+
+def her_copy_on_the_mac(monkeypatch: pytest.MonkeyPatch) -> str:
+    """Root's copy of the official build under the suite's system root, every folder up to it "root's" (the test's
+    account plays root), and her account's number."""
+    from local_assistant import ollama_build
+
+    root = hostsec.estia_root()
+    monkeypatch.setattr(ownuser, "CODE_UID", os.getuid())
+    monkeypatch.setattr(ownuser, "lookup_uid", lambda name: HER_UID if name == "_estia" else os.getuid())
+    folder = root / "usr/local/estia/ollama/v0.40.4"
+    for name in ("ollama", *ollama_build.XGRAMMAR):
+        (folder / name).parent.mkdir(parents=True, exist_ok=True)
+        (folder / name).write_bytes(b"\xcf\xfa\xed\xfe")
+    (folder.parent / "current").symlink_to("v0.40.4")
+    for path in (root, *[p for p in root.rglob("*") if not p.is_symlink()]):
+        path.chmod(0o755 if path.is_dir() else 0o644)
+    return "/usr/local/estia/ollama/v0.40.4/ollama"
+
+
+@pytest.mark.parametrize("as_her", [False, True], ids=["as-you", "as-her"])
+def test_her_own_ollama_is_a_tick_on_her_address_as_you_and_as_her(
+    home: Path, monkeypatch: pytest.MonkeyPatch, as_her: bool
+) -> None:
+    probe = FakeProbe(home)
+    probe.her = as_her
+    probe.ollama_at = her_copy_on_the_mac(monkeypatch)
+    probe.ollama_addresses = ("127.0.0.1.8151",)
+    probe.ollama_uid = HER_UID
+    probe.answers["http://127.0.0.1:8151/api/version"] = {"version": "0.40.4"}
+    probe.answers["http://127.0.0.1:8151/api/tags"] = {"models": [{"name": "local-worker:latest"}]}
+    monkeypatch.setattr(FakeProbe, "owner_uid", lambda self: os.getuid())  # yours: the account, or the move's record
+    parts = by_part(run(write_config(home, MINIMAL + HERS), probe))
+    line = parts["Ollama"]
+    assert line.status == "ok", line
+    assert (
+        line.text
+        == "0.40.4 answers (/usr/local/estia/ollama/v0.40.4/ollama): her own, as _estia, with its JSON-schema library"
+    )
+    assert probe.ollama_ports == [8151] and parts["Model"].status == "ok"
+
+
+def test_her_address_held_by_another_account_or_open_to_other_machines_is_named(
+    home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    probe = FakeProbe(home)
+    probe.ollama_at = her_copy_on_the_mac(monkeypatch)
+    probe.ollama_addresses = ("127.0.0.1.8151",)
+    probe.ollama_uid = os.getuid() + 1  # not hers, not yours
+    probe.answers["http://127.0.0.1:8151/api/version"] = {"version": "0.40.4"}
+    line = by_part(run(write_config(home, MINIMAL + HERS), probe))["Ollama"]
+    assert line.status == "fail" and "another account on this Mac" in line.text
+    probe.ollama_uid = HER_UID
+    probe.ollama_addresses = ("*.8151",)
+    line = by_part(run(write_config(home, MINIMAL + HERS), probe))["Ollama"]
+    assert line.status == "warn" and "OLLAMA_HOST=127.0.0.1:8151" in line.text  # as for any Ollama other Macs reach
+
+
+def test_her_own_ollamas_service_file_is_checked_against_her_own(home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from local_assistant import ollama_build, setup
+
+    monkeypatch.setattr(setup, "memory_gb", lambda: 32.0)
+    daemon = hostsec.estia_root() / ollama_build.DAEMON.relative_to("/")
+    daemon.parent.mkdir(parents=True, exist_ok=True)
+    daemon.write_bytes(ollama_build.her_plist(32_768))
+    assert "Ollama service" not in by_part(run(write_config(home, MINIMAL + HERS), FakeProbe(home)))
+    daemon.write_bytes(ollama_build.her_plist(16_384))
+    line = by_part(run(write_config(home, MINIMAL + HERS), FakeProbe(home)))["Ollama service"]
+    assert line.status == "warn"

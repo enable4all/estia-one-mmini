@@ -1,10 +1,11 @@
-"""Documents: the app's side of the documents folder ([documents]): a PDF the user sends saved and read into the
-index, /docs and /docs send, the hourly look and the note on new PDFs. Built by App, which keeps the delegates the tests
-call; every other part of the app is read through `self.app`."""
+"""Documents: the app's side of the documents folder ([documents]): a PDF or text file the user sends saved and read
+into the index, /docs and /docs send, the hourly look and the note on new documents. Built by App, which keeps the
+delegates the tests call; every other part of the app is read through `self.app`."""
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from datetime import datetime
 from pathlib import Path
@@ -17,12 +18,15 @@ from local_assistant.documents import (
     LOOK_SECONDS,
     LOOKED_KEY,
     MAX_BYTES,
+    MAX_TEXT_BYTES,
     DocumentError,
     Documents,
+    media_type,
     not_estia_kb,
     saved_note,
     shown_folder,
 )
+from local_assistant.gate import AttachmentRef, document_suffix
 from local_assistant.initiative import in_quiet_hours
 from local_assistant.signal_io import NotAllowedError, SignalError
 from local_assistant.store import Attachment, Message
@@ -48,47 +52,66 @@ class DocumentsHost:
         self.quiet = quiet_hours_of(app.cfg.initiative_quiet_hours) or QUIET_HOURS
 
     async def save_documents(self, message: Message, attachments: list[Attachment]) -> tuple[str, bool]:
-        """Save the PDFs the allowed user sent into the documents folder and read them into the index; signal-cli's
-        copies go (as for photos). The message keeps where they were saved, the words sent with them below. Code's
-        note (saved where, or why not) and whether one was saved."""
-        notes: list[str] = []
-        paths: list[str] = []
-        documents = self.app.documents
+        """Save the PDFs and text files the allowed user sent into the documents folder and read them into the index;
+        signal-cli's copies go (as for photos). The message keeps where they were saved, the words sent with them
+        below. Code's note (saved where, or why not) and whether one was saved. A document counts as saved once
+        written (review I15): its copy goes and its path and note are kept before it is read, so a restart saves only
+        the rest."""
+        store, documents = self.app.store, self.app.documents
+        key = f"documents:saving:{message.id}:{message.signal_ts}"  # [path, note] of each document saved so far
+        try:
+            saved = [[str(path), str(note)] for path, note in json.loads(store.get_state(key) or "[]")]
+        except (TypeError, ValueError):
+            saved = []
+        before, notes, paths = len(saved), [note for _, note in saved], [path for path, _ in saved]
         when = datetime.fromtimestamp((message.signal_ts or 0) / 1000 or self.app._clock(), self.app.cfg.timezone)
-        for attachment in attachments[: prompts.DOCUMENTS_PER_MESSAGE]:
+        for attachment in attachments[: max(0, prompts.DOCUMENTS_PER_MESSAGE - before)]:
+            suffix = document_suffix(attachment.content_type, attachment.filename) or ".pdf"
+            limit, too_big = (MAX_BYTES, "too_big") if suffix == ".pdf" else (MAX_TEXT_BYTES, "text_too_big")
             try:
                 if documents is None:
                     raise DocumentError("not_shared")
-                if max(attachment.size, self.app._file_size(attachment.signal_id)) > MAX_BYTES:
-                    raise DocumentError("too_big")  # never fetched
+                if max(attachment.size, self.app._file_size(attachment.signal_id)) > limit:
+                    raise DocumentError(too_big)  # never fetched
                 data = await self.app.signal.get_attachment(message.peer_aci, attachment.signal_id)
-                file = await documents.save(data, attachment.filename, when)
+                item = documents.write(data, attachment.filename, when, suffix=suffix)  # no wait to the copy's end
+                saved.append(
+                    [item.path, prompts.DOCUMENT_SAVED.format(path=item.path, about=prompts.DOCUMENT_READ_LATER)]
+                )
+                with store.tx():
+                    store.mark_attachment_deleted(attachment.id)
+                    store.set_state(key, json.dumps(saved))
+                self.app._discard((AttachmentRef(attachment.signal_id, attachment.content_type, attachment.size),))
+                file = await documents.index_saved(item)
             except DocumentError as exc:
-                log.warning("message %d: a PDF not saved: %s", message.id, exc.code)
+                log.warning("message %d: a document not saved: %s", message.id, exc.code)
                 if exc.code == "not_shared" and documents is not None and not_estia_kb(documents.folder):
                     notes.append(prompts.DOCUMENT_NOT_KB.format(folder=shown_folder(documents.folder)))  # as /docs
                     continue
                 notes.append(prompts.DOCUMENT_NOT_SAVED.get(exc.code, prompts.DOCUMENT_NOT_SAVED["failed"]))
                 continue
             except (SignalError, NotAllowedError) as exc:
-                log.warning("message %d: a PDF not fetched: %s", message.id, type(exc).__name__)
+                log.warning("message %d: a document not fetched: %s", message.id, type(exc).__name__)
                 notes.append(prompts.DOCUMENT_NOT_SAVED["failed"])
                 continue
+            saved[-1][1] = saved_note(file)
+            store.set_state(key, json.dumps(saved))
             paths.append(file.path)
-            notes.append(saved_note(file))
-        if len(attachments) > prompts.DOCUMENTS_PER_MESSAGE:
+            notes.append(saved[-1][1])
+        if before + len(attachments) > prompts.DOCUMENTS_PER_MESSAGE:
             notes.append(prompts.DOCUMENTS_LIMIT.format(count=prompts.DOCUMENTS_PER_MESSAGE))
         self.app._drop_attachments(message.id)  # saved or not: signal-cli's copies go
         words = message.text.partition("\n")[2]
         where = ", ".join(paths) or prompts.DOCUMENT_NONE_SAVED
-        self.app.store.set_message_text(
-            message.id, f"{prompts.DOCUMENT_MARK} {where}" + (f"\n{words}" if words else "")
-        )
-        return "\n".join(notes), bool(paths)
+        with store.tx():
+            store.set_message_text(message.id, f"{prompts.DOCUMENT_MARK} {where}" + (f"\n{words}" if words else ""))
+            store.delete_state(key)
+        # never an empty note: a message whose copies were gone before a restart (an older release's stop)
+        return "\n".join(notes) or prompts.DOCUMENT_NOT_SAVED["failed"], bool(paths)
 
     async def docs_command(self, args: str, message: Message) -> str:
-        """/docs: a look first (a PDF put there a minute ago is listed), then the list, newest first; the list names
-        them, so no note follows for these. /docs send N: that PDF back to the account that asked."""
+        """/docs: a look first (a document put there a minute ago is listed), then the list, newest first; the list
+        names them, so no note follows for these. /docs send N: that document back to the account that asked."""
         documents = self.app.documents
         if documents is None:
             return prompts.DOCS_OFF
@@ -116,7 +139,7 @@ class DocumentsHost:
         except DocumentError as exc:
             return prompts.DOCS_NOT_SENT.format(why=prompts.DOCS_NOT_SENT_WHY.get(exc.code, exc.code))
         try:
-            await self.app.signal.send_document(message.peer_aci, data, Path(file.path).name)
+            await self.app.signal.send_document(message.peer_aci, data, Path(file.path).name, media_type(file.path))
         except (SignalError, NotAllowedError) as exc:
             log.warning("/docs send: not sent: %s", type(exc).__name__)
             return prompts.DOCS_NOT_SENT.format(why=prompts.DOCS_NOT_SENT_WHY["failed"])
@@ -138,7 +161,8 @@ class DocumentsHost:
     async def documents_tick(self) -> None:
         """The hourly look at the folder (outside quiet hours; it starts never during a call, an answer or the lock,
         reads LOOK_SECONDS at most and stops when a call or the lock begins: the rest a minute later), then the note
-        on new PDFs: held in quiet hours, skipped under /quiet. Gemma is used in neither."""
+        on new documents: held in quiet hours, while locked and during a call (one that began during the look too),
+        skipped under /quiet. Gemma is used in neither."""
         documents = self.app.documents
         if documents is None or self.app.guard.locked or not self.app._no_call.is_set():
             return
@@ -159,11 +183,12 @@ class DocumentsHost:
             documents.mark_announced(found)
             log.info("documents: the note on %d new document(s) skipped: /quiet", len(found))
             return
-        if quiet or self.app.guard.locked:
-            return  # held until the quiet hours end
+        quiet = in_quiet_hours(datetime.fromtimestamp(self.app._clock(), self.app.cfg.timezone), self.quiet)  # now
+        if quiet or self.app.guard.locked or not self.app._no_call.is_set():
+            return  # held until the quiet hours, the lock or a call that began during the look end (review I5)
         documents.mark_announced(found)
         conversation = self.app.store.current_conversation()
         for aci in sorted(self.app.cfg.allowed_acis):
-            out_id = self.app.store.add_outgoing(conversation.id, aci, "note", text, None, private=True)  # PDF names
+            out_id = self.app.store.add_outgoing(conversation.id, aci, "note", text, None, private=True)  # their names
             await self.app._send(out_id)
         log.info("documents: the note on %d new document(s) sent", len(found))

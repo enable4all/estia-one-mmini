@@ -1,11 +1,10 @@
-# Estia
+<img src="docs/brand/estia-mark.svg" alt="Estia's mark: a silver ring around an orange rounded square" width="64" align="right">
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/brand/estia-hero-dark.png">
-  <img src="docs/brand/estia-hero-light.png" alt="A stone garden seen from above, its gravel raked in rings around a Mac mini" width="100%">
-</picture>
+# estia one
 
-**An insanely secure & private thinking partner, living at home.** Estia (Εστία, the hearth) runs on one Mac at home and is reached only through Signal: encrypted texts, voice notes and calls. Name her what you like. Ours is called Tiffany. Estia started as Tiffany, our own thinking partner, before she was opened up for every home. Her Signal picture is her name's first letter with Estia's orange full stop, accents left out (Ángela gets an a.); a first letter outside a to z even then, such as Greek or Chinese, keeps Estia's e.
+<picture><source media="(prefers-color-scheme: dark)" srcset="docs/brand/estia-hero-dark.png"><img src="docs/brand/estia-hero-light.png" alt="A stone garden seen from above, its gravel raked in rings around a Mac mini" width="100%"></picture>
+
+**An insanely secure & private thinking partner, living at home.** Estia (Εστία, the hearth) runs on one Mac at home and is reached only through Signal: encrypted texts, voice notes and calls. Name her what you like. Ours is called Tiffany. Estia started as Tiffany, our own thinking partner, before she was opened up for every home. Her Signal picture is Estia's mark, whatever her name: a silver ring around an orange rounded square. A picture of your own can replace it.
 
 Website: [estia.one](https://estia.one)
 
@@ -13,21 +12,21 @@ Website: [estia.one](https://estia.one)
 
 Insanely secure, and every claim can be checked in the open-source code.
 
-- **Local.** Gemma, Google's open AI model, runs on the Mac through Ollama's official build; a cloud model, which Ollama runs on its own servers, is refused. No cloud AI service, no account with us, no telemetry. Chats, memory and profile stay on the Mac.
+- **Local.** Gemma, Google's open AI model, runs on the Mac through Ollama's official build, or the Ollama app when chosen at setup; a cloud model, which Ollama runs on its own servers, is refused. No cloud AI service, no account with us, no telemetry. Chats, memory and profile stay on the Mac.
 - **Read-only mail and calendars.** She never sends, moves, deletes or marks mail, and never changes a calendar event.
 - **Lights and plugs follow a rule set per device.** Each device is `normal`, `ask first` or `never off` (switching it off is refused). A device change after outside text waits for your yes.
 - **Only Signal.** Reached through Signal on your phone or Signal Desktop on your laptop. No web app and no open port: the bridge listens on nothing, so nothing on the network can connect to her. Messages travel end-to-end encrypted through Signal. Only the Signal accounts in the config get an answer.
-- **Keys stay put.** Keys and sign-ins never appear in chat, logs or the code repository. Only her own hidden macOS account, `_estia`, can read the keys: a program you run needs your Mac password to read them, as long as no admin rule skips that password (the security step checks).
+- **Keys stay put.** Keys and sign-ins never appear in chat, logs or the code repository. Only her own hidden macOS account, `_estia`, can read the keys in her files: a program you run needs your Mac password to read them, as long as no admin rule skips that password (the security step checks). A key in your login keychain stays readable by programs you run: the copies setup keeps there (the web keys) and the web and maps keys setup can copy from there. Signal's Recovery key and Account ID: in your login keychain on this Mac. Every read of them asks first, in a macOS dialog, unless that program was given Always Allow there. Over a remote login (SSH), that dialog cannot show, so a read there fails: they are read only on the Mac's own screen (Keychain Access, or Screen Sharing). Setup never reads them back, so a macOS dialog that asks for them comes from another program: deny it. Always Allow for macOS's own security tool, which any program can run, lets every program you run read them without asking. A program you run can still remove or replace them without asking: keep both in your password manager too. The Account ID also stays in setup's answers file, which programs you run can read.
 
 All of it in plain words: [Safe and private](GUIDE.md#safe-and-private-in-plain-words). Known gaps: [SECURITY.md](SECURITY.md#known-accepted-gaps).
 
 ## Architecture
 
-<p align="center">
-  <a href="https://estia.one/#architecture"><img src="docs/images/estia-architecture-dark.svg" width="100%" alt="Estia is reached only through Signal, end-to-end encrypted, and runs on one Mac mini at home with no web app and no open port. Mail and calendars are read-only, searches, web pages, YouTube captions and Google Maps are questions out, models, code and tools are downloaded, and lights, plugs and speakers stay on the home network."></a>
-</p>
+<p align="center"><a href="https://estia.one/#architecture"><img src="docs/images/estia-architecture-dark.svg" width="100%" alt="Estia is reached only through Signal, end-to-end encrypted, and runs on one Mac mini at home with no web app and no open port. Mail and calendars are read-only, searches, web pages, YouTube captions and map questions (OpenStreetMap; Google Maps once set up) are questions out, models, code and tools are downloaded, and lights, plugs and speakers stay on the home network."></a></p>
 
-Estia runs on one Mac mini at home and is reached only through Signal: texts, voice notes, photos, PDFs, locations and calls, end-to-end encrypted. No web app, no open port. She reads mail and calendars but never changes them. Searches, web pages, YouTube captions and Google Maps are questions out; mail, project and document text never go to a search engine or Google Maps. Models, code and tools are downloaded into the Mac. Lights, plugs and speakers are reached over the home network only, never through the TP-Link or Philips cloud. Click the diagram to open it on estia.one, where each part has a short note.
+Estia runs on one Mac mini at home and is reached only through Signal: texts, voice notes, photos, PDFs, locations and calls, end-to-end encrypted. No web app, no open port. She reads mail and calendars but never changes them. Searches, web pages, YouTube captions and map questions (OpenStreetMap; Google Maps once set up) are questions out; an answer that reads mail, a project or a document sends nothing to a search engine or a map. Models, code and tools are downloaded into the Mac. Lights, plugs and speakers are reached over the home network only, never through the TP-Link or Philips cloud. Click the diagram to open it on estia.one, where each part has a short note.
+
+<p align="center"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/images/setup-window-dark.png"><img src="docs/images/setup-window-light.png" alt="The Estia Setup window's first screen: Estia's mark, estia one, the tagline, and Skip or Play intro" width="480"></picture></p>
 
 ## What she does
 
@@ -55,7 +54,7 @@ One line and one example each. Every detail and limit: [What she can do](GUIDE.m
 
 <img src="docs/brand/tags/opt-in.svg" alt="Opt-in" height="22"> Off until you turn it on.
 
-- **Messages she starts.** Now and then: a check-in, a calendar change or an early start, a Sunday look back, a spontaneous note. At most one a day, never between 22:00 and 08:00. Example: `/initiative on` (off until you do).
+- **Messages she starts.** Now and then: a check-in, a calendar change or an early start, a Sunday look back, a spontaneous note. By default at most one a day, never between 22:00 and 08:00. Example: `/initiative on` (off until you do).
 
 - **Evening note.** Three short questions at 21:00, or the time you pick: what went well, what is still open, one thing for tomorrow. The same words each evening, written by the code, never by the AI. Example: `/evening on` (off until you do).
 
@@ -65,13 +64,13 @@ One line and one example each. Every detail and limit: [What she can do](GUIDE.m
 
 - **Wake-up calls.** A text, then a Signal call at that time (once calls are set up). Example: "Call me at 7:00 to wake me up".
 
-- **Voice notes.** Transcribed on the Mac, answered in text, and optionally read back as a voice note (`/voice`). Example: a voice note, in her language.
+- **Voice notes.** Transcribed on the Mac, answered in text, and optionally read back as a voice note, spoken on the Mac in heart, her default voice (`/voice`). Example: a voice note, in her language.
 
 - **Calendar.** That day's events from each calendar, with times and places. Example: "What's on Friday?"
 
-- **Mail.** Unanswered mail from the last week, numbered. "Read 2" opens one. Microsoft 365 mailboxes; Gmail is not built in. Example: "What needs my reply?"
+- **Mail.** Unanswered mail from the last week, numbered. "Read 2" opens one. Microsoft 365 mailboxes. Outlook.com: not supported. Gmail is not built in. Forwarding Gmail to a mailbox she reads works today. Example: "What needs my reply?"
 
-- **Morning digest.** Today's calendar, tomorrow in one line, then the mail that needs a reply. Example: none needed; it comes at 09:15 on its own.
+- **Morning digest.** Today's calendar, tomorrow's first events, one per line, then the mail that needs a reply. Example: none needed; it comes at 09:15 on its own.
 
 - **Music.** Spotify on your speakers (once set up). Music is text only. Example: "Play some jazz".
 
@@ -81,19 +80,21 @@ One line and one example each. Every detail and limit: [What she can do](GUIDE.m
 
 - **Chords.** Chords, key and tempo from a chord site, with a Sources message. Example: "What are the chords of Spooky?"
 
-- **Places and routes.** Up to five places with rating, price and today's hours, or the time, distance and lines, with Google Maps links (once set up). Example: "How long to the station by bike?"
+- **Places and routes.** Up to five places with today's hours where the map lists them, a phone number and a website, or the time, distance and lines, from OpenStreetMap with nothing to install and no account; once set up, Google Maps answers in OpenStreetMap's place: with rating and price, without a phone number or website, in Google's order. Example: "How long to the station by bike?"
 
 - **Projects.** Open to-do items and recent changes from a project on the Mac. An extra, off by default. Example: "What's next on \<project>?"
 
-- **Documents.** An answer from your PDFs that names the document and the page. An extra, off by default. Example: "What does my lease say about pets?"
+- **Documents.** An answer from your PDFs and text files that names the document and the page. An extra, off by default. Example: "What does my lease say about pets?"
 
 - **Transposing chords.** Chords transposed or moved for a capo, a chord's notes and the key of given chords, worked out on the Mac and given in a note from the code, not from the AI. An extra, off by default. Example: "Get the chords of Spooky and transpose them 4 semitones higher".
 
 ## Install
 
-**1. A Mac and a number.** A Mac with Apple silicon and 16 GB of memory or more, plus a spare phone number for her Signal account. On 16 or 24 GB the smaller model failed some of her safety tests (SECURITY.md, known gaps). 32 GB with Gemma 26B is the tested setup.
+**1. A Mac and a Signal account for her.** A Mac with Apple silicon (M1 or later), macOS 27 or later and 16 GB of memory or more. On 16 or 24 GB the smaller model failed some of her safety tests: words planted in forwarded audio, mail or calendar can steer her answers (SECURITY.md, known gaps). 32 GB with Gemma 26B is the tested setup. Her Signal account is one of two:
+- **A spare phone number:** a prepaid SIM in any phone, for one SMS code at setup, kept topped up. The tested route.
+- **An account without a number:** made once in Signal for Android 8.31.2 or later, on a phone with Google Play, and bought once there ($2.99 or EUR 3.49); iPhone not yet. The phone for it is a spare or borrowed one where Signal is not set up yet, never the phone with your own Signal: one Signal app holds one account. Texts and voice notes work both ways; a call she answers on it is untested.
 
-**2. Two lines, in your own Terminal window.** Setup asks its questions there, and the Signal codes, passwords and keys are typed hidden. Over a remote login (SSH), run it inside `screen` (built into macOS), so a dropped connection does not stop it.
+**2. Two lines, in your own Terminal window.** At the Mac's own screen, setup opens its own window, Estia Setup, and every step runs there (Google Maps alone stays in Terminal); the Mac password goes only into macOS's own box, never into the window. Over a remote login (SSH), run it inside `screen` (built into macOS), so a dropped connection does not stop it. There, setup asks in Terminal, and the Signal codes, passwords and keys are typed hidden. Keep the Mac plugged in, with its lid open: setup keeps it awake until it ends. A Mac without Apple's Command Line Tools, which hold git, asks to install them in a window on its own screen; over a remote login, run Homebrew's installer first, which installs them (your Mac password once): `/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"`, then the two lines below.
 
 ```sh
 git clone https://github.com/enable4all/estia-one-mmini.git ~/estia && cd ~/estia
@@ -104,15 +105,13 @@ scripts/setup.sh
 
 **How long:** downloads and builds take about 30 minutes on a 100 Mbit/s line, most of it the model download (18.3 GB); about 15 minutes on a Mac with 16 or 24 GB of memory, where the model is 7.7 GB. Voice adds about 15 minutes while her voice loads, after its build and a 1.7 GB download (about 4 minutes). Each step, measured or computed: [How long it takes](GUIDE.md#how-long-it-takes).
 
-A Mac without Apple's Command Line Tools, which hold git, asks to install them in a window on its own screen. Over a remote login (SSH), run Homebrew's installer first, which installs them (your Mac password once): `/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"`, then the two lines above.
-
-Or open the folder in an AI coding assistant (Claude Code, Codex, ...) and say **"set me up"**. It follows [SETUP-WITH-YOUR-AI.md](SETUP-WITH-YOUR-AI.md): it checks the Mac and explains each question before it comes, and you run `scripts/setup.sh` in your own Terminal window, where the Signal codes, passwords and keys are typed hidden. `/usr/bin/sudo /usr/local/estia/bin/estia doctor` checks the result.
+Or open the folder in an AI coding assistant (Claude Code, Codex, ...) and say **"set me up"**. It follows [SETUP-WITH-YOUR-AI.md](SETUP-WITH-YOUR-AI.md): it checks the Mac, starts setup at the Mac's own screen and says what each screen needs. Every answer is typed in the Estia Setup window, the Mac password only in macOS's own box; setup shows the AI only its step lines, never an answer, a code, a PIN or a key. Over a remote login (SSH), you run `scripts/setup.sh` in your own Terminal window instead, where the Signal codes, passwords and keys are typed hidden. `/usr/bin/sudo /usr/local/estia/bin/estia doctor` checks the result.
 
 ## Everything else
 
 [GUIDE.md](GUIDE.md) has the rest: [what she can do](GUIDE.md#what-she-can-do) · [languages](GUIDE.md#languages) · [language practice](GUIDE.md#language-practice) · [safe and private](GUIDE.md#safe-and-private-in-plain-words) · [what runs where](GUIDE.md#what-runs-where) · [when something is off](GUIDE.md#when-something-is-off) · [slash commands](GUIDE.md#slash-commands) · [requirements](GUIDE.md#requirements) · [a rented Mac (VPS)](GUIDE.md#a-rented-mac-vps) · [set it up](GUIDE.md#set-it-up) · [what's next](GUIDE.md#whats-next) · [for developers](GUIDE.md#for-developers). Every sign-in and key, step by step: [setup_assistant.md](setup_assistant.md).
 
-Not affiliated with Signal, Spotify, Google, Microsoft, Apple, Amazon, Bose, TP-Link, Philips, Fastmail, Nextcloud, Scaleway, MacStadium, Ollama, OpenAI, Anthropic, Hugging Face, Brave, GitHub, Homebrew, crates.io or OpenClaw.
+Not affiliated with Signal, Spotify, Google, Microsoft, Apple, Amazon, Bose, TP-Link, Philips, Fastmail, Nextcloud, Scaleway, MacStadium, Ollama, OpenAI, Anthropic, Hugging Face, Brave, GitHub, Homebrew, crates.io, the OpenStreetMap Foundation, FOSSGIS, Transitous or OpenClaw.
 
 ## License
 

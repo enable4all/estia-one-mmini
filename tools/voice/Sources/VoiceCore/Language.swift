@@ -29,7 +29,11 @@ public enum Languages {
 
 /// The `/health` answer: each engine's state, and the languages (the bridge reads their presence to know the
 /// installed service takes a language); `vad` is the speech detector's (its presence: the service has `/vad`), `turn`
-/// the turn detector's (its presence: the service has `/turn`).
-public func healthBody(stt: String, tts: String, vad: String, turn: String) -> [String: Any] {
-    ["stt": stt, "tts": tts, "vad": vad, "turn": turn, "languages": Languages.all]
+/// the turn detector's (its presence: the service has `/turn`); `hints`: a transcription takes her name (`Hint`);
+/// `pocket`: Pocket TTS's, by model (`PocketSpeech.health`: English's "pocket", every English voice's on the Mac's
+/// model, 100M or 18M; a language's "pocket_<code>", jane's in it; idle, loading, ready, unavailable, refused; their
+/// presence: English in those voices, and that language in jane, is Pocket's).
+public func healthBody(stt: String, tts: String, vad: String, turn: String, pocket: [String: String]) -> [String: Any] {
+    let body: [String: Any] = ["stt": stt, "tts": tts, "vad": vad, "turn": turn, "languages": Languages.all, "hints": true]
+    return body.merging(pocket) { kept, _ in kept }
 }

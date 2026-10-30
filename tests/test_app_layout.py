@@ -1,4 +1,4 @@
-"""The layout of app.py and its four hosts: how long App.__init__ is, which class holds which methods, and that App
+"""The layout of app.py and its five hosts: how long App.__init__ is, which class holds which methods, and that App
 keeps one-line delegates for the names the tests and the call manager use."""
 
 import ast
@@ -64,6 +64,7 @@ def test_the_call_methods_live_on_call_host_and_app_only_delegates() -> None:
         "call_warm_up",
         "practice_call_ended",
         "call_drop_waiting",
+        "call_standby",
         "call_interrupted",
         "call_note",
         "call_chords",
@@ -147,8 +148,30 @@ def test_the_status_methods_live_on_status_host() -> None:
 def test_app_and_the_hosts_are_readable_sizes() -> None:
     sizes = {
         name: len((SRC / f"{name}.py").read_text().splitlines())
-        for name in ("app", "call_host", "documents_host", "lifecycle", "status_host")
+        for name in ("app", "call_host", "documents_host", "lifecycle", "status_host", "signal_host")
     }
     assert sizes["app"] <= 1760, sizes  # 1750 until 0.9.6: C2 (links out of notes) and rule 6 (notes in her history)
-    assert sizes["call_host"] <= 450 and sizes["lifecycle"] <= 350, sizes
+    # call_host 450 until 0.9.7's review: a turn's notes sent in the background (C4), code's lines kept apart (C1);
+    # 500 until 0.9.8's Kokoro cap (owner, 28 Oct): the rest of an answer her voice stopped for, texted (call_text)
+    # lifecycle 350 until 0.9.8: setup_facts, a delegate (setup's handover does its work in setup_handover); 355 until
+    # 0.9.8's review: setup's note owed past the window and the notes from before the update, delegates too (memory-4,
+    # memory-7: setup_handover.send_owed, profiler.learned_before_update); call_host 500 until the 0.9.8 gate's fixes:
+    # her closing question after a full answer left out, never with the glance (calls.without_closing_questions),
+    # and the Kokoro cap's call_text
+    assert sizes["call_host"] <= 525 and sizes["lifecycle"] <= 365, sizes
     assert sizes["status_host"] <= 250 and sizes["documents_host"] <= 200, sizes
+    assert sizes["signal_host"] <= 150, sizes
+
+
+def test_her_signal_accounts_state_lives_on_signal_host() -> None:
+    """The safety numbers that changed, signal-cli's connection, Signal's wait and the stored messages of an account no
+    longer allowed (review 0.9.7 S2-S5): on SignalHost, never grown back into App."""
+    assert {
+        "set_aside_if_not_allowed",
+        "connection",
+        "mark_identity_changed",
+        "identity_opened",
+        "wait_after",
+        "waits",
+    } <= names_of(SRC / "signal_host.py", "SignalHost")
+    assert not {"set_aside_if_not_allowed", "_signal_waits", "_mark_identity_changed"} & names_of(SRC / "app.py", "App")

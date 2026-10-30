@@ -58,12 +58,18 @@ _YES: dict[str, tuple[str, ...]] = {
 YES_WORDS = frozenset(word for words in _YES.values() for word in words)
 
 
+# a call turn's mark when the caller said it over her answer ("[call] (cutting in) yes"; prompts.CUTTING_IN)
+CUTTING_IN = "(cutting in)"
+
+
 def yes_form(text: str) -> str:
-    """A message as a yes is told: without the [voice] or [call] mark, casefolded, trailing punctuation and a leading
-    "¡" dropped, commas as spaces ("[call] Ja, graag." -> "ja graag"). An [audio file] keeps its mark: no yes."""
+    """A message as a yes is told: without the [voice] or [call] mark (and a call's "(cutting in)": a yes said over the
+    end of her answer), casefolded, trailing punctuation and a leading "¡" dropped, commas as spaces ("[call] Ja,
+    graag." -> "ja graag"). An [audio file] keeps its mark: no yes."""
     spoken = text.strip()
     for mark in ("[voice]", "[call]"):
         spoken = spoken.removeprefix(mark)
+    spoken = spoken.strip().removeprefix(CUTTING_IN)
     answer = re.sub(r"[\s.!,。！、]+$", "", spoken.strip().casefold()).lstrip("¡")
     return re.sub(r"[\s,、]+", " ", answer)
 
@@ -257,6 +263,21 @@ THANKS: dict[str, tuple[str, ...]] = {
     "ru": ("спасибо", "спасибо большое", "большое спасибо"),
     "fr": ("merci", "merci beaucoup", "merci bien"),
 }  # fmt: skip
+# words a caller puts beside her name to call her ("hey Estia", the Japanese honorific): with only these and her name,
+# a turn that ends standby is her name alone (wake.only_name), answered by code's wake line
+CALLING: dict[str, tuple[str, ...]] = {
+    "en": ("hey", "hi", "hello", "hallo", "yo", "ok", "okay", "oh", "so", "um", "uh", "hmm"),
+    "es": ("oye", "hola", "eh", "oiga"),
+    "it": ("ehi", "ciao", "senti", "ehm"),
+    "ko": ("저기", "저기요", "여보세요", "야"),
+    "pt": ("oi", "olá", "ei", "alô"),
+    "nl": ("hoi", "hé", "hallo", "hey", "eh"),
+    "pl": ("hej", "halo", "cześć", "słuchaj"),
+    "de": ("hey", "hallo", "he", "hi", "äh"),
+    "ja": ("ねえ", "ねぇ", "もしもし", "あの", "さん", "ちゃん", "えっと"),
+    "ru": ("эй", "привет", "алло", "слушай"),
+    "fr": ("hé", "salut", "allô", "coucou", "euh"),
+}  # fmt: skip
 # leave-taking that also means something else alone ("I'm off" is a day off too): it counts only with a soft word
 # beside it ("Okay, I'm off.", "I'm off now")
 LEAVING_NOT_ALONE: dict[str, tuple[str, ...]] = {"en": ("i'm off", "i am off")}
@@ -412,6 +433,41 @@ GOODBYES: dict[str, tuple[str, ...]] = {
     ),
     "fr": ("au revoir", "à bientôt", "à plus", "à plus tard", "à tout à l'heure", "à demain", "bonne nuit"),
 }  # fmt: skip
+# A caller's goodbye right after hers that is also "hello" elsewhere ("Ciao!", "Пока!"): with her goodbye said, it
+# closes the call too (calls.closes_only; review of 0.9.7: only English goodbyes ended it). Translations need a native
+# speaker's check
+PARTING: dict[str, tuple[str, ...]] = {
+    "it": ("ciao", "ciao ciao"),
+    "ko": ("안녕", "안녕히"),
+    "pt": ("tchau tchau", "boa noite", "falou"),
+    "nl": ("dag", "dag dag", "doei doei"),
+    "pl": ("cześć", "pa"),
+    "de": ("ciao", "servus", "tschau"),
+    "ja": ("じゃあ", "じゃ", "じゃあまた"),
+    "ru": ("пока",),
+    "fr": ("salut", "ciao", "bonne soirée", "bonne journée"),
+}
+# the ones of PARTING that alone are also a greeting or a turn's opening ("Ciao!", "Dag!", "Salut !": "hello" too, as
+# GOODBYES says; "Servus!", "hello" in the south; "じゃあ", "well then"; "falou", "said"): from the caller, after outside
+# text, one closes the call only after a thanks ("Grazie, ciao!"; calls.closes_call; fix review of 0.9.8, voice-01)
+PARTING_NOT_ALONE: dict[str, tuple[str, ...]] = {
+    "it": ("ciao",),
+    "ko": ("안녕",),
+    "pt": ("boa noite", "falou"),
+    "nl": ("dag",),
+    "pl": ("cześć",),
+    "de": ("ciao", "servus"),
+    "ja": ("じゃあ", "じゃ"),
+    "fr": ("salut", "ciao"),
+}
+# the ones of GOODBYES that also mean "for now", "so far" or "later" ("Na razie dobrze.", "so far, good"; "うん、またあとで。
+# 天気を教えて", "yeah, later. Tell me the weather"): from the caller, after outside text, one closes the call only at the
+# turn's end, after a thanks or another goodbye ("Dzięki, na razie!"; calls.closes_call; second fix review of 0.9.8,
+# redteam-calls-so-far-reads-as-goodbye). Translations need a native speaker's check
+GOODBYES_NOT_ALONE: dict[str, tuple[str, ...]] = {
+    "pl": ("na razie",),
+    "ja": ("またあとで", "また今度"),
+}
 # On a call, words after a goodbye, leave-taking or a request to end the call that say more is coming: "wait", "one
 # more thing", "actually", "before you go" (calls._closing_talk keeps the call open; review 18 Oct: they were English
 # only), besides each language's "but" (BUT) and stop words; English's count on every call. Korean is matched inside
@@ -460,6 +516,9 @@ MORE_COMING: dict[str, tuple[str, ...]] = {
 # Her closing wishes and offers to wait at the end of a call (owner, 18 Oct, after reading how her calls end: half of
 # 44 ended "Enjoy your evening!", "I'll be here whenever you're ready."): each a pattern a part of her last sentence must
 # start with, and the most words that part may have (a wish is short: "Good luck with that is what I'd say" is none).
+# A word that is also a noun or a verb counts only in its wish form: alone, or before the words a wish goes on with
+# (the second deep scan, calls-farewell-misfire: "Succes is geen toeval.", "Good luck plays a part.", "いつでも行けますよ。"
+# and "잘 자야 해요." ended a call after its quiet listen).
 # Matched by calls._farewell on the call language's and English's, case folded; a leading "and" is left out (AND).
 # Known gap: the other nine languages' patterns are untested by a native speaker.
 FAREWELLS: dict[str, tuple[tuple[str, int], ...]] = {
@@ -469,7 +528,7 @@ FAREWELLS: dict[str, tuple[tuple[str, int], ...]] = {
          r"|time|session|workout|run|flight|holiday|meal|dinner|lunch)\b", 8),
         (r"have fun\b", 5),
         (r"(?:sleep (?:well|tight)|sweet dreams|rest well)\b", 5),
-        (r"good luck\b", 6),
+        (r"good luck(?:$| with\b| on\b| in\b| at\b| for\b| tomorrow\b| today\b| then\b| to you\b)", 6),
         (r"(?:i'll|i will) (?:catch|talk to|speak to) you\b", 8),
         (r"(?:i'll|i will) be (?:right )?here\b", 20),
         (r"i'm (?:still |always )?here (?:if|when|whenever|for you)\b", 20),
@@ -480,17 +539,17 @@ FAREWELLS: dict[str, tuple[tuple[str, int], ...]] = {
         (r"(?:nog )?(?:een )?fijne? (?:dag|avond|middag|ochtend|nacht|weekend|week|wedstrijd|reis)\b", 6),
         (r"geniet (?:nog )?van je \w+", 6),
         (r"slaap lekker\b", 4),
-        (r"(?:veel )?succes\b", 6),
+        (r"(?:veel )?succes(?:$| met\b| bij\b| ermee\b| morgen\b| vandaag\b| straks\b)", 6),
         (r"veel plezier\b", 6),
         (r"ik ben er (?:als|wanneer|voor je)\b", 12),
         (r"ik ben hier (?:als|wanneer)\b", 12),
-        (r"ik spreek je\b", 6),
+        (r"ik spreek je (?:later|morgen|gauw|snel|straks|nog|binnenkort|vanavond)\b", 6),
     ),
     "de": (
         (r"(?:einen )?schönen (?:tag|abend|nachmittag|morgen)\b", 6),
         (r"(?:ein )?schönes wochenende\b", 6),
         (r"schlaf gut\b", 4),
-        (r"viel (?:erfolg|spaß|glück)\b", 6),
+        (r"viel (?:erfolg|spa(?:ß|ss)|glück)(?:$| bei\b| beim\b| mit\b| dabei\b| damit\b| morgen\b| heute\b| noch\b)", 6),
         (r"ich bin (?:da|hier),? (?:wenn|falls)\b", 12),
     ),
     "fr": (
@@ -503,8 +562,10 @@ FAREWELLS: dict[str, tuple[tuple[str, int], ...]] = {
         (r"que (?:tengas|pases) (?:un |una )?(?:buen|buena|bonito|bonita|feliz) (?:día|tarde|noche|fin de semana)\b", 8),
         (r"disfruta (?:de )?(?:tu|el resto de tu) \w+", 7),
         (r"que descanses\b", 4),
-        (r"(?:mucha )?suerte\b", 6),
-        (r"aquí (?:estoy|estaré)\b", 12),
+        (r"(?:mucha )?suerte(?:$| con\b| en\b| mañana\b| hoy\b| para\b)", 6),
+        # the offer form only, as English's "I'm here if…": a bare "¡Aquí estoy!" answers "¿Estás ahí?" (fix review of
+        # 0.9.8, dialogue-02); "por si" ("in case") is one (its second fix review, voice-06)
+        (r"aquí (?:estaré\b|estoy (?:si|por si|cuando|para ti|para usted|para lo que|siempre)\b)", 12),
     ),
     "it": (
         (r"buona (?:giornata|serata|notte|domenica|settimana)\b", 5),
@@ -517,22 +578,33 @@ FAREWELLS: dict[str, tuple[tuple[str, int], ...]] = {
         (r"tenha (?:um |uma )?(?:bom|boa|ótimo|ótima) (?:dia|tarde|noite|fim de semana)\b", 8),
         (r"aproveite (?:o resto d[aeo]|a sua|o seu|sua|seu) \w+", 7),
         (r"durma bem\b", 4),
-        (r"boa sorte\b", 6),
-        (r"estou aqui (?:se|quando|para)\b", 12),
+        (r"boa sorte(?:$| com\b| na\b| no\b| nas\b| nos\b| em\b| amanhã\b| hoje\b| para\b| pra\b)", 6),
+        # the offer form only: "Estou aqui para ajudar" answers "Você está aí?" (second fix review of 0.9.8, voice-04)
+        (r"estou aqui (?:se|quando|para (?:você|o que|quando))\b", 12),
     ),
     "pl": (
         (r"miłego (?:dnia|wieczoru|weekendu|popołudnia)\b", 5),
         (r"(?:dobrej nocy|śpij dobrze)\b", 4),
-        (r"powodzenia\b", 6),
+        (r"powodzenia(?:$| na\b| z\b| ze\b| w\b| we\b| jutro\b| dziś\b| dzisiaj\b)", 6),
         (r"jestem tu(?:taj)?,? (?:jeśli|gdy|kiedy)\b", 12),
     ),
     "ru": (
         (r"хорошего (?:дня|вечера|выходных)\b", 5),
-        (r"удачи\b", 6),
-        (r"я (?:здесь|на связи)\b", 12),
+        (r"удачи(?:$| тебе\b| вам\b| с\b| со\b| на\b| в\b| завтра\b| сегодня\b)", 6),
+        # never a bare "Я здесь." ("I'm here", to "Ты здесь?"; second fix review of 0.9.8, voice-04)
+        (r"я (?:всегда )?на связи\b", 12),
     ),
-    "ja": ((r"(?:良い|よい)(?:一日|夜|週末)を", 1), (r"頑張って", 1), (r"いつでも", 1)),
-    "ko": ((r"좋은 (?:하루|저녁|주말) 보내(?:세요|요)", 6), (r"잘 자(?:요)?", 3), (r"화이팅", 3), (r"언제든(?:지)?", 8)),
+    "ja": (
+        (r"(?:良い|よい)(?:一日|夜|週末)を", 1),
+        (r"頑張って(?:ください)?(?:ね|よ)?$", 1),
+        (r"いつでも(?:どうぞ|声をかけて|呼んで|聞いて|話しかけて|連絡|お待ちして|ここに)", 1),
+    ),
+    "ko": (
+        (r"좋은 (?:하루|저녁|주말) 보내(?:세요|요)", 6),
+        (r"잘 자(?:요|세요)?$", 3),
+        (r"화이팅", 3),
+        (r"언제든(?:지)? (?:불러|말씀|연락|전화|얘기|이야기)", 8),
+    ),
 }  # fmt: skip
 AND: dict[str, str] = {
     "en": "and", "nl": "en", "de": "und", "fr": "et", "es": "y", "it": "e", "pt": "e", "pl": "i", "ru": "и",
@@ -563,6 +635,19 @@ CONTINUING: dict[str, tuple[str, ...]] = {
     "ru": ("в", "на", "к", "домой"),
     "fr": ("à", "au", "aux", "chez", "pour", "avec"),
 }  # fmt: skip
+# words a turn never ends on: an early end after one is held like one after a "but" or a comma (calls.goes_on; review
+# 0.9.7: "Set a reminder for five and", then a pause to think, was answered cut off). English's count on every call.
+# Italian's and Portuguese's "e" ("and") is left out: compared without accents it is also "è" and "é" ("is"), which end
+# "Com'è?" and "Não é?". Other languages untested by a native speaker.
+LEFT_OPEN: dict[str, tuple[str, ...]] = {
+    "en": ("and", "or", "the", "a", "an", "because"),
+    "es": ("y", "porque"),
+    "nl": ("en", "omdat"),
+    "pl": ("i",),
+    "de": ("und", "weil"),
+    "ru": ("и", "потому что"),
+    "fr": ("et", "parce que"),
+}
 
 
 # Stage directions in her answer ("(pause)", "(short pause)", "[beat]", "*smiles*", "(laughs)") are never spoken or
@@ -717,6 +802,40 @@ _FUNCTION: dict[str, tuple[str, ...]] = {
     ),
 }  # fmt: skip
 FUNCTION_WORDS = frozenset(word for words in _FUNCTION.values() for word in words)
+
+
+# the word guards' pieces of Japanese, Chinese and Korean (second review of 0.9.8, redteam-06): a text without spaces is
+# one long word, so a calendar title or a note's words shared no word with what went to Maps, a search or Spotify
+_SPACELESS = "\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uff66-\uff9f"  # kana, kanji, half-width kana
+_HANGUL = "\uac00-\ud7a3"
+_SCRIPT_RUNS = re.compile(rf"[{_SPACELESS}]+|[{_HANGUL}]+|[^{_SPACELESS}{_HANGUL}]+")
+
+
+def _hiragana(text: str) -> bool:
+    return all("\u3040" <= char <= "\u309f" for char in text)
+
+
+def guard_pieces(word: str, *, pairs: bool = False) -> tuple[list[str], list[str]]:
+    """A word (a run of word characters) for the word guards (`code_notes._words`, `reminders._tokens`), in two
+    lists: the pieces of its Japanese, Chinese and Korean runs, kept as they are, and its other runs, which each guard
+    reads by its own rule. A run of a script without spaces gives its pairs of characters ("山田クリニック": 山田, 田ク, クリ, …), a pair
+    of hiragana only left out (grammar: です, して), and one character alone itself (駅), a hiragana one aside; a Korean
+    run its forms from 2 syllables on ("김내과에서": 김내, 김내과, 김내과에, 김내과에서), as a particle joins the word,
+    and with `pairs` also its pairs of syllables (내과, 과에, 에서), so a word from inside it is found too ("연세치과"
+    in "강남연세치과"): only for a guard that refuses, where finding more fails safe (release review of 0.9.8, G04)."""
+    pieces: list[str] = []
+    others: list[str] = []
+    for run in _SCRIPT_RUNS.findall(word):
+        if re.match(rf"[{_SPACELESS}]", run):
+            twos = [run[at : at + 2] for at in range(len(run) - 1)] if len(run) > 1 else [run]
+            pieces += [two for two in twos if not _hiragana(two)]
+        elif re.match(rf"[{_HANGUL}]", run):
+            pieces += [run[:end] for end in range(2, len(run) + 1)]
+            if pairs:
+                pieces += [run[at : at + 2] for at in range(1, len(run) - 1)]
+        else:
+            others.append(run)
+    return pieces, others
 
 
 def function_words(language: str) -> frozenset[str]:

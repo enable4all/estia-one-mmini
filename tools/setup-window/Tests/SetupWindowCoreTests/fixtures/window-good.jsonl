@@ -1,0 +1,11 @@
+{"t": "ready", "v": 2}
+{"t": "check", "id": "number", "value": "+30 690 000 0000"}
+{"t": "answer", "id": "name", "value": "Maya"}
+{"t": "answer", "id": "move", "value": true}
+{"t": "answer", "id": "extras", "value": ["web", "maps"]}
+{"t": "answer", "id": "extras", "value": []}
+{"t": "answer", "id": "home_area", "value": {"street": "Example Street", "city": "Athens"}}
+{"t": "answer", "id": "name", "value": ""}
+{"t": "back"}
+{"t": "stop"}
+{"t": "closed"}

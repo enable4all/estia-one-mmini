@@ -29,6 +29,7 @@ from typing import Any, Protocol
 
 from local_assistant import prompts
 from local_assistant.claims import sentences
+from local_assistant.fetcher import strip_control_tokens
 from local_assistant.gemma import GemmaClient
 from local_assistant.part_status import PartStatus, Reason
 
@@ -254,7 +255,8 @@ def _captions(data: dict[str, Any]) -> Captions | None:
         if start >= CAP_SECONDS:
             cut, size_cut = True, False
             break
-        text = " ".join(words.split())[:SEGMENT_CHARS]
+        # outside text: no chat-template token or hidden character reaches her (review I9), the parts' notes call too
+        text = " ".join(strip_control_tokens(words[: SEGMENT_CHARS * 4]).split())[:SEGMENT_CHARS]
         if chars + len(text) > CAP_CHARS:
             cut = size_cut = True
             break

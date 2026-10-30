@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; media-src 'self' blob:; font-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Estia Setup</title>
+<link rel="stylesheet" href="page.css">
+</head>
+<body>
+<main class="window" aria-label="Estia Setup">
+  <div class="top" aria-hidden="true"><span class="count" id="count"></span></div>
+
+  <div class="body" id="body">
+    <section class="step intro" id="p-intro">
+      <div class="hero">
+        <svg class="mark" viewBox="0 0 100 100" role="img" aria-label="Estia's mark: a silver ring around an orange rounded square">
+          <circle cx="50" cy="50" r="42.25" fill="#ffffff"/>
+          <path id="ring" d="M92.25 50A42.25 42.25 0 1 1 7.75 50A42.25 42.25 0 1 1 92.25 50Z" fill="none" stroke="#8d9298" stroke-width="7"/>
+          <path id="wave" d="" fill="none" stroke="#8d9298" stroke-width="1.9" stroke-linejoin="round" stroke-linecap="round"/>
+          <rect x="39.5" y="39.5" width="21" height="21" rx="5.5" fill="#ff5c35"/>
+        </svg>
+        <h2 class="word" id="h-intro" tabindex="-1">estia one</h2>
+        <p class="caption" id="caption" aria-live="polite">An insanely secure &amp; private thinking partner, living at home.</p>
+        <p class="sig">Estia needs no account and is open source. Setup registers only her own Signal account; you reach her from the free Signal app on your phone or laptop.</p>
+        <p class="fine" id="status" role="status"></p>
+      </div>
+    </section>
+
+    <section class="step" id="p-screen" hidden aria-live="off"></section>
+  </div>
+
+  <div class="actions">
+    <div>
+      <button class="ghost" id="back" type="button" hidden>Back</button>
+      <button class="ghost" id="mute" type="button" aria-pressed="false" hidden><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9v6h4l5 4V5L8 9H4z"/><path d="M16.5 9.5a4 4 0 0 1 0 5"/><path class="slash" d="M3 3l18 18"/></svg>Mute</button>
+    </div>
+    <div>
+      <span class="choice"><button class="alt" id="alt" type="button">Skip</button><span class="rec" id="alt-rec"></span></span>
+      <span class="choice"><button class="primary" id="main" type="button">Play intro</button><span class="rec" id="main-rec"></span></span>
+    </div>
+  </div>
+</main>
+<p class="sr" id="live" role="status" aria-live="polite"></p>
+<script src="intro-data.js"></script>
+<script src="intro-clip.js"></script>
+<script src="page.js"></script>
+</body>
+</html>

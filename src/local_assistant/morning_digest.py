@@ -48,6 +48,7 @@ class MorningDigest:
         poll_seconds: float = 60.0,
         mail_ready: Callable[[], bool] = lambda: True,
         calendar_seconds: float = 30.0,
+        held: Callable[[], bool] = lambda: False,
     ) -> None:
         self._store = store
         self._tz = config.timezone
@@ -61,6 +62,7 @@ class MorningDigest:
         self._poll = poll_seconds
         self._mail_ready = mail_ready  # the mail sync finished a round since the start (else it misses mail)
         self._calendar_seconds = calendar_seconds
+        self._held = held  # /lock or a call: the digest waits, tried again each minute (until noon; review I5)
 
     async def run_forever(self) -> None:
         while True:
@@ -79,6 +81,8 @@ class MorningDigest:
             return
         if self._mail is not None and not self._mail_ready():
             return  # after a start: wait for the first mail sync round (still until noon)
+        if self._held() and local.hour < MISSED_UNTIL_HOUR:
+            return  # locked or a call: nothing composed, the day not marked; next minute again
         if local.hour >= MISSED_UNTIL_HOUR:
             self._store.set_state(DIGEST_DAY_KEY, today)
             log.info("morning digest of %s skipped: the bridge was down until after noon", today)

@@ -2,7 +2,7 @@
 
 The bridge records, per part, when its last real read or call worked and since when it fails, with a reason from a
 fixed list (`Reason`). Parts: each mailbox ("mail:<name>"), each calendar ("calendar" for the one named calendar,
-"calendar:<name>" for the others), the voice service, the device helper, web search, Google Places and Routes ("places"),
+"calendar:<name>" for the others), the voice service, the device helper, web search, Google Places and Routes ("places"), OpenStreetMap ("osm"),
 Spotify, the YouTube helper ("youtube", always on) and the documents folder with its helper ("documents"). Calls are not
 a part of their own: they use the voice service.
 
@@ -84,6 +84,7 @@ PARTS = (
     "devices",
     "web",
     "places",
+    "osm",
     "spotify",
     "youtube",
     "documents",
@@ -111,6 +112,16 @@ class Security:
     devices_checked: float | None = None  # when they were counted
     model_paused: float | None = None  # since when answers are paused: the model does not match its pinned digest
     model_cloud: float | None = None  # since when answers are paused: Ollama lists the model as a cloud model
+    signal_ready: float | None = None  # the last time signal-cli was ready (subscribed to her messages)
+    signal_down: float | None = None  # since when it is not: its first exit after that (review S2)
+    signal_restarts: int | None = None  # how often it ended and started again since
+    signal_failure: str = ""  # the last one's kind (SIGNAL_FAILURES): what its stderr said of her account
+    limited_until: float | None = None  # Signal limits her sending until then: no send or resend tried (review S4)
+    limited_captcha: bool = False  # it asks for a captcha first (lifted by a solved captcha, or at that time)
+
+
+# the kinds of signal-cli's ends (signal_io.ACCOUNT_KINDS, and its own), the only words status.json keeps of them
+SIGNAL_FAILURES = frozenset({"not registered", "authorization failed", "client too old", "not started", "exited"})
 
 
 DEVICES_WRITE_EVERY_SECONDS = 3_600.0  # an unchanged device count is written at most once an hour
@@ -191,7 +202,23 @@ def read_security(path: Path) -> Security:
         devices_checked=moment("devices_checked") if devices is not None else None,
         model_paused=moment("model_paused"),
         model_cloud=moment("model_cloud"),
+        **_signal_state(section, moment("signal_ready"), moment("signal_down")),
+        limited_until=(until := moment("limited_until")),
+        limited_captcha=until is not None and section.get("limited_captcha") is True,
     )
+
+
+def _signal_state(section: dict[str, Any], ready: float | None, down: float | None) -> dict[str, Any]:
+    """signal-cli's connection as status.json keeps it; a restart count or kind that is odd is left out."""
+    count = section.get("signal_restarts")
+    restarts = count if isinstance(count, int) and not isinstance(count, bool) and count >= 0 else None
+    failure = section.get("signal_failure")
+    return {
+        "signal_ready": ready,
+        "signal_down": down,
+        "signal_restarts": restarts if down is not None else None,
+        "signal_failure": failure if down is not None and failure in SIGNAL_FAILURES else "",
+    }
 
 
 def security_lines(security: Security, now: float, tz: ZoneInfo, *, model: str) -> list[PartLine]:
@@ -353,7 +380,8 @@ def enabled_parts(cfg: Config) -> list[str]:
     for part, enabled in (
         ("devices", cfg.tapo_enabled),
         ("web", cfg.web_enabled),
-        ("places", cfg.maps_enabled),
+        ("places", cfg.maps_enabled),  # Google Maps: shown once Google was asked (`lines`), as its key is in web.env
+        ("osm", cfg.maps_enabled),
         ("spotify", cfg.spotify_enabled),
         ("youtube", True),  # always on, with read_link: no switch
         ("documents", cfg.documents_enabled),
@@ -385,6 +413,7 @@ def lines(cfg: Config, records: Mapping[str, Record], now: float) -> list[PartLi
             estia_kb=in_estia_kb(cfg, part),
         )
         for part in enabled_parts(cfg)
+        if part != "places" or part in records
     ]
 
 
@@ -435,6 +464,31 @@ class PartStatus:
             self._keep_security(replace(self._security, model_cloud=self._clock()))
         elif not paused and self._security.model_cloud is not None:
             self._keep_security(replace(self._security, model_cloud=None))
+
+    def signal_ready(self) -> None:
+        """signal-cli is ready (subscribed): its time kept, a failure before it cleared."""
+        old = self._security
+        self._keep_security(
+            replace(old, signal_ready=self._clock(), signal_down=None, signal_restarts=None, signal_failure="")
+        )
+
+    def signal_failed(self, failure: str) -> None:
+        """signal-cli ended and starts again (`failure`: a kind of SIGNAL_FAILURES; anything else is "exited"): since
+        when, from its first end after it was last ready, and one more restart, across restarts of the bridge too."""
+        old = self._security
+        kind = failure if failure in SIGNAL_FAILURES else "exited"
+        since = old.signal_down if old.signal_down is not None else self._clock()
+        count = (old.signal_restarts or 0) + 1
+        self._keep_security(replace(old, signal_down=since, signal_restarts=count, signal_failure=kind))
+
+    def signal_limited(self, until: float, *, captcha: bool) -> None:
+        """Signal limits her sending until `until` (its retryAfterSeconds); `captcha`: it asks for one first."""
+        self._keep_security(replace(self._security, limited_until=until, limited_captcha=captcha))
+
+    def signal_unlimited(self) -> None:
+        """Signal's wait is over (or a send went out)."""
+        if self._security.limited_until is not None:
+            self._keep_security(replace(self._security, limited_until=None, limited_captcha=False))
 
     def warn(self, part: str, reason: Reason) -> None:
         """The part works, but one of its abilities does not (documents: "ocr_unavailable"); kept from its first time."""
@@ -548,6 +602,12 @@ class PartStatus:
                     ("devices_checked", facts.devices_checked),
                     ("model_paused", facts.model_paused),
                     ("model_cloud", facts.model_cloud),
+                    ("signal_ready", facts.signal_ready),
+                    ("signal_down", facts.signal_down),
+                    ("signal_restarts", facts.signal_restarts),
+                    ("signal_failure", facts.signal_failure or None),
+                    ("limited_until", facts.limited_until),
+                    ("limited_captcha", True if facts.limited_until is not None and facts.limited_captcha else None),
                 )
                 if value is not None
             }

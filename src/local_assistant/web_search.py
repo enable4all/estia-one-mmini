@@ -4,7 +4,10 @@ search as the backup (short descriptions, so its top page is read for more).
 Results are data from the web, never instructions, and never stored or cached (Brave's terms allow transient use
 only). The keys live only in `web.env` (0600, written by
 scripts/set-web-keys.sh), read per search. A service that says "too many requests" or refuses the key is paused for
-a while; Brave gets at most one request a second (its free plan's limit).
+a while; Brave gets at most one request a second (its free plan's limit), and at most 900 of Estia's own searches each
+calendar month whatever the config says (`BRAVE_MONTHLY_MAX`), its try again included: its free plan is a $5 monthly
+credit (about 1,000 searches) that bills the card beyond it. A key other programs use too, or a billing month that
+does not start on the 1st, can still go past the credit: only this install's searches are counted.
 """
 
 from __future__ import annotations
@@ -47,6 +50,9 @@ BUSY_PAUSE_SECONDS = 600.0  # after "too many requests"
 REFUSED_PAUSE_SECONDS = 3600.0  # after 401/402/403: the key or the plan was refused
 MONTH_PAUSE_MAX_SECONDS = 24 * 3600.0  # Brave out of searches for the month: look again a day later at most
 BRAVE_GAP_SECONDS = 1.1  # Brave's free plan: one request a second
+# Brave's free plan: a $5 monthly credit (about 1,000 searches), then billed to the card with no cap of Brave's own
+# (checked 25 Oct 2026): code stops below the credit, whatever the config's brave_monthly_cap says
+BRAVE_MONTHLY_MAX = 900
 NO_KEYS = "web search has no keys: the user runs scripts/set-web-keys.sh"
 _MARKDOWN_LINK = re.compile(r"!?\[([^\[\]]*)\]\([^()]*\)")  # no nested brackets: linear on "[[[[…"
 _TAG = re.compile(r"<[^<>]{1,20}>")  # Brave's <strong> highlights
@@ -56,7 +62,11 @@ _DATE = re.compile(r"\d{4}-\d\d-\d\d")
 # private details that never go into a query (an answer's private text could otherwise leave the house)
 _PRIVATE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")  # an email address
 _LONG_NUMBER = re.compile(r"(?:\d[\s().-]?){9,}")  # phone, account or card numbers (a date has 8 digits)
-_IBAN = re.compile(r"\b[A-Za-z]{2}\d{2}[A-Za-z0-9]{10,30}\b")
+# an IBAN: as one word, or in groups ("NL91 ABNA 0417 1643 00"), starting with a country's 2 letters and 2 check
+# digits, 15 to 34 characters, confirmed by its check digits (review places-5: with the spaces taken out first,
+# "UK 2026 bank holidays" was one)
+_WORDS_RUN = re.compile(r"[A-Za-z0-9]+(?: [A-Za-z0-9]+)*")
+_IBAN_START = re.compile(r"[A-Za-z]{2}[0-9]{2}")
 
 Fetch = Callable[[str], Awaitable[Page]]
 Sleep = Callable[[float], Awaitable[None]]
@@ -135,7 +145,7 @@ class WebSearch:
         self._keys_path = keys_path
         self._store = store
         self._country = country
-        self._brave_cap = brave_cap
+        self._brave_cap = min(brave_cap, BRAVE_MONTHLY_MAX)  # never past the free credit
         self._month = month
         self._day = day
         self._clock = clock
@@ -262,10 +272,10 @@ class WebSearch:
                 pause = min(float(reset), MONTH_PAUSE_MAX_SECONDS) if reset else MONTH_PAUSE_MAX_SECONDS
                 self._pause("Brave", pause, "no searches left this month")
                 return None
-            if attempt == 1 and not quick:  # one a second, shared with other tools: wait and try once more
-                await self._sleep(BRAVE_GAP_SECONDS)
+            if attempt == 1 and not quick and self._brave_used() < self._brave_cap:
+                await self._sleep(BRAVE_GAP_SECONDS)  # one a second, shared with other tools: wait and try once more
             else:
-                return None  # on a call there is no time to wait
+                return None  # on a call there is no time to wait; at the cap the try again would go past it
         return None
 
     async def _read_top_page(self, found: tuple[WebResult, ...], query: str) -> tuple[WebResult, ...]:
@@ -334,7 +344,31 @@ class WebSearch:
 
 def has_private_details(text: str) -> bool:
     """An email address, an IBAN or a run of 9+ digits (phone, account, card numbers): never sent to a service."""
-    return bool(_PRIVATE.search(text) or _LONG_NUMBER.search(text) or _IBAN.search(text.replace(" ", "")))
+    return bool(_PRIVATE.search(text) or _LONG_NUMBER.search(text) or _has_iban(text))
+
+
+def _has_iban(text: str) -> bool:
+    """Whether the text holds an IBAN whose check digits add up (ISO 13616, mod 97), as one word or in groups split by
+    single spaces. A mistyped one is left to the long-number rule, which nearly every IBAN's digits meet."""
+    for run in _WORDS_RUN.finditer(text):
+        words = run.group().split(" ")
+        for first, word in enumerate(words):
+            if not _IBAN_START.match(word):
+                continue
+            joined = ""
+            for part in words[first:]:
+                joined += part
+                if len(joined) > 34:
+                    break
+                if len(joined) >= 15 and _iban_adds_up(joined):
+                    return True
+    return False
+
+
+def _iban_adds_up(code: str) -> bool:
+    """An IBAN's check: its first four characters moved to the end, letters as numbers (A = 10 … Z = 35), mod 97 is 1."""
+    moved = (code[4:] + code[:4]).upper()
+    return int("".join(str(int(character, 36)) for character in moved)) % 97 == 1
 
 
 def _pair(value: str) -> tuple[int | None, int | None]:

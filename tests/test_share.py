@@ -1083,8 +1083,11 @@ def test_the_close_question_says_what_closing_does_and_never_breaks(home: Path) 
     open_home(home)
     said, questions = asked_close(home)
     assert questions == [share.CLOSE_ASK]
-    assert "chmod -h o-rwx" in share.CLOSE_ASK and "Recommendation: yes." in share.CLOSE_ASK
-    assert said[-1] == share.CLOSE_WHAT  # said just before the question
+    assert "chmod -h o-rwx" in share.CLOSE_ASK  # the command that runs (owner, 19 Oct)
+    # the recommendation on a line of its own, right before the question, never inside it (owner, 27 Oct)
+    assert said[-2:] == [share.CLOSE_WHAT, "Yes (recommended)."] and share.CLOSE_RECOMMENDED == "Yes (recommended)."
+    for question in (share.CLOSE_ASK, share.CLOSE_ASK_OPT, share.CLOSE_ASK_OPT_ONLY):
+        assert "Recommend" not in question and question.endswith("?"), question
     what = share.CLOSE_WHAT
     assert "her account" in what and "you keep full access" in what and "people who log in" in what.lower()
     assert "Nothing in them changes" in what and "her share and Ollama keep working" in what
@@ -1183,3 +1186,12 @@ def test_opts_line_says_what_stays_in_plain_words() -> None:
     )
     assert all(len(line) <= 135 for line in share.CLOSE_ASK_OPT.splitlines() if line)
     assert len(share.CLOSE_ASK_OPT + " [Y/n] ") <= 135
+
+
+def test_the_shares_line_without_her_account_names_it_once() -> None:
+    """Review of 0.9.7, X2: 'her user' became 'her own macOS account', which then said it twice in one line."""
+    from local_assistant.ownuser import ROLE_USER
+
+    line = share.NO_ROLE_USER
+    assert line.startswith(f"✗ {ROLE_USER} does not exist yet") and line.endswith("Nothing changed.")
+    assert line.count("her own macOS account") == 1 and "her user" not in line

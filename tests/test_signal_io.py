@@ -2,6 +2,7 @@ import asyncio
 import base64
 import json
 import sys
+import traceback
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -9,14 +10,21 @@ from typing import Any
 import pytest
 
 from local_assistant.signal_io import (
+    RATE_LIMIT_WAIT_S,
+    CaptchaRejectedError,
     NotAllowedError,
+    RateLimitError,
     SignalClient,
     SignalError,
     UntrustedIdentityError,
+    attachment_timeout,
     call_env,
+    shown_error,
     signal_cli_command,
+    stderr_line,
 )
 from tests.conftest import ME, STRANGER, T0
+from tests.fakes.fake_signal_cli import LEAKS
 
 FAKE = Path(__file__).parent / "fakes" / "fake_signal_cli.py"
 
@@ -126,8 +134,9 @@ async def test_the_fake_refuses_text_styles_as_signal_cli_does(
     client = make_client()
     await client.start()
     try:
-        with pytest.raises(SignalError, match=error):
+        with pytest.raises(SignalError) as info:
             await client.request("send", {"recipient": [ME], "message": "hello", "textStyle": styles})
+        assert error in info.value.detail  # signal-cli's words: never in the error's text (review S1)
         assert await client.request("send", {"recipient": [ME], "message": "hello", "textStyle": "0:5:BOLD"})
     finally:
         await client.stop()
@@ -166,6 +175,26 @@ async def test_a_document_goes_as_a_data_link_attachment_with_its_name(fake_dir:
         await client.stop()
 
 
+async def test_a_large_document_gets_time_for_its_upload(fake_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Review O9 (0.9.7): /docs send of a PDF up to 25 MB had signal-cli's fixed request limit; a slow upload was
+    reported failed while signal-cli could still deliver it, so a retry sent it twice. The limit grows with the size
+    (1 s per 200 KB more); other requests keep theirs."""
+    monkeypatch.setenv("FAKE_SIGNAL_ATTACHMENT_DELAY", "1.5")
+    client = make_client(request_timeout=1.0)
+    await client.start()
+    try:
+        data = b"%PDF-1.7\n" + b"x" * 400_000  # 1 s + 2 s
+        assert await client.send_document(ME, data, "manual.pdf") > 0
+        assert await client.send(ME, "small") > 0
+    finally:
+        await client.stop()
+
+
+def test_an_attachments_time_limit_grows_with_its_size() -> None:
+    assert attachment_timeout(60.0, 0) == 60.0
+    assert attachment_timeout(60.0, 25_000_000) == 185.0  # the largest PDF /docs sends: 60 s plus 125 s
+
+
 async def test_refuses_to_send_to_anyone_not_allowed(fake_dir: Path) -> None:
     client = make_client()
     await client.start()
@@ -202,6 +231,65 @@ async def test_untrusted_identity_error_is_typed(fake_dir: Path, monkeypatch: py
         with pytest.raises(UntrustedIdentityError) as info:
             await client.send(ME, "Hello!")
         assert info.value.code == -4
+    finally:
+        await client.stop()
+
+
+def rate_limited(**result: Any) -> str:
+    """signal-cli 0.14.9's error data for a send Signal's server limited (-5): the send's results."""
+    return json.dumps({"response": {"timestamp": T0, "results": [{"type": "RATE_LIMIT_FAILURE", **result}]}})
+
+
+async def test_a_rate_limit_is_typed_with_its_wait(fake_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """-5 (signal-cli's RATELIMIT_ERROR): Signal's server limits her sending for retryAfterSeconds; a short one is
+    waited out (`wait`), a long one is no try now (the resend later), as the man page's codes say."""
+    monkeypatch.setenv("FAKE_SIGNAL_SEND_ERROR", "-5")
+    monkeypatch.setenv("FAKE_SIGNAL_SEND_ERROR_DATA", rate_limited(retryAfterSeconds=7))
+    client = make_client()
+    await client.start()
+    try:
+        with pytest.raises(RateLimitError) as info:
+            await client.send(ME, "Hello!")
+        error = info.value
+        assert (error.code, error.retry_after, error.proof_required) == (-5, 7.0, False)
+        assert error.wait(2.0) == 7.0 and isinstance(error, SignalError)
+    finally:
+        await client.stop()
+    assert RateLimitError("x", -5, retry_after=RATE_LIMIT_WAIT_S + 1).wait(2.0) is None  # too long: no try now
+    assert RateLimitError("x", -5).wait(2.0) == 2.0  # no time told: the usual pause
+    assert SignalError("x").wait(2.0) == 2.0
+
+
+async def test_a_captcha_signal_asks_for_stops_the_tries_and_is_logged_without_its_token(
+    fake_dir: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A rate limit with a challenge token (proof required): lifted by a captcha or after the wait Signal names
+    (signal-cli: "or wait N seconds"), so no more tries now; the log says what Signal asks, the wait and where the
+    steps are, never the token."""
+    monkeypatch.setenv("FAKE_SIGNAL_SEND_ERROR", "-5")
+    challenge = "made-up-challenge-0123"  # Signal's challenge for the captcha (a made-up one)
+    monkeypatch.setenv("FAKE_SIGNAL_SEND_ERROR_DATA", rate_limited(token=challenge, retryAfterSeconds=86400))
+    client = make_client()
+    await client.start()
+    try:
+        with pytest.raises(RateLimitError) as info:
+            await client.send(ME, "Hello!")
+        assert info.value.proof_required and info.value.wait(2.0) is None
+    finally:
+        await client.stop()
+    logged = " ".join(record.getMessage() for record in caplog.records)
+    assert "captcha" in logged and "setup_assistant.md" in logged and challenge not in logged
+    assert "or after 86400 s" in logged and "until it is solved" not in logged
+
+
+async def test_a_rejected_captcha_is_typed(fake_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("FAKE_SIGNAL_SEND_ERROR", "-6")  # CAPTCHA_REJECTED_ERROR
+    client = make_client()
+    await client.start()
+    try:
+        with pytest.raises(CaptchaRejectedError) as info:
+            await client.send(ME, "Hello!")
+        assert info.value.code == -6 and info.value.wait(2.0) is None  # a new captcha is needed: no try now
     finally:
         await client.stop()
 
@@ -508,5 +596,150 @@ async def test_the_fake_names_the_sending_device_as_signal_cli_does(fake_dir: Pa
         stream = client.envelopes()
         assert (await asyncio.wait_for(anext(stream), 5))["sourceDevice"] == 1
         assert (await asyncio.wait_for(anext(stream), 5))["sourceDevice"] == 2
+    finally:
+        await client.stop()
+
+
+def leaked(caplog: pytest.LogCaptureFixture) -> list[str]:
+    """The made-up number, account and challenge token the fake's errors name, wherever the log holds one."""
+    logged = " ".join(record.getMessage() for record in caplog.records)
+    return [value for value in (*LEAKS, ME) if value in logged]
+
+
+@pytest.mark.parametrize("code", ["-1", "-4", "-5", "-6"])
+async def test_signal_clis_words_never_reach_an_errors_text(
+    fake_dir: Path, monkeypatch: pytest.MonkeyPatch, code: str
+) -> None:
+    """A traceback (every log.exception: a call that failed, a message that failed) prints an error's text, so
+    signal-cli's words, which name the recipient's number or account and a captcha's challenge token, stay out of it,
+    and a refused recipient is not named either; the code is kept, the words only in `detail` (review S1)."""
+    monkeypatch.setenv("FAKE_SIGNAL_SEND_ERROR", code)
+    monkeypatch.setenv("FAKE_SIGNAL_SEND_ERROR_DATA", rate_limited(token="made-up", retryAfterSeconds=60))
+    client = make_client()
+    await client.start()
+    try:
+        with pytest.raises(SignalError) as info:
+            await client.send(ME, "Hello!")
+        with pytest.raises(NotAllowedError) as refused:
+            await client.send(STRANGER, "Hello!")
+    finally:
+        await client.stop()
+    shown = "".join(traceback.format_exception(info.value) + traceback.format_exception(refused.value))
+    assert [value for value in (*LEAKS, ME, STRANGER) if value in shown] == []
+    assert info.value.code == int(code) and LEAKS[0] in info.value.detail
+
+
+def test_an_error_is_shown_by_its_type_and_code_only() -> None:
+    """signal-cli's message can name the recipient's number or account and a captcha's challenge token (review S1):
+    the log keeps the error's type and code, never its words."""
+    words = 'CAPTCHA proof required for sending to "+306900000099" with challenge token "secret"'
+    assert shown_error(RateLimitError(words, -5)) == "RateLimitError (code -5)"
+    assert shown_error(SignalError(words)) == "SignalError"
+    assert shown_error(NotAllowedError(f"recipient {STRANGER} is not on the allowlist")) == "NotAllowedError"
+
+
+@pytest.mark.parametrize(
+    ("line", "shown", "kind"),
+    [
+        (
+            'WARN  SendHelper - CAPTCHA proof required for sending to "+306900000099", available options '
+            '"[RECAPTCHA]" with challenge token "made-up", or wait "86400" seconds. (ProofRequiredException)',
+            "signal-cli: WARN SendHelper: captcha asked (ProofRequiredException; {n} characters not logged)",
+            "captcha asked",
+        ),
+        (
+            "User +306900000099 is not registered.",
+            "signal-cli: not registered ({n} characters not logged)",
+            "not registered",
+        ),
+        (
+            "Error while checking account cccccccc-cccc-4ccc-8ccc-cccccccccccc: [401] Authorization failed!",
+            "signal-cli: authorization failed ({n} characters not logged)",
+            "authorization failed",
+        ),
+        (
+            "ERROR App - Error loading state file for user +306900000099: (DeprecatedVersionException)",
+            "signal-cli: ERROR App: client too old (DeprecatedVersionException; {n} characters not logged)",
+            "client too old",
+        ),
+        (
+            "INFO  ReceiveHelper - Connection closed unexpectedly, reconnecting in 100 ms",
+            "signal-cli: INFO ReceiveHelper: a line ({n} characters not logged)",
+            None,
+        ),
+        ("\tat org.asamk.signal.App.loadManager(App.java:344)", "", None),  # a stack frame: nothing to log
+        ("   ", "", None),
+    ],
+)
+def test_signal_clis_error_output_is_summed_up_without_its_words(line: str, shown: str, kind: str | None) -> None:
+    """Its stderr names numbers, accounts and challenge tokens too (review S1): only the level, the class that
+    logged, a kind from a fixed list and the exceptions' names are logged, with the count of characters left out."""
+    assert stderr_line(line) == (shown.format(n=len(line.strip())), kind)
+
+
+async def test_signal_clis_stderr_reaches_the_log_without_numbers_or_tokens(
+    fake_dir: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setenv("FAKE_SIGNAL_STDERR", "1")
+    client = make_client()
+    caplog.set_level("INFO")
+    await client.start()
+    try:
+        await until(lambda: any("authorization failed" in r.getMessage() for r in caplog.records))
+    finally:
+        await client.stop()
+    assert any("signal-cli: WARN SendHelper: captcha asked" in r.getMessage() for r in caplog.records)
+    assert leaked(caplog) == []
+
+
+async def test_a_failed_send_and_a_failed_start_are_logged_without_signal_clis_words(
+    fake_dir: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The fake's errors name a number, an account and a token, as signal-cli's do: none reaches the log."""
+    monkeypatch.setenv("FAKE_SIGNAL_SUBSCRIBE_ERROR", "1")
+    client = make_client(request_timeout=0.8)
+    with pytest.raises(TimeoutError):
+        await client.start()
+    await client.stop()
+    assert any("signal-cli: SignalError (code -1)" in r.getMessage() for r in caplog.records)
+    assert leaked(caplog) == []
+
+
+async def test_each_ready_and_each_exit_is_told_with_the_failures_kind(
+    fake_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Signal logged this Mac out (another device took her account over): signal-cli exits at every start with "User …
+    is not registered." and was restarted quietly every 60 s (review S2). Each ready and each exit is told to the
+    watchers, the exit with its kind from signal-cli's stderr (never its words), so status.json and doctor can say so."""
+    told: list[tuple[bool, str]] = []
+    client = make_client()
+    client.watch(lambda ready, failure: told.append((ready, failure)))
+    await client.start()
+    try:
+        assert told == [(True, "")]
+        monkeypatch.setenv("FAKE_SIGNAL_SUBSCRIBE_ERROR", "1")
+        assert client._proc is not None
+        client._proc.terminate()
+        await until(lambda: len(told) >= 3)
+        assert told[1] == (False, "exited")  # stopped from outside: no kind in its words
+        assert told[2] == (False, "not registered")
+        assert not client.ready
+        monkeypatch.delenv("FAKE_SIGNAL_SUBSCRIBE_ERROR")
+        await until(lambda: client.ready, 10)
+        assert told[-1] == (True, "")
+    finally:
+        await client.stop()
+    assert told[-1] == (True, "")  # a stop is no failure
+
+
+async def test_a_watcher_that_fails_never_stops_signal_cli(fake_dir: Path) -> None:
+    def broken(ready: bool, failure: str) -> None:
+        raise RuntimeError("a bug in a watcher")
+
+    client = make_client()
+    client.watch(broken)
+    await client.start()
+    try:
+        assert client.ready
     finally:
         await client.stop()

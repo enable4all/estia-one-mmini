@@ -390,6 +390,64 @@ async def test_forget_from_an_outside_note_is_refused(store: Store) -> None:
     assert (await tools.call(asked, "forget", '{"fact": "1"}')).startswith("Removed fact #1")
 
 
+@pytest.mark.parametrize(
+    "said",
+    ["I forgot, what time is it?", "do you remember the club's opening hours?", "fun fact: octopuses have 3 hearts"],
+)
+async def test_after_outside_text_a_profile_word_alone_changes_nothing(store: Store, said: str) -> None:
+    """Review G5: after outside text in an earlier answer, any message the profile words matched ("I forgot",
+    "do you remember", "fun fact") let a planted fact be saved or a real one forgotten. The message must also name the
+    fact now: a word of it (every long number and link of a new one among its words), or, to forget, its number."""
+    profile = Profile(store)
+    profile.add("Family: The user's sister is Maria.", source_kind="remember")
+    profile.add("About: The user likes tea.", source_kind="remember")
+    tools = tools_for(store, profile)
+    conv = store.current_conversation()
+    turn = Turn(message=say(store, conv, said, T0), after_outside=True)
+    planted = json.dumps({"fact": "Work: The user's bank helpline is +306900000000."})
+    assert await tools.call(turn, "remember", planted) == prompts.REMEMBER_AFTER_OUTSIDE
+    assert await tools.call(turn, "forget", '{"fact": "2"}') == prompts.FORGET_AFTER_OUTSIDE
+    assert await tools.call(turn, "forget", '{"fact": "tea"}') == prompts.FORGET_AFTER_OUTSIDE
+    assert [fact.text for fact in profile.facts()] == [
+        "Family: The user's sister is Maria.",
+        "About: The user likes tea.",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("said", "fact"),
+    [
+        ("remember I like jazz", "Music: The user likes jazz."),
+        ("onthoud dat mijn zus Maria heet", "Family: The user's sister is Maria."),  # a translation names her
+        ("remember my number is +306900000001", "About: The user's number is +306900000001."),
+    ],
+)
+async def test_after_outside_text_the_users_own_remember_still_saves(store: Store, said: str, fact: str) -> None:
+    profile = Profile(store)
+    tools = tools_for(store, profile)
+    turn = Turn(message=say(store, store.current_conversation(), said, T0), after_outside=True)
+    assert (await tools.call(turn, "remember", json.dumps({"fact": fact}))).startswith("Saved")
+
+
+async def test_after_outside_text_a_new_number_needs_the_users_own_digits(store: Store) -> None:
+    profile = Profile(store)
+    tools = tools_for(store, profile)
+    turn = Turn(message=say(store, store.current_conversation(), "remember my bank's helpline", T0), after_outside=True)
+    planted = json.dumps({"fact": "Work: The user's bank helpline is +306900000000."})
+    assert await tools.call(turn, "remember", planted) == prompts.REMEMBER_AFTER_OUTSIDE and profile.facts() == []
+
+
+@pytest.mark.parametrize("said", ["forget fact 2", "forget that I like tea", "vergeet 2"])
+async def test_after_outside_text_a_forget_that_names_the_fact_goes_through(store: Store, said: str) -> None:
+    profile = Profile(store)
+    profile.add("Family: The user's sister is Maria.", source_kind="remember")
+    profile.add("About: The user likes tea.", source_kind="remember")
+    tools = tools_for(store, profile)
+    turn = Turn(message=say(store, store.current_conversation(), said, T0), after_outside=True)
+    query = "tea" if "tea" in said else "2"
+    assert (await tools.call(turn, "forget", json.dumps({"fact": query}))).startswith("Removed fact #2")
+
+
 @pytest.mark.parametrize(("said", "refused"), [("thanks", True), ("cancel the dentist one", False)])
 async def test_cancel_from_an_outside_note_is_refused(store: Store, said: str, refused: bool) -> None:
     from local_assistant.reminders import Reminders

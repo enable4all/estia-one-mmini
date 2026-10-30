@@ -13,10 +13,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from local_assistant import prompts
+from local_assistant import profiler, prompts, setup_handover
 from local_assistant.config import AvatarError, read_avatar
 from local_assistant.initiative import ANNOUNCED_KEY
-from local_assistant.signal_io import SignalError
+from local_assistant.signal_io import SignalError, shown_error
 from local_assistant.store import Message
 from local_assistant.timefmt import iso_to_epoch, local_hhmm
 
@@ -25,10 +25,11 @@ if TYPE_CHECKING:
 
 log = logging.getLogger("local_assistant")  # the app's own logger: its lines keep their name in bridge.log
 
-# after signal-cli subscribed (and recovery), then every minute: the next start's offline note, and estia-deploy's health
-# check (read-only, as _estia) both read it; its name and timing stay
+# after signal-cli subscribed (and recovery), then every minute while it is ready: the next start's offline note, and
+# estia-deploy's health check (read-only, as _estia) both read it; its name and timing stay
 ALIVE_KEY = "last_alive"
 ALIVE_SECONDS = 60
+RESEND_SECONDS = 60.0  # how often a reply or note that could not be sent is tried again (resend_failed)
 PRUNED_KEY = "privacy:pruned_at"  # when the history was last pruned ([privacy] keep_days)
 PRUNE_HOURS = (3, 5)  # pruned once a night, in this local window, when nothing else runs
 PRUNE_CHECK_SECONDS = 900.0
@@ -58,8 +59,8 @@ class Lifecycle:
             return
         try:
             await self.app.signal.update_profile(name)
-        except SignalError as exc:  # tried again at the next start
-            log.warning("Signal profile name not set: %s", exc)
+        except SignalError as exc:  # tried again at the next start; signal-cli's words may name the account
+            log.warning("Signal profile name not set: %s", shown_error(exc))
             return
         self.app.store.set_state(PROFILE_NAME_KEY, name)
         log.info("Signal profile name set")
@@ -83,7 +84,7 @@ class Lifecycle:
         try:
             await self.app.signal.update_avatar(path)
         except SignalError as exc:  # tried again at the next start; signal-cli's message may name the file
-            log.warning("Signal profile picture not set: %s (code %s)", type(exc).__name__, exc.code)
+            log.warning("Signal profile picture not set: %s", shown_error(exc))
             return
         self.app.store.set_state(PROFILE_AVATAR_KEY, digest)
         log.info("Signal profile picture set")
@@ -140,6 +141,17 @@ class Lifecycle:
         if not left:
             self.app.store.set_state(WELCOME_KEY, f"{self.app._clock():.0f}")
 
+    async def notes_before_update(self) -> None:
+        """0.9.6's count of notes not told yet, once (profiler.learned_before_update). Locked: the next start."""
+        if not self.app.guard.locked:
+            for out_id in profiler.learned_before_update(self.app.store, self.app.cfg.allowed_acis):
+                await self.app._send(out_id)
+
+    async def setup_facts(self) -> None:
+        """What setup handed over (About you, the home area), once, after the welcome (setup_handover.import_facts)."""
+        await setup_handover.send_owed(self.app)  # its note, past the recovery window too (memory-4)
+        await setup_handover.import_facts(self.app)
+
     def keep_sent(self, aci: str, text: str, timestamp: int) -> None:
         """A note delivered at once, not through the queue (a held device's): kept as a sent note in the current
         conversation, so it is in her history (code_notes) and recovery never sends it again."""
@@ -148,11 +160,16 @@ class Lifecycle:
             self.app.store.mark_sent(out_id, timestamp)
 
     async def recover(self) -> None:
-        """After a restart: answer recent messages, one offline note for older ones, resend recent replies."""
+        """After a restart: answer recent messages, one offline note for older ones, resend recent replies. A message
+        from an account no longer in allowed_acis is set aside with its files, never answered (review S3)."""
         now = self.app._clock()
         window = self.app.cfg.recover_window_seconds
         stale: list[Message] = []
         for message in self.app.store.unanswered_incoming():
+            if self.app.signal_host.set_aside_if_not_allowed(
+                message
+            ):  # taken out of allowed_acis since: never read (rule 1)
+                continue
             if now - (message.signal_ts or 0) / 1000 <= window:
                 await self.app.queue.put(message.id)
             else:
@@ -167,6 +184,37 @@ class Lifecycle:
             self.app._drop_attachments(message.id)
         await self.offline_note(stale[-1])
         log.info("recovery: %d older messages got the offline note", len(stale))
+
+    async def resend_failed(self) -> None:
+        """A reply or note that could not be sent while the bridge runs (the network gone for a moment): sent again
+        while it is younger than the recovery window, as `recover` does at a start (review I4); never to an account no
+        longer allowed or whose safety number changed (its replies stop until it is trusted again). A firing reminder's
+        note is left to the reminders' own retry (every 5 minutes for an hour), so the two never send it at once. Texts
+        wait during a call, like every text: the next pass after it."""
+        if not self.app._no_call.is_set() or self.app.signal_host.waits("the resend pass"):  # Signal's wait (review S4)
+            return
+        now, window = self.app._clock(), self.app.cfg.recover_window_seconds
+        allowed = {aci.lower() for aci in self.app.cfg.allowed_acis} - {
+            aci.lower() for aci in self.app.signal_host.identity_changed
+        }
+        retried = {reminder.message_id for reminder in self.app.store.firing_reminders()}
+        for out in self.app.store.unsent_outgoing():
+            if (
+                out.status == "failed"
+                and out.id not in retried
+                and out.peer_aci.lower() in allowed
+                and now - iso_to_epoch(out.created_at) <= window
+            ):
+                await self.app._send(out.id)
+        await setup_handover.send_owed(self.app)  # setup's note, past the window too (memory-4)
+
+    async def resend_loop(self) -> None:
+        while True:
+            await asyncio.sleep(RESEND_SECONDS)
+            try:
+                await self.resend_failed()
+            except Exception:
+                log.exception("resend: a pass failed")
 
     async def offline_note(self, message: Message) -> None:
         """One note per start: 'I was offline HH:MM–HH:MM, ask again if you still need something.'"""
@@ -298,7 +346,16 @@ class Lifecycle:
     def mark_alive(self) -> None:
         self.app.store.set_state(ALIVE_KEY, f"{self.app._clock():.0f}")
 
+    def beat(self) -> None:
+        """A sign of life only while signal-cli is ready: logged out by Signal, it ends at every start and the bridge
+        reaches nobody, so "Always on" must not stay green (review S2)."""
+        if self.app.signal.ready:
+            self.mark_alive()
+
     async def heartbeat(self) -> None:
         while True:
             await asyncio.sleep(ALIVE_SECONDS)
-            self.mark_alive()
+            try:
+                self.beat()
+            except Exception:  # a task of the bridge's group that raises would take the bridge down (review D13)
+                log.exception("heartbeat: the alive mark could not be written")

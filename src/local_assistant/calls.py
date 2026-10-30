@@ -21,9 +21,12 @@ import asyncio
 import contextlib
 import functools
 import logging
+import math
 import os
 import random
 import re
+import statistics
+import sys
 import time
 import unicodedata
 import uuid
@@ -54,6 +57,7 @@ from local_assistant.language import (
     AND,
     BUT,
     BUT_WORDS,
+    CALLING,
     CONTINUING,
     ENDING,
     ENDING_SOFT,
@@ -61,6 +65,7 @@ from local_assistant.language import (
     FAREWELLS,
     FUNCTION_WORDS,
     GOODBYES,
+    GOODBYES_NOT_ALONE,
     GOODBYES_UNTIL,
     INTERRUPTIONS,
     JAPANESE_CALLER_WORDS,
@@ -68,8 +73,11 @@ from local_assistant.language import (
     LEAVING_NOT_ALONE,
     LEAVING_SOFT,
     LEAVING_UNCLEAR,
+    LEFT_OPEN,
     MORE_COMING,
     NEGATIONS,
+    PARTING,
+    PARTING_NOT_ALONE,
     THANKS,
     YES_WORDS,
     acknowledgements,
@@ -79,18 +87,34 @@ from local_assistant.language import (
     stop_words,
 )
 from local_assistant.voice import (
+    _BEFORE_A_NAME,
+    _BEFORE_LOWER_CASE,
+    SpokenClip,
     Transcript,
     VoiceError,
+    VoiceNoStandInError,
     detector_state,
+    pocket_standard,
     sentences,
     spoken_text,
     without_stage_directions,
 )
-from local_assistant.wake import says_name
+from local_assistant.wake import nearest, only_name, says_name
 
 log = logging.getLogger(__name__)
 
 LEAD_MS = 300  # faint noise before an answer: wakes the call's audio before the first word
+CALL_MAX_TOKENS = 500  # owner, 26 Oct ("lets do 500"); a call says at most CALL_SPOKEN_CHARS, so this binds first
+# beside Gemma 4 12B (owner, 28 Oct: "yes, lets have a different limit on the 12B"): a shorter answer, and longer to
+# wait for one; both not measured on a 16 GB M3 yet (the review of 28 Oct, calls-01)
+SMALL_CALL_MAX_TOKENS = 300
+TURN_TIMEOUT_SECONDS = 45.0  # how long a call waits for one answer beside Gemma 4 26B (CallSettings' default)
+SMALL_TURN_TIMEOUT_SECONDS = 60.0
+# how much of an answer a call says: above CALL_MAX_TOKENS (500 tokens: about 2,000-2,300 characters in
+# English, 600-750 in Japanese) in any language, so the token limit binds first (review of 26 Oct, DLG-01: the 1,500
+# characters of voice.spoken_text's default left a full answer's end, her own view, unsaid); the owner may set it
+CALL_SPOKEN_CHARS = 4_000
+SPEECH_MAX_CHARS = 1_500  # the voice service's limit for one speak request (VoiceCore SpeechRequest.maxCharacters)
 PAUSE_AFTER_FILLER_S = 0.35  # "Got it." … a short pause … the answer
 INTERRUPTION_END_S = 1.2  # the end of what the caller says over her (shorter than a turn: a cough resumes sooner)
 RESUME_BACK_S = 0.5  # after a cough she carries on a little before where she stopped
@@ -98,6 +122,7 @@ RESUME_BACK_S = 0.5  # after a cough she carries on a little before where she st
 # one clip before she carries on from the stop itself, no longer a little back
 MAX_FALSE_BARGE = 3
 CONNECT_SECONDS = 10.0
+HANGUP_WAIT_S = 2.0  # her hang-up at a call's end: signal-cli's ENDED (local_hangup) within this, else once more
 NOT_READY_NOTE_SECONDS = 600.0
 PLACED_OUTCOMES = ("answered", "no_answer", "declined", "busy", "call_failed")
 
@@ -127,9 +152,25 @@ class CallSignal(Protocol):
 
 
 class Voice(Protocol):
-    async def transcribe(self, audio: bytes, *, language: str | None = None) -> Transcript: ...
+    async def transcribe(
+        self, audio: bytes, *, language: str | None = None, hint: str = "", call: bool = False
+    ) -> Transcript: ...
 
-    async def speak(self, text: str, *, language: str | None = None) -> bytes: ...
+    async def speak(
+        self, text: str, *, language: str | None = None, context: str = "", call: bool = False, kokoro: bool = True
+    ) -> bytes:
+        """`kokoro` false: Kokoro may not stand in for this line (its call turn had its one Kokoro line, or the line
+        comes before her answer or a device question): when Pocket TTS cannot say it, VoiceNoStandInError."""
+        ...
+
+    @property
+    def voice(self) -> str:
+        """Her voice now (/voice <voice> changes it at once): a canned line is kept in its voice."""
+        ...
+
+    def voice_for(self, language: str) -> str:
+        """The voice a line in `language` is asked in (jane in the six languages Pocket TTS speaks, else hers)."""
+        ...
 
     async def health(self) -> Mapping[str, object] | None: ...
 
@@ -148,6 +189,27 @@ class Turn:
     end_call: bool = False  # hang up once this was spoken (unless the user talked over it)
     # code's own words after Gemma's (a device question or result, why no reminder was set): always said in English
     code_text: str = ""
+    # the lines of code_text that her stored reply keeps (the not-set line, the device question): cut off, it keeps
+    # them only when they were reached, and never code's other lines (rule 6: those are code's notes)
+    kept_code: tuple[str, ...] = ()
+    # no answer: the model failed or took too long (her "lost my train of thought"): the call goes on, whatever the
+    # caller's turn said (review of 0.9.7: "Okay, bye, and remind me at five" then hung up at once)
+    failed: bool = False
+    # the lines of code_text that also go as texts of their own (a reminder's, a device's, the lookup line; the chords
+    # message after the call): a turn whose voice stopped (Kokoro's one line a turn) leaves them out of the rest it
+    # texts, so none comes twice
+    also_texted: tuple[str, ...] = ()
+    # the answer read outside text (Reply.read_outside): the rest of it, texted, is code's note quoting outside text
+    outside: bool = False
+
+
+class Downloads(Protocol):
+    """jane's model of a language downloading (voice_download.LanguageDownload; owner, 25 Oct): no Supertonic-3
+    stand-in for its lines, so a call in it waits for it."""
+
+    def downloading(self, language: str) -> bool: ...
+
+    def call_note(self, aci: str, language: str) -> str: ...
 
 
 class Host(Protocol):
@@ -180,7 +242,16 @@ class Host(Protocol):
         """A device action waiting for the user's yes is dropped (they never heard the question whole, said
         stop or wait, or the answer was abandoned); a device that did switch is still reported."""
 
+    async def call_standby(self, aci: str) -> None:
+        """Standby starts (the caller quiet since the last turn): a device action waiting for a yes and her offer of
+        the day's rundown are dropped, so a yes after her wake line switches and reads nothing."""
+
     async def call_note(self, aci: str, text: str) -> None: ...
+
+    async def call_text(self, aci: str, text: str, *, reply_id: int | None, outside: bool) -> None:
+        """Code's text to the caller during the call (the rest of an answer her voice stopped for): stored as code's
+        note in the conversation of her reply `reply_id` (the current one for None) and sent in the background, after the
+        turn's own notes; `outside`: it quotes outside text."""
 
     async def call_summary(self, aci: str, lines: list[str], minutes: int) -> None: ...
 
@@ -202,7 +273,7 @@ class CallSettings:
     idle_repeat_s: float = 600.0
     max_s: float = 3600.0
     summary: bool = True
-    turn_timeout_s: float = 45.0
+    turn_timeout_s: float = TURN_TIMEOUT_SECONDS  # beside Gemma 4 12B 60 s: `call_limits`
     thinking_after_s: float = 0.7  # a thinking line comes first when the answer takes longer than this
     fillers: bool = False  # "hmm, let me think" / "let me check" lines while she thinks (user: off, sounded unnatural)
     acknowledge: bool = True  # a short "Got it." as soon as a request of 5+ words is taken in (user: on)
@@ -224,10 +295,22 @@ class CallSettings:
     pause: str = "speech"
 
 
+def call_limits(timeout: float | None = None, *, standard: bool | None = None) -> tuple[int, float]:
+    """A call answer's token cap and how long a call waits for it, by the Mac's tier: `standard` (None: this Mac's,
+    `voice.pocket_standard`, read by its memory as setup chose the model) is a Mac setup gives Gemma 4 26B (30 GB of
+    memory or more, `setup.choose_model`; its Pocket TTS model follows the same tier), else Gemma 4 12B. `timeout`:
+    `[calls] turn_timeout_seconds`, which wins."""
+    big = pocket_standard() if standard is None else standard
+    tokens, waits = (
+        (CALL_MAX_TOKENS, TURN_TIMEOUT_SECONDS) if big else (SMALL_CALL_MAX_TOKENS, SMALL_TURN_TIMEOUT_SECONDS)
+    )
+    return tokens, waits if timeout is None else timeout
+
+
 # Whisper writes noise as words: sound labels (*sad music*, [Music]) and, on a short sound, its favourite fillers
 # ("Thank you" is about a quarter of its output on noise). Some phrases are never said on a call at all.
 _SOUND_LABEL = re.compile(r"[*\[(♪][^*\])♪]*[*\])♪]")
-_NOISE_WORDS = frozenset({"thank you", "thank", "thanks", "you", "so", "i", "oh", "hmm", "mm", "the", "a"}) | {
+_NOISE_WORDS = frozenset({"thank you", "thank", "thanks", "bye", "you", "so", "i", "oh", "hmm", "mm", "the", "a"}) | {
     "merci", "danke", "gracias", "grazie", "obrigado", "obrigada", "bedankt", "dank je", "dank je wel", "dziękuję",
     "спасибо", "감사합니다", "ありがとう", "ありがとうございます", "ありがとうございました",
 }  # fmt: skip
@@ -286,6 +369,26 @@ def real_words(text: str) -> list[str]:
 
 
 ACK_MIN_WORDS = 5  # a shorter turn ("how are you?", "yes", "thanks") gets its answer without a "got it" (owner)
+# her wake line comes when her answer to the turn that ended standby is not ready by then (the owner's 51 call turns,
+# 22 Oct: none was answered in under 1.9 s), so an answer that is already fast comes without it
+WAKE_LINE_AFTER_S = 0.3
+# on: in standby her name goes to Whisper as its hint (owner, 22 Oct: her name said in standby was missed); outside
+# standby never, so a hint never writes her name into an ordinary turn's noise. Off: the wake harness
+# (evals/wake_harness.py, 22 Oct) found no wake gained and false wakes with it (names near hers; silence and noise),
+# none without it; 23 Oct (--call, a call's cut on a phone line) 550 of 552 wakes without it once Whisper heard clips of
+# 1 s or less. Switch it on only after the harness shows more wakes and no false wake
+STANDBY_HINT = False
+# on: in standby a turn may end early, at Smart Turn's answer, as outside it. Off (the review of 28 Oct, calls-02):
+# standby waits the full pause (or the pause by speech), as the wake harness measured on the default name, "Estia"
+# (23 Oct, --call, 1,832 streams: 18 items woke only with the full pause, 4 only with the early end; McNemar's exact
+# test p = 0.004; "Tiffany" 0 and 3, p = 0.25), so her name said with a pause after it is one turn and never a lone
+# clip Whisper hears as nothing
+STANDBY_EARLY_END = False
+
+
+def calling_words(language: str) -> frozenset[str]:
+    """The words beside her name that call her, in a call's language and English ("hey", "hallo"), and the fillers."""
+    return frozenset(CALLING.get(language, ()) + CALLING[ENGLISH]) | FILLERS
 
 
 def turn_words(text: str) -> int:
@@ -342,6 +445,21 @@ def asks(hers: Sequence[str]) -> bool:
     or in Japanese with か, a polite question often written without one ("明日にしますか。")."""
     ends = (sentence.rstrip().rstrip("\"')]”’»」』").rstrip("。") for sentence in hers)
     return any(end.endswith(("?", "？", "か")) for end in ends)
+
+
+def last_asks(answer: str) -> bool:
+    """Whether an answer's last sentence asks something (`asks`): a full answer may ask on its way ("But is that really
+    freedom?"), and a yes after it answers nothing (review of 26 Oct, DLG-05; call_host's offer of the rundown)."""
+    return asks(sentences(answer)[-1:])
+
+
+def only_greeting(text: str, *, name: str, language: str = ENGLISH) -> bool:
+    """Words over the opening of a call she placed that only greet or call ("Hello?", "Hallo?", "Hey, hello.", "Hello,
+    Estia?"): the call language's and English's calling words (language.CALLING) and fillers, her name beside them,
+    with or without a question mark (the second deep scan of 0.9.8, calls-hello-over-opening: the callee's "Hello?"
+    took over, and the time and the reminder were never said on the call)."""
+    units = _units(text, language)
+    return made_of(units, _phrases(calling_words(language), language), _phrases(name_words(name), language))
 
 
 def is_interruption(text: str, *, name: str, language: str = ENGLISH, asking: bool = False) -> bool:
@@ -433,8 +551,11 @@ def _own_voice_japanese(text: str, played: Sequence[str]) -> bool:
 def is_own_voice(text: str, played: Sequence[str]) -> bool:
     """Whether a transcript of what stopped her is her own voice: a long part of what she already `played`, in her
     order (see OWN_VOICE_MIN_WORDS), in any of the languages. A word only the caller says ("no", "wait", "yes") that
-    she did not say makes it the caller's."""
+    she did not say makes it the caller's, and so does a question when what she played asked none (review 0.9.7, C9: a
+    repeat-back, "So the dentist at three tomorrow?")."""
     if turn_words(text) < OWN_VOICE_MIN_WORDS:
+        return False
+    if _asked(text) and not any(_asked(sentence) for sentence in played):
         return False
     if _NO_SPACES.search(text):
         return _own_voice_japanese(text, played)
@@ -461,17 +582,70 @@ def is_lone_stop(text: str, *, name: str) -> bool:
     )
 
 
-_LAST_SENTENCE_END = re.compile(r"""[.!?…]["')\]]*(?=\s)""")
+# a sentence's end: a mark and its closing quotes or brackets before a space, or a full-width mark of Japanese (or
+# Chinese) with no space after it (review of 26 Oct, rtcall-4: "自由意志は難しい問題です。決定論は" was said whole)
+_LAST_SENTENCE_END = re.compile(r"""[.!?…]["')\]]*(?=\s)|[。！？][」』）"')\]]*""")
 
 
-def whole_sentences(text: str) -> str:
-    """An answer that was cut off at the token limit ends at its last whole sentence (she never stops mid-sentence);
-    an answer that ends properly, or has no sentence end at all, stays as it is."""
+def _ends_a_sentence(text: str, found: re.Match[str]) -> bool:
+    """Whether a mark ends a sentence: never a title, "vs.", "e.g." or "i.e." before the next word, nor "a.m." or "No."
+    before a lower-case letter or a digit (`voice.sentences`' rule; review of 26 Oct, rtcall-10: a cut answer ended on
+    "As Dr.")."""
+    last = text[: found.end()].rsplit(None, 1)[-1]
+    after = text[found.end() :].lstrip()[:1]
+    return not (last in _BEFORE_A_NAME or (last in _BEFORE_LOWER_CASE and (after.islower() or after.isdigit())))
+
+
+def whole_sentences(text: str, *, cut: bool = True) -> str:
+    """An answer that was cut off at the token limit (`cut`: the model's finish reason was "length") ends at its last
+    whole sentence (she never stops mid-sentence); one the model ended itself is said whole, also when it ends without
+    a mark (an emoji, a name: review of 26 Oct, rtcall-10), and so is one with no sentence end at all."""
     stripped = text.rstrip()
-    if not stripped or stripped[-1] in ".!?…\"')]":
+    if not cut or not stripped or stripped[-1] in ".!?…\"')]。！？」』":
         return stripped
-    ends = list(_LAST_SENTENCE_END.finditer(stripped))
+    ends = [found for found in _LAST_SENTENCE_END.finditer(stripped) if _ends_a_sentence(stripped, found)]
     return stripped[: ends[-1].end()] if ends else stripped
+
+
+# her closing question after a full answer goes (owner, 26 Oct: "I ask a deep question and I get a question back. Take
+# the time to explain in full"; the call rules ask a question back only when she cannot answer without it, and the 0.9.8
+# gate, 28 Oct, still had all 10 of the 12B's answers to a deep question end "What do you think?", the 26B's too): a
+# full answer is at least this many words before it, about 25 s of speech; a shorter one keeps its question
+CLOSING_QUESTION_AFTER_WORDS = 60
+
+
+def _last_sentence_start(text: str) -> int:
+    """Where the text's last spoken sentence starts: right after the sentence end before it; an emoji, a stage
+    direction or markup after its own end ("What do you think? 😄") belongs to it, as the call says none of them."""
+    ends = [found.end() for found in _LAST_SENTENCE_END.finditer(text) if _ends_a_sentence(text, found)]
+    return next((end for end in reversed(ends) if real_words(heard(text[end:]))), 0)
+
+
+def without_last_questions(text: str) -> str:
+    """The text without the questions it ends with, as written ('"who decides?"') or as said (no emoji); "" when it is
+    only questions. While a device change waits, a text answer ends with code's question instead, so a yes never
+    answers hers (second review of 0.9.8, redteam-05)."""
+    kept = text.rstrip()
+    while kept:
+        start = _last_sentence_start(kept)
+        if not asks([kept[start:], heard(kept[start:])]):
+            break
+        kept = kept[:start].rstrip()
+    return kept
+
+
+def without_closing_questions(text: str, *, name: str, language: str = ENGLISH) -> str:
+    """Her answer on a call without the questions it ends with, when what comes before them is a full answer: at least
+    CLOSING_QUESTION_AFTER_WORDS words (`turn_words` of what the call says) that do not end as her goodbye (that ends
+    the call after its quiet, `ends_with_goodbye`, while a question keeps it open); else the text as it is. A question
+    asked on its way stays, and so does one after a short answer ("I can call you. What time?")."""
+    kept = without_last_questions(text)
+    if not kept or kept == text.rstrip() or turn_words(heard(kept)) < CLOSING_QUESTION_AFTER_WORDS:
+        return text
+    if ends_with_goodbye(heard(kept), name=name, language=language):
+        return text
+    log.info("calls: her closing question left out after a full answer (%d words kept)", turn_words(heard(kept)))
+    return kept
 
 
 def speakable(note: str) -> str:
@@ -496,20 +670,34 @@ def _goodbye(name: str) -> re.Pattern[str]:
     )
 
 
-_WRAP_UP = re.compile(
-    r"\b(?:that (?:will|'ll|should|would) do(?: it)?|that'?s? (?:is )?(?:all|it|everything|enough)(?: for (?:now|today))?"
-    r"|that is (?:all|it|everything)|nothing (?:else|more)|no more questions|i'?m done|we'?re done)\b"
+# a wrap-up's own words: "that's", "thats" or "that is", never "that it" or "that all" ("Check that it's locked", "Make
+# sure that all the lights are off"), and "we're done", never "were done" (second fix review of 0.9.8,
+# redteam-calls-wrap-up-lookalike: the apostrophes were optional); "that'll do" is one word "that'll" to Whisper
+_WRAP_UP_WORDS = (
+    r"that(?: will|'ll| should| would) do(?: it)?|that(?:'s|s) (?:all|it|everything|enough)|that is (?:all|it|everything)"
+    r"|nothing (?:else|more)|no more questions|i'?m done|we're done"
+)
+# a part that is a wrap-up alone (`_wraps_up`): its words, maybe with what it was for or what was needed ("that's it
+# for the page", "that's all I needed"), and soft words beside them; never one with more after it ("that's it for
+# mail now the calendar")
+_WRAP_UP_ALONE = re.compile(
+    rf"(?:{_WRAP_UP_WORDS})(?: here| for (?:(?:the|this|my|your) )?[a-z']+| i (?:need|needed|want|wanted|had)"
+    r"(?: to (?:know|ask))?)?"
 )
 
 
-def is_wrap_up(text: str) -> bool:
+def is_wrap_up(text: str, *, name: str, language: str = ENGLISH) -> bool:
     """A short "that will do for now" / "that's all" / "nothing else": the user is finishing. After such a turn the
     call ends once her answer is spoken, unless the answer asks something ("I'm good" is not one: it also answers
-    "how are you?"). Longer turns that only contain such words ("that's all I know, what do you think?") are not."""
+    "how are you?"). At most 8 words, no question mark, and a wrap-up by `_wraps_up`'s rule: a part that is a
+    wrap-up's own words with soft words beside them, only closing words or a thanks in the others; never one with a
+    request or more beside it, an idiom or a part that only holds its words ("That'll do. Read me the calendar.",
+    "Yes, that'll do the trick.", "Make sure nothing else is on."; third fix review of 0.9.8,
+    voice-calls-fixrev3-01: after her goodbye such a turn ended the call and the request was dropped)."""
     words = re.findall(r"[a-z']+", text.lower())
     if not words or len(words) > 8 or "?" in text:
         return False
-    return bool(_WRAP_UP.search(" ".join(words)))
+    return _wraps_up(text, name=name, language=language)
 
 
 def is_goodbye(text: str, *, name: str) -> bool:
@@ -793,6 +981,208 @@ def _closing(language: str, name: str) -> tuple[frozenset[tuple[str, ...]], froz
     return _phrases(words, language), _leaving(language, name).soft
 
 
+@functools.cache
+def _parting(language: str, name: str) -> frozenset[tuple[str, ...]]:
+    """A caller's closing words after her goodbye (`_closing`'s) and the goodbyes that are also "hello" elsewhere
+    (language.PARTING: "ciao", "пока"), the call language's and English, as compared."""
+    closing, _ = _closing(language, name)
+    codes = dict.fromkeys((language, ENGLISH))
+    return closing | _phrases([word for code in codes for word in PARTING.get(code, ())], language)
+
+
+def closes_only(text: str, *, name: str, language: str = ENGLISH) -> bool:
+    """The caller's turn right after her goodbye is only closing words: thanks, acknowledgements and goodbyes, in the
+    call's language or English, with soft words ("Thank you.", "Doei!", "Ciao!", "Пока!", "またね", "Okay, bye."; review of
+    0.9.7: only English goodbyes ended the call); never asked ("Okay?") and never with more ("Thanks, and tomorrow?")."""
+    if _asked(text):
+        return False
+    parts = [_units(part.text, language) for part in _turn_parts(text, language)]
+    soft = _closing(language, name)[1]
+    return bool(parts) and all(made_of(units, _parting(language, name), soft) for units in parts)
+
+
+def _holds(units: tuple[str, ...], phrases: Collection[tuple[str, ...]]) -> bool:
+    """Whether `units` hold one of `phrases` anywhere."""
+    return any(units[at : at + len(one)] == one for one in phrases for at in range(len(units) - len(one) + 1))
+
+
+@dataclass(frozen=True)
+class _Byes:
+    """A caller's goodbyes on a call as compared, the call language's and English (`closes_call`)."""
+
+    goodbyes: frozenset[tuple[str, ...]]  # language.GOODBYES, but its GOODBYES_NOT_ALONE
+    until: frozenset[tuple[str, ...]]  # language.GOODBYES_UNTIL: also "until <a time>"
+    for_now: frozenset[tuple[str, ...]]  # language.GOODBYES_NOT_ALONE: also "for now", "so far" or "later"
+    parting: frozenset[tuple[str, ...]]  # language.PARTING, but its PARTING_NOT_ALONE
+    not_alone: frozenset[tuple[str, ...]]  # language.PARTING_NOT_ALONE: also "hello" or "well then"
+    thanks: frozenset[tuple[str, ...]]  # language.THANKS
+    words: frozenset[tuple[str, ...]]  # closing words (`_parting`'s) and the soft words beside them
+    soft: frozenset[tuple[str, ...]]  # the soft words alone (`_closing`'s)
+    # beside a goodbye that also means "so far" ("пока", "na razie"): thanks, goodbyes, fillers and her name, never an
+    # acknowledgement or a soft word ("Пока всё хорошо.", "Na razie dobrze.": so far, so good)
+    beside: frozenset[tuple[str, ...]]
+
+
+@functools.cache
+def _byes(language: str, name: str) -> _Byes:
+    codes = dict.fromkeys((language, ENGLISH))
+
+    def of(table: Mapping[str, tuple[str, ...]]) -> frozenset[tuple[str, ...]]:
+        return _phrases([word for code in codes for word in table.get(code, ())], language)
+
+    soft = _closing(language, name)[1]
+    not_alone = of(PARTING_NOT_ALONE)
+    for_now = of(GOODBYES_NOT_ALONE)
+    return _Byes(
+        of(GOODBYES) - for_now,
+        of(GOODBYES_UNTIL),
+        for_now,
+        of(PARTING) - not_alone,
+        not_alone,
+        of(THANKS),
+        _parting(language, name) | soft,
+        soft,
+        of(THANKS) | of(GOODBYES) | of(PARTING) | _phrases([*FILLERS, name], language),
+    )
+
+
+def _says_bye(text: str, *, name: str, language: str) -> bool:
+    """A goodbye of the call's language or English in the caller's turn (language.GOODBYES: "Danke, tschüss!",
+    "Tschüss. Ich gehe jetzt einkaufen.", "じゃあね"): not asked, not in quoted speech, only closing talk after it
+    (_closing_talk); one that is also "until <a time>" (GOODBYES_UNTIL) only with nothing but closing words before it in
+    its sentence ("Okay, danke. Bis morgen!", never "Es bleibt bewölkt, bis morgen."). Or a turn that ends on a goodbye
+    that is also "hello" elsewhere (language.PARTING: "Пока!", "Dzięki, pa!"), with only thanks, goodbyes, fillers or
+    her name beside it in its part (`_Byes.beside`: "пока" is also "so far", "Пока всё хорошо."); one that alone is also
+    a greeting or a turn's opening (PARTING_NOT_ALONE: "Ciao!", "Dag!", "じゃあ") only after a thanks ("Grazie, ciao!",
+    "Perfetto, grazie. Ciao!", never "Ciao, bene grazie!"); and one that is also "for now", "so far" or "later"
+    (GOODBYES_NOT_ALONE: "na razie", "またあとで") only there, after a thanks or another goodbye ("Dzięki, na razie!",
+    never "Na razie dobrze." or "うん、またあとで。天気を教えて"; second fix review of 0.9.8,
+    redteam-calls-so-far-reads-as-goodbye)."""
+    parts = _turn_parts(text, language)
+    if not parts:
+        return False
+    units = [_units(part.text, language) for part in parts]
+    byes = _byes(language, name)
+
+    def goodbye(index: int) -> bool:
+        part = parts[index]
+        if part.quoted or _asked(part.text) or not made_of(units[index], byes.goodbyes, byes.words):
+            return False
+        if not _closing_talk([later.text for later in parts[index + 1 :]], language):
+            return False
+        if made_of(units[index], byes.goodbyes - byes.until, byes.words):
+            return True
+        same = [units[at] for at in range(index) if parts[at].sentence == part.sentence]
+        return all(made_of(earlier, byes.words, byes.words) for earlier in same)
+
+    ends = not parts[-1].quoted and not _asked(parts[-1].text)
+    thanked = any(_holds(earlier, byes.thanks) for earlier in units[:-1]) or _starts_with(
+        units[-1], byes.thanks, byes.soft
+    )
+    bid = any(_holds(earlier, byes.goodbyes | byes.parting) for earlier in units[:-1])
+    return (
+        any(goodbye(index) for index in range(len(parts)))
+        or (ends and made_of(units[-1], byes.parting, byes.beside))
+        or (ends and thanked and made_of(units[-1], byes.not_alone, byes.words))
+        or (ends and (thanked or bid) and made_of(units[-1], byes.for_now, byes.beside))
+    )
+
+
+# beside a wrap-up's words, besides closing and soft words: "No, that's it", "I think that's all for today"
+_WRAP_UP_SOFT = ("no", "nope", "no thanks", "i think", "i guess", "i suppose", "really")
+# the most words a thanks may name after "for" and still close the call ("thanks for the help", "thanks for all that"),
+# and the words that say a request follows ("thanks and now my calendar", "thanks for that now read me the rest")
+_THANKS_FOR_WORDS = 3
+_GOES_ON = frozenset({"and", "now", "but", "then", "so", "also", "next", "please"})
+
+
+def _only(units: tuple[str, ...], soft: Collection[tuple[str, ...]]) -> bool:
+    """Whether `units` are none, or only `soft` ones."""
+    return not units or made_of(units, soft, soft)
+
+
+# "all" before these is a "no problem", never a wrap-up ("That's all right.", "That's all good, thanks."; third fix
+# review of 0.9.8, voice-calls-fixrev3-02: "right" and "good" are soft words, so they read as beside "that's all")
+_ALL_AS_FINE = frozenset({("all", "right"), ("all", "good"), ("all", "fine")})
+
+
+def _wrap_up_alone(units: tuple[str, ...], soft: Collection[tuple[str, ...]]) -> bool:
+    """Whether a part's words are a wrap-up's own (_WRAP_UP_ALONE: "that's it for the page", "that's all I needed")
+    with only `soft` ones before and after it ("No, that will do for now", "I think that's it for today, thanks");
+    never a "that's all" that goes on as "all right", "all good" or "all fine" (_ALL_AS_FINE)."""
+    for start in range(len(units)):
+        if not _only(units[:start], soft):
+            continue
+        for end in range(len(units), start, -1):
+            if units[end - 1 : end + 1] in _ALL_AS_FINE:
+                continue
+            if _WRAP_UP_ALONE.fullmatch(" ".join(units[start:end])) and _only(units[end:], soft):
+                return True
+    return False
+
+
+def _thanks_alone(units: tuple[str, ...], byes: _Byes) -> bool:
+    """Whether a part is a thanks that closes: with only closing words ("Thanks a lot", "okay, thank you, bye"), or
+    with what it is for, up to _THANKS_FOR_WORDS words, and closing words after them ("thanks for the help, see you");
+    never with a request ("Thank you and now my calendar please", "thanks for that now read me the rest")."""
+    if made_of(units, byes.thanks, byes.words):
+        return True
+    reached = {0}
+    for start in range(len(units)):
+        if start not in reached:
+            continue
+        for thanks in byes.thanks:
+            after = start + len(thanks)
+            if units[start:after] != thanks or units[after : after + 1] != ("for",):
+                continue
+            for count in range(1, _THANKS_FOR_WORDS + 1):
+                named = units[after + 1 : after + 1 + count]
+                if len(named) == count and not _GOES_ON & set(named) and _only(units[after + 1 + count :], byes.words):
+                    return True
+        reached.update(start + len(soft) for soft in byes.soft if units[start : start + len(soft)] == soft)
+    return False
+
+
+def _wraps_up(text: str, *, name: str, language: str) -> bool:
+    """A wrap-up in the caller's turn (English: "that's all", "nothing else"): a part that is a wrap-up's own words with
+    soft words beside them (_wrap_up_alone: "No, that will do for now", "that's all I needed"), and in the other parts
+    only closing words or a thanks (_thanks_alone: "okay, that's everything for today, thanks for the help"); never
+    asked, never a part that only holds a wrap-up's words ("Make sure nothing else is on"), and never a request beside
+    it ("That's all for the mail. Thank you and now my calendar please.": Whisper often writes no comma after a thanks;
+    second fix review of 0.9.8, guard-01 and voice-02: such turns ended the call after outside text)."""
+    if _asked(text):
+        return False
+    parts = _turn_parts(text, language)
+    byes = _byes(language, name)
+    english = _byes(ENGLISH, name).words | _phrases(_WRAP_UP_SOFT, ENGLISH)
+    wraps = [_wrap_up_alone(_units(part.text, ENGLISH), english) for part in parts]
+    words = byes.words | _phrases(_WRAP_UP_SOFT, language)
+
+    def closing(part: _Part) -> bool:
+        units = _units(part.text, language)
+        return made_of(units, words, words) or (_thanks_alone(units, byes) and not _says_more(part.text, language))
+
+    return any(wraps) and all(wrap or closing(part) for wrap, part in zip(wraps, parts, strict=True))
+
+
+def closes_call(text: str, *, name: str, language: str = ENGLISH) -> bool:
+    """The caller's own words close the call: leave-taking (`takes_leave`), a request to end it (`wants_hang_up`), a
+    goodbye alone or with closing talk after it (`is_goodbye`, `says_goodbye`, and in the call's language `_says_bye`:
+    "Danke, tschüss!", "Пока!", "Grazie, ciao!"), or a wrap-up (`_wraps_up`, English: "Thanks, that's all."). An
+    acknowledgement or a thanks alone is none ("Okay.", "Grazie."), and so is a goodbye that is also "hello" with no
+    thanks before it ("Ciao!"). After outside text her end_call needs one (tools.Tools.may_end_call; release review of
+    0.9.8, G02; its fix review, voice-01: on a call after a mail read, a goodbye in the other ten call languages or a
+    wrap-up left her end_call refused)."""
+    return (
+        takes_leave(text, name=name, language=language)
+        or wants_hang_up(text, name=name, language=language)
+        or is_goodbye(text, name=name)
+        or says_goodbye(text, name=name, language=language)
+        or _wraps_up(text, name=name, language=language)
+        or _says_bye(text, name=name, language=language)
+    )
+
+
 def answers_question(text: str, *, name: str, language: str = ENGLISH) -> bool:
     """The caller's reply only answers her yes-or-no question: a yes (language.is_yes: "yes please", "ja graag") or
     only acknowledgements, negations and thanks, with soft words ("No, thanks.", "Okay.", "Nee hoor.")."""
@@ -850,8 +1240,8 @@ _FAREWELL_PARTS = re.compile(r"\s*(?:[,;:—–]|\s-\s)\s*")
 def _farewell(text: str, language: str) -> bool:
     """Her answer's last sentence is a closing wish or an offer to wait ("Enjoy your evening!", "Sleep well, and I'll
     catch you in the morning!", "I'll be here whenever you're ready."): every part of it starts like one of the call
-    language's or English's (language.FAREWELLS), a leading "and" left out, within that pattern's words (Japanese,
-    without spaces, counts one)."""
+    language's or English's (language.FAREWELLS), a leading "and" and Spanish's opening "¡" or "¿" left out ("¡Y que
+    descanses!"), within that pattern's words (Japanese, without spaces, counts one)."""
     sentences = [sentence for sentence in _FAREWELL_SENTENCES.split(text.strip()) if real_words(sentence)]
     if not sentences:
         return False
@@ -864,7 +1254,7 @@ def _farewell(text: str, language: str) -> bool:
     parts = [part for part in _FAREWELL_PARTS.split(sentences[-1].rstrip(".!?…。！？ ").casefold()) if part.strip()]
 
     def closing(part: str) -> bool:
-        words = part.replace("’", "'").split()
+        words = [word for word in (word.lstrip("¡¿") for word in part.replace("’", "'").split()) if word]
         if words and words[0] in joins:
             words = words[1:]
         said = " ".join(words)
@@ -888,7 +1278,8 @@ def _cased_word(word: str) -> bool:
 
 # An early end's words that end like more is coming (owner, 17 Oct): a comma, an ellipsis or a dash at the end (Whisper's
 # marks of a sentence left open; 、 is Japanese's comma), or a last word that goes on (language.CONTINUING: "to",
-# "naar"), a "but" (language.BUT) or a filler ("um", "äh"), in the call's language or English
+# "naar"), a "but" (language.BUT), a word a turn never ends on (language.LEFT_OPEN: "and", "the", "because") or a
+# filler ("um", "äh"), in the call's language or English
 _OPEN_ENDS = (",", "、", "…", "...", "-", "–", "—")
 AT_ONCE = "at once"  # _call_over: the call ends once her answer is spoken
 AFTER_QUIET = "after quiet"  # _call_over: her plain goodbye ends it after goodbye_grace_s of quiet (_after_goodbye)
@@ -898,7 +1289,9 @@ HOLD_MAX_S = 120.0  # a turn joined in holds is at most this long (one listen's 
 @functools.cache
 def _open_words(language: str) -> frozenset[tuple[str, ...]]:
     codes = dict.fromkeys((language, ENGLISH))
-    words = [word for code in codes for word in (*CONTINUING.get(code, ()), *BUT.get(code, ()))]
+    words = [
+        word for code in codes for word in (*CONTINUING.get(code, ()), *BUT.get(code, ()), *LEFT_OPEN.get(code, ()))
+    ]
     return _phrases([*words, *FILLERS], language)
 
 
@@ -913,10 +1306,118 @@ def goes_on(text: str, language: str = ENGLISH) -> bool:
     return any(len(units) >= len(words) and units[-len(words) :] == words for words in _open_words(language))
 
 
-def _parts(text: str) -> list[str]:
-    """Text to speak on a call, sentence by sentence (even a one-word answer); never a stage direction ("(laughs)")."""
+LONG_ANSWER_WORDS = 60  # the end line counts answers of this many words or more apart (a deep question's, mostly)
+
+
+def percentile(values: Sequence[int], share: float) -> int:
+    """The nearest-rank percentile of `values` (not empty): the smallest value with at least `share` of them at or
+    below it."""
+    ranked = sorted(values)
+    return ranked[max(0, math.ceil(share * len(ranked)) - 1)]
+
+
+def _waits(values: Sequence[int]) -> str:
+    if not values:
+        return "none"
+    answers = f"{len(values)} answer{'' if len(values) == 1 else 's'}"
+    return (
+        f"{answers}, median {round(statistics.median(values))} ms, 90th percentile {percentile(values, 0.9)} ms,"
+        f" {sum(ms <= 3_000 for ms in values)} within 3 s, {sum(ms <= 10_000 for ms in values)} within 10 s"
+    )
+
+
+def waits_line(waits: Sequence[tuple[int, int]], stopped: int = 0) -> str:
+    """The call's end line for her wait (metadata; review of 26 Oct, rtcall-2): the time from the end of each of the
+    caller's turns to her answer's first words, all of them, then long answers (LONG_ANSWER_WORDS or more) and short
+    ones apart; then, when there were any, the turns whose voice stopped before her answer's first words (`stopped`:
+    Kokoro's one line a turn; the review of 28 Oct, pipeline-06), so a turn the caller heard nothing of is counted."""
+    head = "calls: her first words after the end of a turn: "
+    tail = f"; her voice stopped before her answer's first words: {stopped} turn{'' if stopped == 1 else 's'}"
+    tail = tail if stopped else ""
+    if not waits:
+        return f"{head}none{tail}"
+    long = [ms for ms, words in waits if words >= LONG_ANSWER_WORDS]
+    short = [ms for ms, words in waits if words < LONG_ANSWER_WORDS]
+    return (
+        f"{head}{_waits([ms for ms, _ in waits])}; long answers ({LONG_ANSWER_WORDS} words or more): {_waits(long)};"
+        f" short ones: {_waits(short)}{tail}"
+    )
+
+
+_PIECE_BREAKS = (",", "、", "，", ";")  # where a part too long for one speak request is split (a comma first)
+
+
+def _pieces(part: str) -> list[str]:
+    """A part in pieces the voice service takes in one request (SPEECH_MAX_CHARS each; review of 26 Oct, rtcall-6: a
+    longer one is a 400 that ends the call): split at its last comma before the limit, else its last space, else at
+    the limit itself."""
+    pieces: list[str] = []
+    while len(part) > SPEECH_MAX_CHARS:
+        head = part[:SPEECH_MAX_CHARS]
+        cut = max(head.rfind(mark) for mark in _PIECE_BREAKS) + 1
+        if cut <= 0:
+            cut = head.rfind(" ")
+        if cut <= 0:
+            cut = SPEECH_MAX_CHARS
+        pieces.append(part[:cut].rstrip())
+        part = part[cut:].lstrip()
+    return [*pieces, part] if part else pieces
+
+
+def _parts(text: str, max_chars: int = CALL_SPOKEN_CHARS) -> list[str]:
+    """Text to speak on a call, sentence by sentence (even a one-word answer), at most `max_chars` of it (ending at a
+    sentence end), each part short enough for one speak request (`_pieces`); never a stage direction ("(laughs)")."""
     plain = without_stage_directions(text).strip()
-    return sentences(spoken_text(text, min_chars=1, rest="")) or ([plain] if plain else [])
+    parts = sentences(spoken_text(text, max_chars, min_chars=1, rest="")) or ([plain] if plain else [])
+    return [piece for part in parts for piece in _pieces(part)]
+
+
+def kokoro_said(wav: bytes, language: str) -> bool:
+    """Whether Kokoro said this line in her voice's place: the voice service marks a stand-in (`SpokenClip.stand_in`),
+    and in English that is Kokoro's (af_heart, or am_michael for a male voice); in the ten other languages it is
+    Supertonic-3's F1, which never counts (owner, 28 Oct). A Kokoro voice the user picked is no stand-in."""
+    return language == ENGLISH and isinstance(wav, SpokenClip) and bool(wav.stand_in)
+
+
+def heard(text: str) -> str:
+    """What the caller hears of `text` when it is said to its end: the call's parts (`_parts`), as one string. Her
+    stored reply, the end of the call and her offer of the rundown read this, never the words left unsaid."""
+    return " ".join(_parts(text))
+
+
+SUMMARY_CHARS = 12_000  # what a call summary reads of the call's lines, at most
+SUMMARY_HEAD_CHARS = 4_000  # of that, the call's start; the rest its end
+SUMMARY_GAP = "(… the middle of the call is left out …)"
+
+
+def summary_transcript(lines: list[str]) -> str:
+    """The call's lines as its summary reads them: whole when they fit in SUMMARY_CHARS, else the lines of its start
+    (SUMMARY_HEAD_CHARS) and of its end, with SUMMARY_GAP between them (review of 26 Oct, rtcall-7: only the last
+    12,000 characters were read, so a call with seven or more full answers lost its first topics). A line too long for
+    its share is cut to it."""
+    whole = "\n".join(lines)
+    if len(whole) <= SUMMARY_CHARS:
+        return whole
+    head: list[str] = []
+    room = SUMMARY_HEAD_CHARS
+    for line in lines:
+        if room <= 0:
+            break
+        head.append(line[:room])
+        room -= len(line) + 1
+    tail: list[str] = []
+    room = SUMMARY_CHARS - SUMMARY_HEAD_CHARS - len(SUMMARY_GAP) - 2
+    for line in reversed(lines[len(head) :]):
+        if room <= 0:
+            break
+        tail.insert(0, line[-room:])
+        room -= len(line) + 1
+    return "\n".join([*head, SUMMARY_GAP, *tail])
+
+
+def said_whole(text: str) -> bool:
+    """Whether a call says all of `text`: false when CALL_SPOKEN_CHARS cuts it (its speech, uncut, is longer)."""
+    return len(spoken_text(text, sys.maxsize, min_chars=1, rest="")) <= CALL_SPOKEN_CHARS
 
 
 def ended_outcome(reason: str) -> str:
@@ -949,8 +1450,72 @@ def socket_path(accepted: dict[str, Any], connected: dict[str, Any], folder: Pat
     return folder / f"signal-call-{call_id & 0xFFFFFFFFFFFFFFFF}.sock"
 
 
+class _LineClosed(ConnectionError):
+    """The call's line closed while she spoke (the call ended): `played` of the clip went out, its lead left out."""
+
+    def __init__(self, played: float) -> None:
+        super().__init__("the call's line closed while she spoke")
+        self.played = played
+
+
 class _Ended(Exception):
     """The call ended (hung up, timed out or signal-cli restarted)."""
+
+
+@dataclass(frozen=True)
+class _Spoke:
+    """How her answer was spoken (CallManager._speak)."""
+
+    interruption: str | None  # what the caller said over it, or None: said whole
+    heard: str  # what the caller heard of it, code's lines too (the call's transcript for its summary)
+    kept: str  # what her stored reply keeps of that: her words and Turn.kept_code, never code's other lines
+    taken_at: float | None  # how far into her answer (after the lead) the caller took over
+    stopped: bool = False  # her voice stopped for the rest of the turn (Kokoro's one line): the rest went as a text
+
+
+class _Clip(bytes):
+    """A line's audio at 48 kHz; `kokoro`: Kokoro said it in her voice's place (`kokoro_said`)."""
+
+    kokoro: bool = False
+
+    @classmethod
+    def of(cls, wav: bytes, language: str) -> _Clip:
+        """The voice service's WAV of a line in `language`, at the call's rate."""
+        clip = cls(wav_to_pcm48(wav))
+        clip.kokoro = kokoro_said(wav, language)
+        return clip
+
+
+class _Skip:
+    """In a turn that waits for a device's yes: Pocket TTS could not say her words before code's question, so they go
+    as a text from there and the question, last, is said (`CallManager._speak`)."""
+
+
+_SKIPPED = _Skip()
+
+
+@dataclass
+class _KokoroTurn:
+    """Kokoro in one call turn (owner, 28 Oct: "great stuff, do it"; the review of 28 Oct, calls-03: Kokoro, the
+    English stand-in for her Pocket voice, can crash the voice service and the call with it): it says at most one line
+    of the turn. Her "Got it.", thinking, checking, wake and retry lines never ask for it (`_say_line`; the review of
+    28 Oct, pipeline-01: one it said left the whole answer to a text), so that line is her answer's. `said`: it said
+    one, so every later line asks for none (`speak(kokoro=False)`); `stopped`: a later line would have needed it, so
+    she says nothing more in this turn."""
+
+    said: bool = False
+    stopped: bool = False
+
+    def allows(self, clip: bytes | None) -> bool:
+        """Whether a line of this turn is said: Kokoro's first is, and marks the turn; a line the voice service refused
+        (None: Pocket TTS could not say it and Kokoro was not asked) or Kokoro's after its first (an older voice
+        service reads no "kokoro" field) stops her voice for the rest of the turn."""
+        kokoro = isinstance(clip, _Clip) and clip.kokoro
+        if clip is None or (kokoro and self.said):
+            self.stopped = True
+            return False
+        self.said = self.said or kokoro
+        return True
 
 
 @dataclass
@@ -988,6 +1553,9 @@ class _Call:
     user_turns: int = 0
     dropped: bool = False
     unfinished: bool = False  # the call ended while an answer was still being worked on
+    # answers in a row stopped by the turn's time limit: the second says CallLines.too_long, never the lost line again,
+    # and one left at the call's end gets its own note (the second deep scan of 0.9.8, dialogue-call-lost-loop)
+    timeouts: int = 0
     acknowledged_last: bool = False  # the last request got a "got it": the next one gets none
     # the call's end-of-turn rules, given to every listen of hers (never the one after a barge-in); None: both off
     turn_end: TurnEnd | None = None
@@ -995,6 +1563,24 @@ class _Call:
     # the caller asked her to end the call (or took leave) while her answer asked a device question: the call ends
     # once her answer to the caller's reply is spoken, when that reply only answers the question ("yes", "no thanks")
     ends_after_question: bool = False
+    # a message waits for this call's end (CallManager.text_waits; owner, 23 Oct): the accounts code's line went to in
+    # their chat (once a call each), and whether the caller's still waits to be said on the call (once a call)
+    texted: set[str] = field(default_factory=set)
+    text_owed: bool = False
+    text_clip: asyncio.Task[bytes] | None = None  # the speech of her line about it, made while she listens
+    # her latest words (a sentence and the one before it) ask something: the caller's reply may come after any pause,
+    # so her line about a text waits (review, 23 Oct: a "yes" 1.2 s after her question was lost under it)
+    asked: bool = False
+    # her wait after the caller's turns (review of 26 Oct, rtcall-2; metadata): when the latest turn ended (its listen
+    # returned; None once her answer started), her first sound since (a "Got it." or a thinking line), and per answer
+    # the wait until her answer's first words in ms with its words (the end line, `waits_line`)
+    turn_ended_at: float | None = None
+    first_sound_at: float | None = None
+    waits: list[tuple[int, int]] = field(default_factory=list)
+    stopped_before_words: int = 0  # turns whose voice stopped before her answer's first words (the end line)
+    # Kokoro in the turn being answered, from the caller's words to her answer's end (Kokoro's one line a turn); None
+    # between turns (her greeting, check-in, wake line or goodbye: each one line of its own)
+    kokoro: _KokoroTurn | None = None
 
 
 class CallManager:
@@ -1016,8 +1602,10 @@ class CallManager:
         locked: Callable[[], bool] = lambda: False,
         missed: Callable[[str, bool], None] = lambda aci, promised: None,
         reached: Callable[[str], None] = lambda aci: None,
+        downloads: Downloads | None = None,
     ) -> None:
         self._signal = signal
+        self._downloads = downloads  # a call in a language whose model downloads rings out, with code's text
         self._locked = locked  # /lock: no call is answered or placed until /unlock
         # a call that rang while the voice was not ready, and whether its "not ready" note (a promise) went out: the
         # voice-ready note follows
@@ -1043,7 +1631,8 @@ class CallManager:
         # warm-ups still running, held here so that one outlives its call (asyncio keeps only weak references)
         self._warm_ups: set[asyncio.Task[None]] = set()
         self._audio: CallAudio | None = None
-        self._clips: dict[tuple[str, str], bytes] = {}  # canned lines at 48 kHz by (language, text) (no user data)
+        # canned lines at 48 kHz by (voice, language, text) (no user data), never one another voice said in hers' place
+        self._clips: dict[tuple[str, str, str], bytes] = {}
         self._last: tuple[float, int] | None = None  # the last call: wall start, minutes
         self._not_ready_at: float | None = None
         self._detector = "not ready"  # the speech detector's state at the last readiness check (detector_state)
@@ -1054,6 +1643,18 @@ class CallManager:
     @property
     def in_call(self) -> bool:
         return self._call is not None
+
+    def text_waits(self, aci: str) -> bool:
+        """A message from `aci` waits for this call's end (the app: a text, voice note, photo or document, or a command
+        that waits; owner, 23 Oct): whether that account gets code's line in its chat now, once a call. Never with no
+        call on, nor for the caller of a practice call (a text typed during it is a practice turn, answered first after
+        it). The caller's first also has her say so on the call, once, at the next quiet moment (`_text_line`)."""
+        call, aci = self._call, aci.lower()
+        if call is None or (call.practice and aci == call.aci) or aci in call.texted:
+            return False
+        call.texted.add(aci)
+        call.text_owed = call.text_owed or aci == call.aci
+        return True
 
     @property
     def speaking(self) -> bool:
@@ -1107,25 +1708,31 @@ class CallManager:
                 log.exception("calls: a call event failed")
 
     async def hangup(self) -> None:
-        """Hang up a running call, or one she is placing that still rings (the bridge is stopping)."""
+        """Hang up a running call, or one she is placing that still rings (/lock, or the bridge is stopping)."""
         call = self._call
         if call is not None and not call.ended.is_set():
-            with contextlib.suppress(Exception):
+            try:
                 await self._signal.hangup_call(call.aci, call.call_id)
+            except Exception as exc:  # the call's own end hangs up again, checked (_hang_up)
+                log.warning("calls: her hang-up failed (%s)", type(exc).__name__)
         dial = self._dial
         if dial is not None and dial.call_id is not None:
-            with contextlib.suppress(Exception):
+            try:
                 await self._signal.hangup_call(dial.aci, dial.call_id)
+            except Exception as exc:
+                log.warning("calls: her hang-up of the call placed failed (%s)", type(exc).__name__)
 
     async def can_place(self, aci: str) -> str:
-        """ "" when she can place a call now, else why not: locked (/lock), in_call (one call at a time) or not_ready
-        (the voice)."""
+        """ "" when she can place a call now, else why not: locked (/lock), in_call (one call at a time), not_ready
+        (the voice) or downloading (jane's model of the language in use: her call for a reminder is in it)."""
         if self._locked():
             return "locked"
         if self._call is not None or self._dial is not None:
             return "in_call"
         if not await self._voice_ready():
             return "not_ready"
+        if self._downloads is not None and self._downloads.downloading(self.language):
+            return "downloading"
         return ""
 
     async def place(self, aci: str, *, wake: bool, time: str, text: str) -> str:
@@ -1153,10 +1760,14 @@ class CallManager:
                 log.warning("calls: startCall gave no call id")
                 return "call_failed"
             dial.call_id = call_id
+            if self._locked():  # /lock while signal-cli placed it (its hang-up had no call id yet)
+                return await self._locked_dial(dial)
             log.info("calls: placing a call (%s)", "wake-up" if wake else "reminder")
             outcome, event = await self._ring(dial)
             if outcome != "answered" or event.get("state") != "CONNECTED":
                 return outcome  # not picked up (or picked up on another device): nothing more here
+            if self._locked():  # picked up as /lock came: hung up, never a call (review C1)
+                return await self._locked_dial(dial)
             call = self._new_call(aci, call_id, practice_ok=False)  # her call for a reminder is never practice
             lines = call.spoken
             line = f"{(lines.wake if wake else lines.call_reminder).format(time=time)} {text}".strip()
@@ -1167,6 +1778,14 @@ class CallManager:
             return "answered"
         finally:
             self._dial = None
+
+    async def _locked_dial(self, dial: _Dial) -> str:
+        """/lock came while she placed a call: hung up, a failed call (the scheduler's retry then finds her locked)."""
+        log.info("calls: the call placed was hung up: locked (/lock)")
+        if dial.call_id is not None:
+            with contextlib.suppress(Exception):
+                await self._signal.hangup_call(dial.aci, dial.call_id)
+        return "call_failed"
 
     async def _ring(self, dial: _Dial) -> tuple[str, dict[str, Any]]:
         """Wait (ring_wait_s) until the call she placed is picked up (CONNECTED) or ends; CONNECTING only means it
@@ -1223,6 +1842,14 @@ class CallManager:
             return
         if not await self._voice_ready():
             await self._not_ready(aci)
+            return
+        language = self._practice(aci) or self.language  # the call's, as _new_call reads it
+        if self._downloads is not None and (note := self._downloads.call_note(aci, language)):
+            log.info("calls: a call rang while her voice in its language (%s) downloads (text sent)", language)
+            await self._host.call_note(aci, note)  # it rings out, never rejected
+            return
+        if self._locked():  # /lock while her voice was checked: ignored too
+            log.info("calls: a call was ignored while locked (/lock)")
             return
         self._call = self._new_call(aci, call_id, practice_ok=True)
         self._task = asyncio.create_task(self._run_call(self._call), name="call")
@@ -1309,6 +1936,10 @@ class CallManager:
             if opening is None:
                 if await self._rings_out(call):
                     return
+                if self._locked():  # /lock while it rang: ignored, never rejected (a reject is a reply)
+                    log.info("calls: a call was ignored while locked (/lock)")
+                    call.ended.set()  # it rings out: no hang-up below
+                    return
                 accepted = await self._signal.accept_call(call.aci, call.call_id)
                 connected = await self._wait_connected(call)
             else:
@@ -1336,6 +1967,8 @@ class CallManager:
         finally:
             for task in tasks:
                 task.cancel()
+            if call.text_clip is not None:  # a call that ends before her line about a text: nothing more is said
+                call.text_clip.cancel()
             if audio is not None:
                 audio.barge.close()
                 log.info("%s", audio.barge.summary())
@@ -1345,8 +1978,8 @@ class CallManager:
                         log.info("%s", line)
                 audio.close()
             if not call.ended.is_set():
-                with contextlib.suppress(Exception):
-                    await self._signal.hangup_call(call.aci, call.call_id)
+                running = asyncio.current_task()
+                await self._hang_up(call, check=running is None or not running.cancelling())  # stopping: once
             if path is not None:
                 path.unlink(missing_ok=True)
             minutes = max(1, round((self._clock() - call.started) / 60))
@@ -1356,7 +1989,35 @@ class CallManager:
             self._last = (call.started_wall, minutes)
             self._host.call_ended()
             log.info("calls: ended after %d min, %d turns", minutes, call.user_turns)
+            log.info("%s", waits_line(call.waits, call.stopped_before_words))
             await self._after(call, minutes)
+
+    async def _hang_up(self, call: _Call, *, check: bool = True) -> None:
+        """Her hang-up at the call's end, checked (review 0.9.7, C15: a failed hangupCall was swallowed and nothing
+        checked the call ended): a failure is logged by its kind, never the account; with no ENDED within
+        HANGUP_WAIT_S she hangs up once more, and a call still on after that is one warning. Without `check` (the
+        bridge is stopping, and no event reaches the call any more) once, logged the same."""
+        for attempt in range(2):
+            try:
+                await self._signal.hangup_call(call.aci, call.call_id)
+            except Exception as exc:
+                log.warning("calls: her hang-up failed (%s)", type(exc).__name__)
+            if not check or await self._ends_within(call, HANGUP_WAIT_S):
+                return
+            if not attempt:
+                log.warning("calls: the call did not end %.1f s after her hang-up; hanging up once more", HANGUP_WAIT_S)
+        log.warning("calls: the call did not end after her hang-up, tried twice")
+
+    async def _ends_within(self, call: _Call, seconds: float) -> bool:
+        """Whether signal-cli's ENDED for the call comes within `seconds` (the call's other events are dropped)."""
+        try:
+            async with asyncio.timeout(seconds):
+                while (await call.events.get()).get("state") != "ENDED":
+                    pass
+        except TimeoutError:
+            return False
+        call.ended.set()
+        return True
 
     def _warm_up(self, call: _Call) -> None:
         """The model's warm-up for this call (Host.call_warm_up), once, in its own task: the call never awaits it, and
@@ -1383,8 +2044,12 @@ class CallManager:
                 await self._host.call_note(call.aci, prompts.CALL_DROPPED)
             if call.unfinished:  # the caller may think it was done: say it was not
                 await self._host.call_note(call.aci, prompts.CALL_UNFINISHED)
+            elif call.timeouts:  # the last request was stopped by the turn's time limit, never by the call's end
+                await self._host.call_note(call.aci, prompts.CALL_TOO_LONG_NOTE)
             if not call.practice:  # code's exact chords before Gemma's summary, which can fail or be skipped
                 await self._host.call_chords(call.aci)
+            if self._locked():  # /lock ended it: no summary is written (it would never go out)
+                return
             if self.settings.summary and call.user_turns >= 2 and not call.practice:  # practice: the recap instead
                 await self._host.call_summary(call.aci, call.lines, minutes)
 
@@ -1429,7 +2094,8 @@ class CallManager:
             self._last_greeting = greeting = self._pick(greetings, last=self._last_greeting)
             pending = await self._say_line(audio, greeting, call.language, barge=True)
         else:  # a call she placed: the reminder's line (its text is the user's: never kept with the canned clips)
-            pending = await self._say_line(audio, opening.line, call.language, barge=True, keep=False)
+            # the callee's "Hello?" over it is no turn: it goes on (the second deep scan, calls-hello-over-opening)
+            pending = await self._say_line(audio, opening.line, call.language, barge=True, keep=False, greeted=True)
         waking = opening is not None and opening.wake  # silence after "Good morning!" ends the call with a goodbye
         # standby (owner, 18 Oct): after the check-in only a turn with her name is answered (wake.says_name), so the
         # caller can do other things, noise and all; every idle_repeat_s of call time from her last line she says
@@ -1443,7 +2109,7 @@ class CallManager:
         while not call.ended.is_set():
             left = s.max_s - audio.frames_in * FRAME_S  # call time, like the idle timers
             if left <= 0:
-                await self._say_line(audio, prompts.CALL_MAX_BYE, ENGLISH)
+                await self._say_line(audio, lines.max_bye, call.language)
                 return
             cutting_in = pending is not None and not went_on
             went_on = False
@@ -1454,8 +2120,20 @@ class CallManager:
                     wait = s.wake_silence_s
                 audio.unwatch()  # a watch after an earlier end is over: what comes now is this listen's
                 clip, info = await audio.listen(
-                    end_silence_s=s.end_of_turn_s, no_speech_s=min(wait, left), turn=call.turn_end
+                    end_silence_s=s.end_of_turn_s,
+                    no_speech_s=min(wait, left),
+                    turn=call.turn_end,
+                    early=STANDBY_EARLY_END or not standby,  # standby's turn waits the full pause (calls-02)
+                    # the caller's text waits: her line at the next quiet moment, never between a device question
+                    # and its yes, nor after words of hers that ask something (in standby only her name is answered)
+                    line=None if question_waiting or (call.asked and not standby) else lambda: self._text_due(call),
                 )
+                call.turn_ended_at, call.first_sound_at = self._clock(), None  # her wait counts from here
+                if info.get("line"):  # in standby too, which stays; words over it are a turn as any, never a cut-in
+                    pending, went_on = await self._text_line(call, audio), True
+                    waking = waking and pending is None  # words over it answer a wake-up call's opening too
+                    line_at = audio.frames_in * FRAME_S if standby else line_at  # still here: from her latest line
+                    continue
                 if not clip and waking and wait <= left:
                     log.info("calls: no answer to the wake-up line in %.0f s; goodbye", wait)
                     await self._say_line(audio, self._pick(lines.bye), call.language)
@@ -1479,6 +2157,8 @@ class CallManager:
                         await self._say_line(audio, lines.still_here, call.language)
                         continue
                     standby, line_at = True, now
+                    await self._host.call_standby(call.aci)  # no yes waits any more: her wake line invites one
+                    question_waiting = call.ends_after_question = False
                     log.info("calls: standby: only a turn with her name is answered")
                     if idle_said_at is not None and now - idle_said_at < s.idle_repeat_s:
                         log.info("calls: said take-your-time %.0f s ago; listening on", now - idle_said_at)
@@ -1497,12 +2177,14 @@ class CallManager:
                     self._no_turn(call)
                     continue
                 self._watch_after(call, audio, info)
+                hint = self.name if standby and STANDBY_HINT else ""
+                named = False
                 try:
-                    text = await self._hear(call, clip, info)
+                    text = await self._hear(call, clip, info, hint=hint)
                     # typing or noise heard as "thank" or "*music*": silence
                     noise = is_noise_transcript(text, float(info.get("sustained_s", voiced_s)))
                     if not noise:
-                        text = await self._hold(call, audio, text, clip, info)
+                        text, named = await self._hold(call, audio, text, clip, info, hint=hint, standby=standby)
                 except VoiceError:
                     hearing_trouble += 1
                     if hearing_trouble >= 2:
@@ -1516,17 +2198,37 @@ class CallManager:
                     continue
             else:
                 text, pending = pending, None
+                named = False
             if not real_words(text):  # a cough, a noise, a breath: she just keeps listening (no "sorry?")
                 log.info("calls: a sound without words; listening on")
                 if not cutting_in:
                     self._no_turn(call)
                 continue
+            # real words answer a wake-up call's opening, also said over it (the review of 28 Oct, calls-04: a silence
+            # after them ended the call with the wake line's goodbye, never the check-in)
+            waking = False
+            woke = standby  # this turn ends standby when it says her name
             if standby:
-                if not says_name(text, self.name):  # said to someone else, or the TV: heard, never answered or kept
-                    log.info("calls: standby: a turn without her name (%d words); listening on", turn_words(text))
+                # `named`: her name alone was heard before a hold joined what followed (Whisper may lose it in the
+                # joined clip, as a count after a paused name did in the wake harness)
+                if not (named or says_name(text, self.name)):  # said to someone else, or the TV: never answered or kept
+                    log.info(  # how near it came, a number (a missed name shows as 1 or 2 off), never a word
+                        "calls: standby: a turn without her name (%d words, nearest %d letters off); listening on",
+                        turn_words(text),
+                        nearest(text, self.name),
+                    )
+                    self._no_turn(call)  # no turn of the caller's for the end lines (review C16, 0.9.7)
                     continue
                 standby = False
                 log.info("calls: standby over: her name")
+                if only_name(text, self.name, calling_words(call.language)):  # nothing to answer but that she is here
+                    log.info("calls: her name alone; her wake line, listening")
+                    # words over it are the caller's next turn, never a cut-in (it was no answer of hers)
+                    pending, went_on = (
+                        await self._say_line(audio, self._pick(lines.woken), call.language, barge=True),
+                        True,
+                    )
+                    continue
             if is_lone_stop(text, name=self.name):
                 await self._host.call_drop_waiting(call.aci)  # like any answer but yes, a stop drops the question
                 question_waiting = call.ends_after_question = False
@@ -1546,19 +2248,32 @@ class CallManager:
             call.acknowledged_last = acknowledge
             # the model's first try came back empty (research, 17 Oct: about 10 s of silence, then the retry): the
             # same rules but the few words', which would leave only turns that had one at their start; one a turn
-            turn = await self._turn(call, audio, said, acknowledge=acknowledge, on_retry=may and not acknowledge)
-            interruption, heard, taken_at = await self._speak(call, audio, turn, waiting=turn.asks_yes)
-            call.lines.append(f"{self.name}: {heard}")
-            question_waiting = turn.asks_yes and interruption is None
+            call.kokoro = _KokoroTurn()  # Kokoro says at most one line of this turn (owner, 28 Oct)
+            try:
+                turn = await self._turn(
+                    call, audio, said, acknowledge=acknowledge, on_retry=may and not acknowledge, woke=woke
+                )
+                call.unfinished = call.unfinished and turn.failed  # answered: nothing is left undone any more
+                spoke = await self._speak(call, audio, turn, waiting=turn.asks_yes)
+            finally:
+                call.kokoro = None
+            interruption, taken_at = spoke.interruption, spoke.taken_at
+            call.lines.append(f"{self.name}: {spoke.heard}")
+            question_waiting = turn.asks_yes and interruption is None and not spoke.stopped
+            if spoke.stopped:  # the rest went as a text: the call stays up, the caller reads it (owner, 28 Oct)
+                call.ends_after_question = False
+                if turn.asks_yes:  # its question went unheard: no yes may act on it
+                    await self._host.call_drop_waiting(call.aci)
+                continue
             if interruption is not None and not cutting_in:
                 self._taken_over(call, interruption, taken_at)
             if interruption is not None:
-                if turn.reply_id is not None:
-                    self._host.call_interrupted(turn.reply_id, heard)
+                if turn.reply_id is not None:  # her history: what was heard of her stored reply, never code's lines
+                    self._host.call_interrupted(turn.reply_id, spoke.kept)
                 if turn.asks_yes:  # cut off before the question was asked whole: no yes may act on it
                     await self._host.call_drop_waiting(call.aci)
                 pending = interruption
-            elif over := self._call_over(call, text, turn):
+            elif over := self._call_over(call, text, turn, spoke.heard):
                 if over == AFTER_QUIET:  # her plain goodbye: the call ends unless the caller goes on
                     later = await self._after_goodbye(call, audio)
                     if later is not None:
@@ -1566,9 +2281,41 @@ class CallManager:
                         continue
                 return  # her answer said whole, the call over (_call_over): hung up in _run_call
 
-    async def _hear(self, call: _Call, clip: bytes, info: Mapping[str, Any]) -> str:
-        """What the caller said in `clip` (Whisper, told the call's language); the log has its numbers only."""
-        text = (await self._voice.transcribe(pcm48_to_wav16k(clip), language=call.language)).text
+    async def _text_line(self, call: _Call, audio: CallAudio) -> str | None:
+        """Her line that the caller's text waits for the call's end (`text_waits`), once a call, in the call's language,
+        at a quiet moment (`CallAudio.listen(line=…)`), with barge-in: the caller's words over it come back (a sound
+        without words: None). Code's line: never in her history or the call's summary."""
+        call.text_owed = False
+        log.info("calls: a text waits for the call's end; her line about it")
+        made = call.text_clip.result() if call.text_clip is not None else None  # made ahead (_text_due)
+        heard = await self._say_line(audio, call.spoken.text_waits, call.language, barge=True, made=made)
+        return heard if heard is not None and real_words(heard) else None
+
+    def _text_due(self, call: _Call) -> bool:
+        """Whether her line about the caller's text (`_text_line`) waits and its speech is ready. Asked on every frame
+        of a listen, it has the speech made at once, so the line starts the moment the listen gives way (made after
+        it, the line came late over the caller, whose first words were thrown away; review, 23 Oct). A failed one is
+        dropped: the call goes on."""
+        if not call.text_owed:
+            return False
+        made = call.text_clip
+        if made is None:
+            call.text_clip = asyncio.create_task(self._clip(call.spoken.text_waits, call.language))
+            call.text_clip.add_done_callback(lambda task: task.cancelled() or task.exception())  # retrieved: no warning
+            return False
+        if not made.done():
+            return False
+        failed = made.exception() if not made.cancelled() else asyncio.CancelledError()
+        if failed is not None:
+            call.text_owed = False
+            log.warning("calls: her line about a waiting text failed (%s); not said", type(failed).__name__)
+        return failed is None
+
+    async def _hear(self, call: _Call, clip: bytes, info: Mapping[str, Any], *, hint: str = "") -> str:
+        """What the caller said in `clip` (Whisper, told the call's language, and `hint`, her name in standby, as its
+        prompt); the log has its numbers only."""
+        heard = await self._voice.transcribe(pcm48_to_wav16k(clip), language=call.language, hint=hint, call=True)
+        text = heard.text  # a call's: a bare "Bye." or "Thank you." is kept, is_noise_transcript judges it
         voiced_s = float(info.get("voiced_s", 99.0))
         log.info(
             "calls: heard %d words (speech %.1f s, voiced %.2f s, sustained %.2f s, peak %s, floor %s)",
@@ -1581,26 +2328,44 @@ class CallManager:
         )
         return text
 
-    async def _hold(self, call: _Call, audio: CallAudio, text: str, clip: bytes, info: Mapping[str, Any]) -> str:
-        """An early end whose words end the call or end like they go on (`_hold_reason`) waits out the full pause
-        after all: a listen for the rest of it in call time (what came in meanwhile is heard first). Nobody speaks: the
-        turn stands. The caller goes on: that is joined to the turn's clip and heard whole, and checked again, up to
-        HOLD_MAX_S of audio (call_audio.TurnEnd: `held`, then `joined`). Returns the turn's words."""
+    async def _hold(
+        self,
+        call: _Call,
+        audio: CallAudio,
+        text: str,
+        clip: bytes,
+        info: Mapping[str, Any],
+        *,
+        hint: str = "",
+        standby: bool = False,
+    ) -> tuple[str, bool]:
+        """An early end whose words end the call or end like they go on, or in standby are her name alone
+        (`_hold_reason`), waits out the full pause after all: a listen for the rest of it in call time (what came in
+        meanwhile is heard first). Nobody speaks: the turn stands. The caller goes on: that is joined to the turn's
+        clip and heard whole, and checked again, up to HOLD_MAX_S of audio (call_audio.TurnEnd: `held`, then
+        `joined`). Returns the turn's words, and whether her name alone was heard before what was joined to it."""
         turn_end, s = call.turn_end, self.settings
+        named = False
         while turn_end is not None and info.get("ended") in EARLY_KINDS:
             room = HOLD_MAX_S - len(clip) / (2 * RATE)
-            reason = self._hold_reason(call, text)
+            reason = self._hold_reason(call, text, standby=standby)
             if reason is None or room < 1.0:
                 break
+            named = named or reason == "her name"
             audio.unwatch()
             turn_end.held(reason)
             rest = max(0.0, s.end_of_turn_s - float(info.get("quiet_s", 0.0)))
             more, more_info = await audio.listen(
-                end_silence_s=s.end_of_turn_s, no_speech_s=rest, max_s=room, turn=turn_end
+                end_silence_s=s.end_of_turn_s,
+                no_speech_s=rest,
+                max_s=room,
+                turn=turn_end,
+                early=STANDBY_EARLY_END or not standby,  # standby's hold waits the full pause too (second deep scan)
             )
             if not more:
                 log.info("calls: early end held (%s); the turn stands", reason)
                 break
+            call.turn_ended_at = self._clock()  # the caller went on: the turn ends here, and her wait counts from here
             log.info("calls: early end held (%s); the caller went on", reason)
             turn_end.joined()
             self._watch_after(call, audio, more_info)
@@ -1611,15 +2376,18 @@ class CallManager:
                 "sustained_s": round(float(info.get("sustained_s", 0.0)) + float(more_info.get("sustained_s", 0.0)), 2),
                 "peak": max(int(info.get("peak", 0)), int(more_info.get("peak", 0))),
             }
-            text = await self._hear(call, clip, info)
-        return text
+            text = await self._hear(call, clip, info, hint=hint)
+        return text, named
 
-    def _hold_reason(self, call: _Call, text: str) -> str | None:
+    def _hold_reason(self, call: _Call, text: str, *, standby: bool = False) -> str | None:
         """Why an early end waits out the full pause after all (call_audio.HOLDS): its words would end the call (a
-        goodbye, leave-taking, a wrap-up, asking her to hang up), or they end like more is coming (`goes_on`); None:
-        they stand. A hold only costs today's full pause."""
+        goodbye, leave-taking, a wrap-up, asking her to hang up), or they end like more is coming (`goes_on`); in
+        standby, her name alone ("her name": "Estia… what's on tomorrow?" has a pause after the name, and her wake line
+        at once would come over the request); None: they stand. A hold only costs today's full pause."""
         if self._ends_call(call, text):
             return "ends the call"
+        if standby and only_name(text, self.name, calling_words(call.language)):
+            return "her name"
         return "goes on" if goes_on(text, call.language) else None
 
     @staticmethod
@@ -1646,30 +2414,36 @@ class CallManager:
         if call.turn_end is not None and at_s is not None and at_s <= EARLY_BARGE_S and real_words(words):
             call.turn_end.barged_early(at_s)
 
-    def _call_over(self, call: _Call, text: str, turn: Turn) -> str:
-        """Whether the call ends once her answer `turn` to the caller's `text` is spoken whole (no takeover): her
-        end_call; else never while a device question waits for its yes (`turn.asks_yes`: the caller asking her to hang
-        up, a goodbye with more or leave-taking then waits for the answer, `call.ends_after_question`, and ends the call
-        after it when the caller's reply only answers the question: `answers_question`; review 18 Oct); the caller
-        asking her to hang up, a goodbye with more or leave-taking, even when her answer asks something (those checks already leave
-        out a turn that goes on with a question, "wait", "but" or "one more thing"); a wrap-up unless her answer asks
-        something; and her answer ending with a plain goodbye that asks nothing (`ends_with_goodbye`) after a caller's
-        turn that closes the call itself (_closing_cue: only thanks or an okay, a wrap-up, leaving words; review 18
-        Oct: her "Take care!" after "I have a bad cold today." is sympathy) and is closing talk (_closing_talk: no
-        question, "wait", "but", "actually", "one more thing"), on any call but a practice call, where a goodbye may be
-        what is practised (owner, 18 Oct: her "Bye!" after the caller's leaving ended nothing, and the caller hung up
-        himself)."""
+    def _call_over(self, call: _Call, text: str, turn: Turn, heard: str) -> str:
+        """How the call ends once her answer `turn` to the caller's `text` is spoken whole (no takeover; `heard`: what
+        the caller heard of it, code's lines too, never words a cap left unsaid: review of 26 Oct, DLG-01), as
+        docs/agents/calls.md's one rule: not after a failed turn (the caller says it again, whatever it said); never
+        while a device question waits for its yes (`turn.asks_yes`: her end_call, the caller asking her to hang up, a
+        goodbye with more or leave-taking then waits for the answer, `call.ends_after_question`, and ends the call after
+        it when the caller's reply only answers the question: `answers_question`; review 18 Oct; second fix review of
+        0.9.8, redteam-calls-wrap-up-lookalike: her end_call came first and dropped the question); at once for her
+        end_call; at once for the caller asking her to hang up, a goodbye with more or leave-taking, even when her
+        answer asks something
+        (those checks already leave out a turn that goes on with a question, "wait", "but" or "one more thing"); at once
+        for a wrap-up unless her answer ends with a question mark; and AFTER_QUIET (goodbye_grace_s of quiet,
+        `_after_goodbye`) when her answer ends with a plain goodbye or a closing wish and asks nothing
+        (`ends_with_goodbye`), whatever the caller said ("I have a bad cold today." too: a wrong goodbye costs a few
+        seconds, never the call; owner, 18 Oct: "if Gemma says good bye phrases, end_call should trigger"), on any call
+        but a practice call, where a goodbye may be what is practised."""
         held, call.ends_after_question = call.ends_after_question, False
-        if turn.end_call:
-            return AT_ONCE
-        asked_to_end = wants_hang_up(text, name=self.name, language=call.language) or self._leaving(call, text)
+        if turn.failed:  # no answer to it: the caller says it again, whatever it said
+            return ""
+        asked_to_end = turn.end_call or wants_hang_up(text, name=self.name, language=call.language)
+        asked_to_end = asked_to_end or self._leaving(call, text)
         if turn.asks_yes:  # a yes to a device must still count: the request waits for the answer
             call.ends_after_question = asked_to_end
             return ""
+        if turn.end_call:
+            return AT_ONCE
         if asked_to_end or (held and answers_question(text, name=self.name, language=call.language)):
             return AT_ONCE
-        hers = f"{turn.text} {turn.code_text}".strip()
-        if is_wrap_up(text):
+        hers = heard
+        if is_wrap_up(text, name=self.name, language=call.language):
             return "" if hers.endswith("?") else AT_ONCE
         if not call.practice and ends_with_goodbye(hers, name=self.name, language=call.language):
             return AFTER_QUIET
@@ -1677,7 +2451,8 @@ class CallManager:
 
     async def _after_goodbye(self, call: _Call, audio: CallAudio) -> str | None:
         """After her plain goodbye: a listen of goodbye_grace_s. The caller's words, when they go on (not a noise, a
-        sound without words, or a goodbye or leaving of their own), are the next turn; else None: the call ends."""
+        sound without words, a goodbye or leaving of their own, or only closing words in the call's language or
+        English: `closes_only`), are the next turn; else None: the call ends."""
         s = self.settings
         log.info("calls: her goodbye; listening %.1f s before the end", s.goodbye_grace_s)
         audio.unwatch()
@@ -1691,7 +2466,7 @@ class CallManager:
             return None  # heard nothing usable: both said goodbye, the call ends
         if is_noise_transcript(text, float(info.get("sustained_s", 99.0))) or not real_words(text):
             return None
-        if self._ends_call(call, text):
+        if self._ends_call(call, text) or closes_only(text, name=self.name, language=call.language):
             log.info("calls: the caller said goodbye too")
             return None
         log.info("calls: the caller went on after her goodbye (%d words)", turn_words(text))
@@ -1702,7 +2477,7 @@ class CallManager:
         return (
             is_goodbye(text, name=self.name)
             or self._leaving(call, text)
-            or is_wrap_up(text)
+            or is_wrap_up(text, name=self.name, language=call.language)
             or wants_hang_up(text, name=self.name, language=call.language)
         )
 
@@ -1713,9 +2488,10 @@ class CallManager:
         )
 
     async def _turn(
-        self, call: _Call, audio: CallAudio, text: str, *, acknowledge: bool, on_retry: bool = False
+        self, call: _Call, audio: CallAudio, text: str, *, acknowledge: bool, on_retry: bool = False, woke: bool = False
     ) -> Turn:
-        """The app's answer. A short "Got it." first when `acknowledge` (the request was taken in), or with
+        """The app's answer. A short "Got it." first when `acknowledge` (the request was taken in); else, when the
+        turn ended standby (`woke`), her wake line ("Yes?") once the answer is not ready after WAKE_LINE_AFTER_S. Or with
         `on_retry` as soon as the model's first try came back empty and it is asked again (the caller is not left in
         silence; it counts as this turn's, so the next request gets none), unless a thinking or checking line came
         before it. A varied thinking line when the answer takes a moment after that (then a short pause before the
@@ -1740,12 +2516,21 @@ class CallManager:
                 ack = self._pick_acknowledgement(lines.acknowledge)
                 await self._say_line(audio, ack, call.language, watch=True)  # the caller may go on over it
                 line_end = think_from = self._clock()  # a thinking line only after a real wait beyond it
+            elif woke and not (await asyncio.wait({task}, timeout=WAKE_LINE_AFTER_S))[0]:  # she woke: she says so
+                on_retry = False  # a line at the turn's start: no acknowledgement for a retry after it
+                log.info("calls: standby over; her wake line while the answer is worked out")
+                # one that asks nothing ("I'm here."): "Yes?" would ask for what was just said
+                woken = tuple(line for line in lines.woken if not asks([line])) or lines.woken
+                await self._say_line(audio, self._pick(woken), call.language, watch=True)
+                line_end = think_from = self._clock()
             while not task.done():
                 now = self._clock()
                 if now - started >= s.turn_timeout_s:
                     log.warning("calls: an answer took over %.0f s", s.turn_timeout_s)
+                    call.timeouts += 1  # work stopped by the limit (an answer clears it): its own note after the call
                     await self._abandon(call, task)
-                    return Turn(lines.lost)
+                    # a second in a row: asking to hear it again would only loop, so she asks for a text
+                    return Turn(lines.too_long if call.timeouts > 1 else lines.lost, failed=True)
                 if on_retry and retry.is_set():  # asked again: the acknowledgement now, while the retry runs
                     on_retry = False
                     if not filled:  # after "Let me think." or "Let me check." it would come in the wrong order
@@ -1786,6 +2571,7 @@ class CallManager:
             raise
         finally:
             ended.cancel()
+        call.timeouts = 0  # an answer came, or failed in time: no time-out in a row any more
         if line_end is not None:
             gap = PAUSE_AFTER_FILLER_S - (self._clock() - line_end)
             if gap > 0:
@@ -1795,7 +2581,7 @@ class CallManager:
         except Exception:
             log.exception("calls: the answer failed")
             await self._host.call_drop_waiting(call.aci)
-            return Turn(lines.lost)
+            return Turn(lines.lost, failed=True)
 
     def _pick(self, lines: tuple[str, ...], *, last: str | None = None) -> str:
         """A line from `lines`, never the one said last (or never `last`, for lines with their own memory)."""
@@ -1820,12 +2606,24 @@ class CallManager:
             await task
         await self._host.call_drop_waiting(call.aci)
 
-    async def _clip(self, text: str, language: str, *, keep: bool = True) -> bytes:
-        clip = self._clips.get((language, text))
+    async def _clip(self, text: str, language: str, *, keep: bool = True, kokoro: bool = True) -> bytes:
+        """A canned line at 48 kHz, kept for next time in the voice that says it now (the review of 24 Oct: kept by
+        language and text alone, `/voice af_heart` left them eve's until the bridge restarted; jane's in the six
+        languages Pocket TTS speaks, whatever the English voice), never one the voice service says another voice said in
+        hers' place (Kokoro's af_heart, or Supertonic-3's F1 in another language, while Pocket TTS fetches or rests):
+        that one is asked again next time, and Kokoro's says so (`_Clip.kokoro`). At most 32 kept; a full cache drops
+        another voice's lines first. `kokoro` false: Kokoro may not stand in (VoiceNoStandInError when Pocket TTS
+        cannot say it)."""
+        voice = self._voice.voice_for(language)
+        key = (voice, language, text)
+        clip = self._clips.get(key)
         if clip is None:
-            clip = wav_to_pcm48(await self._voice.speak(text, language=language))
-            if keep and len(self._clips) < 32:
-                self._clips[(language, text)] = clip
+            wav = await self._voice.speak(text, language=language, call=True, kokoro=kokoro)
+            clip = _Clip.of(wav, language)
+            if len(self._clips) >= 32:
+                self._clips = {kept: line for kept, line in self._clips.items() if kept[0] == voice}
+            if keep and not (isinstance(wav, SpokenClip) and wav.stand_in) and len(self._clips) < 32:
+                self._clips[key] = clip
         return clip
 
     async def _say_line(
@@ -1837,13 +2635,42 @@ class CallManager:
         barge: bool = False,
         keep: bool = True,
         watch: bool = False,
+        made: bytes | None = None,
+        greeted: bool = False,
     ) -> str | None:
         """A code-written line in `language`, spoken whole; with barge-in it returns what the caller said over it.
         `keep`: the clip may be kept for next time (canned lines only, never one with the user's words). `watch`: a
-        line while her answer is worked out, so the watch after an early end goes on (`CallAudio.say`)."""
+        line while her answer is worked out, so the watch after an early end goes on (`CallAudio.say`). `made`: its
+        speech, made ahead. `greeted`: the opening of a call she placed, which a greeting alone over it never stops
+        (`only_greeting`). In a call turn ("Got it.", a thinking, checking, wake or retry line) Kokoro's one line a turn
+        holds (`_KokoroTurn`): the line asks for no Kokoro, so that line stays her answer's (the review of 28 Oct,
+        pipeline-01); one Pocket TTS cannot say is left unsaid and her voice goes on. An older voice service, which
+        reads no "kokoro" field, may still have Kokoro say it: then it is the turn's one, and a later line that needs
+        Kokoro is left unsaid with every line after it in the turn."""
+        kokoro = self._call.kokoro if self._call is not None else None
+        if kokoro is not None and kokoro.stopped:
+            return None
         self.saying = text
-        clip = await self._clip(text, language, keep=keep)
-        result = await self._say_checked(audio, faint_noise(LEAD_MS) + clip, barge, hers=(text,), watch=watch)
+        clip: bytes | None = made
+        try:
+            if clip is None:
+                clip = await self._clip(text, language, keep=keep, kokoro=kokoro is None)
+        except VoiceNoStandInError:
+            if kokoro is None:  # never asked so outside a turn
+                raise
+            if not kokoro.said:  # never the turn's Kokoro line: left unsaid, her voice goes on
+                log.info("calls: Pocket TTS could not say her line before the answer; not said")
+                self.saying = ""
+                return None
+        stops = kokoro is not None and not kokoro.allows(clip)
+        if stops or clip is None:
+            log.warning("calls: her line before the answer would need Kokoro a second time in this turn; not said")
+            self.saying = ""
+            return None
+        lead = faint_noise(LEAD_MS)
+        result = await self._say_checked(
+            audio, lead + clip, barge, hers=(text,), watch=watch, lead=len(lead), greeted=greeted
+        )
         self._done(text)
         return result[0] if result else None
 
@@ -1851,9 +2678,25 @@ class CallManager:
         self.said = [*self.said[-19:], text]
         self.saying = ""
 
-    async def _speak(
-        self, call: _Call, audio: CallAudio, turn: Turn, *, waiting: bool
-    ) -> tuple[str | None, str, float | None]:
+    @staticmethod
+    def _waited(call: _Call, words_at: float, said: Sequence[str]) -> None:
+        """Her answer to the caller's latest turn starts: its wait, logged (metadata, review of 26 Oct, rtcall-2: speech
+        starts only once the whole answer is written, so the wait grows with it) and kept for the end line; her first
+        sound (a "Got it.", a thinking line) and her answer's first words apart, the faint lead before each left out."""
+        assert call.turn_ended_at is not None
+        first = words_at if call.first_sound_at is None else min(call.first_sound_at, words_at)
+        words_ms = round((words_at - call.turn_ended_at) * 1000)
+        count = len(" ".join(said).split())
+        log.info(
+            "calls: first audio %d ms after the end of the turn (her answer's first words %d ms, %d words)",
+            round((first - call.turn_ended_at) * 1000),
+            words_ms,
+            count,
+        )
+        call.waits.append((words_ms, count))
+        call.turn_ended_at = call.first_sound_at = None
+
+    async def _speak(self, call: _Call, audio: CallAudio, turn: Turn, *, waiting: bool) -> _Spoke:
         """Gemma's answer sentence by sentence (the next one is made while one plays), then code's own words: in
         English, so a device question is always clear (on an English call they simply follow). On a call in another
         language a turn that waits for a device's yes says only code's question: Gemma's words about the device are
@@ -1861,64 +2704,248 @@ class CallManager:
         question in the history too; a turn whose reminder was not set comes with no words of hers at all, only code's
         line why. `waiting`: a device question waits for the yes (turn.asks_yes): its last sentence is said whole, and
         a yes word over the ones before answers it. Returns what the caller said over it (or None), what they heard
-        of it, and how far into her answer (after the lead) they took over (or None)."""
-        if call.language == ENGLISH:
-            spoken = [(_parts(f"{turn.text} {turn.code_text}"), ENGLISH)]
-        elif turn.asks_yes and turn.code_text.strip():
-            spoken = [(_parts(turn.code_text), ENGLISH)]
-        else:
-            spoken = [(_parts(turn.text), call.language), (_parts(turn.code_text), ENGLISH)]
-        said = [(part, language) for parts_, language in spoken for part in parts_]
-        parts = [part for part, _ in said]
+        of it, the part of that her stored reply keeps (her words and `turn.kept_code`, never code's other lines), and
+        how far into her answer (after the lead) they took over (or None). Left unsaid (the call ends or her speech
+        fails), the stored reply keeps what was said, as after a cut-in (review 0.9.7, C8). Kokoro's one line a turn
+        (`_KokoroTurn`): a part that would need it a second time stops her voice for the turn, and the rest goes as a
+        text (`_texted_rest`). On a turn that waits for a yes, the parts before the question ask for no Kokoro while
+        that line is unspent (the review of 28 Oct, words-01: else the question went unheard, its yes was dropped, and
+        asking again went the same way while Pocket TTS was down): from the first Pocket TTS cannot say, they go as a
+        text, and the question, last, is said."""
+        her_parts = [] if call.language != ENGLISH and turn.asks_yes and turn.code_text.strip() else _parts(turn.text)
+        kept = {part for line in turn.kept_code for part in _parts(line)}
+        # each sentence, its language, whether it is hers (code's words go with no words of hers: below) and whether
+        # her stored reply keeps it
+        said = [(part, call.language, True, True) for part in her_parts]
+        said += [(part, ENGLISH, False, part in kept) for part in _parts(turn.code_text)]
+        parts = [part for part, _, _, _ in said]
         if not parts:
-            return None, "", None
-        clips: asyncio.Queue[bytes | VoiceError] = asyncio.Queue(maxsize=1)
+            return _Spoke(None, "", "", None)
+        kokoro = call.kokoro
+        if kokoro is not None and kokoro.stopped:  # an older voice service's line before her answer stopped her voice
+            return await self._texted_rest(call, turn, said, 0)
+        last = len(parts) - 1  # a device question is the last part (said whole)
+        for_question = turn.asks_yes and kokoro is not None and last > 0
+        # a part's speech; None: her voice stops there for the rest of the turn (Kokoro's one line a turn); _SKIPPED:
+        # the parts from there to the question go as a text, and the question comes next
+        clips: asyncio.Queue[bytes | VoiceError | _Skip | None] = asyncio.Queue(maxsize=1)
+        skipped: set[int] = set()  # the parts before the question that went as a text
 
         async def produce() -> None:
-            for part, language in said:
+            index = 0
+            while index < len(said):
+                part, language, own, _ = said[index]
+                # her answer's sentences before this one, in its language: the voice service reads them for a time's
+                # part of the day only ("at 7:30" two sentences after "tonight" is no morning); code's words go with
+                # none (its reminder line's "07:00" after "tonight" stays the morning: the review of 24 Oct)
+                before = " ".join(earlier for earlier, spoken, mine, _ in said[:index] if mine and spoken == language)
+                before = before if own else ""
+                # the turn's one Kokoro line was said (never again), or it is kept for the question
+                held = for_question and index < last and kokoro is not None and not kokoro.said
+                no_kokoro = held or (kokoro is not None and kokoro.said)
                 try:
-                    await clips.put(wav_to_pcm48(await self._voice.speak(part, language=language)))
+                    spoken = await self._voice.speak(
+                        part, language=language, context=before, call=True, kokoro=not no_kokoro
+                    )
+                    clip: _Clip | None = _Clip.of(spoken, language)
+                except VoiceNoStandInError:  # Pocket TTS could not say it, and Kokoro was not asked
+                    clip = None
                 except VoiceError as exc:
                     await clips.put(exc)
                     return
                 except Exception as exc:  # e.g. a body that is not a WAV: the call must not wait forever
                     await clips.put(VoiceError(f"speech failed: {type(exc).__name__}"))
                     return
+                if held and (clip is None or clip.kokoro):  # an older voice service's Kokoro line is never played
+                    await clips.put(_SKIPPED)
+                    index = last
+                    continue
+                stops = kokoro is not None and not kokoro.allows(clip)
+                if stops or clip is None:
+                    await clips.put(None)  # her voice stops here: nothing more of this turn is asked
+                    return
+                await clips.put(clip)
+                index += 1
+
+        def cut_at(index: int, fraction: float) -> tuple[str, str]:
+            """What the caller heard (code's lines too) and what her stored reply keeps, up to `fraction` of part
+            `index` (the parts before it whole, but those that went as a text)."""
+            part = parts[index]
+            cut = part[: int(len(part) * fraction)].rsplit(" ", 1)[0] if fraction < 1 else part
+            before = [at for at in range(index) if at not in skipped]
+            heard = " ".join([*(parts[at] for at in before), cut]).strip()
+            stored = [said[at][0] for at in before if said[at][3]] + [cut] * said[index][3]
+            return f"{heard} …".strip(), f"{' '.join(stored).strip()} …".strip()
 
         producer = asyncio.create_task(produce())
         played_s = 0.0  # her answer's sentences before this one, whole, in seconds
+        index = 0
+        first = True  # the first part said: its faint lead, her wait and a fresh listen
         try:
-            for index, part in enumerate(parts):
+            while index < len(parts):
                 item = await self._next_clip(clips, audio)
                 if isinstance(item, VoiceError):
                     raise item
+                if item is None:  # a second line of this turn needed Kokoro: never said, the rest goes as a text
+                    return await self._texted_rest(call, turn, said, index, skipped=skipped)
+                if isinstance(item, _Skip):  # her words before the question go as a text; the question comes next
+                    skipped.update(range(index, last))
+                    await self._text_before_question(call, turn, said, index)
+                    index = last
+                    continue
+                part = parts[index]
                 self.saying = part
-                lead = faint_noise(LEAD_MS) if index == 0 else b""
+                lead = faint_noise(LEAD_MS) if first else b""
+                if first and call.turn_ended_at is not None:
+                    self._waited(call, self._clock() + len(lead) / (2 * RATE), her_parts or parts)
                 whole = waiting and index == len(parts) - 1
-                hers = tuple(parts[max(0, index - 1) : index + 1])  # the sentence and the one before it
+                near = [at for at in (index - 1, index) if at >= 0 and at not in skipped]
+                hers = tuple(parts[at] for at in near)  # the sentence and the one before it
+                # of those, the ones among her answer's last two parts: a question she talked on from was rhetorical
+                # (review of 26 Oct, DLG-04: a full answer may ask on its way, and a "はい" after it took over)
+                asking = tuple(parts[at] for at in near if at >= len(parts) - 2)
                 result = await self._say_checked(
-                    audio, lead + item, barge=not whole, fresh=index == 0, hers=hers, waiting=waiting
+                    audio,
+                    lead + item,
+                    barge=not whole,
+                    fresh=first,
+                    hers=hers,
+                    asking_parts=asking,
+                    waiting=waiting,
+                    lead=len(lead),
                 )
+                first = False
                 self._done(part)
                 if result is not None:
                     text, fraction, stop_s = result
-                    cut = part[: int(len(part) * fraction)].rsplit(" ", 1)[0] if fraction < 1 else part
-                    heard = " ".join([*parts[:index], cut]).strip()
-                    return text, f"{heard} …".strip(), max(0.0, played_s + stop_s - len(lead) / (2 * RATE))
+                    heard, stored = cut_at(index, fraction)
+                    at = max(0.0, played_s + stop_s - len(lead) / (2 * RATE))
+                    return _Spoke(text, heard, stored, at)
                 played_s += len(item) / (2 * RATE)
-            return None, " ".join(parts), None
+                index += 1
+            stored = " ".join(part for at, (part, _, _, keep) in enumerate(said) if keep and at not in skipped)
+            if turn.reply_id is not None and (skipped or (her_parts and not said_whole(turn.text))):
+                # CALL_SPOKEN_CHARS cut her answer, or her words before the question went as a text: the stored reply
+                # keeps what was said, as after a cut-in (review of 26 Oct, DLG-01: the unsaid end stayed in her history)
+                self._host.call_interrupted(turn.reply_id, stored)
+            return _Spoke(None, " ".join(part for at, part in enumerate(parts) if at not in skipped), stored, None)
+        except BaseException as exc:  # left unsaid: the call ended, her speech failed, the call is being stopped
+            if turn.reply_id is not None:
+                _, stored = cut_at(index, exc.played if isinstance(exc, _LineClosed) else 0.0)
+                self._host.call_interrupted(turn.reply_id, stored)
+            raise
         finally:
             producer.cancel()
             self.saying = ""
 
+    async def _texted_rest(
+        self,
+        call: _Call,
+        turn: Turn,
+        said: Sequence[tuple[str, str, bool, bool]],
+        index: int,
+        *,
+        skipped: Collection[int] = (),
+    ) -> _Spoke:
+        """Her voice stopped at part `index` of her answer (Kokoro's one line a turn; owner, 28 Oct): the parts not said,
+        whole, go to the caller as a text after code's line (`_text_rest`), her words and the code lines her reply
+        keeps, never one that goes as a text of its own (`Turn.also_texted`) nor a device question (`turn.asks_yes`, the
+        last part: never heard, so its yes is dropped and a yes to it in writing could switch nothing; the review of 28
+        Oct, pipeline-04); `skipped`: parts that went as a text already. Her stored reply keeps what was heard ("…" when
+        nothing was). When none of her answer was said, her wait until her voice stopped is logged (metadata; the
+        review of 28 Oct, pipeline-06). The call stays up."""
+        question = len(said) - 1 if turn.asks_yes else None
+        heard = " ".join(part for at, (part, _, _, _) in enumerate(said[:index]) if at not in skipped)
+        stored = " ".join(part for at, (part, _, _, keep) in enumerate(said[:index]) if keep and at not in skipped)
+        rest = [
+            (part, own)
+            for at, (part, _, own, _) in enumerate(said)
+            if at >= index and at not in skipped and at != question
+        ]
+        sent = self._texted(turn, rest)
+        if call.turn_ended_at is not None:  # no word of her answer came: the time she left the caller waiting
+            log.warning(
+                "calls: her voice stopped %d ms after the end of the turn, before her answer's first words; %d of %d"
+                " parts go as a text",
+                round((self._clock() - call.turn_ended_at) * 1000),
+                len(sent),
+                len(said),
+            )
+            call.stopped_before_words += 1
+            call.turn_ended_at = call.first_sound_at = None
+        else:
+            log.warning(
+                "calls: a second line of this turn needed Kokoro; her voice stops for the turn, %d of %d parts go as a"
+                " text",
+                len(sent),
+                len(said),
+            )
+        if turn.reply_id is not None:
+            self._host.call_interrupted(turn.reply_id, stored or "…")
+        await self._text_rest(call, turn, sent)
+        return _Spoke(None, heard, stored, None, stopped=True)
+
+    async def _text_before_question(
+        self, call: _Call, turn: Turn, said: Sequence[tuple[str, str, bool, bool]], index: int
+    ) -> None:
+        """Pocket TTS could not say part `index`, before a device question that keeps the turn's Kokoro line
+        (`_speak`): the parts from there to the question go as a text after code's line (`_text_rest`); the question
+        is said next."""
+        sent = self._texted(turn, [(part, own) for part, _, own, _ in said[index:-1]])
+        log.warning(
+            "calls: Pocket TTS could not say her words before a device question; %d of %d parts go as a text, the"
+            " question is said",
+            len(sent),
+            len(said),
+        )
+        await self._text_rest(call, turn, sent)
+
     @staticmethod
-    async def _next_clip(clips: asyncio.Queue[bytes | VoiceError], audio: CallAudio) -> bytes | VoiceError:
+    def _texted(turn: Turn, rest: Sequence[tuple[str, bool]]) -> list[str]:
+        """Of the parts `rest` (each with whether it is hers), the ones a text holds: hers, and code's lines but those
+        that go as a text of their own (`Turn.also_texted`), so nothing comes twice."""
+        texted = {part for line in turn.also_texted for part in _parts(line)}
+        return [part for part, own in rest if own or part not in texted]
+
+    async def _text_rest(self, call: _Call, turn: Turn, rest: Sequence[str]) -> None:
+        """`rest`, whole, to the caller as a text after code's line (`prompts.CALL_VOICE_STOPPED`; code's note, so it
+        is in her history in these words: rule 6); the call goes on when it cannot be stored."""
+        if not rest:
+            return
+        text = f"{prompts.CALL_VOICE_STOPPED}\n{' '.join(rest)}"
+        try:
+            await self._host.call_text(call.aci, text, reply_id=turn.reply_id, outside=turn.outside)
+        except Exception:  # the call goes on; the log says it, never the text
+            log.exception("calls: the rest of her answer could not be stored to go as a text")
+
+    @staticmethod
+    async def _next_clip[T](clips: asyncio.Queue[T], audio: CallAudio) -> T:
         while True:
             try:
                 return await asyncio.wait_for(clips.get(), 1.0)
             except TimeoutError:
                 if audio.closed.is_set():
                     raise ConnectionError("the call's audio ended") from None
+
+    async def _cut_in_rest(self, audio: CallAudio, clip: bytes, text: str, language: str) -> str:
+        """A cut-in whose words go on ("Wait, I meant," `goes_on`): its listen ended after INTERRUPTION_END_S, so the
+        rest of the full pause (end_of_turn_s) is listened for, as a turn's hold does; what comes is joined to it and
+        heard whole, and checked again, up to HOLD_MAX_S of audio (review 0.9.7, C10: the rest was thrown away when her
+        next answer started). Returns the cut-in's words."""
+        rest = self.settings.end_of_turn_s - INTERRUPTION_END_S
+        while rest > 0 and goes_on(text, language) and (room := HOLD_MAX_S - len(clip) / (2 * RATE)) >= 1.0:
+            more, _ = await audio.listen(end_silence_s=self.settings.end_of_turn_s, no_speech_s=rest, max_s=room)
+            if not more:
+                break
+            if self._call is not None:  # the cut-in went on: its turn ends here, and her wait counts from here
+                self._call.turn_ended_at = self._clock()
+            clip += more
+            try:
+                text = (await self._voice.transcribe(pcm48_to_wav16k(clip), language=language, call=True)).text
+            except VoiceError:
+                break  # the words heard before stand
+            log.info("calls: the cut-in went on; heard whole (%d words)", turn_words(text))
+        return text
 
     async def _say_checked(
         self,
@@ -1928,51 +2955,75 @@ class CallManager:
         *,
         fresh: bool = True,
         hers: tuple[str, ...] = (),
+        asking_parts: tuple[str, ...] | None = None,
         waiting: bool = False,
         watch: bool = False,
+        lead: int = 0,
+        greeted: bool = False,
     ) -> tuple[str, float, float] | None:
         """Say `pcm` (her sentences `hers`: the one before and the one being said); when the caller talks over it,
         listen and check the words: an interruption returns (what they said, how much of the clip went out, and the
         stop's place in the clip in seconds); a cough,
         a noise or her own voice (compared with what she played of `hers` up to the stop) resumes a little before the
         stop. Her own voice also raises the level a stop needs, once a call (call_audio.Barge.her_own_voice); it never
-        reaches Gemma. A listener's acknowledgement alone ("okay", "mm-hm") resumes too, unless `hers` asks something
-        or a device question is `waiting`: then it answers her (owner, 14 Oct). Each acknowledgement takes her further
+        reaches Gemma. A listener's acknowledgement alone ("okay", "mm-hm") resumes too, unless `asking_parts` (those of
+        `hers` that may still wait for an answer: among her answer's last two parts; None: all of `hers`) asks something
+        or a device question is `waiting`: then it answers her (owner, 14 Oct; review of 26 Oct, DLG-04). Each acknowledgement takes her further
         on: a little before the stop, never back to where she resumed (a stop that soon would replay the same audio
         for good), and after MAX_FALSE_BARGE of them in one clip from the stop itself. `watch` (without barge-in): the
-        watch after an early end goes on over it (`CallAudio.say`)."""
+        watch after an early end goes on over it (`CallAudio.say`). `lead`: the bytes of faint noise before her words,
+        never counted as heard (review 0.9.7, C8). `greeted`: the opening of a call she placed, where greeting or
+        calling words alone ("Hello?") resume it like an acknowledgement (`only_greeting`). The line closing before the
+        clip went out whole raises _LineClosed with how much of it went out."""
+        asking = waiting or asks(hers if asking_parts is None else asking_parts)
+        if self._call is not None:  # her latest words: whether they ask something (_Call.asked)
+            self._call.asked = asking
+            if self._call.turn_ended_at is not None and self._call.first_sound_at is None:  # her first sound (metadata)
+                self._call.first_sound_at = self._clock() + lead / (2 * RATE)
         offset = 0
         false_alarms = 0
         carried_on = 0  # acknowledgements in this clip
         resumed = False
         while True:
             said = await audio.say(pcm[offset:], barge=barge, fresh=fresh and not resumed, watch=watch and not barge)
+            stop = offset + 2 * int(said.played_s * RATE)
+            fraction = min(1.0, max(0, stop - lead) / max(1, len(pcm) - lead))  # of her words, the lead left out
+            if said.closed:
+                raise _LineClosed(fraction)
             if not said.barged:
                 return None
-            stop = offset + 2 * int(said.played_s * RATE)
             clip, info = await audio.listen(
                 preroll=said.preroll, floor=said.floor, end_silence_s=INTERRUPTION_END_S, max_s=60.0
             )
+            if self._call is not None:  # a cut-in's turn ends here: her wait for its answer counts from here
+                self._call.turn_ended_at, self._call.first_sound_at = self._clock(), None
             try:
                 language = self._call.language if self._call is not None else self.language
-                text = (await self._voice.transcribe(pcm48_to_wav16k(clip), language=language)).text if clip else ""
+                wav = pcm48_to_wav16k(clip)
+                text = (await self._voice.transcribe(wav, language=language, call=True)).text if clip else ""
             except VoiceError:
                 text = ""
             noise = is_noise_transcript(text, float(info.get("sustained_s", 0.0)))  # typing heard as "*music*"
-            fraction = min(1.0, stop / max(1, len(pcm)))
             own = not noise and is_own_voice(text, played_part(hers, fraction))
             if own:
                 audio.barge.her_own_voice(said.level)
-            asking = waiting or asks(hers)
             words = not noise and not own
             acknowledged = words and not asking and is_acknowledgement(text, language)
+            greeting = words and greeted and not acknowledged and only_greeting(text, name=self.name, language=language)
             caller = (
-                words and not acknowledged and is_interruption(text, name=self.name, language=language, asking=asking)
+                words
+                and not acknowledged
+                and not greeting
+                and is_interruption(text, name=self.name, language=language, asking=asking)
             )
             resumed = True
-            if acknowledged:  # words: no false stop, and never a takeover however often, but always further on
-                audio.barge.acknowledgement()
-                log.info("calls: an acknowledgement; carrying on")
+            # words: no false stop, and never a takeover however often, but always further on
+            if acknowledged or greeting:
+                if greeting:
+                    log.info("calls: a greeting over her opening; carrying on")
+                else:
+                    audio.barge.acknowledgement()
+                    log.info("calls: an acknowledgement; carrying on")
                 carried_on += 1
                 back = stop - 2 * int(RESUME_BACK_S * RATE)
                 offset = back if back > offset and carried_on <= MAX_FALSE_BARGE else stop
@@ -1983,6 +3034,8 @@ class CallManager:
                 taken = "" if noise or own else text  # noise and her own words never reach Gemma
                 if real_words(taken):
                     log.info("calls: taken over (%d words)", turn_words(taken))
+                    audio.barge.caller_took_over()  # a raise for her own voice was wrong or is lowered again
+                    taken = await self._cut_in_rest(audio, clip, taken, language)
                 return taken, fraction, stop / (2 * RATE)
             false_alarms += 1
             log.info("calls: her own voice heard; carrying on" if own else "calls: a sound without words; carrying on")

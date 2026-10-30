@@ -1,10 +1,7 @@
+import errno
 import io
-import json
-import os
 import plistlib
 import re
-import select
-import shlex
 import stat
 import subprocess
 import sys
@@ -12,33 +9,41 @@ import termios
 import threading
 import time
 import tomllib
-from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from local_assistant import doctor, prompts
+from local_assistant import doctor, prompts, setup_ai
 from local_assistant import setup as wizard_module
 from local_assistant.config import parse_config
 from local_assistant.setup import (
-    EXTRAS,
-    Sender,
     Wizard,
     choose_model,
     main,
     modelfile,
-    one_time_word,
-    owner_by_word,
-    parse_extras,
     read_hidden,
     render_config,
-    senders,
 )
+from local_assistant.setup_questions import plain_text
+from tests.setup_helpers import (
+    ACI,
+    BOT,
+    EXAMPLE,
+    TERMINAL,
+    enter_but_signal,
+    fake_signal_cli,
+    filled,
+    her_own_user,
+    noted,
+    recorder,
+    refuse,
+    rerun,
+    typed_once,
+)
+from tests.setup_helpers import Pty as Pty  # tests/test_signal_login.py reads it here
 
-EXAMPLE = (Path(__file__).resolve().parents[1] / "config.example.toml").read_text(encoding="utf-8")
-BOT = "+306900000000"
-ACI = "11111111-2222-4333-8444-555555555555"
+pytestmark = pytest.mark.usefixtures("no_real_ollama", "no_system_paths", "a_terminal")
 
 
 @pytest.mark.parametrize(
@@ -75,6 +80,20 @@ def test_the_models_are_the_mlx_builds_pinned_by_digest_with_the_ollama_they_nee
     assert big.tested and not small.tested and "failed" not in small.note
 
 
+@pytest.mark.parametrize("memory_gb", [16, 24, 29.9, 30, 32, 64])
+def test_a_calls_limits_follow_the_model_setup_chose(memory_gb: float) -> None:
+    """The review of 28 Oct (calls-01): the bridge reads the Mac's tier by its memory (`voice.pocket_standard`), as
+    setup chose the model by it; a call's answer cap and wait go with that model (owner: shorter beside 12B)."""
+    from local_assistant.calls import call_limits
+    from local_assistant.voice import pocket_standard
+
+    choice = choose_model(memory_gb)
+    assert choice is not None
+    small = choice.tag == "gemma4:12b-mlx"
+    assert call_limits(standard=pocket_standard(memory_gb)) == ((300, 60.0) if small else (500, 45.0))
+    assert call_limits(90.0, standard=pocket_standard(memory_gb))[1] == 90.0  # [calls] turn_timeout_seconds wins
+
+
 def test_a_mac_with_8_gb_is_too_small() -> None:
     assert choose_model(8) is None
 
@@ -106,29 +125,6 @@ def test_only_gemma_4_tags_of_12b_or_more_get_the_large_prompt(tag: str, large: 
     assert ("RENDERER gemma4-large" in modelfile(ModelChoice(tag, "0" * 64, 8192, ""))) is large
 
 
-def envelope(source: str, name: str, text: str | None, *, uuid: str = ACI) -> str:
-    data = {"timestamp": 1, "message": text} if text is not None else None
-    env: dict[str, object] = {"sourceNumber": source, "sourceUuid": uuid, "sourceName": name, "timestamp": 1}
-    if data is not None:
-        env["dataMessage"] = data
-    return json.dumps({"envelope": env, "account": BOT})
-
-
-def test_who_sent_hello_is_found_in_what_signal_cli_received() -> None:
-    lines = [
-        envelope("+306900000001", "Alex", "hello"),
-        envelope("+306900000001", "Alex", None),  # a receipt or typing notice: no message
-        "not json",
-        envelope("+306900000002", "Sam", "hi there", uuid="66666666-7777-4888-9999-000000000000"),
-        envelope("+306900000001", "Alex", "hello again"),  # the same person once
-    ]
-    found = senders(lines)
-    assert [(s.name, s.aci, s.text) for s in found] == [
-        ("Alex", ACI, "hello"),
-        ("Sam", "66666666-7777-4888-9999-000000000000", "hi there"),
-    ]
-
-
 def test_the_config_is_the_example_with_the_bot_and_the_owner_filled_in() -> None:
     text = render_config(EXAMPLE, BOT, ACI)
     cfg = parse_config(tomllib.loads(text))
@@ -140,49 +136,6 @@ def test_the_config_is_the_example_with_the_bot_and_the_owner_filled_in() -> Non
 def test_a_bad_number_is_refused(number: str) -> None:
     with pytest.raises(ValueError, match="number"):
         render_config(EXAMPLE, number, ACI)
-
-
-def test_extras_are_picked_by_name_or_number_and_unknown_ones_are_named() -> None:
-    names = list(EXTRAS)
-    assert parse_extras("") == ([], [])
-    assert parse_extras("voice, calendar") == (["voice", "calendar"], [])
-    assert parse_extras("1 3") == ([names[0], names[2]], [])
-    assert parse_extras("voice teleport") == (["voice"], ["teleport"])
-    assert parse_extras("all") == (names, [])
-
-
-def test_the_owner_is_the_one_who_sent_the_one_time_word() -> None:
-    """A profile name can be copied by anyone; the one-time word only the owner was shown cannot."""
-    found = [
-        Sender("Alex", "66666666-7777-4888-9999-000000000000", "hello"),  # someone named Alex, but not the word
-        Sender("Alex", ACI, "estia-4821"),
-    ]
-    assert owner_by_word(found, "estia-4821") == ACI
-    assert owner_by_word(found, "estia-9999") is None
-
-
-def test_the_one_time_word_is_her_name_and_a_number() -> None:
-    assert one_time_word("Estia", 4821) == "estia-4821"
-    assert one_time_word("Tiffany", 1000) == "tiffany-1000"
-    assert one_time_word("Mary-Jane Zoë", 9999) == "mary-jane-zoë-9999"
-
-
-def refuse(*args: object, **kwargs: object) -> object:
-    raise AssertionError("a dry run must not ask or run anything")
-
-
-@pytest.fixture(autouse=True)
-def no_real_ollama(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Never the Mac's own Ollama: no answer unless a test gives one."""
-
-    def get_json(self: doctor.Probe, url: str) -> object:
-        raise OSError("no Ollama in tests")
-
-    def post_json(self: doctor.Probe, url: str, payload: object) -> object:
-        raise OSError("no Ollama in tests")
-
-    monkeypatch.setattr(doctor.Probe, "get_json", get_json)
-    monkeypatch.setattr(doctor.Probe, "post_json", post_json)
 
 
 def ollama_lists(monkeypatch: pytest.MonkeyPatch, *names: str) -> list[str]:
@@ -211,10 +164,10 @@ def test_a_dry_run_asks_nothing_runs_nothing_and_writes_nothing(
     config = tmp_path / "cfg" / "config.toml"
     assert main(["--dry-run", "--config", str(config)]) == 0
     out = capsys.readouterr().out
-    assert "ollama pull" in out and "register" in out and "verify" in out and "one-time word" in out
-    assert "Extras" in out and "(asks which ones" in out
-    assert "or type any name" in out and "Enter keeps Estia" in out  # the name question, shown, not asked
-    assert prompts.SETUP_STYLE_DRY_RUN in out and "hearth (Enter): steady, kind and frank." in out
+    assert "/api/pull" in out and "register" in out and "verify" in out and "one-time word" in out
+    assert "Extra Features" in out and "(asks which ones" in out
+    assert "Estia · Maya · Melina · Socrates" in out and "Enter keeps Estia" in out  # the name question, shown
+    assert prompts.SETUP_STYLE_DRY_RUN in out and "  hearth: steady, kind and frank." in out
     assert f"(dry run) would write config {config}" in out and "✓ Config" not in out
     assert not (tmp_path / "cfg").exists() and not (tmp_path / "home").exists()
 
@@ -350,6 +303,7 @@ def remake(
         return answer
 
     monkeypatch.setattr("local_assistant.setup.REPO", tmp_path)
+    monkeypatch.setattr("local_assistant.harden.in_terminal", lambda: True)  # the person's own Terminal: Enter is yes
     wizard = Wizard(tmp_path / "config.toml", dry_run=dry)
     wizard.ollama_program = "/opt/example/ollama"
     if not dry:
@@ -376,13 +330,15 @@ def test_a_rerun_makes_an_alias_with_the_small_models_prompt_again_on_a_yes(
     monkeypatch.setattr(wizard, "run", create_then_new_digest)
     wizard.model()
     out = capsys.readouterr().out
-    assert asked == [f"{prompts.SETUP_MODEL_REMAKE_ASK} [y/N] "]
+    assert asked == [f"{prompts.SETUP_MODEL_REMAKE_ASK} [Y/n] "]
     assert ran == [["/opt/example/ollama", "create", "local-worker", "-f", str(tmp_path / ".local-worker.Modelfile")]]
     assert specs == ["FROM gemma4:26b-mlx\nRENDERER gemma4-large\n"]
     assert not (tmp_path / ".local-worker.Modelfile").exists()
     assert ollama.shown == [("http://127.0.0.1:11434/api/show", {"model": "local-worker"})]
     assert prompts.SETUP_MODEL_SMALL_PROMPT in out and "✓ Model: local-worker is there." not in out
-    assert prompts.SETUP_MODEL_REMAKE.format(tag="gemma4:26b-mlx", stop=prompts.SETUP_MODEL_STOP_YOURS) in out
+    assert (
+        plain_text(prompts.SETUP_MODEL_REMAKE.format(tag="gemma4:26b-mlx", stop=prompts.SETUP_MODEL_STOP_YOURS)) in out
+    )
     assert prompts.SETUP_MODEL_REMADE in out and f"Its new digest: sha256:{'cd' * 32}." in out
     pin = prompts.SETUP_MODEL_REMADE_PIN.format(
         digest="cd" * 32, where=prompts.SETUP_MODEL_PIN_YOURS.format(path=tmp_path / "config.toml")
@@ -404,7 +360,7 @@ def test_an_alias_setup_made_is_traced_by_what_it_holds_and_keeps_its_context(
     ollama = OldAlias(monkeypatch, base=base, num_ctx=num_ctx)
     wizard, ran, asked, specs = remake(tmp_path, monkeypatch, "y")
     wizard.model()
-    assert asked == [f"{prompts.SETUP_MODEL_REMAKE_ASK} [y/N] "] and len(ran) == 1
+    assert asked == [f"{prompts.SETUP_MODEL_REMAKE_ASK} [Y/n] "] and len(ran) == 1
     assert specs == [f"FROM {base}\nPARAMETER num_ctx {num_ctx}\nRENDERER gemma4-large\n"]
     assert ("http://127.0.0.1:11434/api/show", {"model": base}) in ollama.shown
 
@@ -458,7 +414,7 @@ def test_an_alias_whose_tag_does_not_answer_show_is_left_with_the_way_by_hand(
     assert ran == [] and asked == [] and prompts.SETUP_MODEL_PROMPT_BY_HAND in capsys.readouterr().out
 
 
-@pytest.mark.parametrize("answer", ["", "n"], ids=["enter", "no"])
+@pytest.mark.parametrize("answer", ["n", "no"])  # Enter is the recommended yes (owner's call, 29 Oct)
 def test_no_leaves_the_alias_as_it_is(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], answer: str
 ) -> None:
@@ -477,7 +433,7 @@ def test_a_dry_run_shows_the_question_and_the_command_and_makes_nothing(
     wizard, _ran, _asked, _specs = remake(tmp_path, monkeypatch, "", dry=True)
     wizard.model()
     out = capsys.readouterr().out
-    assert prompts.SETUP_MODEL_REMAKE_DRY_RUN.format(ask=prompts.SETUP_MODEL_REMAKE_ASK) in out
+    assert prompts.SETUP_ASKS.format(ask=f"{prompts.SETUP_MODEL_REMAKE_ASK} [Y/n]") in out
     assert "  $ /opt/example/ollama create local-worker -f" in out
     assert not (tmp_path / ".local-worker.Modelfile").exists()
 
@@ -519,7 +475,9 @@ def test_in_her_own_user_the_pin_line_says_how_to_edit_her_config(
     wizard, _ran, _asked, _specs = remake(tmp_path, monkeypatch, "y")
     wizard.model()
     out = capsys.readouterr().out
-    assert prompts.SETUP_MODEL_REMAKE.format(tag="gemma4:26b-mlx", stop=prompts.SETUP_MODEL_STOP_HERS) in out
+    assert (
+        plain_text(prompts.SETUP_MODEL_REMAKE.format(tag="gemma4:26b-mlx", stop=prompts.SETUP_MODEL_STOP_HERS)) in out
+    )
     assert prompts.SETUP_MODEL_PIN_HERS in out
 
 
@@ -624,141 +582,6 @@ def test_replacing_a_config_keeps_a_private_copy_first(
     assert str(copies[0]) in capsys.readouterr().out
 
 
-def owner_step(
-    monkeypatch: pytest.MonkeyPatch, answers: list[str], arrivals: list[bool]
-) -> tuple[Wizard, list[str], list[list[str]]]:
-    """The owner step with a fake person and a fake signal-cli: the person types `answers` in order (then no terminal:
-    EOF), and receive number i brings the shown one-time word when arrivals[i], else nothing."""
-    wizard = Wizard(Path("/nonexistent/config.toml"), dry_run=False)
-    said: list[str] = []
-    commands: list[list[str]] = []
-    typed = iter(answers)
-
-    def type_answer(prompt: str) -> str:
-        said.append(prompt)
-        try:
-            return next(typed)
-        except StopIteration:
-            raise EOFError from None
-
-    def run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
-        commands.append(command)
-        shown = re.search(r"estia-\d{4}", said[0])
-        assert shown is not None
-        lines = [envelope("+306900000001", "Alex", shown.group())] if arrivals[len(commands) - 1] else []
-        return subprocess.CompletedProcess(command, 0, "\n".join(lines), "")
-
-    monkeypatch.setattr("builtins.input", type_answer)
-    monkeypatch.setattr(wizard, "say", said.append)
-    monkeypatch.setattr(wizard, "run", run)
-    return wizard, said, commands
-
-
-def test_the_owner_step_looks_again_until_the_word_arrives(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Nothing arrived: the likely causes (most common first, with her number), then Enter looks again."""
-    wizard, said, commands = owner_step(monkeypatch, ["", ""], [False, True])
-    assert wizard.owner(BOT) == ACI
-    assert len(commands) == 2 and all("receive" in command for command in commands)
-    text = "\n".join(said)
-    assert "wrong number" in text and f"send it to {BOT}" in text and "Note to Self" in text
-    assert text.index("wrong number") < text.index("before") < text.index("ran out")
-    assert "Press Enter to look again, or type q to stop." in text
-    assert len(set(re.findall(r"estia-\d{4}", text))) == 1  # the same word on every try
-    assert f"send it to {BOT} (Estia's new number)" in text
-    assert "Only your account can talk to Estia" in said[-1]
-
-
-@pytest.mark.parametrize("answers", [["", "q"], [""]], ids=["q", "no terminal"])
-def test_q_or_no_terminal_stops_the_owner_step(monkeypatch: pytest.MonkeyPatch, answers: list[str]) -> None:
-    wizard, _said, commands = owner_step(monkeypatch, answers, [False, True])
-    with pytest.raises(SystemExit, match="Run setup again"):
-        wizard.owner(BOT)
-    assert len(commands) == 1
-
-
-FAKE = Path(__file__).parent / "fakes" / "fake_signal_cli.py"
-
-
-def fake_signal_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, **env: str) -> tuple[str, Path]:
-    """The fake signal-cli as a program of its own: a real process, so its arguments are what ps would show any user
-    of the Mac. `env` sets its FAKE_SIGNAL_* answers (the captcha, the SMS code, the PIN)."""
-    folder = tmp_path / "signal"
-    folder.mkdir()
-    monkeypatch.setenv("FAKE_SIGNAL_DIR", str(folder))
-    for key, value in env.items():
-        monkeypatch.setenv(key, value)
-    program = tmp_path / "signal-cli"
-    program.write_text(f'#!/bin/sh\nexec {shlex.quote(sys.executable)} {shlex.quote(str(FAKE))} "$@"\n')
-    program.chmod(0o755)
-    return str(program), folder
-
-
-def launches(folder: Path) -> list[list[str]]:
-    """Every start's arguments."""
-    path = folder / "launches.jsonl"
-    return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
-
-
-def rpc_requests(folder: Path) -> list[dict[str, object]]:
-    path = folder / "requests.jsonl"
-    return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
-
-
-def signal_step(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, hidden: list[str], **env: str
-) -> tuple[Wizard, list[str], Path]:
-    """The Signal number step against the fake signal-cli: the person types her number, then `hidden` at the hidden
-    prompts (code, PIN, ...), and no to the Registration Lock; `env` sets the fake's answers."""
-    program, folder = fake_signal_cli(tmp_path, monkeypatch, **env)
-    wizard = Wizard(Path("/nonexistent/config.toml"), dry_run=False)
-    wizard.signal_cli = program
-    said: list[str] = []
-    typed = iter(hidden)
-
-    def type_hidden(prompt: str = "") -> str:
-        try:
-            return next(typed)
-        except StopIteration:
-            raise EOFError from None
-
-    monkeypatch.setattr("builtins.input", lambda prompt="": "n" if "Registration Lock" in prompt else BOT)
-    monkeypatch.setattr("local_assistant.setup.read_hidden", type_hidden)
-    monkeypatch.setattr(wizard, "registered_numbers", list)
-    monkeypatch.setattr(wizard, "say", said.append)
-    return wizard, said, folder
-
-
-def verify_codes(folder: Path) -> list[object]:
-    return [r["params"]["verificationCode"] for r in rpc_requests(folder) if r["method"] == "verify"]  # type: ignore[index]
-
-
-def test_a_wrong_sms_code_can_be_typed_again(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    wizard, said, folder = signal_step(tmp_path, monkeypatch, ["111-111", "", "222-222", ""], FAKE_SIGNAL_CODE="222222")
-    assert wizard.signal_number() == BOT
-    assert verify_codes(folder) == ["111111", "222222"]
-    assert any("type q to stop" in line for line in said)
-
-
-@pytest.mark.parametrize(
-    "hidden",
-    [["111111", "", "q"], ["111111", ""], ["111111", "q"]],
-    ids=["q-after-a-refused-code", "no terminal", "q-at-the-old-pin"],
-)
-def test_q_or_no_terminal_stops_the_sms_code_step(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, hidden: list[str]
-) -> None:
-    """A stop is not a failed check (audit, 19 Oct: q printed "Verification failed"): it says the number is not
-    registered yet and what the next run does."""
-    wizard, _said, folder = signal_step(tmp_path, monkeypatch, hidden, FAKE_SIGNAL_CODE="222222")
-    with pytest.raises(SystemExit) as stopped:
-        wizard.signal_number()
-    assert str(stopped.value) == prompts.SETUP_CODE_STOPPED and "Verification failed" not in str(stopped.value)
-    assert "not registered yet" in prompts.SETUP_CODE_STOPPED and "Run setup again" in prompts.SETUP_CODE_STOPPED
-    # also after a code was checked and refused: never "before the code was checked" (review, 19 Oct)
-    assert prompts.SETUP_CODE_STOPPED.startswith("Stopped: her number is not registered yet.")
-    assert len(verify_codes(folder)) == (0 if hidden == ["111111", "q"] else 1)
-
-
 @pytest.mark.parametrize("dry", [False, True], ids=["real", "dry"])
 def test_the_config_step_leaves_soul_md_to_the_user(
     dry: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
@@ -796,11 +619,105 @@ def test_ctrl_c_at_a_question_stops_setup_with_one_line(
         raise KeyboardInterrupt
 
     monkeypatch.setattr(Wizard, "ollama", ctrl_c)
+    monkeypatch.setattr("builtins.input", enter_but_signal)  # the plan's questions come first: Enter
     assert setup.main(["--config", str(tmp_path / "config.toml")]) == 130
     captured = capsys.readouterr()
     assert captured.out.strip().splitlines()[-1] == prompts.SETUP_STOPPED
     assert "Traceback" not in captured.out + captured.err
     assert "scripts/setup.sh" in prompts.SETUP_STOPPED and "skipped" in prompts.SETUP_STOPPED
+
+
+def test_the_terminal_window_closed_ends_setup_the_way_ctrl_c_does(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """stops-reruns-terminal-closed: at the desk the setup window looks like the installer, so the friend closes
+    Terminal, and macOS's hang-up killed setup with no word and no cleanup. The hang-up takes Ctrl-C's way out (the
+    terminal's mode, the answers file's lock and the window put back), and the handler is put back after."""
+    import os
+    import signal as signals
+
+    from local_assistant import setup
+
+    before = signals.getsignal(signals.SIGHUP)
+
+    def terminal_closed(self: Wizard) -> None:
+        os.kill(os.getpid(), signals.SIGHUP)
+        time.sleep(2)  # the handler runs here, in the main thread
+        raise AssertionError("the hang-up did not end the step")
+
+    monkeypatch.setattr(Wizard, "ollama", terminal_closed)
+    monkeypatch.setattr("builtins.input", enter_but_signal)
+    assert setup.main(["--config", str(tmp_path / "config.toml")]) == 130
+    assert signals.getsignal(signals.SIGHUP) is before
+    captured = capsys.readouterr()
+    assert "Traceback" not in captured.out + captured.err and "did not end the step" not in captured.out + captured.err
+
+
+@pytest.mark.parametrize("profile", [True, False], ids=["path", "no-path"])
+def test_a_file_setup_cannot_use_is_a_stop_never_a_traceback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], profile: bool
+) -> None:
+    """mac-ollama-home-unwritable-crash (round 1): a login profile owned by root, or a read-only folder, ended setup
+    with a Python traceback at the same place on every run. Any file error a step did not handle is a stop with the
+    path and the fix, the answers kept."""
+    from local_assistant import setup
+
+    path = str(Path.home() / ".zprofile") if profile else None
+
+    def unwritable(self: Wizard) -> None:
+        raise PermissionError(13, "Permission denied", path)
+
+    monkeypatch.setattr(Wizard, "ollama", unwritable)
+    monkeypatch.setattr("builtins.input", enter_but_signal)
+    with pytest.raises(SystemExit) as stopped:
+        setup.main(["--config", str(tmp_path / "config.toml")])
+    words = str(stopped.value)
+    if path is not None:
+        assert words.startswith(f"✗ Setup: could not use {path} (Permission denied).")
+        assert "Fix: give your account Read and Write on it (Finder: Get Info, then Sharing and Permissions; " in words
+    else:
+        assert words.startswith("✗ Setup: a file error stopped it (Permission denied).")
+    assert "run setup again: your answers are kept." in words
+    out = capsys.readouterr().out
+    assert "Traceback" not in out and "✗ Setup:" in out  # said once, by the face
+
+
+def test_setup_os_error_outside_home_no_finder_fix(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Review of 30 Oct (P07): every file error got "give your account Read and Write in Finder", her folders too
+    (advice that weakens her account's isolation), a missing file or a full disk too. The Finder fix is only for a
+    file of your own home your account may not use, with the key that shows a dot name (Finder hides ~/.zprofile)."""
+    from local_assistant.setup import os_error_stop
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    hers = os_error_stop(PermissionError(13, "Permission denied", "/var/estia/x"))
+    assert hers.startswith("✗ Setup: could not use /var/estia/x (Permission denied).")
+    assert "Read and Write" not in hers and "Finder" not in hers
+    assert "Fix: run setup again: your answers are kept. If it says the same, report it (SECURITY.md)." in hers
+    for other in (FileNotFoundError(2, "No such file or directory", str(tmp_path / "x")),
+                  OSError(28, "No space left on device", str(tmp_path / "x"))):  # fmt: skip
+        assert "Read and Write" not in os_error_stop(other)
+    dotted = os_error_stop(PermissionError(13, "Permission denied", str(tmp_path / ".zprofile")))
+    assert "Read and Write" in dotted and "Command-Shift-. (period)" in dotted
+    plain = os_error_stop(PermissionError(1, "Operation not permitted", str(tmp_path / "Documents/x")))
+    assert "Read and Write" in plain and "Command-Shift" not in plain
+    escape = os_error_stop(PermissionError(13, "Permission denied", f"{tmp_path}/../../var/estia/x"))
+    assert "Read and Write" not in escape
+
+
+@pytest.mark.parametrize("code", [errno.ENOSPC, errno.EDQUOT], ids=["ENOSPC", "EDQUOT"])
+def test_setup_os_error_full_disk_says_free_space(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, code: int) -> None:
+    """Fix review (dialogue-04): a full disk got "run setup again … If it says the same, report it (SECURITY.md)":
+    running again cannot free space, and SECURITY.md is the route for a vulnerability. It gets the storage fix, in
+    setup's disk words (System Settings → General → Storage), with a path or without."""
+    from local_assistant.setup import os_error_stop
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    for full in (OSError(code, "No space left on device", str(tmp_path / ".config/estia-setup/answers.toml")),
+                 OSError(code, "No space left on device")):  # fmt: skip
+        said = os_error_stop(full)
+        assert said.startswith("✗ Disk: the Mac ran out of space (No space left on device")
+        assert "Fix: free space (System Settings → General → Storage), then run setup again" in said
+        assert "SECURITY.md" not in said and "report it" not in said and "Read and Write" not in said
 
 
 def test_setup_says_the_configured_name(
@@ -818,9 +735,7 @@ def test_setup_says_the_configured_name(
     path.chmod(0o600)
     assert setup.main(["--dry-run", "--config", str(path)]) == 0
     out = capsys.readouterr().out
-    assert (
-        out.startswith("Tiffany setup: Ollama, the model, her name, her Signal number") and "Tiffany's welcome" in out
-    )
+    assert out.startswith("Tiffany setup: the questions first") and "Tiffany's welcome" in out
     assert "Estia" not in out
     path.unlink()
     monkeypatch.setattr("shutil.which", lambda name: None)
@@ -828,53 +743,7 @@ def test_setup_says_the_configured_name(
     assert setup.main(["--dry-run", "--config", str(path)]) == 0
     out = capsys.readouterr().out
     assert out.startswith("Estia setup:") and "Estia's number" in out and "like estia-4821" in out
-    assert "Language: Estia listens and speaks" in out and "Tiffany setup" not in out and "Tiffany's" not in out
-
-
-def test_the_captcha_code_and_pin_go_to_signal_cli_on_stdin_never_in_its_arguments(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """Typed hidden, sent over signal-cli's JSON-RPC on stdin (ps shows a program's arguments to every user of the
-    Mac), and not printed either: the commands are shown with placeholders, on every try (the terminal may be an AI's
-    transcript, SETUP-WITH-YOUR-AI.md). register and verify exist only in signal-cli's multi-account mode (no -a)."""
-    token = "signal-hcaptcha.00000000-0000-4000-8000-000000000000.registration.fake-token-777"
-    captcha = f"signalcaptcha://{token}"
-    secrets = [captcha, "111-111", "9876", "222-222", "9876"]
-    hidden = iter(secrets)
-    program, folder = fake_signal_cli(
-        tmp_path, monkeypatch, FAKE_SIGNAL_CAPTCHA=token, FAKE_SIGNAL_CODE="222222", FAKE_SIGNAL_PIN="9876"
-    )
-    monkeypatch.setattr("builtins.input", lambda prompt="": "n" if "Registration Lock" in prompt else BOT)
-    monkeypatch.setattr("local_assistant.setup.read_hidden", lambda prompt="": next(hidden))
-    wizard = Wizard(Path("/nonexistent/config.toml"), dry_run=False)
-    wizard.signal_cli = program
-    monkeypatch.setattr(wizard, "registered_numbers", list)
-    assert wizard.signal_number() == BOT
-    assert [(r["method"], r["params"]) for r in rpc_requests(folder)] == [
-        ("register", {"account": BOT}),
-        ("register", {"account": BOT, "captcha": token}),
-        ("verify", {"account": BOT, "verificationCode": "111111", "pin": "9876"}),
-        ("verify", {"account": BOT, "verificationCode": "222222", "pin": "9876"}),
-    ]
-    started = launches(folder)
-    assert len(started) == 4 and all("jsonRpc" in argv and "-a" not in argv for argv in started)
-    for secret in (*secrets, "111111", "222222", token):
-        assert not any(secret in arg for argv in started for arg in argv)
-    out = capsys.readouterr().out
-    for secret in (*secrets, "111111", "222222", "fake-token-777"):
-        assert secret not in out
-    assert out.count(f"verify {BOT} with <SMS code> and <PIN> on stdin") == 2
-    assert f"register {BOT} with <captcha link> on stdin" in out
-
-
-def test_a_refused_registration_says_why_without_the_captcha(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """A captcha signal-cli refuses again: setup stops with its reason, and the link is not in it."""
-    wizard, _said, _folder = signal_step(
-        tmp_path, monkeypatch, ["signalcaptcha://wrong-token-1234"], FAKE_SIGNAL_CAPTCHA="right-token"
-    )
-    with pytest.raises(SystemExit, match="Registration failed: Captcha required") as stopped:
-        wizard.signal_number()
-    assert "wrong-token-1234" not in str(stopped.value)
+    assert "Estia listens and speaks" in out and "Tiffany setup" not in out and "Tiffany's" not in out
 
 
 def test_the_config_gets_the_chosen_language() -> None:
@@ -902,6 +771,32 @@ def test_the_wizard_asks_for_the_language_once(
     assert parse_config(tomllib.loads(path.read_text(encoding="utf-8"))).language == language
     out = capsys.readouterr().out
     assert "Nederlands, Dutch (nl)" in out and "日本語, Japanese (ja)" in out and "/language" in out
+
+
+def test_the_config_names_the_context_local_worker_was_made_with() -> None:
+    """The 16 GB tier's 16,384 tokens (review I24): each request is kept within it; left out, none."""
+    text = render_config(EXAMPLE, BOT, ACI, context_tokens=16_384)
+    assert parse_config(tomllib.loads(text)).context_tokens == 16_384
+    assert "\ncontext_tokens = 16384" in text and "#context_tokens" not in text
+    assert parse_config(tomllib.loads(render_config(EXAMPLE, BOT, ACI))).context_tokens is None
+    with pytest.raises(ValueError, match="context_tokens"):
+        render_config(EXAMPLE.replace("#context_tokens = 32768", ""), BOT, ACI, context_tokens=16_384)
+
+
+def test_the_wizard_reads_local_workers_context_from_ollama(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from local_assistant.setup import Wizard
+
+    def show(probe: doctor.Probe, url: str, payload: object) -> object:
+        assert url.endswith("/api/show") and payload == {"model": "local-worker"}
+        return {"parameters": 'num_ctx                        16384\nstop                           "<eos>"'}
+
+    monkeypatch.setattr(doctor.Probe, "post_json", show)
+    monkeypatch.setattr("builtins.input", lambda prompt="": "")
+    path = tmp_path / "config" / "config.toml"
+    Wizard(path, dry_run=False).config(BOT, ACI)
+    assert parse_config(tomllib.loads(path.read_text(encoding="utf-8"))).context_tokens == 16_384
 
 
 def test_the_config_gets_the_chosen_style() -> None:
@@ -936,21 +831,18 @@ def test_the_wizard_asks_her_style_once_after_the_language(
     wizard.config(BOT, ACI)
     assert parse_config(tomllib.loads(path.read_text(encoding="utf-8"))).personality_style == style == wizard.style
     out = capsys.readouterr().out
-    assert "  hearth (Enter): steady, kind and frank." in out and "  playful: warm, curious and playful." in out
-    assert out.index("Language:") < out.index("Style:") < out.index("Projects (extra")
+    assert "  hearth: steady, kind and frank." in out and "  playful: warm, curious and playful." in out
+    assert out.index("\nLanguage\n") < out.index("\nStyle\n") < out.index("Projects (extra")
     assert f"✓ Style: {style}." in out and sum("Enter keeps hearth" in prompt for prompt in asked) == len(answers)
     assert not (tmp_path / "config" / "soul.md").exists()  # owner's D2: her style file stays the user's to write
 
 
 def test_each_style_is_one_plain_line() -> None:
-    lines = prompts.SETUP_STYLE.format(name="Estia").splitlines()[1:]
-    assert [line.split(":")[0].strip() for line in lines] == ["hearth (Enter)", "playful"]
+    lines = prompts.SETUP_STYLE.format(name="Estia").splitlines()[2:]
+    assert [line.split(":")[0].strip() for line in lines] == ["hearth", "playful"]
     for line in lines:
         assert len(line) <= 120 and "you" not in line.lower().split() and "&" not in line, line
-    assert (
-        "hearth (Enter): steady, kind and frank." in lines[0]
-        and "a joke only when asked for fun or on banter" in lines[0]
-    )
+    assert "hearth: steady, kind and frank." in lines[0] and "a joke only when asked for fun or on banter" in lines[0]
     assert "playful: warm, curious and playful." in lines[1] and "never on a worry" in lines[1]
 
 
@@ -961,22 +853,22 @@ def test_a_dry_run_shows_the_style_question_and_asks_nothing(
     wizard = Wizard(tmp_path / "config.toml", dry_run=True)
     assert wizard.her_style() == "hearth"
     out = capsys.readouterr().out
-    assert "Style:" in out and prompts.SETUP_STYLE_DRY_RUN in out and "✓ Style" not in out
+    assert "\nStyle\n" in out and prompts.SETUP_STYLE_DRY_RUN in out and "✓ Style" not in out
 
 
 def test_in_her_own_user_setup_asks_her_style_and_prints_the_line_to_add(
     no_system_paths: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """Her config is hers alone: a re-run in her own user asks the style, then prints the lines to add as her and the
-    restart; it writes nothing."""
+    """Her config is hers alone: a re-run in her own user asks the style, then prints the lines to add as her and
+    offers to open her config as her (Enter runs it, owner 27 Oct); it writes nothing."""
     her_own_user(no_system_paths)
     config = tmp_path / "config.toml"
     rerun(monkeypatch, config, typed="playful")
     out = capsys.readouterr().out
-    lines = prompts.SETUP_STYLE_HERS.format(style="playful", edit=prompts.HER_CONFIG_EDIT, save=prompts.NANO_SAVE)
+    lines = prompts.SETUP_STYLE_HERS.format(style="playful", save=prompts.NANO_SAVE)
     assert lines in out and '    [personality]\n    style = "playful"\n' in out
-    assert "/usr/bin/sudo /usr/local/estia/bin/estia restart" in lines and prompts.HER_CONFIG_EDIT in lines
-    assert out.index("Style:") < out.index("Personality:") < out.index("Checking everything:")
+    assert f"  $ {prompts.HER_CONFIG_EDIT}\n" in out and "/usr/bin/sudo" not in lines
+    assert out.index("\nStyle\n") < out.index("Personality:") < out.index(": the check\n")
     assert not config.exists() and not (tmp_path / "soul.md").exists()
 
 
@@ -1001,15 +893,21 @@ def test_a_first_setup_asks_her_style_once_even_after_the_move(
     monkeypatch.setattr("builtins.input", refuse)
     wizard.personality()
     out = capsys.readouterr().out
-    assert out.count("Style: how") == 1 and 'style = "' not in out
+    assert out.count("How Estia sounds.") == 1 and 'style = "' not in out
 
 
-def test_the_ai_briefing_names_the_style_question() -> None:
+def test_the_ai_briefing_takes_the_style_question_from_the_list() -> None:
+    """Owner, 29 Oct: the AI's guide borrows setup's screens; the style question's place and words are the list's."""
+    from local_assistant import setup_plan
+
     briefing = (Path(__file__).resolve().parents[1] / "SETUP-WITH-YOUR-AI.md").read_text(encoding="utf-8")
-    briefing = briefing.split("## 3. The briefing", 1)[1].split("\n## ", 1)[0]
-    assert briefing.index("**The language**") < briefing.index("**Her style**") < briefing.index("projects on this Mac")
-    style = briefing.split("**Her style**", 1)[1].split("\n", 1)[0]
-    assert "hearth" in style and "playful" in style and "Enter" in style
+    briefing = briefing.split("## 3. Brief each screen from the source", 1)[1].split("\n## ", 1)[0]
+    assert "`setup_plan.QUESTIONS`" in briefing and "**Her style**" not in briefing
+    # in setup's plan, in its order (review PROM-05): the language, her style, calls, then the Extra Features
+    ids = [q.id for q in setup_plan.QUESTIONS]
+    assert ids.index("language") < ids.index("style") < ids.index("calls") < ids.index("extras")
+    style = setup_plan.question("style")
+    assert [option.id for option in style.options] == ["hearth", "playful"] and style.recommended == "hearth"
 
 
 def named_wizard(
@@ -1038,24 +936,26 @@ def voice_on(text: str) -> str:
 def test_enter_keeps_estia_with_a_female_voice(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """One question with the suggestions; Enter keeps Estia (and af_heart), written into the config."""
+    """One question with the suggestions; Enter keeps Estia (and heart, Pocket TTS's: the default English voice for a
+    female name where its 100M model runs, 32 GB in the tests; owner, 27 Oct: "do heart, and make it default"), written
+    into the config."""
     # the name, the language, her style, then whether she sees projects: Enter for each
     wizard, asked = named_wizard(tmp_path, monkeypatch, ["", "", "", ""])
     wizard.her_name()
-    assert (wizard.name, wizard.voice) == ("Estia", "af_heart")
+    assert (wizard.name, wizard.voice) == ("Estia", "heart")
     wizard.config(BOT, ACI)
     text = (tmp_path / "config.toml").read_text(encoding="utf-8")
     assert parse_config(tomllib.loads(text)).name == "Estia"
-    assert parse_config(tomllib.loads(voice_on(text))).voice_name == "af_heart"
+    assert parse_config(tomllib.loads(voice_on(text))).voice_name == "heart"
     out = capsys.readouterr().out
-    assert "1. Estia (default)" in out and "female: Tiffany · Maya · Melina" in out
-    assert "male: Socrates · Perikles · Plato" in out and "or type any name" in out
+    assert "Estia · Maya · Melina · Socrates" in out and "Estia (recommended)." in out  # four names, owner 27 Oct
     assert "Female or male" not in " ".join(asked) and len(asked) == 4
 
 
 @pytest.mark.parametrize(
     ("answer", "name", "voice"),
-    [("Socrates", "Socrates", "am_michael"), ("plato", "Plato", "am_michael"), ("Melina", "Melina", "af_heart")],
+    # a male name Pocket TTS's alba (owner, 26 Oct: "alba & michael for males"), a female one heart (27 Oct)
+    [("Socrates", "Socrates", "alba"), ("socrates", "Socrates", "alba"), ("Melina", "Melina", "heart")],
 )
 def test_a_suggested_name_brings_its_voice(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, answer: str, name: str, voice: str
@@ -1070,7 +970,7 @@ def test_a_suggested_name_brings_its_voice(
     assert not any("Female or male" in prompt for prompt in asked)  # a suggestion needs no voice question
 
 
-@pytest.mark.parametrize(("choice", "voice"), [("m", "am_michael"), ("male", "am_michael"), ("", "af_heart")])
+@pytest.mark.parametrize(("choice", "voice"), [("m", "alba"), ("male", "alba"), ("", "heart")])
 def test_a_typed_name_asks_for_the_voice(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, choice: str, voice: str
 ) -> None:
@@ -1086,9 +986,9 @@ def test_a_bad_name_is_asked_again(
     """The config's name rule: 1-20 letters, spaces or hyphens. A name that breaks it is named and asked again."""
     wizard, asked = named_wizard(tmp_path, monkeypatch, ["R2-D2", "x" * 21, "Juno", "f"])
     wizard.her_name()
-    assert (wizard.name, wizard.voice) == ("Juno", "af_heart")
+    assert (wizard.name, wizard.voice) == ("Juno", "heart")
     out = capsys.readouterr().out
-    assert '"R2-D2" does not fit' in out and "1-20 letters, spaces or hyphens" in out
+    assert "1 to 20 letters, spaces or hyphens." in out  # the owner's words (27 Oct), only as the error
     assert sum("Enter keeps Estia" in prompt for prompt in asked) == 3
 
 
@@ -1098,92 +998,77 @@ def test_a_dry_run_shows_the_name_question_and_asks_nothing(
     monkeypatch.setattr("builtins.input", refuse)
     wizard = Wizard(tmp_path / "config.toml", dry_run=True)
     wizard.her_name()
-    assert (wizard.name, wizard.voice) == ("Estia", "af_heart")
+    assert (wizard.name, wizard.voice) == ("Estia", "heart")
     out = capsys.readouterr().out
-    assert "1. Estia (default)" in out and "or type any name" in out and "Enter keeps Estia" in out
+    assert "Estia · Maya · Melina · Socrates" in out and "Enter keeps Estia" in out
+
+
+@pytest.mark.parametrize("answers", [["", "", "", ""], ["Melina", ""], ["Juno", "f"]], ids=["estia", "melina", "typed"])
+def test_a_female_name_on_a_mac_with_the_small_model_brings_heart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, answers: list[str]
+) -> None:
+    """Owner, 29 Oct: "on 16gb make Heart the default as well" (its own clone on the 18M; this replaces 27 Oct's "for
+    small, do Jane"): a female name on a 16 GB Mac writes heart, as on a Mac with the 100M model."""
+    monkeypatch.setattr("local_assistant.setup.memory_gb", lambda: 16.0)
+    wizard, _ = named_wizard(tmp_path, monkeypatch, answers)
+    wizard.her_name()
+    assert wizard.voice == "heart"
+    wizard.config(BOT, ACI)
+    text = (tmp_path / "config.toml").read_text(encoding="utf-8")
+    assert parse_config(tomllib.loads(voice_on(text))).voice_name == "heart"
+    from local_assistant import setup
+
+    assert setup.female_voice(16.0) == "heart" and setup.female_voice(32.0) == "heart"
+    assert setup.female_voice(29.9) == "heart" and setup.female_voice(30.0) == "heart"
+    with pytest.raises(ValueError, match="the voice must be heart or alba"):  # jane is no longer setup's to write
+        render_config(EXAMPLE, BOT, ACI, voice="jane")
 
 
 def test_the_config_gets_the_chosen_name_and_voice() -> None:
-    text = render_config(EXAMPLE, BOT, ACI, name="Perikles", voice="am_michael")
+    text = render_config(EXAMPLE, BOT, ACI, name="Perikles", voice="alba")
     assert parse_config(tomllib.loads(text)).name == "Perikles" and 'name = "Estia"' not in text
-    assert parse_config(tomllib.loads(voice_on(text))).voice_name == "am_michael"
+    assert parse_config(tomllib.loads(voice_on(text))).voice_name == "alba"
     assert parse_config(tomllib.loads(text)).voice_url == ""  # voice stays off until you turn it on
     with pytest.raises(ValueError, match="name"):
         render_config(EXAMPLE, BOT, ACI, name='Bad"name')
 
 
+@pytest.mark.parametrize(
+    # owner, 27 Oct: "not af_heart, do heart": heart, jane, eve, vera (female) on the 100M; 29 Oct, heart, jane, eve on
+    # the 18M (heart first: "just make the small heart")
+    ("memory", "female"),
+    [(32.0, "heart, jane, eve, vera"), (16.0, "heart, jane, eve")],
+    ids=["26b", "12b"],
+)
+def test_the_last_step_lists_the_voices_and_the_commands_in_signal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], memory: float, female: str
+) -> None:
+    """Owner, 26 Oct: setup's last step lists the voices (never by the model's size; 27 Oct: "heart, jane, eve, vera
+    (female); alba, michael (male)", vera only where Pocket TTS's 100M model runs, beside Gemma 4 26B; "not
+    af_heart, do heart") and how to get /voices, /tools and /help in Signal, right before what done means."""
+    from local_assistant import setup
+
+    assert setup.voices_line(memory) == prompts.SETUP_VOICES.format(female=female, male="alba, michael")
+    assert prompts.SETUP_VOICES.format(female=female, male="alba, michael") == (
+        f"Voices for voice notes and calls in English: {female} (female); alba, michael (male).\n"
+        "  In Signal: /voices lists them and /voice <name> picks one; /tools lists her tools; /help lists the rest."
+    )
+    for target in ("builtins.input", "local_assistant.setup.read_hidden", "subprocess.run", "subprocess.Popen"):
+        monkeypatch.setattr(target, refuse)
+    monkeypatch.setattr("shutil.which", lambda name: None)
+    monkeypatch.setattr("time.sleep", lambda seconds: None)
+    monkeypatch.setattr("local_assistant.setup.memory_gb", lambda: memory)
+    monkeypatch.setattr("local_assistant.setup_extras._voice_installed", lambda: True)  # said once it is installed
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    ollama_lists(monkeypatch)
+    assert main(["--dry-run", "--config", str(tmp_path / "cfg" / "config.toml")]) == 0
+    out = capsys.readouterr().out.rstrip("\n")
+    assert out.count(setup.voices_line(memory)) == 1  # one last step: P2's voices line inside P5's closing
+    last = out[out.index(setup.voices_line(memory)) :]
+    assert last.endswith(plain_text(prompts.SETUP_DONE.format(name="Estia")))  # done: last
+
+
 # ------------------------------------------------------------------ her own user, the security step, Registration Lock
-
-
-@pytest.fixture(autouse=True)
-def no_system_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """Setup reads /Library/LaunchDaemons and /usr/local/estia under ESTIA_ROOT: a fresh temporary one per test."""
-    root = tmp_path / "system-root"
-    monkeypatch.setenv("ESTIA_ROOT", str(root))
-    return root
-
-
-def test_the_registration_lock_pin_is_typed_twice_and_never_shown(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """Right after the SMS code: the PIN twice, hidden; it goes to signal-cli on stdin and is never printed."""
-    from local_assistant import harden
-
-    hidden = iter(["111-111", "", "7319-04", "731904", "731904", "731904"])
-    pins: list[tuple[str, str, str]] = []
-
-    def set_pin(signal_cli: str, number: str, pin: str, **kwargs: object) -> tuple[bool, str]:
-        pins.append((signal_cli, number, pin))
-        return True, ""
-
-    def answer(prompt: str = "") -> str:
-        return "y" if "Registration Lock" in prompt else BOT
-
-    monkeypatch.setattr(harden, "set_pin", set_pin)
-    monkeypatch.setattr("builtins.input", answer)
-    monkeypatch.setattr("local_assistant.setup.read_hidden", lambda prompt="": next(hidden))
-    wizard = Wizard(Path("/nonexistent/config.toml"), dry_run=False)
-    wizard.signal_cli, _folder = fake_signal_cli(tmp_path, monkeypatch)
-    monkeypatch.setattr(wizard, "registered_numbers", list)
-    assert wizard.signal_number() == BOT
-    assert [pin for _cli, number, pin in pins] == ["731904"] and pins[0][1] == BOT
-    out = capsys.readouterr().out
-    assert "731904" not in out and "7319-04" not in out
-    assert "password manager" in out and "locked for 7 days" in out
-    assert "The PIN needs no spaces" not in out and "did not match" in out
-    assert "setPin with <PIN> on stdin" in out
-
-
-def test_the_registration_lock_can_be_left_for_later(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    from local_assistant import harden
-
-    monkeypatch.setattr(harden, "set_pin", refuse)
-    monkeypatch.setattr("builtins.input", lambda prompt="": "n" if "Registration Lock" in prompt else BOT)
-    monkeypatch.setattr("local_assistant.setup.read_hidden", lambda prompt="": "111111" if "SMS" in prompt else "")
-    wizard = Wizard(Path("/nonexistent/config.toml"), dry_run=False)
-    wizard.signal_cli, _folder = fake_signal_cli(tmp_path, monkeypatch)
-    monkeypatch.setattr(wizard, "registered_numbers", list)
-    assert wizard.signal_number() == BOT
-    assert "scripts/harden.sh" in capsys.readouterr().out
-
-
-def test_signal_cli_calls_pin_the_identity_rule(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """register, verify and receive trust a new identity only on first use, like the bridge."""
-    wizard, _said, folder = signal_step(tmp_path, monkeypatch, ["111-111", "", "q"])
-    wizard.signal_number()
-    started = launches(folder)
-    assert len(started) == 2 and all(c[c.index("--trust-new-identities") + 1] == "on-first-use" for c in started)
-
-
-def recorder(ran: list[list[str]]) -> Callable[..., subprocess.CompletedProcess[str]]:
-    def run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
-        command = [str(arg) for arg in args[-1]] if isinstance(args[-1], list) else []
-        ran.append(command)
-        return subprocess.CompletedProcess(command, 0, "", "")
-
-    return run
 
 
 def test_always_on_moves_her_into_her_own_user(
@@ -1198,18 +1083,84 @@ def test_always_on_moves_her_into_her_own_user(
     wizard.always_on()
     assert ran == [[str(setup.REPO / "scripts" / "migrate-to-own-user.sh")]]
     out = capsys.readouterr().out
-    assert "_estia" in out and "/var/estia" in out and "never runs as you or as root" in out
+    assert "hidden macOS account" in out and prompts.SETUP_MOVE_MORE_TYPED in out  # the details: the window's fold
+    assert "_estia" in prompts.SETUP_MOVE_MORE and "never runs as you or as root" in prompts.SETUP_MOVE_MORE
 
 
-def her_own_user(root: Path, user: str = "_estia") -> Path:
-    """An own-user install under ESTIA_ROOT: bin/estia and the bridge's service file, which says who she runs as."""
-    estia = root / "usr/local/estia/bin/estia"
-    estia.parent.mkdir(parents=True)
-    estia.write_text("#!/bin/sh\n")
-    plist = root / "Library/LaunchDaemons/com.local-assistant.bridge.plist"
-    plist.parent.mkdir(parents=True)
-    plist.write_bytes(plistlib.dumps({"Label": "com.local-assistant.bridge", "UserName": user}))
-    return estia
+def test_setup_run_as_root_stops_before_it_writes_anything(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Review MAC-7: root's setup would make setup's own folders root's (the answers file, gum's folder)."""
+    from local_assistant import setup_answers
+
+    monkeypatch.setattr("os.geteuid", lambda: 0)
+    monkeypatch.setattr("builtins.input", refuse)
+    assert main(["--config", str(tmp_path / "config.toml")]) == 2
+    assert capsys.readouterr().out.strip() == prompts.SETUP_NOT_ROOT
+    folder = setup_answers.default_path().parent
+    assert not folder.exists() or list(folder.iterdir()) == []  # no answers file, no lock
+    assert not (tmp_path / "config.toml").exists()
+
+
+@pytest.mark.parametrize("code", [0, 3])
+def test_a_kept_yes_to_the_move_is_forgotten_once_she_moved(
+    no_system_paths: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, code: int
+) -> None:
+    """Review MAC-4: a kept yes would move her again, with no question, at any later run where she is not moved, as
+    after a deliberate rollback. Once the move went through, the yes is forgotten: a later run asks again."""
+    import subprocess
+
+    from local_assistant import setup_answers
+
+    answers = setup_answers.Answers.load(setup_answers.default_path(), say=print)
+    wizard = Wizard(tmp_path / "config.toml", dry_run=False, answers=answers)
+    monkeypatch.setattr("builtins.input", lambda prompt="": "y")
+
+    def run(self: Wizard, command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        her_own_user(no_system_paths)  # the move went through
+        return subprocess.CompletedProcess(command, code, "", "")
+
+    monkeypatch.setattr(Wizard, "run", run)
+    assert wizard.always_on()
+    assert setup_answers.Answers.load(setup_answers.default_path(), say=print).get("move") is None
+
+
+def test_a_kept_yes_stays_while_the_move_did_not_go_through(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import subprocess
+
+    from local_assistant import setup_answers
+
+    answers = setup_answers.Answers.load(setup_answers.default_path(), say=print)
+    wizard = Wizard(tmp_path / "config.toml", dry_run=False, answers=answers)
+    monkeypatch.setattr("builtins.input", lambda prompt="": "y")
+    monkeypatch.setattr(Wizard, "run", lambda self, command, **kwargs: subprocess.CompletedProcess(command, 1, "", ""))
+    assert not wizard.always_on()
+    assert setup_answers.Answers.load(setup_answers.default_path(), say=print).get("move") is True
+
+
+def test_a_set_up_install_whose_signal_account_is_gone_stops_before_the_moves_password(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """c-5 (round 3): her config set up, signal-cli's data gone. The move would stop after macOS's box with "setup
+    registers it", which a set-up install never does (no Signal step there): a dead end on every run. Setup stops
+    before the move with the fix that works, and nothing runs."""
+    import subprocess
+
+    home = tmp_path / "home"
+    (home / ".local/share/signal-cli/data").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    config = tmp_path / "config.toml"
+    config.write_text('bot_number = "+306900000000"\n', encoding="utf-8")
+    wizard = Wizard(config, dry_run=False)
+    wizard.first_install = False
+    ran: list[list[str]] = []
+    monkeypatch.setattr("builtins.input", lambda prompt="": "y")
+    monkeypatch.setattr(
+        Wizard, "run", lambda self, command, **kwargs: noted(ran, command, subprocess.CompletedProcess(command, 0))
+    )
+    assert not wizard.always_on()
+    assert wizard.move_stop == prompts.SETUP_MOVE_NO_SIGNAL and ran == []
+    assert "mv ~/.config/local-assistant ~/.config/local-assistant.old" in prompts.SETUP_MOVE_NO_SIGNAL
 
 
 def test_always_on_is_done_once_she_has_her_own_user(
@@ -1218,7 +1169,7 @@ def test_always_on_is_done_once_she_has_her_own_user(
     her_own_user(no_system_paths)
     monkeypatch.setattr("builtins.input", refuse)
     Wizard(tmp_path / "config.toml", dry_run=False).always_on()
-    assert "✓ Always on: as her own user _estia" in capsys.readouterr().out
+    assert "✓ Always on: as her own macOS account _estia" in capsys.readouterr().out
 
 
 def test_the_security_step_runs_harden_and_shows_the_phone_checklist(
@@ -1236,7 +1187,23 @@ def test_the_security_step_runs_harden_and_shows_the_phone_checklist(
     wizard.security()
     out = capsys.readouterr().out
     assert "Linked devices" in out and "port-out" in out  # declined: the checklist still comes
-    assert "Security level hardened:" in out and "default" not in out.lower()
+    assert "The security step, each change only on your yes:" in out and "default" not in out.lower()
+
+
+def test_a_security_step_that_did_not_finish_is_said_and_named_at_the_end(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """stops-reruns-harden-exit-ignored: harden.sh ended with an error and the next line was the calls step, the end
+    read as a success. Its exit code is read: one line, and the closing list names it again."""
+    wizard = Wizard(tmp_path / "config.toml", dry_run=False)
+    monkeypatch.setattr("builtins.input", lambda prompt="": "y")
+    monkeypatch.setattr(wizard, "run", lambda command, **kwargs: subprocess.CompletedProcess(command, 1, "", ""))
+    wizard.security()
+    assert prompts.SETUP_SECURITY_FAILED in capsys.readouterr().out
+    assert prompts.SETUP_SECURITY_FAILED in wizard.for_terminal
+    assert prompts.SETUP_SECURITY_FAILED == (
+        "✗ Security: the step did not finish (its lines say why). Run scripts/harden.sh again."
+    )
 
 
 def test_a_rerun_in_her_own_user_never_registers_or_writes_the_config(
@@ -1256,23 +1223,15 @@ def test_a_rerun_in_her_own_user_never_registers_or_writes_the_config(
     monkeypatch.setattr("builtins.input", lambda prompt="": "")  # her style: Enter keeps hearth (the lines printed)
     config = tmp_path / "config.toml"
     assert setup.main(["--config", str(config)]) == 0
-    assert ran == [["/usr/bin/sudo", "/usr/local/estia/bin/estia", "doctor"]]  # the fixed path, never ESTIA_ROOT's
+    estia = "/usr/local/estia/bin/estia"  # the fixed path, never ESTIA_ROOT's
+    # her style's lines: her config opened as her and her restart, each on Enter; then her doctor
+    assert ran == [
+        ["/usr/bin/sudo", estia, "config"],
+        ["/usr/bin/sudo", estia, "restart"],
+        ["/usr/bin/sudo", estia, "doctor"],
+    ]
     assert not config.exists()
-    assert "her own user _estia" in capsys.readouterr().out
-
-
-def rerun(monkeypatch: pytest.MonkeyPatch, config: Path, typed: str = "") -> None:
-    """setup.main again in her own user, every step but the end stubbed; `typed` answers her style question."""
-    from local_assistant import setup
-
-    monkeypatch.setattr("builtins.input", lambda prompt="": typed)
-    for name in ("signal_number", "owner", "config", "her_name"):
-        monkeypatch.setattr(Wizard, name, refuse)
-    for name in ("model", "security", "extras"):
-        monkeypatch.setattr(Wizard, name, lambda self: None)
-    monkeypatch.setattr(Wizard, "run", recorder([]))
-    monkeypatch.setattr("time.sleep", lambda seconds: None)
-    assert setup.main(["--config", str(config)]) == 0
+    assert "her own macOS account _estia" in capsys.readouterr().out
 
 
 def test_the_end_of_setup_says_when_calls_work(
@@ -1287,7 +1246,8 @@ def test_the_end_of_setup_says_when_calls_work(
     out = capsys.readouterr().out.splitlines()
     # her config is hers alone: setup cannot see [calls], so it promises no text
     assert ownuser.VOICE_LOADING_NO_CALLS in out and ownuser.VOICE_LOADING not in out
-    assert out.index(ownuser.VOICE_LOADING_NO_CALLS) > out.index("Checking everything:")  # at the end, after the check
+    check = next(at for at, line in enumerate(out) if line.endswith(": the check"))
+    assert out.index(ownuser.VOICE_LOADING_NO_CALLS) > check  # at the end, after the check
     monkeypatch.setattr(Wizard, "voice_health", lambda self: {"stt": "ready", "tts": "ready"})
     rerun(monkeypatch, tmp_path / "config.toml")
     assert "voice: ready" in capsys.readouterr().out.splitlines()
@@ -1308,6 +1268,61 @@ def test_with_calls_the_end_of_setup_promises_the_text_only_after_the_long_load_
     wizard.voice_end(calls=True)
     assert capsys.readouterr().out.splitlines()[-1] == ownuser.VOICE_LOADING
     assert now[0] >= ownuser.VOICE_WAIT_SECONDS
+
+
+def test_setup_reads_her_voice_as_her_once_she_runs_as_her_own_user(
+    no_system_paths: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Her voice service answers only her own account: in her own user setup (as you) reads it as her, through
+    sudo without a password (the admin sign-in of the check just before); before the move it is yours."""
+    from local_assistant import ownuser
+
+    asked: list[bool] = []
+    monkeypatch.setattr(ownuser, "voice_health", lambda live, *, as_her=False: asked.append(as_her))
+    Wizard(tmp_path / "config.toml", dry_run=False).voice_health()
+    her_own_user(no_system_paths)
+    Wizard(tmp_path / "config.toml", dry_run=False).voice_health()
+    assert asked == [False, True]
+
+
+def test_setup_says_when_her_voice_was_not_read_as_her(
+    no_system_paths: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Review R2-F4: with sudo asking every time (timestamp_timeout=0) the read as her finds no admin sign-in running:
+    setup says so, never "loading"."""
+    from local_assistant import ownuser
+
+    her_own_user(no_system_paths)
+    (no_system_paths / "Library/LaunchDaemons/com.local-assistant.voice.plist").write_bytes(b"x")
+    monkeypatch.setattr(
+        ownuser, "voice_health", lambda live, *, as_her=False: ownuser.VoiceNotRead(ownuser.VOICE_NOT_SIGNED_IN)
+    )
+    rerun(monkeypatch, tmp_path / "config.toml")
+    out = capsys.readouterr().out.splitlines()
+    assert ownuser.voice_line(ownuser.VoiceNotRead(ownuser.VOICE_NOT_SIGNED_IN)) in out
+    assert ownuser.VOICE_LOADING_NO_CALLS not in out and ownuser.VOICE_LOADING not in out
+
+
+def test_a_ctrl_c_in_setups_voice_wait_before_her_own_user_names_the_checkouts_check(
+    no_system_paths: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Review R2-F7: before her own macOS account her wrapper refuses; scripts/check.sh shows her voice."""
+    from local_assistant import ownuser
+
+    (no_system_paths / "Library/LaunchDaemons").mkdir(parents=True, exist_ok=True)
+    (no_system_paths / "Library/LaunchDaemons/com.local-assistant.voice.plist").write_bytes(b"x")
+    monkeypatch.setattr(Wizard, "voice_health", lambda self: {"stt": "loading", "tts": "loading"})
+    wizard = Wizard(tmp_path / "config.toml", dry_run=False)
+
+    def stopped(_seconds: float) -> None:
+        raise KeyboardInterrupt
+
+    wizard.sleep = stopped
+    wizard.voice_end(calls=True)
+    assert capsys.readouterr().out.splitlines()[-1] == ownuser.VOICE_STOPPED_YOURS
+    monkeypatch.setattr(Wizard, "own_user", lambda self: True)  # in her own user: her wrapper's check
+    wizard.voice_end(calls=True)
+    assert capsys.readouterr().out.splitlines()[-1] == ownuser.VOICE_STOPPED
 
 
 def test_without_a_voice_service_setup_says_nothing_about_calls(
@@ -1334,11 +1349,12 @@ def test_the_dry_run_describes_her_own_user_the_lock_and_the_security_step(
     assert main(["--dry-run", "--config", str(tmp_path / "cfg" / "config.toml")]) == 0
     out = capsys.readouterr().out
     assert "Registration Lock" in out and "setPin with <PIN> on stdin" in out
-    assert "scripts/migrate-to-own-user.sh" in out and "_estia" in out
+    assert "scripts/migrate-to-own-user.sh" in out and "hidden macOS account" in out
     assert "scripts/harden.sh" in out and "Linked devices" in out
-    assert "scripts/harden.sh --nuclear" in out and "other services on this Mac" in out  # never part of setup
+    flat = " ".join(out.split())  # the step's lines are fitted to the terminal
+    assert "scripts/harden.sh --nuclear" in flat and "other services on this Mac" in flat  # never part of setup
     # the two levels by name (owner, 14 Oct): setup's step is the hardened level, --nuclear the nuclear one
-    assert "Security level hardened:" in out and "The nuclear level, only for deeply technical users" in out
+    assert "• Remote logins (SSH): keys only." in out and prompts.SETUP_NUCLEAR_TYPED in out
     # a dry run asks nothing (input() refuses above); it names the question and its Enter default (review, 19 Oct)
     assert f'asks "{prompts.SETUP_SECURITY_ASK} [Y/n]"' in out
 
@@ -1370,386 +1386,10 @@ def test_a_new_config_pins_the_model_ollama_lists(
     assert "#model_digest" in text and not parse_config(tomllib.loads(text)).model_digest  # none given: no pin
 
 
-# projects: an extra, off by default; setup asks explicitly (never looks for git folders itself)
-
-
-def test_the_example_config_has_projects_off() -> None:
-    cfg = parse_config(tomllib.loads(render_config(EXAMPLE, BOT, ACI)))
-    assert not cfg.projects_enabled
-    assert "\n#[projects]\n" in EXAMPLE and "\n[projects]\n" not in EXAMPLE
-
-
-@pytest.mark.parametrize("level", ["summary", "docs", "code"])
-def test_the_config_gets_the_projects_folder_and_level(level: str) -> None:
-    text = render_config(EXAMPLE, BOT, ACI, projects=("~/code", level))
-    cfg = parse_config(tomllib.loads(text))
-    assert cfg.projects_enabled and cfg.projects_default == level and cfg.projects_root == Path.home() / "code"
-    assert cfg.projects_docs == frozenset() and cfg.projects_code == frozenset()
-    with pytest.raises(ValueError, match="level"):
-        render_config(EXAMPLE, BOT, ACI, projects=("~/code", "everything"))
-
-
-def projects_wizard(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, answers: list[str]) -> tuple[Wizard, list[str]]:
-    """The config step with a person who types `answers` after the language and style questions (then Enter)."""
-    typed = iter(["", "", *answers])  # the language and her style first: Enter keeps English and hearth
-    asked: list[str] = []
-
-    def type_answer(prompt: str = "") -> str:
-        asked.append(prompt)
-        return next(typed, "")
-
-    monkeypatch.setattr("builtins.input", type_answer)
-    return Wizard(tmp_path / "cfg" / "config.toml", dry_run=False), asked
-
-
-def test_setup_asks_about_projects_and_enter_means_no(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    wizard, asked = projects_wizard(tmp_path, monkeypatch, [])
-    wizard.config(BOT, ACI)
-    assert "Should she see projects on this Mac? Recommendation: no. [y/N] " in asked
-    assert not parse_config(tomllib.loads(wizard.config_path.read_text(encoding="utf-8"))).projects_enabled
-    out = capsys.readouterr().out
-    assert "reads the git projects directly in one folder" in out and "passes through your home" in out
-    assert "summary: the README" not in out  # the levels come with the level question, after a yes
-
-
-def test_setup_writes_the_folder_and_level_named(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    home = tmp_path / "home"
-    (home / "work").mkdir(parents=True)
-    monkeypatch.setenv("HOME", str(home))
-    wizard, _asked = projects_wizard(tmp_path, monkeypatch, ["y", "~/nowhere", "~", "~/work", "all", "docs"])
-    wizard.config(BOT, ACI)
-    cfg = parse_config(tomllib.loads(wizard.config_path.read_text(encoding="utf-8")))
-    assert cfg.projects_enabled and cfg.projects_root == home / "work" and cfg.projects_default == "docs"
-    out = capsys.readouterr().out
-    assert f"No folder {home / 'nowhere'}" in out and "your home itself" in out and "'all' is not a level" in out
-    assert "✓ Projects: ~/work, level docs" in out
-    levels = "summary: the README, open to-do items and recent commits; docs: also the project's documents; code: also"
-    assert levels in out and out.index(levels) > out.index("your home itself")  # said just before the level question
-
-
-@pytest.mark.parametrize("where", ["the-folder", "on-the-way", "outside-on-the-way"])
-def test_a_projects_folder_reached_through_a_link_is_asked_again(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], where: str
-) -> None:
-    """The share refuses a link (its entry would land on the target): setup asks the folder by the share's rules, so
-    a first install never records one the move cannot share."""
-    home = tmp_path / "home"
-    (home / "real/projects").mkdir(parents=True)
-    (tmp_path / "srv/projects").mkdir(parents=True)
-    (home / "dev").symlink_to(home / "real/projects")
-    (home / "linked").symlink_to(home / "real")
-    (tmp_path / "srv-link").symlink_to(tmp_path / "srv")
-    monkeypatch.setenv("HOME", str(home))
-    typed = {
-        "the-folder": "~/dev",
-        "on-the-way": "~/linked/projects",
-        "outside-on-the-way": str(tmp_path / "srv-link/projects"),
-    }
-    wizard, _asked = projects_wizard(tmp_path, monkeypatch, ["y", typed[where], "~/real/projects", "docs"])
-    wizard.config(BOT, ACI)
-    out = capsys.readouterr().out
-    if where == "the-folder":
-        assert f"{home / 'dev'} is a symbolic link: name the folder it leads to. Type another one" in out
-    else:
-        shown = home / "linked/projects" if where == "on-the-way" else tmp_path / "srv-link/projects"
-        assert f"A folder on the way to {shown} is a symbolic link. Type another one" in out
-    cfg = parse_config(tomllib.loads(wizard.config_path.read_text(encoding="utf-8")))
-    assert cfg.projects_root == home / "real/projects" and "✓ Projects: ~/real/projects, level docs" in out
-
-
-def test_a_first_install_with_a_projects_folder_outside_your_home_says_it_is_opened_by_hand(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    home = tmp_path / "home"
-    home.mkdir()
-    elsewhere = tmp_path / "srv" / "projects"
-    elsewhere.mkdir(parents=True)
-    monkeypatch.setenv("HOME", str(home))
-    wizard, _asked = projects_wizard(tmp_path, monkeypatch, ["y", str(elsewhere), "docs"])
-    wizard.config(BOT, ACI)
-    out = capsys.readouterr().out
-    assert (
-        f"{elsewhere} is outside your home, so scripts/share-projects.sh does not share it: give _estia read access "
-        "to it yourself"
-    ) in out
-    cfg = parse_config(tomllib.loads(wizard.config_path.read_text(encoding="utf-8")))
-    assert cfg.projects_root == elsewhere
-
-
-def test_a_dry_run_shows_the_projects_question_and_asks_nothing(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    monkeypatch.setattr("builtins.input", refuse)
-    assert Wizard(tmp_path / "config.toml", dry_run=True).projects() is None
-    out = capsys.readouterr().out
-    assert "Should she see projects on this Mac? Recommendation: no." in out and "(dry run" in out
-
-
-def test_projects_are_among_the_extras() -> None:
-    projects = EXTRAS["projects"]
-    assert projects.how.startswith("Nothing to install: setup asks the folder and the level")
-    assert projects.leaves_the_mac == "nothing (the files are read on the Mac)"
-    assert list(EXTRAS).index("projects") == 7  # the numbers of the earlier ones stay
-
-
-def test_the_extras_name_every_kind_of_kit_and_every_extra() -> None:
-    """Hue and the CalDAV calendars are supported, and documents and calls are extras too (findings 21, 60): the list
-    names them, with what each needs that only the person can do."""
-    assert list(EXTRAS)[-3:] == ["documents", "calls", "chords"]
-    assert "Hue" in EXTRAS["lights"].title and "Kasa" in EXTRAS["lights"].title
-    assert "scripts/hue-pair.sh" in EXTRAS["lights"].how
-    for service in ("Google", "Outlook", "iCloud"):
-        assert service in EXTRAS["calendar"].title, service
-    assert "scripts/share-documents.sh" in EXTRAS["documents"].how and "~/Estia-KB" in EXTRAS["documents"].how
-    calls = EXTRAS["calls"]
-    assert "gh auth login" in calls.how and "voice" in calls.how
-    assert "install-signal-cli-jvm.sh" in calls.how and "build.sh" in calls.how
-
-
-def test_the_web_extra_says_how_a_key_gets_in() -> None:
-    """set-web-keys.sh copies keys from the login keychain; it never asks for one (finding 54)."""
-    how = EXTRAS["web"].how
-    assert 'security add-generic-password -U -a "$USER" -s ollama -w' in how and "-s brave-search" in how
-    assert "scripts/set-web-keys.sh" in how
-
-
-def test_in_her_own_user_the_extras_name_her_config_and_the_restart(
-    no_system_paths: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """After the move her config is in /var/estia: each picked extra ends with how to edit it (nano, and how to save)
-    and the restart (findings 18, 55, 56)."""
-    her_own_user(no_system_paths)
-    wizard, _asked = extras_wizard(tmp_path, monkeypatch, ["voice calendar"])
-    wizard.extras()
-    out = capsys.readouterr().out
-    assert "/usr/bin/sudo /usr/local/estia/bin/estia config" in out  # nano as her: no copy of hers in your account
-    assert "sudo -u _estia -e" not in out
-    assert "Ctrl-O, Enter saves; Ctrl-X quits" in out
-    assert "/usr/bin/sudo /usr/local/estia/bin/estia restart" in out
-    assert "~/.config/local-assistant" not in out
-
-
-def test_before_the_move_the_extras_name_your_config(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    wizard, _asked = extras_wizard(tmp_path, monkeypatch, ["voice"])
-    wizard.extras()
-    out = capsys.readouterr().out
-    assert str(wizard.config_path) in out and "_estia -e" not in out
-
-
-def test_the_projects_lines_in_her_own_user_say_how_to_save(
-    no_system_paths: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    her_own_user(no_system_paths)
-    wizard, _asked = extras_wizard(tmp_path, monkeypatch, ["projects", "~/work", "summary"])
-    wizard.extras()
-    out = capsys.readouterr().out
-    assert "/usr/bin/sudo /usr/local/estia/bin/estia config" in out and "sudo -u _estia -e" not in out
-    assert "Ctrl-O, Enter saves; Ctrl-X quits" in out
-
-
-def extras_wizard(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, answers: list[str], config: str | None = None
-) -> tuple[Wizard, list[str]]:
-    """setup --extras for a person who types `answers` (then Enter), with `config` as the config file, if any."""
-    home = tmp_path / "home"
-    (home / "work").mkdir(parents=True)
-    monkeypatch.setenv("HOME", str(home))
-    path = tmp_path / "cfg" / "config.toml"
-    if config is not None:
-        path.parent.mkdir(parents=True)
-        path.write_text(config, encoding="utf-8")
-        path.chmod(0o600)
-    typed = iter(answers)
-    asked: list[str] = []
-
-    def type_answer(prompt: str = "") -> str:
-        asked.append(prompt)
-        return next(typed, "")
-
-    monkeypatch.setattr("builtins.input", type_answer)
-    return Wizard(path, dry_run=False), asked
-
-
-def test_the_projects_extra_asks_the_folder_and_level_and_switches_them_on(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """setup --extras, projects: no sniffing for git folders; the folder and the level asked, then [projects]."""
-    before = render_config(EXAMPLE, BOT, ACI)
-    wizard, asked = extras_wizard(tmp_path, monkeypatch, ["projects", "~/work", "code"], before)
-    wizard.extras()
-    assert asked[1:] == [f"{prompts.SETUP_PROJECTS_FOLDER} ", f"{prompts.SETUP_PROJECTS_LEVEL} "]
-    assert asked[1].endswith("(Enter: ~/dev; q: no projects) ") and asked[2].endswith("(Enter: summary) ")
-    text = wizard.config_path.read_text(encoding="utf-8")
-    cfg = parse_config(tomllib.loads(text))
-    assert cfg.projects_enabled and cfg.projects_root == tmp_path / "home" / "work" and cfg.projects_default == "code"
-    assert len(re.findall(r"^\[projects\]$", text, re.MULTILINE)) == 1  # the example's block, filled in
-    assert stat.S_IMODE(wizard.config_path.stat().st_mode) == 0o600
-    copies = list(wizard.config_path.parent.glob("config.toml.bak-*"))
-    assert [copy.read_text(encoding="utf-8") for copy in copies] == [before]  # the old config kept, never just replaced
-    out = capsys.readouterr().out
-    assert "summary: the README, open to-do items and recent commits" in out
-    assert "✓ Projects: ~/work, level code." in out and "from her next start" in out
-
-
-def test_the_projects_extra_on_a_config_without_the_example_lines_adds_the_section(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    before = (
-        f'bot_number = "{BOT}"\nallowed_acis = ["{ACI}"]\n\n[[tapo.devices]]\nname = "lamp"\nhost = "192.168.1.30"\n'
-    )
-    wizard, _asked = extras_wizard(tmp_path, monkeypatch, ["projects", "", "docs"], before)
-    (tmp_path / "home" / "dev").mkdir()
-    wizard.extras()
-    text = wizard.config_path.read_text(encoding="utf-8")
-    assert text.startswith(before)
-    cfg = parse_config(tomllib.loads(text))
-    assert cfg.projects_enabled and cfg.projects_root == tmp_path / "home" / "dev" and cfg.projects_default == "docs"
-    assert [device.name for device in cfg.tapo_devices] == ["lamp"]
-
-
-def test_the_projects_extra_leaves_a_config_with_projects_alone(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """The owner's own config already has [projects] (default = "docs"): nothing is asked or changed."""
-    before = f'bot_number = "{BOT}"\nallowed_acis = ["{ACI}"]\n[projects]\ndefault = "docs"\n'
-    wizard, asked = extras_wizard(tmp_path, monkeypatch, ["projects"], before)
-    wizard.extras()
-    assert len(asked) == 1 and wizard.config_path.read_text(encoding="utf-8") == before
-    assert "✓ Projects: on already" in capsys.readouterr().out
-
-
-def test_the_projects_extra_in_her_own_user_shows_the_lines_and_writes_nothing(
-    no_system_paths: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """Her config is hers alone: the folder by its absolute path (her ~ is /var/estia), shared, then a restart."""
-    her_own_user(no_system_paths)
-    wizard, _asked = extras_wizard(tmp_path, monkeypatch, ["projects", "~/work", "summary"])
-    wizard.extras()
-    assert not wizard.config_path.exists()
-    out = capsys.readouterr().out
-    work = tmp_path / "home" / "work"
-    assert "/usr/bin/sudo /usr/local/estia/bin/estia config" in out
-    assert f'[projects]\n    root = "{work}"\n    default = "summary"' in out
-    assert f"scripts/share-projects.sh {work}" in out and "/usr/bin/sudo /usr/local/estia/bin/estia restart" in out
-
-
-def test_the_projects_extra_in_her_own_user_with_a_folder_outside_your_home(
-    no_system_paths: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """scripts/share-projects.sh shares only a folder in your home: for one outside it, the step says so instead."""
-    her_own_user(no_system_paths)
-    elsewhere = tmp_path / "srv" / "projects"
-    elsewhere.mkdir(parents=True)
-    wizard, _asked = extras_wizard(tmp_path, monkeypatch, ["projects", str(elsewhere), "docs"])
-    wizard.extras()
-    out = capsys.readouterr().out
-    assert f'[projects]\n    root = "{elsewhere}"\n    default = "docs"' in out
-    assert f"scripts/share-projects.sh {elsewhere}" not in out
-    assert (
-        f"  2. {elsewhere} is outside your home, so scripts/share-projects.sh does not share it: give _estia read "
-        "access to it yourself"
-    ) in out
-    assert "/usr/bin/sudo /usr/local/estia/bin/estia restart" in out
-
-
-def test_the_extras_help_says_projects_are_added(capsys: pytest.CaptureFixture[str]) -> None:
-    from local_assistant.setup import main
-
-    with pytest.raises(SystemExit):
-        main(["--help"])
-    help_text = " ".join(capsys.readouterr().out.split())
-    assert "show the extras and how to add them (projects: asks the folder and the level and adds [projects])" in (
-        help_text
-    )
-
-
-def test_the_projects_folder_question_without_a_terminal_stops(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """`printf 'projects\\n' | scripts/setup.sh --extras` (an AI driving setup through a pipe), with no ~/dev: no
-    terminal counts as q, asked once, never a loop on the default folder."""
-    before = render_config(EXAMPLE, BOT, ACI)
-    wizard, asked = extras_wizard(tmp_path, monkeypatch, ["projects"], before)
-    typed = iter(["projects"])
-
-    def piped(prompt: str = "") -> str:
-        asked.append(prompt)
-        if len(asked) > 5:
-            raise AssertionError("asked again and again")
-        try:
-            return next(typed)
-        except StopIteration:
-            raise EOFError from None
-
-    monkeypatch.setattr("builtins.input", piped)
-    assert not (tmp_path / "home" / "dev").exists()
-    wizard.extras()
-    assert asked[1:] == [f"{prompts.SETUP_PROJECTS_FOLDER} "]
-    assert wizard.config_path.read_text(encoding="utf-8") == before
-    assert "No folder" not in capsys.readouterr().out
-
-
-def test_the_projects_extra_on_a_config_that_does_not_load_asks_nothing(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    before = f'bot_number = "{BOT}"\n'  # no allowed_acis: the bridge would refuse it
-    wizard, asked = extras_wizard(tmp_path, monkeypatch, ["projects", "~/work", "docs"], before)
-    wizard.extras()
-    assert len(asked) == 1 and wizard.config_path.read_text(encoding="utf-8") == before
-    assert "✗ Projects: not added, the config does not load (allowed_acis" in capsys.readouterr().out
-
-
-def test_the_projects_extra_without_a_config_points_to_setup(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    wizard, asked = extras_wizard(tmp_path, monkeypatch, ["projects"])
-    wizard.extras()
-    assert len(asked) == 1 and not wizard.config_path.exists()
-    assert "no config yet" in capsys.readouterr().out
-
-
 # ------------------------------------------------------------------ hidden answers of any length, only from a terminal
 
 
 REAL_HAS_TERMINAL = wizard_module.has_terminal
-
-
-@pytest.fixture(autouse=True)
-def a_terminal(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The person's own Terminal: setup's full run needs one (a test of its absence says so)."""
-    monkeypatch.setattr(wizard_module, "has_terminal", lambda: True)
-
-
-class Pty:
-    """A terminal pair: the program reads `path` (the terminal's end); the test types into `master`."""
-
-    def __init__(self) -> None:
-        self.master, self.slave = os.openpty()
-        self.path = os.ttyname(self.slave)
-        self.seen = b""
-
-    def wait_for(self, text: bytes, seconds: float = 10) -> None:
-        deadline = time.monotonic() + seconds
-        while text not in self.seen:
-            assert time.monotonic() < deadline, self.seen[-200:]
-            ready, _, _ = select.select([self.master], [], [], 0.2)
-            if ready:
-                self.seen += os.read(self.master, 4096)
-
-    def type(self, text: str) -> None:
-        data = text.encode()
-        while data:
-            data = data[os.write(self.master, data) :]
-
-    def close(self) -> None:
-        os.close(self.master)
-        os.close(self.slave)
 
 
 def hidden_in_a_pty(typed: str) -> tuple[str | BaseException, Pty]:
@@ -1808,16 +1448,24 @@ def test_a_hidden_answer_never_comes_from_stdin_without_a_terminal(monkeypatch: 
     assert sys.stdin.read() == "fake-captcha-value\n"  # left unread
 
 
-def test_setup_without_a_terminal_runs_nothing(
+def test_setup_without_a_terminal_away_from_the_desk_runs_nothing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """Under pytest stdin is no terminal: the real check says so, and setup's full run stops before its first step."""
+    """Under pytest stdin is no terminal: the real check says so. Started that way (an AI's command tool) setup's only
+    face is its window, which opens only at the Mac's own screen: away from it one line says where to run it (exit 2),
+    before anything runs; a --config of its own is for Terminal (setup_ai.refused). setup's run called on its own
+    without main's route still says where to run it."""
     monkeypatch.setattr(wizard_module, "has_terminal", REAL_HAS_TERMINAL)
     monkeypatch.setattr("sys.stdin", io.StringIO(""))
     assert not wizard_module.has_terminal()
     for name in ("model", "her_name", "signal_number", "always_on", "security", "extras", "check"):
         monkeypatch.setattr(Wizard, name, refuse)
-    assert main(["--config", str(tmp_path / "config.toml")]) == 1
+    monkeypatch.setattr(setup_ai, "detach", refuse)
+    assert main([]) == 2  # no launchctl that says Aqua under the tests' tools root: not the desk
+    assert capsys.readouterr().out == prompts.SETUP_AI_NOT_AT_DESK + "\n"
+    assert main(["--config", str(tmp_path / "config.toml")]) == 2
+    assert capsys.readouterr().out == prompts.SETUP_AI_FILES + "\n"
+    assert wizard_module.run_setup(["--config", str(tmp_path / "config.toml")]) == 1
     assert prompts.SETUP_NO_TERMINAL in capsys.readouterr().out
 
 
@@ -1847,6 +1495,16 @@ def test_the_documented_by_hand_route_reads_a_long_line_with_the_line_mode_off()
 # ------------------------------------------------------------------ a step that failed stops setup (findings 10, 59)
 
 
+def pulls(monkeypatch: pytest.MonkeyPatch, wizard: Wizard, ran: list[list[str]], why: str = "") -> None:
+    """Ollama's own pull, as setup asks it (Wizard.pull: its /api/pull stream), recorded as ["pull", tag]."""
+
+    def pull(tag: str, *, size: int = 0) -> str:
+        ran.append(["pull", tag])
+        return why
+
+    monkeypatch.setattr(wizard, "pull", pull)
+
+
 def ollama_has_pulled(monkeypatch: pytest.MonkeyPatch, digests: dict[str, str] | None = None) -> None:
     """Ollama's list after the pull: both MLX builds with their tested digests (or the ones given)."""
     from local_assistant.setup import GEMMA_12B, GEMMA_12B_DIGEST, GEMMA_26B, GEMMA_26B_DIGEST
@@ -1873,6 +1531,7 @@ def test_a_failed_ollama_create_stops_setup(
 
     monkeypatch.setattr("local_assistant.setup.REPO", tmp_path)
     monkeypatch.setattr(wizard, "run", run)
+    pulls(monkeypatch, wizard, ran)
     ollama_has_pulled(monkeypatch)
     with pytest.raises(SystemExit, match="local-worker was not made"):
         wizard.model()
@@ -1889,13 +1548,56 @@ def test_the_model_is_pulled_by_its_mlx_tag_with_the_ollama_in_use_and_checked_b
     wizard = Wizard(tmp_path / "config.toml", dry_run=False)
     wizard.ollama_program = "/opt/example/ollama"  # the one the Ollama step kept or installed
     monkeypatch.setattr(wizard, "run", recorder(ran))
+    pulls(monkeypatch, wizard, ran)
     ollama_has_pulled(monkeypatch)
     wizard.model()
-    assert ran[0] == ["caffeinate", "-i", "/opt/example/ollama", "pull", "gemma4:26b-mlx"]
+    assert ran[0] == ["pull", "gemma4:26b-mlx"]  # through Ollama's own pull, its dots lit (setup_progress)
     assert ran[1][:3] == ["/opt/example/ollama", "create", "local-worker"]
     out = capsys.readouterr().out
     assert "Model: gemma4:26b-mlx for this Mac's 32 GB (an 18.3 GB download, about 25 minutes at 100 Mbit/s" in out
     assert "✓ Model: local-worker = gemma4:26b-mlx" in out
+
+
+def test_a_pull_that_stops_says_why_and_how_to_go_on(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    ran: list[list[str]] = []
+    wizard = Wizard(tmp_path / "config.toml", dry_run=False)
+    pulls(monkeypatch, wizard, ran, why="connection reset")
+    ollama_has_pulled(monkeypatch)
+    with pytest.raises(SystemExit) as stopped:
+        wizard.model()
+    assert str(stopped.value) == prompts.SETUP_PULL_FAILED.format(why="connection reset")
+
+
+def test_her_models_dots_count_against_the_pinned_builds_whole_size(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review PROM-06: Ollama names each of the 1073 layers of gemma4:26b-mlx only when its turn comes, so the dots
+    count against the model's whole size: every blob of its pinned manifest (the layers and the config), measured on
+    the live Mac's copy of each pinned build (Ollama 0.40.4, 27 Oct)."""
+    from local_assistant import setup_progress
+
+    big, small = choose_model(32), choose_model(16)
+    assert big is not None and small is not None
+    assert (big.size, small.size) == (18_334_652_006, 7_714_253_126)
+    asked: list[tuple[str, int]] = []
+
+    def pull(base: str, tag: str, watch: object, *, total: int = 0, post: object = None) -> str:
+        asked.append((tag, total))
+        return ""
+
+    monkeypatch.setattr(setup_progress, "pull", pull)
+    monkeypatch.setattr("local_assistant.setup.REPO", tmp_path)
+    wizard = Wizard(tmp_path / "config.toml", dry_run=False)
+    monkeypatch.setattr(wizard, "run", recorder([]))
+    ollama_has_pulled(monkeypatch)
+    wizard.model()
+    assert asked == [("gemma4:26b-mlx", 18_334_652_006)]
+
+
+def test_setups_own_pull_never_reaches_the_macs_ollama_in_tests(tmp_path: Path) -> None:
+    """tests/conftest.py's guard: Wizard.pull's stream is the Mac's Ollama, which no test may ask."""
+    wizard = Wizard(tmp_path / "config.toml", dry_run=False)
+    assert "a test asked the Mac's Ollama to pull" in wizard.pull("gemma4:26b-mlx")
 
 
 def smaller_mac(
@@ -1910,35 +1612,40 @@ def smaller_mac(
         return answer
 
     monkeypatch.setattr("local_assistant.setup.REPO", tmp_path)
+    monkeypatch.setattr("local_assistant.harden.in_terminal", lambda: True)  # the person's own Terminal: Enter is yes
     wizard = Wizard(tmp_path / "config.toml", dry_run=dry)
     monkeypatch.setattr(wizard, "run", recorder(ran))
+    if not dry:
+        pulls(monkeypatch, wizard, ran)
     ollama_has_pulled(monkeypatch)
     monkeypatch.setattr("local_assistant.setup.memory_gb", lambda: memory)
     monkeypatch.setattr("builtins.input", refuse if dry else type_answer)
     return wizard, ran, asked
 
 
+@pytest.mark.parametrize("typed", ["y", ""], ids=["y", "enter"])
 @pytest.mark.parametrize("memory", [16.0, 24.0])
 def test_on_16_and_24_gb_setup_says_what_12b_failed_and_asks_before_the_download(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], memory: float
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], memory: float, typed: str
 ) -> None:
     """Owner, 15 Oct: setup still picks 12B there, and only a yes starts the 7.7 GB download; owner, 19 Oct: "use with
     caution", in plain words, never what failed in a test."""
-    wizard, ran, asked = smaller_mac(tmp_path, monkeypatch, memory, "y")
+    wizard, ran, asked = smaller_mac(tmp_path, monkeypatch, memory, typed)
     wizard.model()
-    assert asked == [f"{prompts.SETUP_SMALLER_MODEL_ASK} [y/N] "]
-    assert ran[0][3:] == ["pull", "gemma4:12b-mlx"]
+    # owner's call, 29 Oct: Enter takes the recommended answer wherever a line says it is recommended (12B: yes)
+    assert asked == [f"{prompts.SETUP_SMALLER_MODEL_ASK} [Y/n] "]
+    assert ran[0] == ["pull", "gemma4:12b-mlx"]
     out = capsys.readouterr().out
     lines = out.splitlines()
     model = next(line for line in lines if line.startswith("Model: gemma4:12b-mlx"))
     assert "a 7.7 GB download" in model and "SECURITY.md" not in model
-    warning = next(line for line in lines if line.startswith("! Gemma 4 12B"))
-    assert "use it with caution" in warning
-    assert prompts.SETUP_SMALLER_MODEL in out
-    assert lines.index(model) < lines.index(warning) < lines.index(prompts.SETUP_DOWNLOAD)
+    warning = next(line for line in lines if line.startswith("Gemma 4 12B"))
+    assert warning == "Gemma 4 12B on this Mac."
+    assert plain_text(prompts.SETUP_SMALLER_MODEL) in out
+    assert lines.index(model) < lines.index(warning) < lines.index(prompts.SETUP_DOWNLOAD.splitlines()[0])
 
 
-@pytest.mark.parametrize("answer", ["", "n"], ids=["enter", "no"])
+@pytest.mark.parametrize("answer", ["n", "no"])
 def test_no_to_the_smaller_model_downloads_nothing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], answer: str
 ) -> None:
@@ -1951,12 +1658,12 @@ def test_no_to_the_smaller_model_downloads_nothing(
 def test_a_dry_run_shows_the_smaller_models_question_and_asks_nothing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    wizard, ran, _asked = smaller_mac(tmp_path, monkeypatch, 16.0, "", dry=True)
+    wizard, _ran, _asked = smaller_mac(tmp_path, monkeypatch, 16.0, "", dry=True)
     wizard.model()
     out = capsys.readouterr().out
-    assert "! Gemma 4 12B" in out
-    assert f'(dry run: asks "{prompts.SETUP_SMALLER_MODEL_ASK} [y/N]"; only y downloads it)' in out
-    assert ran[0][3:] == ["pull", "gemma4:12b-mlx"]  # shown as it would run after a yes
+    assert "Gemma 4 12B on this Mac" in out
+    assert prompts.SETUP_ASKS.format(ask=f"{prompts.SETUP_SMALLER_MODEL_ASK} [Y/n]") in out
+    assert prompts.SETUP_PULLING.format(url="http://127.0.0.1:11434/api/pull", tag="gemma4:12b-mlx") in out
 
 
 def test_the_tested_model_asks_nothing(
@@ -1965,15 +1672,21 @@ def test_the_tested_model_asks_nothing(
     wizard, ran, _asked = smaller_mac(tmp_path, monkeypatch, 32.0, "", dry=False)
     monkeypatch.setattr("builtins.input", refuse)
     wizard.model()
-    assert ran[0][3:] == ["pull", "gemma4:26b-mlx"] and "smaller model" not in capsys.readouterr().out
+    assert ran[0] == ["pull", "gemma4:26b-mlx"] and "smaller model" not in capsys.readouterr().out
 
 
 def test_the_ai_briefing_names_the_smaller_model_question() -> None:
+    from local_assistant import setup_plan
+
     briefing = (Path(__file__).resolve().parents[1] / "SETUP-WITH-YOUR-AI.md").read_text(encoding="utf-8")
-    briefing = briefing.split("## 3. The briefing", 1)[1].split("\n## ", 1)[0]
-    model = briefing.split("**The model download:**", 1)[1].split("\n", 1)[0]
-    assert '**"Go on with the smaller model?"**' in model and "16 or 24 GB" in model
-    assert "only y downloads it" in model
+    briefing = briefing.split("## 3. Brief each screen from the source", 1)[1].split("\n## ", 1)[0]
+    smaller = '"The smaller model" ("Go on with the smaller model?")'
+    assert f"- 16 or 24 GB of memory: {smaller}." in briefing
+    assert (
+        briefing.index(smaller) < briefing.index("**The steps, in one sentence each") < briefing.index("**Her model:**")
+    )
+    q = setup_plan.question("smaller_model")  # asked in setup's plan, before anything is installed
+    assert q.plan and q.recommended == "yes" and q.ask == "Go on with the smaller model?"  # Enter: yes (29 Oct)
 
 
 def test_a_pulled_model_with_another_digest_is_never_made_into_local_worker(
@@ -1984,10 +1697,11 @@ def test_a_pulled_model_with_another_digest_is_never_made_into_local_worker(
     monkeypatch.setattr("local_assistant.setup.REPO", tmp_path)
     wizard = Wizard(tmp_path / "config.toml", dry_run=False)
     monkeypatch.setattr(wizard, "run", recorder(ran))
+    pulls(monkeypatch, wizard, ran)
     ollama_has_pulled(monkeypatch, {"gemma4:26b-mlx": "ab" * 32})
     with pytest.raises(SystemExit, match="came down as abababababab, not the tested build f0fc7e0ae494"):
         wizard.model()
-    assert len(ran) == 1 and ran[0][3:] == ["pull", "gemma4:26b-mlx"]  # pulled, nothing made from it
+    assert ran == [["pull", "gemma4:26b-mlx"]]  # pulled, nothing made from it
     assert not (tmp_path / ".local-worker.Modelfile").exists()
 
 
@@ -2002,7 +1716,7 @@ def test_the_ollama_step_comes_first_and_off_the_live_mac_only_prints(
     wizard = Wizard(tmp_path / "config.toml", dry_run=False)
     wizard.ollama()
     out = capsys.readouterr().out
-    assert "Ollama: its official build 0.40.4" in out and "/usr/bin/curl -q -fL" in out
+    assert "Ollama: its official build 0.40.4" in out and "/usr/bin/curl -q -fsSL" in out  # its five dots, no %
     assert (
         "/usr/bin/sudo /bin/launchctl bootstrap system /Library/LaunchDaemons/com.local-assistant.ollama.plist" in out
     )
@@ -2010,9 +1724,72 @@ def test_the_ollama_step_comes_first_and_off_the_live_mac_only_prints(
     assert not (tmp_path / "home").exists()
 
 
+def test_the_ollama_step_prints_its_download_as_a_command_that_asks_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review PROM-08: the Ollama step's download line goes through the Wizard's command (the window keeps its
+    screen during the download)."""
+    from local_assistant import ollama_build
+
+    given: dict[str, object] = {}
+
+    class Install(ollama_build.Install):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            given.update(kwargs)
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(ollama_build, "Install", Install)
+    monkeypatch.setattr("local_assistant.ollama_build.owner_home", lambda: tmp_path / "home")
+    monkeypatch.setattr("local_assistant.setup.memory_gb", lambda: 32.0)
+    for target in ("builtins.input", "local_assistant.setup.read_hidden", "subprocess.run", "subprocess.Popen"):
+        monkeypatch.setattr(target, refuse)
+    wizard = Wizard(tmp_path / "config.toml", dry_run=False)
+    wizard.ollama()
+    assert given["command"] == wizard.command
+
+
+@pytest.mark.parametrize("chosen", ["app", "build", None])
+def test_the_ollama_step_uses_the_app_only_when_the_person_chose_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, chosen: str | None
+) -> None:
+    """Owner, 29 Oct: yes uses the Ollama app (nothing installed); no, or the app not on this Mac, the official build."""
+    from local_assistant import ollama_build, setup_plan
+
+    given: dict[str, object] = {}
+
+    class Install(ollama_build.Install):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            given.update(kwargs)
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(ollama_build, "Install", Install)
+    monkeypatch.setattr("local_assistant.ollama_build.owner_home", lambda: tmp_path / "home")
+    monkeypatch.setattr("local_assistant.setup.memory_gb", lambda: 32.0)
+    for target in ("builtins.input", "local_assistant.setup.read_hidden", "subprocess.run", "subprocess.Popen"):
+        monkeypatch.setattr(target, refuse)
+    wizard = Wizard(tmp_path / "config.toml", dry_run=False)
+    wizard.fixed_mac = setup_plan.Mac(memory_gb=32.0, ollama_app="" if chosen is None else "/Applications/Ollama.app")
+    if chosen is not None:
+        wizard.planned["ollama_app"] = chosen
+    wizard.ollama()
+    app = Path("/Applications/Ollama.app") if chosen == "app" else None
+    assert given["app"] == app and wizard.ollama_app == app
+    if app is not None:
+        assert wizard.ollama_program == "/Applications/Ollama.app/Contents/Resources/ollama"
+
+
+def test_a_config_written_after_the_chosen_app_records_it(tmp_path: Path) -> None:
+    """ollama = "app" in her config: doctor, and every later run, know the person chose the app."""
+    text = render_config(EXAMPLE, BOT, ACI, ollama="app")
+    assert re.search(r'^ollama = "app"$', text, re.MULTILINE)
+    assert parse_config(tomllib.loads(text)).ollama == "app"
+    assert parse_config(tomllib.loads(render_config(EXAMPLE, BOT, ACI))).ollama == "build"
+
+
 def test_setup_runs_the_ollama_step_before_the_model(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     order: list[str] = []
     monkeypatch.setattr("local_assistant.setup.has_terminal", lambda: True)
+    monkeypatch.setattr("builtins.input", enter_but_signal)  # the plan's questions come first: Enter
 
     def model(self: Wizard) -> None:
         order.append("model")
@@ -2042,13 +1819,18 @@ def test_a_failed_move_stops_before_the_security_step_and_the_extras(
     path.write_text(GOOD, encoding="utf-8")
     path.chmod(0o600)
     monkeypatch.setattr(Wizard, "model", lambda self: None)
+    monkeypatch.setattr(Wizard, "her_signal_here", lambda self: True)  # her Signal account there: the move runs
     for name in ("security", "extras", "check"):
         monkeypatch.setattr(Wizard, name, refuse)
     monkeypatch.setattr("builtins.input", lambda prompt="": "y")
     monkeypatch.setattr(Wizard, "run", lambda self, command, **kwargs: subprocess.CompletedProcess(command, 1, "", ""))
-    assert main(["--config", str(path)]) == 1
-    out = capsys.readouterr().out
-    assert "The move did not finish" in out and "scripts/migrate-to-own-user.sh --dry-run" in out
+    stopped: list[str] = []
+    monkeypatch.setattr("local_assistant.setup.PlainFace.stopped", lambda self, text: stopped.append(text))
+    with pytest.raises(SystemExit) as ended:  # a stop, as step 1's are drawn (stops-reruns-move-failed)
+        main(["--config", str(path)])
+    assert ended.value.code == 1
+    assert stopped == [prompts.SETUP_MOVE_FAILED.format(move=wizard_module.REPO / "scripts/migrate-to-own-user.sh")]
+    assert "the move did not finish" in stopped[0] and "scripts/migrate-to-own-user.sh --dry-run" in stopped[0]
 
 
 def test_a_move_that_succeeds_while_the_share_fails_goes_on_to_the_security_step(
@@ -2063,6 +1845,7 @@ def test_a_move_that_succeeds_while_the_share_fails_goes_on_to_the_security_step
     path.chmod(0o600)
     reached: list[str] = []
     monkeypatch.setattr(Wizard, "model", lambda self: None)
+    monkeypatch.setattr(Wizard, "her_signal_here", lambda self: True)  # her Signal account there: the move runs
     monkeypatch.setattr(Wizard, "security", lambda self: reached.append("security"))
     monkeypatch.setattr(Wizard, "extras", lambda self: reached.append("extras"))
     monkeypatch.setattr(Wizard, "personality", lambda self: None)
@@ -2078,7 +1861,7 @@ def test_a_move_that_succeeds_while_the_share_fails_goes_on_to_the_security_step
     assert main(["--config", str(path)]) == 0
     out = capsys.readouterr().out
     assert "The move did not finish" not in out and reached == ["security", "extras"]
-    assert "✓ Always on: Estia runs in her own user _estia. Only her projects folder is not shared yet" in out
+    assert "✓ Always on: Estia runs in her own macOS account _estia. Only her projects folder is not shared yet" in out
     assert f"then run {setup.REPO / 'scripts' / 'share-projects.sh'}" in out
 
 
@@ -2091,6 +1874,7 @@ def test_a_failed_move_whose_restore_left_her_service_file_still_stops(
     path.write_text(GOOD, encoding="utf-8")
     path.chmod(0o600)
     monkeypatch.setattr(Wizard, "model", lambda self: None)
+    monkeypatch.setattr(Wizard, "her_signal_here", lambda self: True)  # her Signal account there: the move runs
     for name in ("security", "extras", "check"):
         monkeypatch.setattr(Wizard, name, refuse)
     monkeypatch.setattr("builtins.input", lambda prompt="": "y")
@@ -2100,41 +1884,10 @@ def test_a_failed_move_whose_restore_left_her_service_file_still_stops(
         return subprocess.CompletedProcess(command, 1, "", "")
 
     monkeypatch.setattr(Wizard, "run", run)
-    assert main(["--config", str(path)]) == 1
+    with pytest.raises(SystemExit):
+        main(["--config", str(path)])
     out = capsys.readouterr().out
-    assert "The move did not finish" in out and "Only her projects folder is not shared yet" not in out
-
-
-# ------------------------------------------------------------------ only a verified number is offered (findings 20, 53)
-
-
-def signal_accounts(home: Path, **registered: bool | None) -> None:
-    """signal-cli's account list, and each account's own file with its "registered" flag (None: no file)."""
-    data = home / ".local/share/signal-cli/data"
-    data.mkdir(parents=True)
-    listed = []
-    for i, (number, flag) in enumerate(registered.items()):
-        listed.append({"path": str(100 + i), "environment": "LIVE", "number": number.replace("n", "+")})
-        if flag is not None:
-            (data / str(100 + i)).write_text(json.dumps({"version": 8, "registered": flag}))
-    (data / "accounts.json").write_text(json.dumps({"accounts": listed, "version": 2}))
-
-
-@pytest.mark.parametrize(
-    ("registered", "offered"),
-    [
-        ({"n306900000000": True}, ["+306900000000"]),
-        ({"n306900000000": False}, []),  # register ran, verify did not: register it again
-        ({"n306900000000": None}, []),  # no account file
-        ({"n306900000000": False, "n306900000001": True}, ["+306900000001"]),
-    ],
-)
-def test_only_a_verified_number_is_offered_again(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, registered: dict[str, bool | None], offered: list[str]
-) -> None:
-    monkeypatch.setenv("HOME", str(tmp_path))
-    signal_accounts(tmp_path, **registered)
-    assert Wizard(tmp_path / "config.toml", dry_run=False).registered_numbers() == offered
+    assert "the move did not finish" in out and "Only her projects folder is not shared yet" not in out
 
 
 # ------------------------------------------------------------------ over SSH, the move inside screen (finding 51)
@@ -2162,38 +1915,24 @@ def test_over_ssh_the_move_is_offered_inside_screen(
 # ------------------------------------------------------------------ the personality, where her files are (finding 11)
 
 
-def test_the_web_extra_leads_with_the_hidden_prompt_that_works_over_ssh() -> None:
-    """Over SSH the login keychain is not the default one and stays locked: her hidden prompt works (review 15 Oct,
-    21); both keys are named."""
-    how = EXTRAS["web"].how
-    assert "/usr/bin/sudo /usr/local/estia/bin/estia secret set web.env OLLAMA_API_KEY" in how
-    assert "BRAVE_API_KEY" in how and how.index("secret set") < how.index("security add-generic-password")
-
-
-def test_the_calls_extra_deploys_the_builds_before_calls_are_on() -> None:
-    """In her own user the JVM signal-cli and the call helper reach her only with a deploy: [calls] before it stops
-    her texts too (review 15 Oct, 11)."""
-    how = EXTRAS["calls"].how
-    assert "/usr/bin/sudo /usr/local/estia/bin/estia-deploy" in how
-    assert how.index("estia-deploy") < how.index("[calls]")
-
-
 def test_the_personality_hint_names_her_folder_once_she_has_her_own_user(
     no_system_paths: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     monkeypatch.setattr("builtins.input", lambda prompt="": "")  # her style, in her own user: Enter keeps hearth
     wizard = Wizard(tmp_path / "config.toml", dry_run=False)
+    monkeypatch.setattr(wizard, "run", recorder([]))  # her config opened as her: on Enter, never run here
     wizard.personality()
     out = capsys.readouterr().out
-    assert f"cp soul.example.md {tmp_path / 'soul.md'} && chmod 600 {tmp_path / 'soul.md'}" in out
-    assert "Personality: Estia's built-in style, hearth (steady, kind and frank). To give her yours instead:" in out
+    assert f"Your own instead, any time: a soul.md in {tmp_path} (setup_assistant.md, 2.5)." in out
+    assert "Personality: Estia's built-in style, hearth (steady, kind and frank).\n" in out
+    assert "cp soul.example.md" not in out  # never a command a default Enter would run: it replaces her style
     wizard.style = "playful"  # a config that chose it
     wizard.personality()
     assert "built-in style, playful (warm, curious and playful)." in capsys.readouterr().out
     her_own_user(no_system_paths)
     wizard.personality()
     out = capsys.readouterr().out
-    assert "/usr/bin/sudo /usr/local/estia/bin/estia config soul" in out  # nano as her; the example the first time
+    assert "Your own, as her, any time: setup_assistant.md, 2.5." in out  # the guide has the command
     assert "built-in style (hearth, the default, or playful: [personality] style in her config)" in out
     assert "sudo -u _estia -e" not in out
     assert "cp soul.example.md" not in out
@@ -2205,7 +1944,8 @@ def test_setup_gives_the_personality_hint_after_the_move(
     order: list[str] = []
     monkeypatch.setattr(Wizard, "model", lambda self: None)
     monkeypatch.setattr(Wizard, "her_name", lambda self: None)
-    monkeypatch.setattr(Wizard, "signal_number", lambda self: BOT)
+    monkeypatch.setattr("builtins.input", enter_but_signal)  # the plan's questions come first: Enter
+    monkeypatch.setattr(Wizard, "signal_account", lambda self: BOT)
     monkeypatch.setattr(Wizard, "owner", lambda self, number: ACI)
     monkeypatch.setattr(Wizard, "config", lambda self, number, aci: order.append("config"))
 
@@ -2223,67 +1963,6 @@ def test_setup_gives_the_personality_hint_after_the_move(
     assert order == ["config", "always on", "security", "extras", "personality"]
 
 
-def test_chords_is_the_last_extra_with_nothing_to_install() -> None:
-    chords = EXTRAS["chords"]
-    assert list(EXTRAS)[-1] == "chords"  # new ones go last: the numbers of the others stay
-    # before her own user setup writes the line; in it, her config is hers alone: it prints the line to add (review
-    # of 0.9.5: the menu said it adds it in both)
-    assert chords.how.startswith("Nothing to install: setup adds [chords] to your config now; in her own user it")
-    assert "prints the line to add" in chords.how
-    assert chords.leaves_the_mac == "nothing (the chords are worked out on the Mac)"
-
-
-def test_the_chords_extra_adds_its_section(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    before = render_config(EXAMPLE, BOT, ACI)
-    wizard, asked = extras_wizard(tmp_path, monkeypatch, ["chords"], before)
-    wizard.extras()
-    assert len(asked) == 1  # nothing to ask
-    text = wizard.config_path.read_text(encoding="utf-8")
-    assert parse_config(tomllib.loads(text)).chords_enabled
-    assert len(re.findall(r"^\[chords\]$", text, re.MULTILINE)) == 1
-    assert stat.S_IMODE(wizard.config_path.stat().st_mode) == 0o600
-    assert [copy.read_text(encoding="utf-8") for copy in wizard.config_path.parent.glob("config.toml.bak-*")] == [
-        before
-    ]
-    out = capsys.readouterr().out
-    assert "✓ Chords: [chords] added to" in out and "from her next start" in out
-    assert "add each section there" not in out  # nothing left to add by hand
-
-
-def test_the_chords_extra_leaves_a_config_with_chords_alone(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    before = f'bot_number = "{BOT}"\nallowed_acis = ["{ACI}"]\n\n[chords]\n'
-    wizard, _asked = extras_wizard(tmp_path, monkeypatch, ["chords"], before)
-    wizard.extras()
-    assert wizard.config_path.read_text(encoding="utf-8") == before
-    assert "✓ Chords: on already" in capsys.readouterr().out
-
-
-def test_the_chords_extra_in_her_own_user_shows_the_line_and_writes_nothing(
-    no_system_paths: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    her_own_user(no_system_paths)
-    wizard, _asked = extras_wizard(tmp_path, monkeypatch, ["chords"])
-    wizard.extras()
-    assert not wizard.config_path.exists()
-    out = capsys.readouterr().out
-    assert "[chords]" in out and "/usr/bin/sudo /usr/local/estia/bin/estia config" in out
-    assert "/usr/bin/sudo /usr/local/estia/bin/estia restart" in out
-
-
-def test_the_chords_extra_on_a_config_that_does_not_load_changes_nothing(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    before = f'bot_number = "{BOT}"\n'
-    wizard, _asked = extras_wizard(tmp_path, monkeypatch, ["chords"], before)
-    wizard.extras()
-    assert wizard.config_path.read_text(encoding="utf-8") == before
-    assert "✗ Chords: not added, the config does not load (allowed_acis" in capsys.readouterr().out
-
-
 # Enter picks the safe answer (owner, 19 Oct: "have the defaults as safe but not nuclear"): the Registration Lock, the
 # move into her own user and the security step; the end of input, Ctrl-C and no terminal are never a yes
 
@@ -2293,27 +1972,13 @@ def in_a_terminal(monkeypatch: pytest.MonkeyPatch, on: bool = True) -> None:
     monkeypatch.setattr(Wizard, "terminal", lambda self: on)
 
 
-def typed_once(monkeypatch: pytest.MonkeyPatch, answer: str | None) -> list[str]:
-    """`answer` at every question (None: the end of input, Ctrl-D); the prompts are recorded."""
-    asked: list[str] = []
-
-    def type_answer(prompt: str = "") -> str:
-        asked.append(prompt)
-        if answer is None:
-            raise EOFError
-        return answer
-
-    monkeypatch.setattr("builtins.input", type_answer)
-    return asked
-
-
 @pytest.mark.parametrize(
     ("answer", "terminal", "said_yes", "hint"),
     [
         ("", True, True, "[Y/n]"),
         ("y", True, True, "[Y/n]"),
         ("n", True, False, "[Y/n]"),
-        ("maybe", True, False, "[Y/n]"),  # anything but Enter or a y is a no
+        ("maybe", False, False, "[y/N]"),  # from a pipe, anything but a yes is a no (a terminal asks again)
         (None, True, False, "[Y/n]"),  # the end of input is never a yes
         ("", False, False, "[y/N]"),  # no terminal: Enter keeps the no
     ],
@@ -2326,6 +1991,17 @@ def test_enter_takes_the_safe_answer_only_from_a_terminal(
     asked = typed_once(monkeypatch, answer)
     assert Wizard(tmp_path / "config.toml", dry_run=False).yes("Safe?", default=True) is said_yes
     assert asked == [f"Safe? {hint} "]
+
+
+def test_a_steps_yes_or_no_asks_again_in_a_terminal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """answers-extras-yes-no-other-words: "ok" or "1" was a no; "ναι" too. Asked again, with the keyboard's hint."""
+    in_a_terminal(monkeypatch)
+    typed = iter(["ok", "ναι"])
+    monkeypatch.setattr("builtins.input", lambda prompt="": next(typed))
+    assert Wizard(tmp_path / "config.toml", dry_run=False).yes("Safe?", default=False) is True
+    assert capsys.readouterr().out.count(prompts.SETUP_YES_NO_AGAIN) == 1
 
 
 def test_the_wizard_takes_its_terminal_from_both_ends(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -2356,7 +2032,7 @@ def test_enter_turns_registration_lock_on_and_asks_the_pin_twice(
 
     def answer(prompt: str = "") -> str:
         asked.append(prompt)
-        return "" if "Registration Lock" in prompt else BOT
+        return "" if "Registration Lock" in prompt or "right?" in prompt else BOT
 
     def set_pin(signal_cli: str, number: str, pin: str, **kwargs: object) -> tuple[bool, str]:
         pins.append(pin)
@@ -2371,7 +2047,7 @@ def test_enter_turns_registration_lock_on_and_asks_the_pin_twice(
     assert wizard.signal_number() == BOT
     assert pins == ["731904"]
     lock = next(prompt for prompt in asked if prompt.startswith("Turn on Registration Lock now?"))
-    assert lock.endswith("[Y/n] ") and "Recommendation: yes" in lock
+    assert lock == "Turn on Registration Lock now? [Y/n] "  # its recommendation on the line before (owner, 27 Oct)
 
 
 @pytest.mark.parametrize("legacy", [False, True], ids=["new", "older-install"])
@@ -2393,7 +2069,7 @@ def test_enter_moves_her_into_her_own_user(
     monkeypatch.setattr(wizard, "run", recorder(ran))
     assert wizard.always_on()
     assert ran == [[str(setup.REPO / "scripts" / "migrate-to-own-user.sh")]]
-    assert asked[-1].endswith("Recommendation: yes. [Y/n] ")
+    assert asked[-1] in ("Install it now? [Y/n] ", "Move her into her own macOS account now? [Y/n] ")
 
 
 def test_over_ssh_without_screen_enter_keeps_the_move_for_later(
@@ -2410,9 +2086,10 @@ def test_over_ssh_without_screen_enter_keeps_the_move_for_later(
     wizard = Wizard(tmp_path / "config.toml", dry_run=False)
     monkeypatch.setattr(wizard, "run", recorder(ran))
     assert wizard.always_on() and ran == []
-    assert asked[-1].endswith("[y/N] ") and "screen" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert asked[-1].endswith("[y/N] ") and "screen" in out
     # the question agrees with the line before it: no recommended yes there
-    assert asked[-1] == "Install it now? Recommendation: no here; run setup again inside screen. [y/N] "
+    assert asked[-1] == "Install it now? [y/N] " and "No (recommended, run setup again inside screen)." in out
 
 
 def test_over_ssh_without_screen_the_dry_run_shows_the_same_question(
@@ -2424,8 +2101,8 @@ def test_over_ssh_without_screen_the_dry_run_shows_the_same_question(
     wizard = Wizard(tmp_path / "config.toml", dry_run=True)
     assert wizard.always_on()
     out = capsys.readouterr().out
-    assert "screen" in out
-    assert '(asks "Install it now? Recommendation: no here; run setup again inside screen. [y/N]"' in out
+    assert "screen" in out and "No (recommended, run setup again inside screen)." in out
+    assert '(asks "Install it now? [y/N]"' in out
 
 
 def test_enter_goes_through_the_security_step(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2438,7 +2115,7 @@ def test_enter_goes_through_the_security_step(tmp_path: Path, monkeypatch: pytes
     monkeypatch.setattr(wizard, "run", recorder(ran))
     wizard.security()
     assert ran == [[str(setup.REPO / "scripts" / "harden.sh")]]
-    assert asked == ["Go through the security step now? Recommendation: yes. [Y/n] "]
+    assert asked == ["Go through the security step now? [Y/n] "]
 
 
 @pytest.mark.parametrize("answer", [None, "n"], ids=["end-of-input", "no"])
@@ -2457,10 +2134,29 @@ def test_the_end_of_input_or_a_no_never_runs_the_move_or_the_security_step(
     assert ran == []
 
 
-def test_the_projects_and_known_number_questions_keep_enter_as_no(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_a_no_at_always_on_says_she_does_not_run_yet(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """Not safety questions: Enter keeps no (projects stay off; a number is registered afresh)."""
+    """answers-extras-move-no-unsaid: Step 5 printed nothing on a no, and the end promised a welcome "when she first
+    runs": the friend waited for one that never came. The step says so, and so does the closing list."""
+    for key in ("SSH_CONNECTION", "STY", "TMUX"):
+        monkeypatch.delenv(key, raising=False)
+    in_a_terminal(monkeypatch)
+    typed_once(monkeypatch, "n")
+    wizard = Wizard(tmp_path / "config.toml", dry_run=False)
+    monkeypatch.setattr(wizard, "run", refuse)
+    assert wizard.always_on()
+    assert prompts.SETUP_MOVE_SKIPPED in capsys.readouterr().out
+    assert prompts.SETUP_MOVE_NOT_RUNNING in wizard.for_terminal
+    assert prompts.SETUP_MOVE_SKIPPED == "Skipped: she runs only while scripts/run.sh is open."
+    assert prompts.SETUP_MOVE_NOT_RUNNING == (
+        "She does not run yet: start her with scripts/run.sh, or run setup again and answer yes at Always on."
+    )
+
+
+def test_the_projects_question_keeps_enter_as_no(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """It recommends nothing: Enter keeps no (projects stay off). A number set up here before is a recommended yes:
+    Enter takes it (owner's call, 29 Oct; tests/test_setup_signal.py)."""
     in_a_terminal(monkeypatch)
     asked = typed_once(monkeypatch, "")
     wizard = Wizard(tmp_path / "config.toml", dry_run=False)
@@ -2468,28 +2164,9 @@ def test_the_projects_and_known_number_questions_keep_enter_as_no(
     assert asked[-1].endswith("[y/N] ")
 
 
-# each question says what it is for, what yes and no do, and "Recommendation: …" before its Enter hint (owner, 19 Oct:
-# never "Most people"); every line fits a terminal, counted with the name Estia and the number +306900000000
-
-TERMINAL = 135
-FILLED = {
-    "tag": "gemma4:26b-mlx",
-    "stop": "Stop her first: /usr/bin/sudo /usr/local/estia/bin/estia stop (start puts her back).",
-    "reason": "an example reason from Signal",
-    "name": "Estia",
-    "default": "Estia",
-    "number": BOT,
-    "word": "estia-4821",
-    "seconds": 20,
-    "files": "zz-alex-setup",
-    "folder": "~/dev",
-    "female": "Tiffany · Maya · Melina",
-    "male": "Socrates · Perikles · Plato",
-}
-
-
-def filled(text: str) -> str:
-    return text.format(**FILLED)
+# each question says what it is for and what yes and no do (owner, 19 Oct: never "Most people"); setup's own keep their
+# recommendation out of the question, on a line of its own (owner, 27 Oct), and harden.sh's own say "Yes
+# (recommended…)" on the line before the question (owner, 29 Oct); every line fits a terminal, counted with the name Estia and the number +306900000000
 
 
 def setup_questions() -> dict[str, str]:
@@ -2521,19 +2198,23 @@ def setup_questions() -> dict[str, str]:
 
 
 @pytest.mark.parametrize("key", list(setup_questions()))
-def test_every_question_says_its_recommendation_before_the_enter_hint(key: str) -> None:
+def test_every_question_says_its_recommendation_where_its_face_shows_it(key: str) -> None:
     text = filled(setup_questions()[key])
-    assert "Recommendation: " in text and "most people" not in text.lower(), key
+    hardens = key in ("keys only", "sudo rule", "other sudo rule", "her files", "her lock")
+    if hardens:  # the recommendation on the line right before the bare question, never inside it (review words-08)
+        *_lead, recommended, asked = text.splitlines()
+        assert recommended.startswith("Yes (recommended") and "ecommend" not in asked, key
+        assert asked.endswith("?") and "Recommendation" not in text, key
+    else:
+        assert "Recommend" not in text, key
+    assert "most people" not in text.lower(), key
     words = f" {text.lower()} ".replace("/usr/bin/sudo", "")
     assert " sudo " not in words and "passwordless" not in words, key  # "admin rights", "without your password"
-    for hint in ("(Enter", "[y/N]", "[Y/n]"):
-        if hint in text:
-            assert text.index("Recommendation: ") < text.index(hint), key
     assert all(len(line) <= TERMINAL for line in text.splitlines()), key
 
 
 def explanations() -> dict[str, str]:
-    from local_assistant import harden, hostsec
+    from local_assistant import harden, hostsec, setup
 
     return {
         "smaller model": prompts.SETUP_SMALLER_MODEL,
@@ -2550,7 +2231,7 @@ def explanations() -> dict[str, str]:
         "levels": prompts.SETUP_PROJECTS_LEVELS,
         "move": prompts.SETUP_MOVE,
         "older move": prompts.SETUP_MOVE_OLDER,
-        "security": prompts.SETUP_SECURITY + "\n" + prompts.SETUP_NUCLEAR,
+        "security": prompts.SETUP_SECURITY + "\n" + setup.nuclear_text("Maria-Christina Ann"),  # a long name fits
         "extras": prompts.SETUP_EXTRAS,
         "check": prompts.SETUP_CHECK_HERS,
         "harden password": harden.PASSWORD_HERS + "\n" + harden.PASSWORD_YOURS,
@@ -2561,6 +2242,9 @@ def explanations() -> dict[str, str]:
         "opening": prompts.SETUP_OPENING,
         "ssh screen": prompts.SETUP_SSH_SCREEN,
         "projects share": prompts.SETUP_PROJECTS_SHARE,
+        "signal account": prompts.SETUP_ACCOUNT,
+        "phone's steps": hostsec.NUMBERLESS_STEPS,
+        "key": hostsec.KEY_ASK,
     }
 
 
@@ -2577,12 +2261,27 @@ def test_every_explanation_fits_the_terminal_in_plain_words(key: str) -> None:
 def test_the_smaller_model_is_for_use_with_caution_and_never_names_tests() -> None:
     """Owner, 19 Oct: "smaller model, use with caution - dont say it failed tests": shorter than the 490 characters
     before, what caution means for her answers in plain words, and no tests, test set, scores or failures."""
-    said = " ".join([prompts.SETUP_SMALLER_MODEL, prompts.SETUP_SMALLER_MODEL_ASK, prompts.SETUP_SMALLER_MODEL_NO])
-    assert len(prompts.SETUP_SMALLER_MODEL) < 400
-    assert "use it with caution" in said and "Recommendation: yes, with caution." in said
-    for word in ("test", "fail", "score", "safety"):
+    said = plain_text(
+        " ".join([prompts.SETUP_SMALLER_MODEL, prompts.SETUP_SMALLER_MODEL_ASK, prompts.SETUP_SMALLER_MODEL_NO])
+    )  # as shown: the bold words' marks left out
+    assert len(plain_text(prompts.SETUP_SMALLER_MODEL)) < 400
+    for word in ("test", "fail", "score", "safety", "caution"):
         assert word not in said.lower(), word
-    assert "forwarded audio file" in said and "on a call" in said and "wait for your yes" in said
+    # the owner's words (29 Oct, 12b-gap-words: "dont scare the users"): the limits, then the safeguards, then 26B;
+    # one idea a paragraph (the safeguards on two short lines), a blank line between them; a plain "Yes (recommended)"
+    assert prompts.SETUP_SMALLER_MODEL == (
+        "Gemma 4 12B on this Mac.\n\n"
+        "Forwarded audio, mail or calendar may **steer her**.\n\n"
+        "She may say a reminder is set when it is not.\n\n"
+        "On calls, lights or plugs may switch before you say yes.\n\n"
+        "Safeguards in code: audio facts stay out of her memory,\n"
+        "and after audio, device changes wait for your yes on Signal.\n\n"
+        "Generally, Gemma 26B (32 GB or more) keeps her rules better.\n\n"
+        "No stops setup; nothing downloads."
+    )
+    assert prompts.SETUP_SMALLER_MODEL_ADVICE == ""
+    shown = plain_text(prompts.SETUP_SMALLER_MODEL)
+    assert all(len(part.splitlines()) <= 2 for part in shown.split("\n\n"))
     # review, 19 Oct: "before you have answered" (answered what?) and "after one wait" confused
     assert "before you say yes" in said and "have answered" not in said and "after one wait" not in said
 
@@ -2602,7 +2301,9 @@ def test_every_hidden_prompt_says_nothing_shows(tmp_path: Path, monkeypatch: pyt
         prompted.append(prompt)
         return next(typed)
 
-    monkeypatch.setattr("builtins.input", lambda prompt="": "y" if "Registration Lock" in prompt else BOT)
+    monkeypatch.setattr(
+        "builtins.input", lambda prompt="": "y" if "Registration Lock" in prompt or "right?" in prompt else BOT
+    )
     monkeypatch.setattr("local_assistant.setup.read_hidden", hidden)
     monkeypatch.setattr(harden, "set_pin", lambda *args, **kwargs: (True, ""))
     wizard = Wizard(Path("/nonexistent/config.toml"), dry_run=False)
@@ -2634,19 +2335,6 @@ def hostsec_fake_host(tmp_path: Path) -> Any:
     return Host(tmp_path / "root", dry_run=True, say=lambda text: None)
 
 
-def test_a_known_number_says_what_yes_and_no_do(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    asked = typed_once(monkeypatch, "y")
-    wizard = Wizard(Path("/nonexistent/config.toml"), dry_run=False)
-    monkeypatch.setattr(wizard, "registered_numbers", lambda: [BOT])
-    assert wizard.signal_number() == BOT
-    out = capsys.readouterr().out
-    assert f"{BOT} finished registering with Signal on this Mac before" in out
-    assert "Yes uses it" in out and "No registers a number again" in out
-    assert asked == [f"{filled(prompts.SETUP_KNOWN_NUMBER_ASK)} [y/N] "]
-
-
 def test_the_move_says_why_in_plain_words(
     no_system_paths: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -2657,8 +2345,9 @@ def test_the_move_says_why_in_plain_words(
     typed_once(monkeypatch, "n")
     Wizard(tmp_path / "config.toml", dry_run=False).always_on()
     out = capsys.readouterr().out
-    assert "as long as no admin rule skips the password" in out and "admin rights" in out
-    assert "scripts/run.sh" in out and "never runs as you or as root" in out
+    assert "admin rights" in out and "scripts/run.sh" in out and prompts.SETUP_MOVE_MORE_TYPED in out
+    more = prompts.SETUP_MOVE_MORE  # the details, in the window's fold and the setup guide (2.7)
+    assert "as long as no admin rule skips the password" in more and "never runs as you or as root" in more
     assert "sudo" not in out and "owned by root" not in out and "service files" not in out
 
 
@@ -2668,23 +2357,21 @@ def test_the_security_step_names_the_nuclear_level_for_deeply_technical_users(
     typed_once(monkeypatch, "n")
     Wizard(tmp_path / "config.toml", dry_run=False).security()
     out = capsys.readouterr().out
-    nuclear = out.split("nuclear level", 1)[1].split("\nGo through", 1)[0]
-    assert "only for deeply technical users" in out and "scripts/harden.sh --nuclear" in nuclear
-    for words in ("firewall", "python3 and ruby", "stealth mode", "keychain lock", "file share", "a laptop"):
-        assert words in nuclear, words
+    from local_assistant import hostsec, setup
+
+    # Terminal has no fold (owner, 27 Oct: at most ~3 lines before a question): the nuclear level in one line
+    assert prompts.SETUP_NUCLEAR_TYPED in out and hostsec.NUCLEAR in prompts.SETUP_NUCLEAR_TYPED
     assert "once 5 minutes have passed since admin rights were last used" in out
+    # the owner's words (20 Oct), the same as harden's, doctor's and the docs', in the window's More fold
+    from local_assistant.setup_answers import Answers
+    from local_assistant.setup_plan import Mac, question
 
-
-def test_the_extras_say_what_each_needs_and_what_is_recommended(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    asked = typed_once(monkeypatch, "")
-    Wizard(tmp_path / "config.toml", dry_run=False).extras()
-    out = capsys.readouterr().out
-    assert out.count("Leaves the Mac: ") == len(EXTRAS) == out.count("Needs: ")
-    assert all(extra.needs for extra in EXTRAS.values())
-    assert asked == [f"{prompts.SETUP_EXTRAS_ASK} "] and "scripts/setup.sh --extras" in out
-    assert all(len(line) <= TERMINAL for line in out.splitlines()), max(out.splitlines(), key=len)
+    filled = {"nuclear": setup.nuclear_text("Estia")}
+    fold = " ".join(question("security").at(Answers.memory(), Mac(), filled).more.split())
+    assert hostsec.NUCLEAR_LINE in fold
+    assert all(len(line) <= TERMINAL for line in setup.nuclear_text("Estia").splitlines())
+    for words in ("never part of setup", "a page opened from a laptop"):
+        assert words in fold, words
 
 
 def test_the_last_check_says_when_the_password_is_asked(
@@ -2701,51 +2388,42 @@ def test_the_last_check_says_when_the_password_is_asked(
 # the smaller frictions (audit, 19 Oct, section 4)
 
 
-@pytest.mark.parametrize("typed", ["+30 690 000 0000", "+30-690-000-0000", " +306900000000 "])
-def test_her_number_may_be_typed_with_spaces_or_dashes(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, typed: str
-) -> None:
-    """A space in her number stopped setup; the prompt says spaces and dashes are fine, and they are left out."""
-    program, folder = fake_signal_cli(tmp_path, monkeypatch, FAKE_SIGNAL_CODE="222222")
-    monkeypatch.setattr("builtins.input", lambda prompt="": "n" if "Registration Lock" in prompt else typed)
-    hidden = iter(["222222", ""])
-    monkeypatch.setattr("local_assistant.setup.read_hidden", lambda prompt="": next(hidden))
-    wizard = Wizard(Path("/nonexistent/config.toml"), dry_run=False)
-    wizard.signal_cli = program
-    monkeypatch.setattr(wizard, "registered_numbers", list)
-    assert wizard.signal_number() == BOT
-    assert rpc_requests(folder)[0]["params"] == {"account": BOT}
-
-
-@pytest.mark.parametrize("typed", ["0690 000 0000", "+30 69x", ""])
-def test_a_number_without_its_country_code_still_stops_setup(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, typed: str
-) -> None:
-    monkeypatch.setattr("builtins.input", lambda prompt="": typed)
-    wizard = Wizard(Path("/nonexistent/config.toml"), dry_run=False)
-    monkeypatch.setattr(wizard, "registered_numbers", list)
-    monkeypatch.setattr(wizard, "registration", refuse)
-    with pytest.raises(SystemExit, match=r"\+ and the country code"):
-        wizard.signal_number()
-
-
 def test_the_remaining_lines_say_their_facts_in_plain_words() -> None:
     """Review, 19 Oct: each says what a no does, nothing shows at a hidden prompt, and no internal words."""
     assert "No: she reads no projects." in prompts.SETUP_PROJECTS and "project tools" not in prompts.SETUP_PROJECTS
-    assert "the files in your home that every account may" in prompts.SETUP_PROJECTS
+    assert "the files in your home that every account may" in " ".join(prompts.SETUP_PROJECTS.split())
     assert "No or q: the security step asks again." in prompts.SETUP_LOCK_HOW
     for move in (prompts.SETUP_MOVE, prompts.SETUP_MOVE_OLDER):
-        assert "your Mac password once (nothing shows while you type)" in move
+        assert "your Mac password once (nothing shows while you type)" in plain_text(move)
     assert "hidden: nothing shows while you type" in prompts.SETUP_OLD_PIN_ASK
     assert prompts.SETUP_LANGUAGE_DRY_RUN == "  (asks which one; Enter: English)"
     assert "Changed later only" not in prompts.SETUP_LANGUAGE and "wins over language in the config" in " ".join(
         prompts.SETUP_LANGUAGE.split()
     )
-    assert "Recommendation: a short name everyone at home likes to say." in prompts.SETUP_NAME_ASK
+    assert prompts.SETUP_NAME_ASK == "Pick a name or type your own. (Enter keeps {default})"  # owner, 27 Oct
     assert "after a drop, screen -r goes back to it" in prompts.SETUP_SSH_SCREEN
     assert "no sudo" not in prompts.SETUP_PROJECTS_SHARE and "no admin rights needed" in prompts.SETUP_PROJECTS_SHARE
     opening = " ".join(prompts.SETUP_OPENING.split())
-    assert "the model, her name, her Signal number" in opening and "the security step and the extras" in opening
+    assert "the questions first" in opening and "her Signal account" in opening
+    # round 2 (words-13): the opening named seven steps in other words; it names the steps as the run numbers them
+    for step in prompts.SETUP_STEPS.values():
+        assert step in opening, step
+
+
+def test_ollamas_step_line_is_as_short_as_its_facts_allow() -> None:
+    """Round 2 (words-15, owner 29 Oct "be concise"): step 1's line was one 60-word paragraph with "sha256" and the
+    developer ID; the checks stay, in GUIDE's words, and the IDs stay in the dry run (OLLAMA_CHECKS)."""
+    checked = "checked before anything is installed: its fingerprint, every program's signature by Ollama and Apple's notarization"
+    for text in (prompts.OLLAMA_INSTALL, prompts.OLLAMA_HER_INSTALL):
+        assert checked in text and "{team}" not in text and "sha256" not in text, text
+    assert "{team}" in prompts.OLLAMA_CHECKS
+    guide = (Path(__file__).resolve().parent.parent / "GUIDE.md").read_text(encoding="utf-8")
+    assert (
+        "checked before anything is installed: its fingerprint, every program's signature by Ollama and Apple's notarization"
+        in guide
+    )
+    assert "up to an hour" not in prompts.SETUP_AI_STARTED  # with calls it takes longer (round 2, ai-4)
+    assert "Her notes, /status and /help **stay English**." in prompts.SETUP_LANGUAGE  # words-18: no "What code writes"
 
 
 def test_the_dry_runs_show_the_enter_default_where_it_is_yes(
@@ -2758,3 +2436,223 @@ def test_the_dry_runs_show_the_enter_default_where_it_is_yes(
     out = capsys.readouterr().out
     assert f'"{prompts.SETUP_LOCK_ASK} [Y/n]"' in out and f'"{prompts.SETUP_SECURITY_ASK} [Y/n]"' in out
     assert "if you say yes" not in out
+
+
+# ------------------------------------------------------------------ Ctrl-C while a step runs (review setup-ctrl-c-kills-harden)
+
+
+def _press_ctrl_c_once(started: Path) -> threading.Thread:
+    """Ctrl-C at setup once the step's program says it started (the terminal sends it to every program in the
+    foreground; the step's own program decides for itself)."""
+    import os
+    import signal
+    import time
+
+    def press() -> None:
+        deadline = time.monotonic() + 10
+        while not started.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        os.kill(os.getpid(), signal.SIGINT)
+
+    thread = threading.Thread(target=press, daemon=True)
+    thread.start()
+    return thread
+
+
+@pytest.mark.parametrize("step", ["harden.sh", "migrate-to-own-user.sh", "estia-deploy"])
+def test_a_ctrl_c_during_a_step_lets_it_end_then_stops_setup(tmp_path: Path, step: str) -> None:
+    """A Ctrl-C while the security step, the move to her own account or her deploy runs: setup lets the step end
+    (harden ignores it from her stop to her start again, the move restores her) and then stops with its line. Before,
+    setup's own Ctrl-C killed the step halfway, and she stayed stopped."""
+    import signal
+
+    started, finished = tmp_path / "started", tmp_path / "finished"
+    program = tmp_path / step
+    program.write_text(f"#!/bin/sh\ntrap '' INT\n: > '{started}'\nsleep 1\n: > '{finished}'\n")
+    program.chmod(0o755)
+    wizard = Wizard(tmp_path / "config.toml", dry_run=False)
+    before = signal.getsignal(signal.SIGINT)
+    pressed = _press_ctrl_c_once(started)
+    with pytest.raises(KeyboardInterrupt):
+        wizard.run([str(program)])
+    pressed.join(timeout=10)
+    assert finished.exists()  # the step ended by itself
+    assert signal.getsignal(signal.SIGINT) is before  # setup's own Ctrl-C is back
+
+
+def test_without_a_ctrl_c_a_step_runs_as_before(tmp_path: Path) -> None:
+    import signal
+
+    wizard = Wizard(tmp_path / "config.toml", dry_run=False)
+    before = signal.getsignal(signal.SIGINT)
+    done = wizard.run(["/bin/sh", "-c", "exit 3"])
+    assert done.returncode == 3 and signal.getsignal(signal.SIGINT) is before
+
+
+# ------------------------------------------------------------------ a Mac too small, said first (review setup-small-mac-after-plan)
+
+
+@pytest.mark.parametrize("hers", [False, True], ids=["first install", "her own account"])
+def test_a_mac_too_small_says_so_before_any_question(
+    no_system_paths: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    hers: bool,
+) -> None:
+    """Below 15 GB setup stopped only after the whole plan (her number, About you): now before its first question,
+    with the same line, and nothing is opened, asked or saved."""
+    from local_assistant import setup_answers, setup_window
+    from tests.setup_helpers import her_own_user
+
+    if hers:
+        her_own_user(no_system_paths)
+    monkeypatch.setattr("local_assistant.setup.memory_gb", lambda: 8.0)
+    monkeypatch.setattr(setup_window, "face", refuse)  # the window is never built or opened
+    monkeypatch.setattr("builtins.input", refuse)
+    for name in ("ollama", "model"):
+        monkeypatch.setattr(Wizard, name, refuse)
+    assert main(["--config", str(tmp_path / "config.toml")]) == 1
+    out = capsys.readouterr().out
+    assert prompts.SETUP_TOO_SMALL.format(memory=8.0, name="Estia") in out
+    assert not setup_answers.default_path().exists()
+
+
+@pytest.mark.parametrize(
+    ("calls", "move", "need", "ollama"),
+    [("n", "", 20, "Ollama 1 GB"), ("y", "", 27, "Ollama 1 GB"), ("n", "y", 22, "her Ollama 3 GB")],
+    ids=["no-calls", "calls", "her-own-ollama"],
+)
+def test_too_little_free_disk_is_said_before_the_first_step(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    calls: str,
+    move: str,
+    need: int,
+    ollama: str,
+) -> None:
+    """mac-ollama-disk-full (round 1): free disk was never checked; a 12B download stopped at 3 of 5 dots with "no
+    space left on device ... run again to resume it", which loops. The space the steps picked need (her model,
+    Ollama, calls) is checked right after the plan, before anything is downloaded, with how much to free."""
+    from local_assistant import setup_plan
+
+    monkeypatch.setattr(setup_plan, "free_disk_gb", lambda: 5.0)
+    monkeypatch.setattr(
+        "builtins.input",
+        lambda prompt="": (
+            calls
+            if prompt.startswith("Set up calls?")
+            else move
+            if prompt.startswith(prompts.SETUP_MOVE_ASK)
+            else enter_but_signal(prompt)
+        ),
+    )
+    for name in ("ollama", "model", "signal_number", "always_on", "security", "extras"):
+        monkeypatch.setattr(Wizard, name, refuse)
+    with pytest.raises(SystemExit) as stopped:
+        main(["--config", str(tmp_path / "config.toml")])
+    words = str(stopped.value)
+    # her own Ollama on a new install with her own account: the room step 1 checks too (c-6, round 3)
+    assert words.startswith(f"✗ Disk: 5 GB free, and this run needs about {need} GB (her model 18.3 GB, {ollama}")
+    assert ("calls about 7 GB" in words) is (calls == "y")
+    assert f"Fix: free about {need - 5} GB (System Settings → General → Storage), then run setup again" in words
+    assert "Traceback" not in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    ("memory", "calls", "line"),
+    [
+        (16.0, None, "Next, the steps: about 15 minutes on a 100 Mbit/s line, most of it her model (7.7 GB)."),
+        (
+            32.0,
+            "yes",
+            "Next, the steps: about 30 minutes on a 100 Mbit/s line, most of it her model (18.3 GB); calls add a long "
+            "build.",
+        ),
+    ],
+)
+def test_the_steps_time_is_said_once_the_plan_is_answered(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, memory: float, calls: str | None, line: str
+) -> None:
+    """The friend's review (round 2, ux-21): no screen said how long the steps take. Once the plan is answered, one
+    line says it, README's figures; nothing when her model is there already (a re-run: short steps)."""
+    from local_assistant import setup_plan
+
+    monkeypatch.setattr("local_assistant.setup.memory_gb", lambda: memory)
+    said: list[str] = []
+    wizard = Wizard(tmp_path / "config.toml", dry_run=False)
+    monkeypatch.setattr(wizard, "say", said.append)
+    wizard.fixed_mac = setup_plan.Mac(memory_gb=memory)
+    if calls:
+        wizard.planned["calls"] = calls
+    wizard.steps_time()
+    assert said == [line]
+    said.clear()
+    wizard.fixed_mac = setup_plan.Mac(memory_gb=memory, model_listed=True)
+    wizard.steps_time()
+    assert said == []
+
+
+def test_a_download_that_fills_the_disk_names_the_disk_not_the_network(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The pull's "no space left on device" was "The download did not finish (...). Run scripts/setup.sh again to
+    resume it", which loops on a full disk; it names the disk and what to free."""
+    from local_assistant import setup_plan
+
+    monkeypatch.setattr(setup_plan, "free_disk_gb", lambda: 500.0)
+    monkeypatch.setattr(
+        Wizard, "pull", lambda self, tag, size=0: "write blobs/sha256-ab-partial: no space left on device"
+    )
+    wizard = Wizard(tmp_path / "config.toml", dry_run=False)
+    wizard.fixed_mac = setup_plan.Mac(memory_gb=32.0)
+    with pytest.raises(SystemExit) as stopped:
+        wizard.model()
+    assert str(stopped.value) == prompts.SETUP_DISK_FULL.format(
+        why="write blobs/sha256-ab-partial: no space left on device"
+    )
+    assert str(stopped.value).startswith("✗ Disk: the Mac ran out of space during the download (")
+    assert "Fix: free space (System Settings → General → Storage), then run setup again: the download goes on" in (
+        str(stopped.value)
+    )
+
+
+def test_a_dry_run_on_a_mac_too_small_still_shows_the_plan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr("local_assistant.setup.memory_gb", lambda: 8.0)
+    monkeypatch.setattr("shutil.which", lambda name: None)
+    with pytest.raises(SystemExit):
+        main(["--dry-run", "--config", str(tmp_path / "config.toml")])
+    out = capsys.readouterr().out
+    assert prompts.SETUP_NAME_DRY_RUN.format(default="Estia") in out  # the plan, as a dry run shows it
+    assert prompts.SETUP_TOO_SMALL.format(memory=8.0, name="Estia") in out
+
+
+@pytest.mark.parametrize("dry", [False, True], ids=["real", "dry"])
+def test_the_mac_stays_awake_for_the_whole_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, dry: bool) -> None:
+    """plat-09: only the model download kept the Mac awake; the voice build, the voice service's model wait and the
+    calls build had nothing, while the screen said "the Mac stays awake". Setup holds macOS's caffeinate for the whole
+    run (a dry run changes nothing and holds none); the screen says to keep it plugged in, its lid open."""
+    import contextlib
+    from collections.abc import Iterator
+
+    from local_assistant import setup_progress
+
+    held: list[str] = []
+
+    @contextlib.contextmanager
+    def awake() -> Iterator[None]:
+        held.append("on")
+        yield None
+        held.append("off")
+
+    monkeypatch.setattr(setup_progress, "awake", awake)
+    monkeypatch.setattr(wizard_module, "_run", lambda wizard, args: noted(held, "run", 0))
+    argv = ["--config", str(tmp_path / "config.toml"), *(["--dry-run"] if dry else [])]
+    assert wizard_module.run_setup(argv) == 0
+    assert held == (["run"] if dry else ["on", "run", "off"])
+    assert prompts.SETUP_DOWNLOAD.splitlines()[0] == (
+        "  Nothing to answer meanwhile. Keep the Mac plugged in, with its lid open: setup keeps it awake until it ends."
+    )

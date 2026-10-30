@@ -11,6 +11,7 @@ from zoneinfo import ZoneInfo
 
 from local_assistant import prompts
 from local_assistant.babble import LEVELS, NOT_YET, OFFERED, START_LEVEL, Babble, listing, listing_lines
+from local_assistant.config import POCKET_LANGUAGES, POCKET_VOICES, STANDARD_ONLY, VOICE_ALIASES, canonical_voice
 from local_assistant.context import ContextBuilder
 from local_assistant.initiative import Initiative
 from local_assistant.language import ENGLISH, LANGUAGE_KEY, LANGUAGES, find
@@ -19,6 +20,8 @@ from local_assistant.reminders import ReminderError, Reminders, parse_when
 from local_assistant.soul import SOUL_MAX_CHARS, has_parts, soul_part
 from local_assistant.store import Fact, Message, Store
 from local_assistant.timefmt import local_date, local_datetime, short_date
+from local_assistant.voice import pocket_standard as macs_pocket_model
+from local_assistant.voice_download import LanguageDownload
 
 log = logging.getLogger(__name__)
 
@@ -38,9 +41,16 @@ _VOICE_MODES = {
     "off": "off",
 }
 _VOICE_ECHO = {"on": "on (I show what I heard first)", "off": "off"}
-VOICE_NAME_KEY = "voice_name"  # a Kokoro voice chosen with /voice name (else the config's)
-# Kokoro's English voices the voice service can load: (name, description)
+VOICE_NAME_KEY = "voice_name"  # a voice chosen with /voice <voice> or /voice name <voice> (else the config's)
+# the English voices the voice service can speak: (name, description); Pocket's first, in its order (config.POCKET_ORDER:
+# vera only beside the 100M model, `Commands.pocket_standard`), then Kokoro's
 VOICES: dict[str, str] = {
+    "heart": "female",  # Kokoro's af_heart cloned onto each Pocket TTS model (owner, 27 Oct: "call the voice Heart")
+    "jane": "female",
+    "eve": "female",
+    "vera": "female",
+    "alba": "male",  # Alba MacKenna's voice, male to the owner's ear (26 Oct: "they are both male, definitely")
+    "michael": "male",  # VCTK p360 (owner, 26 Oct: "alba & michael for males, both on small and big")
     "am_michael": "American, male, warm",
     "am_fenrir": "American, male, deeper",
     "am_puck": "American, male, lively",
@@ -60,6 +70,46 @@ VOICES: dict[str, str] = {
     "bf_emma": "British, female",
     "bf_isabella": "British, female",
 }
+
+
+_VOICE_KEYWORDS = {"echo", "name"}  # the words of /voice's two-word forms: alone they get the usage line
+
+
+def voice_label(voice: str) -> str:
+    """A voice as the replies call it: a Pocket voice by its name ("Jane", "Heart"; eve-full, another name for eve, is
+    Eve), a Kokoro voice by its id as the owner types it ("af_heart", never "Heart", which is Pocket's heart: the id is
+    what /voice takes), any other word capitalised as a name ("Zoe")."""
+    voice = canonical_voice(voice)
+    return voice if "_" in voice else voice.capitalize()
+
+
+def voice_pronoun(voice: str) -> str:
+    """The pronoun for a voice: "his" for a male one, "her" for a female one (the list's own words), else "its"."""
+    about = VOICES.get(voice, "").split(", ")
+    return "her" if "female" in about else "his" if "male" in about else "its"
+
+
+def engine(voice: str) -> str:
+    """Who speaks an English voice: Pocket TTS for Pocket's (on the Mac's one model: owner, 26 Oct, never named by its
+    size), Kokoro for the others."""
+    return "Pocket TTS" if voice in POCKET_VOICES else "Kokoro"
+
+
+def voices_here(standard: bool) -> dict[str, str]:
+    """The English voices of this Mac, in /voices' order: every one of `VOICES`, vera only beside the 100M model
+    (`standard`; owner, 26 Oct: "vera stays on the 100M only"; heart on either: 29 Oct, "just make the small heart").
+    Setup's last step names only voices of these (`setup.voices_line`)."""
+    return {name: about for name, about in VOICES.items() if standard or name not in STANDARD_ONLY}
+
+
+def voices_listing(standard: bool) -> list[str]:
+    """/voices' lines: each voice of this Mac with who speaks it, Pocket's first, then each other name after them
+    ("eve-full: another name for eve": owner, 26 Oct, old configs and habits), then Kokoro's."""
+    here = voices_here(standard)
+    lines = [f"{name}: {about} ({engine(name)})" for name, about in here.items()]
+    pocket = sum(1 for name in here if name in POCKET_VOICES)
+    aliases = [f"{alias}: another name for {name}" for alias, name in VOICE_ALIASES.items()]
+    return lines[:pocket] + aliases + lines[pocket:]
 
 
 @dataclass(frozen=True)
@@ -287,6 +337,7 @@ class Commands:
         language: str = ENGLISH,
         set_language: Callable[[str], None] | None = None,
         voice_languages: VoiceLanguages | None = None,
+        language_voice: str = "",
         reminders: Reminders | None = None,
         initiative: Initiative | None = None,
         babble: Babble | None = None,
@@ -294,10 +345,18 @@ class Commands:
         capabilities: Callable[[], list[str]] | None = None,
         changed: Callable[[], None] | None = None,
         docs: Docs | None = None,
+        inventory: Callable[[], str] | None = None,
+        downloads: LanguageDownload | None = None,
+        pocket_standard: bool | None = None,
+        has_home: Callable[[], bool] | None = None,
     ) -> None:
         """`capabilities`: code's list of what she can do here, which /help shows above the commands (the lines her
-        rules carry); `changed`: told when a level that list shows changes (/voice auto|on|off, /initiative on|off,
-        /evening), so her rules follow."""
+        rules carry); `inventory`: her tools' list as /tools shows it (prompts.inventory_text: the lines her rules
+        carry); `changed`: told when a level that list shows changes (/voice auto|on|off, /initiative on|off,
+        /evening), so her rules follow. `downloads`: jane's model of a language downloading (owner, 25 Oct):
+        /language's and /babble's replies say so. `pocket_standard`: this Mac speaks Pocket TTS's 100M model, vera's
+        (owner, 26 Oct: by its Gemma); None reads it from the Mac's memory (`voice.pocket_standard`). `has_home`:
+        whether a home area is known (`Maps.has_home`), None with places off."""
         self._store = store
         self._profile = profile
         self._context = context
@@ -308,8 +367,11 @@ class Commands:
         self._voice = voice
         self._set_voice = set_voice
         self._language = language
+        self._language_voice = language_voice  # jane: the voice of POCKET_LANGUAGES ("": none, as before)
         self._set_language = set_language
         self._voice_languages = voice_languages
+        self._downloads = downloads
+        self.pocket_standard = macs_pocket_model() if pocket_standard is None else pocket_standard
         self._reminders = reminders
         self._initiative = initiative
         self._babble = babble
@@ -317,6 +379,8 @@ class Commands:
         self._capabilities = capabilities
         self._changed = changed or (lambda: None)
         self._docs = docs  # the documents (/docs, /docs send N): off without [documents]
+        self._inventory = inventory
+        self._has_home = has_home
 
     async def handle(self, message: Message) -> str:
         command, _, rest = message.text.strip().partition(" ")
@@ -325,7 +389,10 @@ class Commands:
             case "/new":
                 return self._new()
             case "/profile":
-                return self._notes_text() if args.lower() == "notes" else self._profile_text()
+                part = args.lower()
+                if part == "new":
+                    return self._quiet_text()
+                return self._notes_text() if part == "notes" else self._profile_text()
             case "/forget":
                 return self._forget(args, message.id)
             case "/fix":
@@ -341,7 +408,7 @@ class Commands:
             case "/voices":
                 return self._voice_settings("voices")
             case "/language":
-                return await self._language_setting(args)
+                return await self._language_setting(args, message.peer_aci)
             case "/babble":
                 return await self._babble_setting(args, message)
             case "/remind":
@@ -364,6 +431,8 @@ class Commands:
                 return self._guard.lock(message.peer_aci, message.source_device) or prompts.LOCK_NOT_FROM_KNOWN
             case "/unlock" if self._guard is not None:
                 return self._guard.unlock(message.peer_aci, message.source_device) or prompts.LOCK_NOT_FROM_KNOWN
+            case "/tools" if self._inventory is not None:
+                return self._inventory()
             case "/help":
                 return self._help()
             case _:
@@ -400,7 +469,7 @@ class Commands:
             )
         except ReminderError as exc:
             return f"Not set: {exc}."
-        return created.note
+        return created.note or created.already  # typed again: the one already set, never an empty reply (review O1)
 
     def _reminder_list(self, args: str, message: Message) -> str:
         """/reminders: the list; /reminders cancel N, cN (a check-in) or all."""
@@ -505,30 +574,34 @@ class Commands:
     def _voice_settings(self, args: str) -> str:
         if not self._voice:
             return "Voice notes aren't set up on the Mac."
-        words = args.split()
+        words = args.lower().split()
         if words and words[0] in _VOICE_MODES and len(words) == 1:
             self._store.set_state(VOICE_MODE_KEY, words[0])
             self._changed()  # the list in her rules shows the voice answers' level
             return f"Voice replies: {_VOICE_MODES[words[0]]}."
+        spoken_in = self._spoken_in()
         if words == ["voices"]:
-            listed = "\n".join(f"{name}: {about}" for name, about in VOICES.items())
-            return f"Voices (try one with /voice name <voice>):\n{listed}"
-        if len(words) == 2 and words[0] == "name":
-            name = words[1].lower()
+            listed = "\n".join(voices_listing(self.pocket_standard))
+            return f"Voices (try one with /voice <voice>):\n{listed}" + (f"\n{spoken_in}" if spoken_in else "")
+        if (len(words) == 2 and words[0] == "name") or (len(words) == 1 and words[0] not in _VOICE_KEYWORDS):
+            typed = words[-1]
+            name = canonical_voice(typed)
             if name not in VOICES:
-                return f"Unknown voice {words[1]}. /voice voices lists them."
+                return f"There's no voice called {voice_label(name)} here yet. /voice voices lists them."
+            if name not in voices_here(self.pocket_standard):  # vera beside the 18M model: nothing changes
+                return prompts.VOICE_STANDARD_ONLY.format(voice=voice_label(name))
             self._store.set_state(VOICE_NAME_KEY, name)
             if self._set_voice is not None:
                 self._set_voice(name)
-            gender = VOICES[name].split(", ")
-            return f"Voice: {name} ({', '.join(gender[:2])}). Calls and voice notes use it now."
+            other = f" {prompts.VOICE_OTHER_NAME.format(typed=typed, name=name)}" if typed != name else ""
+            on = prompts.VOICE_ON_ENGLISH if spoken_in else prompts.VOICE_ON
+            told = on.format(voice=voice_label(name), pronoun=voice_pronoun(name))
+            return told + other + (f" {spoken_in}" if spoken_in else "")
         if len(words) == 2 and words[0] == "echo" and words[1] in _VOICE_ECHO:
             self._store.set_state(VOICE_ECHO_KEY, words[1])
             return f"Transcript echo: {_VOICE_ECHO[words[1]]}."
         if words:
-            return (
-                "Usage: /voice auto, /voice on, /voice off, /voice echo on or off, /voice voices, /voice name <voice>"
-            )
+            return "Usage: /voice auto, /voice on, /voice off, /voice echo on or off, /voice voices, /voice <voice>"
         mode = self._store.get_state(VOICE_MODE_KEY) or "auto"
         echo = self._store.get_state(VOICE_ECHO_KEY) or "off"
         return (
@@ -536,9 +609,19 @@ class Commands:
             "Change with /voice auto, on or off, and /voice echo on or off."
         )
 
-    async def _language_setting(self, args: str) -> str:
+    def _spoken_in(self) -> str:
+        """While one of the six languages jane speaks is in use (owner, 25 Oct): that it is spoken in her voice and /voice
+        sets the English one; "" in English, in the four Supertonic-3 speaks and without a language voice."""
+        if not self._language_voice or self._language not in POCKET_LANGUAGES:
+            return ""
+        language = LANGUAGES[self._language].english
+        return prompts.VOICE_IN_LANGUAGE.format(language=language, voice=voice_label(self._language_voice))
+
+    async def _language_setting(self, args: str, aci: str) -> str:
         """/language: the list; /language <code or name>: switch (only ever by this typed command). The text switches
-        at once; when the voice service cannot do the new language yet, the reply says how to update it."""
+        at once; when the voice service cannot do the new language yet, the reply says how to update it, and while
+        jane's model of it downloads, the reply is the owner's (25 Oct): it is on, her voice downloads, answers come as
+        text (`aci` gets the note once it is ready)."""
         if not args:
             return prompts.language_list(self._language)
         practising = self._babble.running() if self._babble is not None else None
@@ -562,6 +645,8 @@ class Commands:
         installed = await self._voice_languages() if self._voice_languages is not None else None
         if installed is not None and chosen.code not in installed:
             reply += "\n" + prompts.LANGUAGE_VOICE_TOO_OLD.format(english=chosen.english)
+        elif installed is not None and self._downloads is not None:
+            reply = await self._downloads.reply(chosen.code, aci) or reply
         return reply
 
     async def _babble_setting(self, args: str, message: Message) -> str:
@@ -637,6 +722,8 @@ class Commands:
         installed = await self._voice_languages() if self._voice_languages is not None and code != ENGLISH else None
         if installed is not None and code not in installed:
             lines.append(prompts.LANGUAGE_VOICE_TOO_OLD.format(english=language.english))
+        elif installed is not None and self._downloads is not None and (note := await self._downloads.note(code, aci)):
+            lines.append(note)  # jane's model of it downloads (owner, 25 Oct)
         reply = "\n\n".join(lines)
         if resumed:  # the list below, the last one marked; never "start with" (practice runs)
             reply += "\n\n" + prompts.BABBLE_RESUMED_LIST.format(lines=listing_lines((code, level)))
@@ -653,13 +740,15 @@ class Commands:
         """/profile: the user's own facts (in every prompt), one per line with its number, where it came from and its
         date, under its category as a bold heading (the snapshot's order; without a category: Other; no category at
         all: no headings), a blank line between groups; then one line about her notes, which /profile notes lists
-        (owner, 18 Oct)."""
+        (owner, 18 Oct). With nothing of the user's yet, the guide (`_guide`) stands in for their facts."""
         if not self._profile.facts():
-            return 'Your profile is empty so far. Tell me about yourself, or say "remember that ...".'
+            return "\n".join([prompts.PROFILE_EMPTY, *self._guide(), prompts.PROFILE_ALSO_NOTES])
         yours, notes = self._profile.yours(), self._profile.notes()
         used, limit = self._profile.used_chars(), self._profile.max_chars
         blocks = [prompts.PROFILE_HEADER.format(used=used, limit=limit, percent=_percent(used, limit))]
-        blocks += self._grouped(yours, source=True) if yours else [prompts.PROFILE_NONE_YET]
+        blocks += (
+            self._grouped(yours, source=True) if yours else ["\n".join([prompts.PROFILE_NONE_YET, *self._guide()])]
+        )
         if notes:
             used, limit = self._profile.notes_used_chars(), self._profile.notes_max_chars
             blocks.append(
@@ -673,6 +762,14 @@ class Commands:
                 )
             )
         return "\n\n".join([*blocks, prompts.PROFILE_FOOTER])
+
+    def _guide(self) -> list[str]:
+        """The empty /profile's guide (0.9.8, approved 26 Oct; never with a fact of the user's): what is worth telling,
+        the home area for "near me" only with places on and no home area known (the user's own fact, setup's or the
+        config's), and the limits from the config."""
+        home = [prompts.PROFILE_HOME_AREA] if self._has_home is not None and not self._has_home() else []
+        limits = prompts.PROFILE_LIMITS.format(fact_max=self._profile.fact_max_chars, limit=self._profile.max_chars)
+        return [prompts.PROFILE_WORTH_TELLING, *home, limits]
 
     def _notes_text(self) -> str:
         """/profile notes: her notes from chats as /profile groups the user's facts, each with its date only (all of
@@ -693,6 +790,17 @@ class Commands:
                 "\n".join([prompts.PROFILE_MOVED, *(self._line(fact, fact.text, source=True) for fact in moved)])
             )
         return "\n\n".join([*blocks, prompts.PROFILE_FOOTER])
+
+    def _quiet_text(self) -> str:
+        """/profile new: the last quiet time's changes only, all of them, each note as it is now (owner, 26 Oct: "only
+        display what happened in the last quiet time... no complexity"); with only "Removed:" lines, none with a number,
+        the closing points to /profile notes, not to /fix N."""
+        quiet = self._profile.last_quiet()
+        lines = [*quiet.noted, *quiet.removed]
+        if not lines:
+            return prompts.PROFILE_NEW_NONE
+        closing = prompts.PROFILE_NEW_FOOTER if quiet.noted else prompts.PROFILE_NEW_NOTES
+        return prompts.fact_note(prompts.PROFILE_NEW_HEADER, lines, closing)
 
     def _line(self, fact: Fact, text: str, *, source: bool) -> str:
         when = short_date(fact.created_at, self._tz, today=datetime.now(self._tz).date())

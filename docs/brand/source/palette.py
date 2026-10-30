@@ -1,5 +1,5 @@
-"""Estia's colours: sumi ink on washi paper, brushed aluminium like the Mac she lives on. The e. mark keeps
-enable4all's own colours from its file (ink #111210, orange #ff5c35, edge #c9c8bd): see mark.py."""
+"""Estia's colours: sumi ink on washi paper, brushed aluminium like the Mac she lives on. The Hearth mark keeps
+the colours of its own file (`../estia-mark.svg`): see mark.py."""
 
 INK = "#1c1a17"  # sumi ink: the name and the tagline
 PAPER = "#f2ede3"  # washi paper: the light background

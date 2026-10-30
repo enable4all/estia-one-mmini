@@ -20,15 +20,19 @@ if [ ! -d "$DEST/.git" ]; then
   mkdir -p "$(dirname "$DEST")"
   git clone -q "$TUNNEL_REPO" "$DEST"
 fi
+BIN="$DEST/signal-call-tunnel/target/release/signal-call-tunnel"
+# what this helper is built from, written beside it once built: setup and doctor compare it with the checkout's or
+# her release's own sources, so a later Estia's local.patch builds it again (second deep scan, signal-06)
+PATCH_SHA=$(shasum -a 256 "$HERE/local.patch" | cut -d ' ' -f 1)
+rm -f "$BIN.stamp"
 cd "$DEST"
 git fetch -q origin "$PR5_HEAD"
+git reset -q --hard  # its own clone: an older local.patch applied before is undone first
 git checkout -q --detach "$PR5_HEAD"
 git submodule update --init third-party/ringrtc >/dev/null
 [ "$(git -C third-party/ringrtc rev-parse HEAD)" = "$RINGRTC" ] || { echo "unexpected RingRTC commit" >&2; exit 1; }
 if git apply --check "$HERE/local.patch" 2>/dev/null; then
   git apply "$HERE/local.patch"
-elif git apply --reverse --check "$HERE/local.patch" 2>/dev/null; then
-  echo "local.patch already applied"
 else
   echo "local.patch does not apply: is the tree clean?" >&2
   exit 1
@@ -36,6 +40,6 @@ fi
 env -u OUTPUT_DIR RUSTUP_TOOLCHAIN=1.91.1 \
   PATH="$BREW/opt/rustup/bin:$BREW/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
   ./build.sh build --locked
-BIN="$DEST/signal-call-tunnel/target/release/signal-call-tunnel"
+printf 'pr5_head=%s\nringrtc=%s\nlocal_patch=%s\n' "$PR5_HEAD" "$RINGRTC" "$PATCH_SHA" > "$BIN.stamp"
 echo "built: $BIN"
 shasum -a 256 "$BIN"

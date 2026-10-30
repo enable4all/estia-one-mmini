@@ -1,0 +1,16 @@
+{"why": "not JSON", "line": "ready"}
+{"why": "not an object", "line": "\"ready\""}
+{"why": "an unknown t", "line": "{\"t\": \"open\", \"url\": \"https://example.com\"}"}
+{"why": "an engine's message from the window", "line": "{\"t\": \"progress\", \"line\": \"hi\"}"}
+{"why": "an older version", "line": "{\"t\": \"ready\", \"v\": 1}"}
+{"why": "an answer without its value", "line": "{\"t\": \"answer\", \"id\": \"name\"}"}
+{"why": "an answer without its id", "line": "{\"t\": \"answer\", \"value\": \"Maya\"}"}
+{"why": "a field more", "line": "{\"t\": \"closed\", \"why\": \"x\"}"}
+{"why": "an id with capitals", "line": "{\"t\": \"answer\", \"id\": \"Name\", \"value\": \"Maya\"}"}
+{"why": "a value that is a number", "line": "{\"t\": \"answer\", \"id\": \"name\", \"value\": 7}"}
+{"why": "a value that is null", "line": "{\"t\": \"answer\", \"id\": \"name\", \"value\": null}"}
+{"why": "a list holding a number", "line": "{\"t\": \"answer\", \"id\": \"extras\", \"value\": [\"web\", 1]}"}
+{"why": "an object holding a list", "line": "{\"t\": \"answer\", \"id\": \"home_area\", \"value\": {\"street\": [\"a\"]}}"}
+{"why": "a NUL in a value", "line": "{\"t\": \"answer\", \"id\": \"name\", \"value\": \"Ma\\u0000ya\"}"}
+{"why": "a version that is a fraction", "line": "{\"t\": \"ready\", \"v\": 1.5}"}
+{"why": "a version that is a bool", "line": "{\"t\": \"ready\", \"v\": true}"}

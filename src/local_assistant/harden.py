@@ -36,10 +36,11 @@ import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
-from local_assistant import hostsec, ownuser
+from local_assistant import hostsec, ownuser, prompts
 from local_assistant.hostsec import CHMOD, LAUNCHCTL, SOCKETFILTERFW, SUDO, Check, Host, estia_root
+from local_assistant.signal_io import jvm_opts, signal_data
 
 REPO = Path(__file__).resolve().parents[2]
 TRUST = ("--trust-new-identities", "on-first-use")  # the identity rule the bridge pins too
@@ -53,30 +54,38 @@ QUESTIONS = {
         "Take python3 and ruby (programs that run scripts) off the firewall's list? With the firewall on, a script "
         "run with them then no longer takes connections from other machines."
     ),
+    # the hardened level's: what a no does, then the recommendation on a line of its own right before the bare
+    # question, never inside it (owner, 27 Oct: setup's own questions do the same; review words-08), named as gum's
+    # menus name it: "Yes (recommended)" (owner, 29 Oct)
     "ssh_password": (
         "Keys only: only a device whose key is in ~/.ssh/authorized_keys logs in over SSH, never with a password. This\n"
         "  session stays open, and the step prints how to take it back from here. No: passwords keep working.\n"
-        "Allow SSH with keys only? Recommendation: yes, then test a new login before you close this one."
+        "Yes (recommended, then test a new login before you close this one).\n"
+        "Allow SSH with keys only?"
     ),
     # Enter takes yes only for rule files that give you (or the admins) every program and nothing else
     # (hostsec.rule_for_you_alone): removing those stops nothing another account or a tool of yours set up
     "sudoers": (
-        "Remove {files}, the rule file(s) that give you admin rights without your password? No keeps them. "
-        "Recommendation: yes."
+        "The rule file(s) {files} give you admin rights without your password. No keeps them.\n"
+        "Yes (recommended).\n"
+        "Remove them?"
     ),
     "sudoers_others": (
-        "Remove {files}, the rule file(s) that give admin rights without a password, to another account too or for\n"
-        "  some programs only? A script or scheduled job that uses them then stops at the password.\n"
-        "  Recommendation: yes, unless something here needs them."
+        "The rule file(s) {files} give admin rights without a password, to another account too or for some\n"
+        "  programs only. Once removed, a script or scheduled job that uses them stops at the password. No keeps them.\n"
+        "Yes (recommended, unless something here needs them).\n"
+        "Remove them?"
     ),
     "data_modes": (
-        "Make her files private, so no other account on this Mac can read them? No leaves them as they are. "
-        "Recommendation: yes."
+        "Made private, her files are read by no other account on this Mac. No leaves them as they are.\n"
+        "Yes (recommended).\n"
+        "Make her files private?"
     ),
     "keychain": "Lock your login keychain after 15 minutes and at sleep? macOS then asks for your password more often.",
     "registration_lock": (
-        "Set a Registration Lock PIN for her number now? She is stopped for about a minute. No leaves it off. "
-        "Recommendation: yes."
+        "Setting the PIN stops her for about a minute. No leaves the lock off.\n"
+        "Yes (recommended).\n"
+        "Set a Registration Lock PIN for her number now?"
     ),
 }
 NUCLEAR_KEYS = ("firewall", "stealth", "firewall_apps", "keychain")  # only with --nuclear
@@ -98,10 +107,19 @@ NUCLEAR_WARNING = (
 LEVEL_HARDENED = f"Security level: {hostsec.HARDENED} (the security step; {hostsec.NUCLEAR_LEVEL} is the other level)."
 LEVEL_NUCLEAR = f"Security level: {hostsec.NUCLEAR_LEVEL} ({hostsec.HARDENED}, plus the settings above)."
 LEVEL_REACHED = "Doctor names the level reached: {doctor}"
-LOCK_NOTE = (
-    "Registration Lock: a PIN Signal asks for before her number can be registered on another device, so her SMS code\n"
-    "  alone (a SIM swap, a lapsed prepaid number) is not enough. Keep it in your password manager: without it and her\n"
-    "  data, the number is locked for 7 days."
+# admin rights asked again after the questions (sudo's sign-in lasts 5 minutes from its last use) and refused: nothing
+# of that part changed (second deep scan, macos-harden-stale-sudo-left)
+ADMIN_RAN_OUT = "✗ {part}: not changed: admin rights were refused. Run scripts/harden.sh again."
+# her own macOS account's dry run reads nothing as her: the PIN step's lines come with when they apply (second deep
+# scan, signal-08: they read as if every account got a PIN and a stop)
+DRY_RUN_LOCK_ONLY = (
+    "  Her Registration Lock is read as her in a real run only. The PIN step below comes only for an account with a\n"
+    "  number and no lock yet; an account without a number has none."
+)
+LOCK_NOTE = (  # short paragraphs, a blank line between them (owner, 27 Oct)
+    "Registration Lock: a PIN Signal asks for before her number can be registered on another device,\n"
+    "so her SMS code alone (a SIM swap, a lapsed prepaid number) is not enough.\n\n"
+    "Keep it in your password manager: without it and her data, the number is locked for 7 days."
 )
 PIN_ASK = "Registration Lock PIN, a new one (hidden: nothing shows while you type; q skips): "
 PIN_AGAIN = "The same PIN again (hidden: nothing shows while you type): "
@@ -116,6 +134,9 @@ PASSWORD_HERS = (
     "Your Mac password now, if asked (once 5 minutes have passed since admin rights were last used; nothing shows\n"
     "  while you type): to read her files as her, and for the changes you said yes to."
 )
+# admin rights not given (Cancel at macOS's box then Not now, or sudo refused): the step ends with its ✗ (round 2)
+ADMIN_NOT_GIVEN = "✗ Admin rights: not given, so nothing that needs them was changed. Later: scripts/harden.sh."
+HER_NOT_CHECKED = "! Her files and Registration Lock: not checked, as admin rights were not given."
 PASSWORD_ONCE_MORE = (
     "Your Mac password once more (nothing shows while you type): to check that admin rights now ask for it."
 )
@@ -123,16 +144,27 @@ SSH_DONE = (
     "✓ SSH: keys only from the next login on. Test a new login from your laptop before you close this one; if it\n"
     "  fails, type this here to take it back: {undo}"
 )
+# setup's window (owner, 29 Oct: every step in the window): admin rights from macOS's own box, the undo on a line of
+# its own (the window draws it with Copy), and sudo's password check read as you
+PASSWORD_WHEN_WINDOW = "Admin rights are asked when first needed, by macOS in its own box."
+SSH_DONE_WINDOW = (
+    "✓ SSH: keys only from the next login on. Test a new login from your laptop; if it fails, this takes it back:\n"
+    "  $ {undo}"
+)
+# her start after the PIN, refused (admin rights run out, the window's box cancelled): she stays stopped, and how
+HER_NOT_STARTED = "; she stays stopped (her start was refused): start her with {start}"
 PHONE_CHECKLIST = (
-    "On your phone and the device with her SIM (no Mac needed):",
+    "On your phone and, when she has a number, the device with her SIM (no Mac needed):",
     "  • Signal → Settings → Linked devices: only devices you know.",
     "  • Signal → Settings → Account → Registration Lock: on, for your own number too.",
     "  • Signal → Settings → Privacy → Screen lock: on, 1 minute or less.",
     "  • Her chat → her name → View safety number: compare it with `/usr/bin/sudo /usr/local/estia/bin/estia signal "
     "listIdentities` on the Mac (setup_assistant.md, 7), then Mark as verified.",
-    "  • The device with her SIM: a SIM PIN (not 0000), a screen lock, notifications that hide their content.",
-    "  • Her carrier: a port-out or SIM-swap PIN; for a prepaid number, a reminder to top it up before it lapses.",
-    "  • A Signal code by SMS that nobody asked for means someone tries to register her number.",
+    "  • With a number, the device with her SIM: a SIM PIN (not 0000), a screen lock, notifications that hide their "
+    "content.",
+    "  • With a number, her carrier: a port-out or SIM-swap PIN; for a prepaid number, a reminder to top it up before "
+    "it lapses.",
+    "  • With a number, a Signal code by SMS that nobody asked for means someone tries to register her number.",
 )
 
 
@@ -151,8 +183,19 @@ def pin_problem(pin: str) -> str:
 
 
 def set_pin_argv(signal_cli: str, number: str, *, jvm: bool = False) -> list[str]:
-    """IPv4 as the bridge uses it: an argument for Homebrew's native build, JAVA_OPTS for the JVM build."""
-    return [signal_cli, *([] if jvm else [IPV4]), *TRUST, "-a", number, "jsonRpc", "--receive-mode", "manual"]
+    """IPv4 as the bridge uses it: an argument for Homebrew's native build, JAVA_OPTS for the JVM build; her data
+    folder by name, as the bridge's (her account record keeps /var/empty as home)."""
+    data = ["--config", str(signal_data())]
+    return [signal_cli, *([] if jvm else [IPV4]), *data, *TRUST, "-a", number, "jsonRpc", "--receive-mode", "manual"]
+
+
+class RpcAnswer(NamedTuple):
+    """signal-cli's answer to one JSON-RPC request: done, why not (its words, secrets as placeholders) and the error's
+    code (signal-cli's: -5 Signal's rate limit, …; None when it answered nothing)."""
+
+    done: bool
+    why: str
+    code: int | None
 
 
 def json_rpc(
@@ -165,9 +208,25 @@ def json_rpc(
     timeout: float = 90.0,
     env: Mapping[str, str] | None = None,
 ) -> tuple[bool, str]:
+    """`json_rpc_answer` without the error's code: (done, why not)."""
+    answer = json_rpc_answer(argv, method, params, secrets=secrets, popen=popen, timeout=timeout, env=env)
+    return answer.done, answer.why
+
+
+def json_rpc_answer(
+    argv: Sequence[str],
+    method: str,
+    params: Mapping[str, object],
+    *,
+    secrets: Mapping[str, str] | None = None,
+    popen: Callable[..., Any] = subprocess.Popen,
+    timeout: float = 90.0,
+    env: Mapping[str, str] | None = None,
+) -> RpcAnswer:
     """One request to `signal-cli … jsonRpc` on stdin, its answer read from stdout: a secret goes in `params`, never
-    in argv (ps shows a program's arguments to every user of the Mac). (done, why not); `secrets` maps each secret to
-    the placeholder shown in its place, should signal-cli's error repeat it."""
+    in argv (ps shows a program's arguments to every user of the Mac). `secrets` maps each secret to the placeholder
+    shown in its place, should signal-cli's error repeat it; the error's code is kept (review S8: -5 is Signal's rate
+    limit, never a wrong key)."""
     request = json.dumps({"jsonrpc": "2.0", "method": method, "params": dict(params), "id": 1})
     proc = popen(
         list(argv),
@@ -191,10 +250,10 @@ def json_rpc(
         while True:
             line = proc.stdout.readline()
             if not line:
-                return (
-                    False,
-                    f"no answer within {timeout:.0f} s" if expired.is_set() else "signal-cli stopped without an answer",
+                why = (
+                    f"no answer within {timeout:.0f} s" if expired.is_set() else "signal-cli stopped without an answer"
                 )
+                return RpcAnswer(False, why, None)
             try:
                 answer = json.loads(line)
             except ValueError:
@@ -202,12 +261,14 @@ def json_rpc(
             if not isinstance(answer, dict) or answer.get("id") != 1:
                 continue
             if "error" in answer:
-                message = str((answer.get("error") or {}).get("message", "refused"))
+                error = answer.get("error") or {}
+                message = str(error.get("message", "refused"))
                 for secret, placeholder in sorted((secrets or {}).items(), key=lambda item: -len(item[0])):
                     if secret:
                         message = message.replace(secret, placeholder)
-                return False, message[:200]
-            return True, ""
+                code = error.get("code")
+                return RpcAnswer(False, message[:200], code if isinstance(code, int) else None)
+            return RpcAnswer(True, "", None)
     finally:
         watchdog.cancel()
         with contextlib.suppress(OSError):
@@ -230,7 +291,11 @@ def set_pin(
 ) -> tuple[bool, str]:
     """Set her Registration Lock: signal-cli's JSON-RPC on stdin (receiving nothing meanwhile). (done, why not)."""
     env = (
-        {**os.environ, "JAVA_OPTS": IPV4, **({"JAVA_HOME": str(java_home)} if java_home is not None else {})}
+        {
+            **os.environ,
+            "JAVA_OPTS": jvm_opts(Path.home()),
+            **({"JAVA_HOME": str(java_home)} if java_home is not None else {}),
+        }
         if jvm
         else None
     )
@@ -251,6 +316,9 @@ def _helper_set_pin() -> int:
     except ConfigError as exc:
         print(f"Registration Lock: not set (config: {exc})")
         return 1
+    if hostsec.is_account_id(cfg.bot_number):  # Signal Login: no number to lock, and no Signal PIN
+        print(f"Registration Lock: not set ({hostsec.NUMBERLESS_LOCK})")
+        return 1
     if cfg.calls_enabled:  # with calls she runs the JVM build: its Java, IPv4 in JAVA_OPTS
         java = cfg.java_home or find_java_home()
         done, why = set_pin(str(cfg.call_signal_cli), cfg.bot_number, pin, jvm=True, java_home=java)
@@ -258,6 +326,17 @@ def _helper_set_pin() -> int:
         done, why = set_pin(cfg.signal_cli, cfg.bot_number, pin)
     print("Registration Lock: on" if done else f"Registration Lock: not set ({why})")
     return 0 if done else 1
+
+
+def her_number(config: Path) -> str:
+    """Her config's bot_number (a number, or an account without one by its Account ID); "" when it cannot be read or
+    loaded: then signal-cli's only account is read, as before."""
+    from local_assistant.config import ConfigError, load_config
+
+    try:
+        return load_config(config).bot_number
+    except (ConfigError, OSError, UnicodeDecodeError):  # never a crash of the security step
+        return ""
 
 
 def _helper_her_checks() -> int:
@@ -284,6 +363,14 @@ def _helper_her_checks() -> int:
     return 0
 
 
+def with_password(rules: str) -> bool:
+    """sudo's listing of your rules holds one that gives you every program with your password."""
+    return any(
+        line.strip().startswith("(") and line.strip().endswith(") ALL") and "NOPASSWD" not in line
+        for line in rules.splitlines()
+    )
+
+
 HER_PARTS = {"data_modes": "Her files", "registration_lock": "Registration Lock"}
 
 
@@ -298,7 +385,7 @@ def her_check(key: str, data: dict[str, Any]) -> Check:
         roots = data.get("roots")
         named = [str(name) for name in roots if str(name) in hostsec.HER_FOLDERS] if isinstance(roots, list) else []
         apply = tuple(
-            (SUDO, "-n", "-u", ownuser.ROLE_USER, CHMOD, "-R", "go-rwx", str(ownuser.HOME / name))
+            (SUDO, "-n", "-u", ownuser.ROLE_USER, "-H", "--", CHMOD, "-R", "go-rwx", str(ownuser.HOME / name))
             for name in (hostsec.HER_FOLDERS if roots is None else named)  # none named (a link only): no chmod
         )
     fix = f"{hostsec.HARDEN} makes them private (it asks first)" if apply else ""
@@ -325,8 +412,15 @@ class Harden:
         sleep: Callable[[float], None] = time.sleep,
         nuclear: bool = False,
         new_pin: bool = False,
+        window: bool | Callable[[], bool] = False,
+        held: Callable[[], contextlib.AbstractContextManager[None]] = ownuser.interruptions_ignored,
     ) -> None:
         self.host = host
+        # setup's window runs the step (its host's sudo through macOS's own box): no password is typed anywhere; a
+        # callable says whether it is still open (closed, the rest is harden.sh's: sudo asks in Terminal)
+        self._window = window
+        # from her stop to her start: hang-ups, TERMs and Ctrl-Cs ignored (in the window its Stop here waits too)
+        self.held = held
         self.new_pin = new_pin  # a new Registration Lock PIN also while the lock is on (after a compromise)
         self.owner = owner
         self.owner_home = owner_home
@@ -340,9 +434,15 @@ class Harden:
         self.sleep = sleep
         self.nuclear = nuclear
         self.sudo_ready = False
+        self.refused = False  # admin rights not given at the step's sign-in: it ends with 1
         self.questions: list[str] = []
 
     # ---------------------------------------------------------------- small parts
+
+    @property
+    def window(self) -> bool:
+        """The setup window runs the step now: macOS's own box asks; once it closed, Terminal's sudo and words."""
+        return self._window() if callable(self._window) else self._window
 
     def show(self, check: Check) -> None:
         mark = {"ok": "✓", "info": "○", "warn": "!", "fail": "✗"}[check.status]
@@ -363,12 +463,32 @@ class Harden:
         """sudo's password once (its own cached sign-in covers the rest)."""
         if self.sudo_ready:
             return True
-        self.say(PASSWORD_HERS if self.own_user else PASSWORD_YOURS)
+        if self.window:
+            self.say(prompts.SETUP_WINDOW_ADMIN_BOX)
+        else:
+            self.say(PASSWORD_HERS if self.own_user else PASSWORD_YOURS)
         code, _ = self.host.run([SUDO, "-v"])
         self.sudo_ready = code == 0
         if not self.sudo_ready:
-            self.say("✗ sudo did not work: nothing that needs it was changed.")
+            self.refused = True
+            self.say(ADMIN_NOT_GIVEN)
+            if self.own_user:
+                self.say(HER_NOT_CHECKED)
         return self.sudo_ready
+
+    def sudo_again(self) -> bool:
+        """Admin rights right before her stop: sudo's sign-in lasts 5 minutes from its last use, and the questions
+        before may take longer, so the stop, the PIN helper and the start (each `sudo -n`) would fail (review
+        host-harden-stale-sudo). One still running is kept (`sudo -n -v`, no question); one run out is asked again.
+        In the window an authorize now (`sudo -v`: macOS's box only once its 5 minutes ran out), as the window maps
+        `sudo -n -v` to nothing (review ADM-3)."""
+        if self.window:
+            self.sudo_ready = self.host.run([SUDO, "-v"])[0] == 0
+            return self.sudo_ready
+        if self.sudo_ready and self.host.run([SUDO, "-n", "-v"])[0] == 0:
+            return True
+        self.sudo_ready = False
+        return self.sudo()
 
     def as_her(self, *argv: str) -> list[str]:
         python = str(ownuser.CURRENT / ".venv" / "bin" / "python")
@@ -419,6 +539,9 @@ class Harden:
             if self.offer(
                 f"Let {name} keep answering other machines on port {port} ({program})?", argv, key="firewall"
             ):
+                if not self.sudo_again():  # after its question: the sign-in may have run out
+                    self.say(ADMIN_RAN_OUT.format(part=f"Firewall: {name}"))
+                    continue
                 failed = [cmd for cmd in argv if self.host.run(list(cmd))[0] != 0]
                 self.say(f"{'✗' if failed else '✓'} Firewall: {name} {'not changed' if failed else 'allowed'}")
 
@@ -426,10 +549,11 @@ class Harden:
     def root_free(check: Check) -> bool:
         return not any(argv[0] == SUDO for argv in check.apply)
 
-    def apply(self, check: Check) -> None:
+    def apply(self, check: Check) -> bool:
+        """The check's commands, in order, until one fails; its line says which. Whether all of them worked."""
         if check.key == "ssh_password":
             self.ssh_keys_only(check)
-            return
+            return True
         why = ""
         for argv in check.apply:
             code, out = self.host.run(list(argv))
@@ -437,6 +561,16 @@ class Harden:
                 why = hostsec.tail(out, 2) or f"exit {code}"
                 break
         self.say(f"✗ {check.part}: not changed ({why})" if why else f"✓ {check.part}: done")
+        return not why
+
+    def admin_again(self, check: Check) -> bool:
+        """Before a check's admin commands that follow a question: a sign-in that ran out is asked for again
+        (`sudo_again`); a refusal says that nothing of it changed and names scripts/harden.sh. True without admin
+        commands."""
+        if self.root_free(check) or self.sudo_again():
+            return True
+        self.say(ADMIN_RAN_OUT.format(part=check.part))
+        return False
 
     def ssh_keys_only(self, check: Check) -> None:
         with tempfile.TemporaryDirectory() as folder:
@@ -452,7 +586,8 @@ class Harden:
                 self.host.run([SUDO, "-n", hostsec.RM, "-f", str(hostsec.SSH_DROP_IN_PATH)])
                 self.say("✗ SSH: sshd refused the new setting, so it was taken back; passwords still work")
                 return
-        self.say(SSH_DONE.format(undo=f"{SUDO} {hostsec.RM} {hostsec.SSH_DROP_IN_PATH}"))
+        undo = f"{SUDO} {hostsec.RM} {hostsec.SSH_DROP_IN_PATH}"
+        self.say((SSH_DONE_WINDOW if self.window else SSH_DONE).format(undo=undo))
 
     # ---------------------------------------------------------------- sudoers
 
@@ -486,11 +621,7 @@ class Harden:
             return
         if not rules:
             _, rules = self.host.run([SUDO, "-n", "-l"], read_only=True)
-        with_password = any(
-            line.strip().startswith("(") and line.strip().endswith(") ALL") and "NOPASSWD" not in line
-            for line in rules.splitlines()
-        )
-        if not with_password:
+        if not with_password(rules):
             self.say(
                 "  Kept: no rule gives you sudo with your password, so removing it would lock you out of sudo. "
                 "Add your account to the admins first (System Settings → Users & Groups)."
@@ -503,9 +634,17 @@ class Harden:
             for line in hostsec.sudoers_lines(contents.get(name))
         )
         key = "sudoers" if yours else "sudoers_others"  # Enter: yes only for yours (ENTER_YES)
-        if not self.offer(QUESTIONS[key].format(files=", ".join(removed)), check.apply, key=key) or not self.sudo():
+        if not self.offer(QUESTIONS[key].format(files=", ".join(removed)), check.apply, key=key):
             return
-        self.apply(check)
+        if not self.admin_again(check) or not self.apply(check):  # the file stays: sudo is as it was
+            return
+        if self.window:  # read as you, no password typed: "a password is required" (hostsec.owner_sudo), and root's
+            # listing of your rules still holds one with your password: sudo says the same to an account with none
+            # (review ADM-10)
+            code, left = self.host.run([SUDO, "-n", "-l"], read_only=True)
+            asks = hostsec.owner_sudo(self.host).status == "ok" and code == 0 and with_password(left)
+            self.say("✓ sudo asks for your password now." if asks else "! sudo: check it in a new terminal.")
+            return
         self.host.run([SUDO, "-k"])
         self.say(PASSWORD_ONCE_MORE)
         code, _ = self.host.run([SUDO, "-v"])
@@ -544,7 +683,10 @@ class Harden:
             self.say("  Skipped: scripts/harden.sh offers it again.")
             return
         daemon = self.host.path(PLIST).exists()
-        if daemon and not self.sudo():
+        again = "scripts/harden.sh --new-pin" if self.new_pin else "scripts/harden.sh"
+        not_stopped = f"  She was not stopped and no PIN was set: run {again} again."
+        if daemon and not self.sudo_again():  # right before the stop: the PIN questions may outlast a sign-in
+            self.say(not_stopped)
             return
         # she runs again afterwards only when launchd had her before: one stopped on purpose (`estia stop`, the first
         # step after a compromise) stays stopped; an answer that cannot be read (a timeout, another message) may be
@@ -559,39 +701,46 @@ class Harden:
         ):
             self.say("✗ A bridge runs in a terminal: stop it (Ctrl-C), then run scripts/harden.sh again.")
             return
-        if running or unread:
-            self.host.run([SUDO, "-n", LAUNCHCTL, "bootout", f"system/{ownuser.BRIDGE}"])
-            if self.host.live:
-                for _ in range(50):  # one signal-cli per account: wait until hers is gone
-                    if self.host.run([LAUNCHCTL, "print", f"system/{ownuser.BRIDGE}"], read_only=True)[0] != 0:
-                        break
-                    self.sleep(0.2)
-        try:
-            code, out = self.host.run(self.pin_helper(), input=f"{pin}\n", timeout=180, cwd=Path("/"))
-        finally:
-            pin = ""
-            if running:  # she runs again, whatever happened to the PIN
-                self.host.run([SUDO, "-n", LAUNCHCTL, "bootstrap", "system", str(PLIST)])
+        with self.held():  # a dropped connection, a Ctrl-C or the window's Stop here never leaves her booted out
+            if running or unread:
+                stopped = self.host.run([SUDO, "-n", LAUNCHCTL, "bootout", f"system/{ownuser.BRIDGE}"])[0] == 0
+                if running and not stopped:  # refused (the window's box) or failed: her account is live, no PIN
+                    self.say(not_stopped)
+                    return
                 if self.host.live:
-                    for _ in range(30):
-                        if (
-                            "pid = "
-                            in self.host.run([LAUNCHCTL, "print", f"system/{ownuser.BRIDGE}"], read_only=True)[1]
-                        ):
+                    for _ in range(50):  # one signal-cli per account: wait until hers is gone
+                        if self.host.run([LAUNCHCTL, "print", f"system/{ownuser.BRIDGE}"], read_only=True)[0] != 0:
                             break
-                        self.sleep(2)
-        result = out.strip().splitlines()[-1] if out.strip() else "Registration Lock: no answer"
-        start = f"{ownuser.ESTIA} start" if self.own_user else f"{SUDO} {LAUNCHCTL} bootstrap system {PLIST}"
-        after = (
-            "; she runs again."
-            if running
-            else f"; she stays stopped (whether she ran before could not be read): start her with {start}"
-            if unread
-            else "; she stays stopped (she was stopped before)."
-            if daemon
-            else ""
-        )
-        self.say(("✓ " if code == 0 else "✗ ") + result + after)
+                        self.sleep(0.2)
+            started = True
+            try:
+                code, out = self.host.run(self.pin_helper(), input=f"{pin}\n", timeout=180, cwd=Path("/"))
+            finally:
+                pin = ""
+                if running:  # she runs again, whatever happened to the PIN
+                    started = self.host.run([SUDO, "-n", LAUNCHCTL, "bootstrap", "system", str(PLIST)])[0] == 0
+                    if self.host.live and started:
+                        for _ in range(30):
+                            if (
+                                "pid = "
+                                in self.host.run([LAUNCHCTL, "print", f"system/{ownuser.BRIDGE}"], read_only=True)[1]
+                            ):
+                                break
+                            self.sleep(2)
+            # said inside the section: a stop held for its end (the window's Stop here) comes after this line, so the
+            # friend learns whether the PIN was set and whether she runs (round 2, r2-window-stream-05)
+            result = out.strip().splitlines()[-1] if out.strip() else "Registration Lock: no answer"
+            start = f"{ownuser.ESTIA} start" if self.own_user else f"{SUDO} {LAUNCHCTL} bootstrap system {PLIST}"
+            after = (
+                ("; she runs again." if started else HER_NOT_STARTED.format(start=start))
+                if running
+                else f"; she stays stopped (whether she ran before could not be read): start her with {start}"
+                if unread
+                else "; she stays stopped (she was stopped before)."
+                if daemon
+                else ""
+            )
+            self.say(("✓ " if code == 0 else "✗ ") + result + after)
 
     def pin_helper(self) -> list[str]:
         if self.own_user:
@@ -606,9 +755,8 @@ class Harden:
                 self.say(line)
             self.say("")
         self.say(LEVEL_NUCLEAR if self.nuclear else LEVEL_HARDENED)
-        self.say(
-            f"The Mac's security around her: each setting, why it matters, and on your yes the fix. {PASSWORD_WHEN}"
-        )
+        when = PASSWORD_WHEN_WINDOW if self.window else PASSWORD_WHEN
+        self.say(f"The Mac's security around her: each setting, why it matters, and on your yes the fix. {when}")
         strict = (
             [
                 hostsec.firewall(self.host),
@@ -624,8 +772,9 @@ class Harden:
             hostsec.ssh_password(self.host, key_home=self.owner_home),
             hostsec.owner_sudo(self.host),  # what sudo lists for you: /etc/sudoers and /etc/sudoers.d alike
         ]
-        if not self.own_user:
-            visible += [hostsec.data_modes(self.owner_home), hostsec.registration_lock_check(self.owner_home)]
+        if not self.own_user:  # her account by her config's bot_number, as --her-checks reads it (review S11)
+            number = her_number(self.owner_home / ".config" / "local-assistant" / "config.toml")
+            visible += [hostsec.data_modes(self.owner_home), hostsec.registration_lock_check(self.owner_home, number)]
         shown_only = [
             hostsec.filevault(self.host),
             hostsec.auto_login(self.host),
@@ -637,9 +786,8 @@ class Harden:
         for check in [*visible, *shown_only]:
             self.show(check)
         if not self.nuclear:  # never a "!" or a "✗": one neutral line
-            self.show(
-                Check("nuclear", "info", "Nuclear level", hostsec.NUCLEAR_LINE.removeprefix("the nuclear level: "))
-            )
+            line = f"{hostsec.NUCLEAR_LINE.removeprefix('The nuclear level, ')} {hostsec.NUCLEAR_HOW}"
+            self.show(Check("nuclear", "info", "Nuclear level", hostsec.terminal_text(line, len("○ Nuclear level: "))))
         listening = hostsec.listeners(self.host) if self.nuclear else []
         accepted = [
             check
@@ -654,6 +802,8 @@ class Harden:
         if (needs_root or self.own_user) and not self.dry_run and not self.sudo():
             accepted = [check for check in accepted if not any(argv[0] == SUDO for argv in check.apply)]
         for check in accepted:
+            if not self.admin_again(check):  # the keep-listening questions come between two of them
+                continue
             self.apply(check)
             if check.key == "firewall":
                 self.keep_listening(listening)
@@ -661,7 +811,7 @@ class Harden:
         if sudoers.status != "ok" or self.sudo_ready:
             self.sudoers(sudoers)
         her = [check for check in visible if check.key in ("data_modes", "registration_lock")]
-        if self.own_user and self.sudo_ready:
+        if self.own_user and self.sudo_ready and self.sudo_again():  # read as her with sudo -n, after the questions
             her = self.her_checks()
         elif self.own_user and self.dry_run:
             self.say(f"  would read her file modes and her Registration Lock as {ownuser.ROLE_USER}:")
@@ -671,18 +821,23 @@ class Harden:
                 self.show(check)
             private = check.key == "data_modes" and check.status != "ok" and bool(check.apply)  # a link: no chmod
             asked = private and self.offer(QUESTIONS["data_modes"], check.apply, key="data_modes")
-            if asked and (self.root_free(check) or self.sudo()):
+            if asked and self.admin_again(check):
                 self.apply(check)
             no_account = check.text.startswith(hostsec.NO_ACCOUNT)
-            if check.key == "registration_lock" and (check.status != "ok" or self.new_pin) and not no_account:
+            numberless = check.text == hostsec.NUMBERLESS_LOCK  # no number to lock: never a PIN, --new-pin too
+            lock = check.key == "registration_lock" and (check.status != "ok" or self.new_pin)
+            if lock and not no_account and not numberless:
                 wants_lock = True
-        if wants_lock or (self.dry_run and self.own_user):
+        if self.dry_run and self.own_user:  # her lock is not read in a dry run: the step says when it applies
+            self.say(DRY_RUN_LOCK_ONLY)
+            self.registration_lock()
+        elif wants_lock:
             self.registration_lock()
         self.say(LEVEL_REACHED.format(doctor=ownuser.ESTIA + " doctor" if self.own_user else "scripts/doctor.sh"))
         self.say("")
         for line in PHONE_CHECKLIST:
             self.say(line)
-        return 0
+        return 1 if self.refused else 0
 
     def her_checks(self) -> list[Check]:
         code, out = self.host.run(self.as_her("--her-checks"), read_only=True, cwd=Path("/"))
@@ -756,7 +911,7 @@ def main(argv: list[str] | None = None) -> int:
         own_user=own_user_installed(host),
         ask=terminal_ask,
         hidden=hidden,
-        say=lambda text: print(text, flush=True),
+        say=ownuser._say,  # a terminal that is gone (a dropped SSH session) never stops the step
         nuclear=args.nuclear,
         new_pin=args.new_pin,
     )

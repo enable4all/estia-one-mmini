@@ -19,6 +19,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
 
+from local_assistant import prompts
 from local_assistant.timefmt import utc_now
 
 Direction = Literal["in", "out"]
@@ -303,6 +304,9 @@ ALTER TABLE conversations ADD COLUMN kind TEXT NOT NULL DEFAULT 'chat' CHECK (ki
 """
 # the practice conversations' ids, for the queries that leave practice turns out
 _NOT_PRACTICE = "conversation_id NOT IN (SELECT id FROM conversations WHERE kind = 'practice')"
+# an incoming message set `ignored` (it came in before /lock, or from an account no longer allowed: review S3) is never
+# read for her: not in her window, idle learning, the check-ins or her history search
+_NOT_IGNORED = "NOT (direction = 'in' AND status = 'ignored')"
 
 # v9: the user's devices (an ACI and a Signal device id: 1 is their phone, 2 and up are linked devices): known from the
 # start (the phone), allowed with /devices ok N, or held (seen, not allowed: no answer); last_seen: its last message
@@ -322,10 +326,11 @@ CREATE TABLE known_devices (
 ALTER TABLE messages ADD COLUMN source_device INTEGER;
 """
 
-# v10: documents ([documents]): the PDFs of the documents folder, keyed by their path in it, size and change time
+# v10: documents ([documents]): the PDFs (and, since 0.9.8, text files) of the documents folder, keyed by their path
+# in it, size and change time
 # (an unchanged file is never read twice), with why one could not be read and the pages skipped; each page's text in a
 # full-text index. AUTOINCREMENT: a number /docs shows is never reused. An attachment keeps the name it was sent with
-# (a PDF the user sends is saved under it).
+# (a document the user sends is saved under it).
 MIGRATION_V10 = """
 CREATE TABLE doc_files (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -508,6 +513,19 @@ class Message:
     # code's note or command answer: "note" or "outside" (it quotes outside text) in her history (code_notes); None never
     history: NoteHistory | None = None
 
+    @property
+    def own_text(self) -> str:
+        """The user's own words in this message (`own_text`)."""
+        return own_text(self.text)
+
+
+def own_text(text: str) -> str:
+    """The words of a stored message that are the user's own: a sent document's first line ("[document] <the saved
+    name>") left out, as a name is the file's, never what the user said (review of P1, R1-F1), so only its caption, ""
+    when there is none; any other text as it is. Her history and her input keep the whole text."""
+    first, _, rest = text.partition("\n")
+    return rest if first.startswith(prompts.DOCUMENT_MARK) else text
+
 
 DeviceSource = Literal["primary", "allowed", "held"]
 
@@ -543,6 +561,8 @@ OUTSIDE_TOOLS = (
     "read_document",
 )
 OUTSIDE_TOOL_PREFIXES = ("mail_", "calendar_", "project_")
+# state key of an open conversation whose outside text a prune deleted: its answers stay after outside text until /new
+OUTSIDE_SEEN = "outside_seen:"
 
 
 @dataclass(frozen=True)
@@ -598,9 +618,9 @@ class DocPage:
 
 @dataclass(frozen=True)
 class DocFile:
-    """A PDF of the documents folder in her index: its path in the folder, size and change time (the key), the pages
-    read, the pages skipped with why, why it could not be read at all ("" when it was), and the reader that read it
-    (documents.INDEX_VERSION; 1 for rows from before v12)."""
+    """A document (a PDF or text file) of the folder in her index: its path in the folder, size and change time (the
+    key), the pages read, the pages skipped with why, why it could not be read at all ("" when it was), and the reader
+    that read it (documents.INDEX_VERSION; 1 for rows from before v12)."""
 
     id: int
     path: str
@@ -887,8 +907,8 @@ def fold(text: str) -> str:
 
 
 def name_words(path: str) -> set[str]:
-    """A document's name as words (its file name without .pdf; folders not), folded; numbers left out (the date a
-    sent PDF's name starts with, "2026-10-14 lease.pdf", names nothing)."""
+    """A document's name as words (its file name without its ending; folders not), folded; numbers left out (the
+    date a sent document's name starts with, "2026-10-14 lease.pdf", names nothing)."""
     return {word for word in re.findall(r"[^\W_]+", fold(Path(path).stem)) if not word.isdecimal()}
 
 
@@ -1111,11 +1131,25 @@ class Store:
             )
 
     def move_window_start(self, conversation_id: int, upto_seq: int) -> None:
-        """Emergency trim: drop messages up to this position from the window; the summary stays as it is."""
+        """A trim (the emergency one, or to the model's context): drop messages up to this position from the window;
+        the summary stays as it is. A turn that read outside text leaving the window without a summary keeps the
+        conversation's mark (OUTSIDE_SEEN, as prune does: review I8), as her later replies may repeat it."""
+        now = utc_now()
         with self.tx():
+            row = self._conn.execute("SELECT summary FROM conversations WHERE id = ?", (conversation_id,)).fetchone()
+            if (
+                row is not None
+                and not row["summary"]
+                and any(seq <= upto_seq for _, seq in self.outside_seqs(conversation_id))
+            ):
+                self._conn.execute(
+                    "INSERT INTO state (key, value, created_at, updated_at) VALUES (?, '1', ?, ?)"
+                    " ON CONFLICT (key) DO UPDATE SET updated_at = excluded.updated_at",
+                    (f"{OUTSIDE_SEEN}{conversation_id}", now, now),
+                )
             self._conn.execute(
                 "UPDATE conversations SET summary_upto_seq = ?, updated_at = ? WHERE id = ?",
-                (upto_seq, utc_now(), conversation_id),
+                (upto_seq, now, conversation_id),
             )
 
     # messages
@@ -1292,10 +1326,10 @@ class Store:
 
     def user_messages_after(self, after_id: int, limit: int) -> list[Message]:
         """The user's texts after `after_id` for idle learning and the check-ins: never an audio file (someone else's
-        voice) or a practice turn (a roleplay in another language, never a fact or a plan)."""
+        voice), a practice turn (a roleplay in another language, never a fact or a plan) or an ignored one."""
         rows = self._conn.execute(
             "SELECT * FROM messages WHERE direction = 'in' AND kind = 'text' AND id > ?"
-            f" AND text NOT LIKE '[audio file]%' AND {_NOT_PRACTICE} ORDER BY id LIMIT ?",
+            f" AND text NOT LIKE '[audio file]%' AND {_NOT_PRACTICE} AND {_NOT_IGNORED} ORDER BY id LIMIT ?",
             (after_id, limit),
         ).fetchall()
         return [_message(row) for row in rows]
@@ -1365,12 +1399,12 @@ class Store:
     def _neighbours(self, message: Message, before: int, after: int) -> list[Message]:
         earlier = self._conn.execute(
             "SELECT * FROM messages WHERE conversation_id = ? AND id < ? AND kind = 'text'"
-            f" AND {_NOT_PRACTICE} ORDER BY id DESC LIMIT ?",
+            f" AND {_NOT_PRACTICE} AND {_NOT_IGNORED} ORDER BY id DESC LIMIT ?",
             (message.conversation_id, message.id, before),
         ).fetchall()
         later = self._conn.execute(
             f"SELECT * FROM messages WHERE conversation_id = ? AND id > ? AND kind = 'text' AND {_NOT_PRACTICE}"
-            " ORDER BY id LIMIT ?",
+            f" AND {_NOT_IGNORED} ORDER BY id LIMIT ?",
             (message.conversation_id, message.id, after),
         ).fetchall()
         return [*(_message(row) for row in reversed(earlier)), message, *(_message(row) for row in later)]
@@ -1385,6 +1419,7 @@ class Store:
         rows = self._conn.execute(
             "SELECT m.* FROM messages_fts JOIN messages m ON m.id = messages_fts.rowid"
             " WHERE messages_fts MATCH ? AND m.kind = 'text' AND m.id != ?"
+            " AND NOT (m.direction = 'in' AND m.status = 'ignored')"  # _NOT_IGNORED
             " AND m.conversation_id NOT IN (SELECT id FROM conversations WHERE kind = 'practice')"
             " ORDER BY bm25(messages_fts) LIMIT ?",
             (match, exclude_message_id or 0, limit * 3),
@@ -1585,7 +1620,7 @@ class Store:
             for row in rows
         ]
 
-    # documents (the folder's PDFs and their pages; [documents])
+    # documents (the folder's PDFs and text files and their pages; [documents])
 
     def put_doc_file(
         self,
@@ -2005,6 +2040,15 @@ class Store:
         ).fetchall()
         return [_mail(row) for row in rows]
 
+    def count_unsorted_mail(self, since: str) -> int:
+        """Unlabelled, unanswered Inbox mail since `since`: what the sorter has not sorted yet (behind, or down)."""
+        row = self._conn.execute(
+            "SELECT count(*) FROM mail_messages WHERE folder = 'inbox' AND label IS NULL AND answered_at IS NULL"
+            " AND received_at >= ?",
+            (since,),
+        ).fetchone()
+        return int(row[0])
+
     def unlabelled_from_known(self, since: str) -> list[MailHeader]:
         """Unlabelled, unanswered Inbox mail from people the user has written to (shown with its subject)."""
         rows = self._conn.execute(
@@ -2138,23 +2182,28 @@ class Store:
 
     def reschedule_reminder(
         self, reminder_id: int, local_time: str, due_at: float, *, outcome: str, at: str | None = None
-    ) -> None:
-        """A repeating reminder fired: open again for its next occurrence."""
+    ) -> bool:
+        """A repeating reminder fired: open again for its next occurrence. Only one still open or firing: one cancelled
+        while its note was on its way stays cancelled (review O3). Whether it was."""
         with self.tx():
-            self._conn.execute(
+            cursor = self._conn.execute(
                 "UPDATE reminders SET status = 'open', message_id = NULL, fired = fired + 1, local_time = ?,"
-                " due_at = ?, outcome = ?, updated_at = ? WHERE id = ?",
+                " due_at = ?, outcome = ?, updated_at = ? WHERE id = ? AND status IN ('open', 'firing')",
                 (local_time, due_at, outcome, at or utc_now(), reminder_id),
             )
+        return cursor.rowcount == 1
 
     def finish_reminder(
         self, reminder_id: int, status: Literal["done", "failed"], outcome: str, *, at: str | None = None
-    ) -> None:
+    ) -> bool:
+        """Done or failed: only one still open or firing (one cancelled meanwhile stays cancelled). Whether it was."""
         with self.tx():
-            self._conn.execute(
-                "UPDATE reminders SET status = ?, fired = fired + 1, outcome = ?, updated_at = ? WHERE id = ?",
+            cursor = self._conn.execute(
+                "UPDATE reminders SET status = ?, fired = fired + 1, outcome = ?, updated_at = ?"
+                " WHERE id = ? AND status IN ('open', 'firing')",
                 (status, outcome, at or utc_now(), reminder_id),
             )
+        return cursor.rowcount == 1
 
     def cancel_reminders(self, peer_aci: str, reminder_id: int | None, *, at: str | None = None) -> list[Reminder]:
         """Cancel one of this user's open (or firing) reminders, or all of them (`reminder_id` None); the cancelled."""
@@ -2411,9 +2460,10 @@ class Store:
 
     def prune(self, keep_days: int, *, now: float | None = None) -> Pruned:
         """Delete messages, pages and tool calls older than `keep_days`, with their search rows (the FTS triggers),
-        then merge the search indexes so no deleted word stays in them. Kept: a message an open reminder, an open
-        check-in or the initiative log points to (those rows are never touched); the profile stays, its link to a
-        deleted message or page is cleared, and so is a finished reminder's. An ended conversation with no message
+        then merge the search indexes so no deleted word stays in them. Kept: a message an open reminder or an open
+        check-in points to (those rows are never touched); the profile stays, its link to a deleted message or page is
+        cleared, and so are a finished reminder's and the initiative log's (its rows stay a year, without the message:
+        "goes well" counts a reply within a day, and keep_days is at least one). An ended conversation with no message
         left goes, with its summary. Compaction (`compact`) is separate: it blocks the database for a moment."""
         before = datetime.fromtimestamp((time.time() if now is None else now) - keep_days * 86_400, UTC).isoformat(
             timespec="seconds"
@@ -2427,14 +2477,15 @@ class Store:
                 "   AND source_message_id IS NOT NULL)"
                 " AND id NOT IN (SELECT message_id FROM reminders WHERE status IN ('open', 'firing')"
                 "   AND message_id IS NOT NULL)"
-                " AND id NOT IN (SELECT source_message_id FROM followups WHERE status = 'open')"
-                " AND id NOT IN (SELECT message_id FROM initiative_log WHERE message_id IS NOT NULL)",
+                " AND id NOT IN (SELECT source_message_id FROM followups WHERE status = 'open')",
                 (before,),
             )
             gone = "IN (SELECT id FROM pruned_messages)"
             run = self._conn.execute
+            self._keep_outside_seen(before)
             run(f"UPDATE reminders SET source_message_id = NULL WHERE source_message_id {gone}")
             run(f"UPDATE reminders SET message_id = NULL WHERE message_id {gone}")
+            run(f"UPDATE initiative_log SET message_id = NULL WHERE message_id {gone}")
             run(f"DELETE FROM followups WHERE source_message_id {gone}")
             run(f"UPDATE profile_facts SET source_message_id = NULL WHERE source_message_id {gone}")
             run(f"UPDATE profile_changes SET source_message_id = NULL WHERE source_message_id {gone}")
@@ -2453,12 +2504,36 @@ class Store:
                 "DELETE FROM conversations WHERE ended_at IS NOT NULL"
                 " AND id NOT IN (SELECT DISTINCT conversation_id FROM messages)"
             )
+            run(  # an ended or gone conversation's mark
+                "DELETE FROM state WHERE key LIKE ? ESCAPE '\\' AND substr(key, ?) NOT IN"
+                " (SELECT CAST(id AS TEXT) FROM conversations WHERE ended_at IS NULL)",
+                (OUTSIDE_SEEN.replace("_", "\\_") + "%", len(OUTSIDE_SEEN) + 1),
+            )
             run("DELETE FROM pruned_messages")
             if messages:
                 run("INSERT INTO messages_fts (messages_fts) VALUES ('optimize')")
             if documents:
                 run("INSERT INTO documents_fts (documents_fts) VALUES ('optimize')")
         return Pruned(messages, documents, tool_calls)
+
+    def _keep_outside_seen(self, before: str) -> None:
+        """Inside prune's transaction, before its deletes (review I8): an open conversation whose answers count as after
+        outside text (`outside_seqs`, in the window or summarised) keeps that mark (OUTSIDE_SEEN) when prune takes the
+        rows that showed it: the summary and later replies that may repeat it stay."""
+        pruned = {int(row[0]) for row in self._conn.execute("SELECT id FROM pruned_messages")}
+        old_calls = "SELECT DISTINCT message_id FROM tool_calls WHERE created_at < ?"
+        pruned |= {int(row[0]) for row in self._conn.execute(old_calls, (before,))}
+        now = utc_now()
+        for row in self._conn.execute(
+            "SELECT id, summary, summary_upto_seq FROM conversations WHERE ended_at IS NULL"
+        ).fetchall():
+            upto = -1 if row["summary"] else int(row["summary_upto_seq"])  # as ContextBuilder.after_outside counts
+            if any(found in pruned for found, seq in self.outside_seqs(int(row["id"])) if seq > upto):
+                self._conn.execute(
+                    "INSERT INTO state (key, value, created_at, updated_at) VALUES (?, '1', ?, ?)"
+                    " ON CONFLICT (key) DO UPDATE SET updated_at = excluded.updated_at",
+                    (f"{OUTSIDE_SEEN}{row['id']}", now, now),
+                )
 
     def compact(self) -> None:
         """After a prune, in a quiet moment: empty the write-ahead log (old pages in it go), rebuild the file without
@@ -2494,12 +2569,13 @@ class Store:
         )
         return [(str(row["key"]), str(row["value"])) for row in rows]
 
-    def rewrite_notes(self, olds: list[str], new: str) -> int:
-        """Replace each of `olds` in code-written notes with `new` (an UPDATE, so the search index's trigger takes the
-        old words out), then merge the index so no deleted words stay in it. How many notes changed."""
+    def rewrite_notes(self, pairs: list[tuple[str, str]]) -> int:
+        """Replace each (old, new) pair's old text in code-written notes with its new one (an UPDATE, so the search
+        index's trigger takes the old words out), then merge the index so no deleted words stay in it. How many notes
+        changed."""
         changed = 0
         with self.tx():
-            for old in olds:
+            for old, new in pairs:
                 changed += self._conn.execute(
                     "UPDATE messages SET text = replace(text, ?, ?), updated_at = ?"
                     " WHERE kind = 'note' AND instr(text, ?) > 0",

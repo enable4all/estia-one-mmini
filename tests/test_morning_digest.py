@@ -54,6 +54,24 @@ async def test_the_digest_is_sent_once_a_day_at_its_time(tmp_path: Path, store: 
     assert len(sent) == 2
 
 
+async def test_the_digest_waits_while_held_and_comes_after_until_noon(tmp_path: Path, store: Store) -> None:
+    """/lock at 09:14 or a call at 09:15: the digest waits (nothing composed, the day not marked), and comes after
+    /unlock or the call's end, until noon (review I5: it was composed, dropped by the lock, and the day marked)."""
+    held = [True]
+    clock = Clock(DIGEST_TIME)
+    sent = Sent()
+    mail = MailDigest(store, config(tmp_path), MailNumbers(store, TZ, clock), clock=clock)
+    digest = MorningDigest(
+        store, config(tmp_path), mail=mail, calendar=None, send=sent, clock=clock, held=lambda: held[0]
+    )
+    await digest.tick()
+    assert sent == [] and store.get_state(DIGEST_DAY_KEY) is None
+    clock.now += 15 * 60  # 09:30: unlocked, or the call ended
+    held[0] = False
+    await digest.tick()
+    assert sent == ["**Mail**: nothing needs you today."]
+
+
 async def test_a_missed_digest_comes_at_start_until_noon(tmp_path: Path, store: Store) -> None:
     clock = Clock(DIGEST_TIME + 2 * 3600)  # 11:15, the bridge just started
     digest, sent = mail_only(tmp_path, store, clock)
@@ -90,7 +108,8 @@ async def test_an_action_sorted_after_the_digest_comes_the_next_day(tmp_path: Pa
     digest, sent = mail_only(tmp_path, store, clock)
     late = add(store, "g1", None, "", "2026-10-08T07:10:00+00:00", subject="Appointment")  # 09:10, not sorted yet
     await digest.tick()
-    assert sent == ["**Mail**: nothing needs you today."]  # EMPTY, its name in bold in the digest
+    # not "nothing needs you": unsorted mail is counted (review O8); the section's name in bold in the digest
+    assert sent == ["**Thu 8 Oct**\n\n**Mail**: nothing sorted needs you today.\n\n1 mail not sorted yet."]
     store.set_mail_label(late, "action", "Confirm the dentist appointment.")
     store._conn.execute("UPDATE mail_messages SET labelled_at = '2026-10-08T07:30:00+00:00' WHERE id = ?", (late,))
     clock.now += 86_400

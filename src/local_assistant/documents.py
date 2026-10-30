@@ -1,4 +1,5 @@
-"""Documents: the PDFs in the owner's ~/Estia-KB, and the ones the user sends on Signal ([documents]).
+"""Documents: the PDFs and text files (.txt, .md) in the owner's ~/Estia-KB, and the ones the user sends on Signal
+([documents]).
 
 Her access to the folder is one set of ACL entries the owner gives without admin rights (`share.share_documents`,
 `scripts/share-documents.sh`). The share writes a random token into `.estia-share` in the folder; the revoke deletes
@@ -6,9 +7,11 @@ it, so a new share has a new token and her index starts fresh. A folder she cann
 index with it at once.
 
 The look (every `look_minutes`, and whenever the user asks about documents or types /docs) lists names, sizes and change
-times only, never following a link; a PDF is read only when it is new or changed. The reading is tools/documents'
-helper (Apple's PDFKit, and Vision for a page without text, on the Mac), run with fixed arguments, a clean environment
-and a time limit, one document at a time; it prints one JSON line. Each page's text goes into her database's full-text
+times only, never following a link; a document is read only when it is new or changed. A PDF's reading is
+tools/documents' helper (Apple's PDFKit, and Vision for a page without text, on the Mac), run with fixed arguments, a
+clean environment and a time limit, one document at a time; it prints one JSON line. A text file is read by the bridge
+itself, with the standard library only (`text_pages`), in pages of about one printed page. Each page's text goes into
+her database's full-text
 index (`store`, schema v10; v12 keeps the reader that read each file, `INDEX_VERSION`, so a fix to the reader reads
 again what an older one did not read whole). Gemma is not used in any of this: it only answers from the index when the
 user asks.
@@ -18,15 +21,16 @@ between two; the hourly look reads `LOOK_SECONDS` at most and stops when a call 
 and a look while another runs reads nothing (the answer comes from the index as it is). A share's first look announces
 nothing, however many looks it takes (`FIRST_LOOK_KEY`, cleared only when one has read the whole folder).
 
-A PDF the user sends is saved into the folder itself (never into a folder of hers: in a folder her account made, she
-could rename or delete any file) under a clean name with the date, never over another file, and indexed at once; the
-files she adds are the owner's to open, move or delete (the share's inherited entry). Code's note names new PDFs found
-in the folder (`announcement`); a PDF she saved herself is never announced.
+A PDF or text file the user sends is saved into the folder itself (never into a folder of hers: in a folder her
+account made, she could rename or delete any file) under a clean name with the date, never over another file, and
+indexed at once; the files she adds are the owner's to open, move or delete (the share's inherited entry). Code's note
+names new documents found in the folder (`announcement`); one she saved herself is never announced.
 """
 
 from __future__ import annotations
 
 import asyncio
+import codecs
 import contextlib
 import errno
 import json
@@ -36,7 +40,7 @@ import re
 import stat
 import time
 import unicodedata
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Coroutine, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
@@ -62,23 +66,42 @@ WARM_TIMEOUT = 200.0
 PAGE_CHARS = 20_000  # a page's text kept at most (a full page of small print is about 5,000 characters)
 READ_CHARS = 6_000  # read_document gives at most this much of a page
 READ_PAGES = 3  # read_document reads this many pages at most in one call (a section that goes on)
+# ... and this many under a 32,768-token context (the 16 GB tier; review of 0.9.8, guards-2: three pages and her
+# answer passed 16,384 tokens)
+SMALL_READ_PAGES = 1
 SEARCH_HITS = 6  # passages search_documents gives
 LOOK_ON_REQUEST_SECONDS = 45.0  # a question's look reads new files this long at most; the rest at the next look
 LOOK_SECONDS = 600.0  # the hourly look reads this long at most; the rest at the next tick, a minute later
 SAVE_WAIT_SECONDS = 45.0  # a sent PDF waits this long at most for the document being read; else read at the next look
+STOP_POLL_SECONDS = 0.25  # how often a look asks `stop` while a document is read (a call or the lock begins)
 OUTPUT_LIMIT = 32 * 1024 * 1024  # the helper's answer (300 pages of text fit many times over)
 PROBE_TIMEOUT = 10.0  # the helper run with no arguments, after a document that got no answer: does it answer at all?
-MAX_FILES = 2_000  # PDFs one look lists; more are left out (logged)
+MAX_FILES = 2_000  # documents one look lists; more are left out (logged)
 MAX_DEPTH = 3  # folders of yours below the documents folder a look goes into
 LISTED = 30  # documents /docs shows
 ANNOUNCED_NAMES = 5  # names in the note; more are counted
-NAME_CHARS = 80  # a saved file's name from its sent name, at most (before the date and .pdf)
+NAME_CHARS = 80  # a saved file's name from its sent name, at most (before the date and its ending)
 SHARE_KEY = "documents:share"  # the share token her index belongs to
 LOOKED_KEY = "documents:looked_at"  # when the folder was last looked at (epoch seconds); a look cut short leaves it
 FIRST_LOOK_KEY = "documents:first_look"  # "1" until a new share's first look has read the whole folder
 # why the folder cannot be listed: these mean closed (her index goes); any other error passes (the index stays)
 CLOSED_ERRORS = frozenset({errno.EACCES, errno.EPERM, errno.ENOENT, errno.ENOTDIR, errno.ELOOP})
 PDF_START = b"%PDF-"
+TEXT_SUFFIXES = (".txt", ".md")  # text files (owner, 25 Oct): read by the bridge itself, never by the helper
+SUFFIXES = (".pdf", *TEXT_SUFFIXES)  # the documents a look lists, by the name's ending (any case)
+MEDIA_TYPES = {".pdf": "application/pdf", ".txt": "text/plain", ".md": "text/markdown"}  # /docs send N
+# a text file is read at most this big: 1 MB of plain text is about 330 pages of TEXT_PAGE_CHARS, as long as the
+# longest PDF read (MAX_PAGES); a bigger text file is most likely a log or an export, not a document to ask about
+MAX_TEXT_BYTES = 1_000_000
+TEXT_PAGE_CHARS = 3_000  # a text file's page: about one printed page (read_document gives READ_PAGES of them at once)
+# a text file's pages at most: the most 1 MB gives without page breaks, as a cut falls in a page's second half (review
+# of P1, R1-F3: a 1 MB file of "a" and a form feed gave about 500,000 pages, written in one go on the event loop)
+MAX_TEXT_PAGES = 2 * MAX_TEXT_BYTES // TEXT_PAGE_CHARS + 1
+# "1" once a whole look has read the folder's text files: before it (the first release that reads them), a text file
+# found is one that was there all along, so it is read and never announced
+TEXT_LOOK_KEY = "documents:reads_text"
+_LINE_ENDS = re.compile(r"\r\n?|[\u2028\u2029\x85]")  # a line's end, as the PDF reader reads it (PageText)
+_CONTROLS = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x84\x86-\x9f]")  # every other control character: a space
 # the reader (the helper and the bridge's reading of it) that read a file, kept per file (`doc_files.reader`): a fix to
 # the reader changes neither a file's size nor its change time, so a file an older reader did not read whole (pages
 # skipped, or the file unreadable) is read again once. 1: the first reader (14 Oct), and every row from before v12;
@@ -107,8 +130,8 @@ class HelperError(Exception):
 
 
 class DocumentError(Exception):
-    """A sent PDF was not saved: "not_pdf", "too_big", "not_shared" (the folder cannot be written), "refused" (macOS
-    itself refuses it: EPERM) or "failed"."""
+    """A sent document was not saved: "not_pdf", "too_big", "not_text", "text_too_big", "not_shared" (the folder
+    cannot be written), "refused" (macOS itself refuses it: EPERM) or "failed"."""
 
     def __init__(self, code: str) -> None:
         super().__init__(code)
@@ -276,6 +299,29 @@ class Helper:
         return data
 
 
+async def _unless_stopped(work: Coroutine[Any, Any, DocFile], stop: Callable[[], bool] | None) -> DocFile | None:
+    """One document's read, asked `stop` every STOP_POLL_SECONDS: when it says so (a call or the lock began), the read
+    is cancelled, which stops the helper (`Helper._run`) before any row is written, and None comes back (review C21:
+    a scan read by Vision, up to 75 s, ran on into the call)."""
+    if stop is None:
+        return await work
+    task = asyncio.ensure_future(work)
+    try:
+        while not task.done():
+            await asyncio.wait({task}, timeout=STOP_POLL_SECONDS)
+            if not task.done() and stop():
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+                return None if task.cancelled() else task.result()
+    except BaseException:  # the look itself cancelled (a shutdown): the read goes with it, the helper stopped
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, HelperError):
+            await task
+        raise
+    return task.result()
+
+
 async def _bounded(proc: asyncio.subprocess.Process) -> bytes | None:
     """The helper's output, read to its end; None (and the helper stopped) past OUTPUT_LIMIT."""
     assert proc.stdout is not None
@@ -333,18 +379,73 @@ def _reading(data: dict[str, Any]) -> Reading:
     return Reading(tuple(sorted(pages, key=lambda page: page.n)), tuple(sorted(skipped)), count)
 
 
-def clean_name(sent: str, day: date) -> str:
-    """The name a sent PDF is saved under: its own name's letters, digits, spaces and a few signs (no path, no
-    hidden name, nothing a data link or a shell would read), at most NAME_CHARS, after the day it came."""
+def is_text(path: str) -> bool:
+    """A text file (.txt, .md, in any case), read by the bridge itself; any other document is a PDF."""
+    return path.lower().endswith(TEXT_SUFFIXES)
+
+
+def media_type(path: str) -> str:
+    """A document's type by its name's ending, as /docs send N names it to Signal."""
+    return MEDIA_TYPES.get(Path(path).suffix.lower(), MEDIA_TYPES[".pdf"])
+
+
+def text_pages(data: bytes) -> list[str]:
+    """A text file's pages, read with the standard library only: UTF-8 (its byte order mark left out), else UTF-16
+    with its byte order mark (Windows Notepad's "Unicode"), else Windows-1252 (Western European, as older Windows and
+    Mac files are; a byte with no letter there becomes U+FFFD). Line ends become line feeds and every other control
+    character a space (tabs stay), as the PDF reader cleans a page (tools/documents' PageText). A form feed starts a
+    new page, and a page over TEXT_PAGE_CHARS is cut at its last blank line, else line end, else space in its second
+    half (`_cut`); blank pages are left out, and an empty file is one empty page. ValueError("not_text") for a file
+    that holds a NUL: a binary file, never a text one; ValueError("text_too_many_pages") past MAX_TEXT_PAGES."""
+    text = _decoded(data)
+    if "\x00" in text:
+        raise ValueError("not_text")
+    pages: list[str] = []
+    for part in text.split("\f"):
+        part = _CONTROLS.sub(" ", _LINE_ENDS.sub("\n", part))
+        while len(part) > TEXT_PAGE_CHARS:
+            at, width = _cut(part)
+            pages.append(part[:at])
+            part = part[at + width :]
+        pages.append(part)
+    kept = [page for page in (page.strip("\n").rstrip() for page in pages) if page.strip()]
+    if len(kept) > MAX_TEXT_PAGES:
+        raise ValueError("text_too_many_pages")
+    return kept or [""]
+
+
+def _decoded(data: bytes) -> str:
+    if data.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)):
+        return data.decode("utf-16", "replace")
+    try:
+        return data.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return data.decode("cp1252", "replace")
+
+
+def _cut(text: str) -> tuple[int, int]:
+    """Where a page over TEXT_PAGE_CHARS ends, and the separator's width (left out of both pages)."""
+    for separator in ("\n\n", "\n", " "):
+        at = text.rfind(separator, TEXT_PAGE_CHARS // 2, TEXT_PAGE_CHARS)
+        if at >= 0:
+            return at, len(separator)
+    return TEXT_PAGE_CHARS, 0
+
+
+def clean_name(sent: str, day: date, suffix: str = ".pdf") -> str:
+    """The name a sent document is saved under: its own name's letters, digits, spaces and a few signs (no path, no
+    hidden name, nothing a data link or a shell would read), at most NAME_CHARS, after the day it came, with the
+    ending it is saved with (`suffix`: ".pdf", ".txt" or ".md"; its own ending, any of those, goes)."""
     base = unicodedata.normalize("NFC", sent).replace("\\", "/").rsplit("/", 1)[-1]
-    stem = base[:-4] if base.lower().endswith(".pdf") else base
+    ending = next((known for known in SUFFIXES if base.lower().endswith(known)), "")
+    stem = base[: len(base) - len(ending)]
     stem = re.sub(r"[^\w .()\-]+|_", " ", stem)
     stem = " ".join(stem.split()).strip(" .-()")[:NAME_CHARS].strip(" .-")
-    return f"{day.isoformat()} {stem or 'document'}.pdf"
+    return f"{day.isoformat()} {stem or 'document'}{suffix}"
 
 
 class Documents:
-    """The documents folder and her index of it: the look, the reading, saving a sent PDF, and code's texts."""
+    """The documents folder and her index of it: the look, the reading, saving a sent document, and code's texts."""
 
     def __init__(
         self,
@@ -375,9 +476,11 @@ class Documents:
     # the look
 
     async def look(self, *, budget: float | None = None, stop: Callable[[], bool] | None = None) -> Look:
-        """List the folder and read what is new or changed, one document at a time (a sent PDF is saved between two);
-        `budget`: seconds the reading may take, `stop`: asked before each document (a call began); the rest is read
-        at the next look. A look while another runs reads nothing: the answer comes from the index as it is."""
+        """List the folder and read what is new or changed, one document at a time (a sent one is saved between two);
+        `budget`: seconds the reading may take, `stop`: asked before each document and while one is read (a call or
+        the lock began: the helper is stopped, that file read again); the rest is read at the next look. A look while
+        another runs reads nothing: the answer comes from the index as it is. Without the helper, text files are
+        still read and the PDFs wait for the next look."""
         if self._looking:
             log.info("documents: a look is running: this one reads nothing")
             return Look(skipped=True)
@@ -397,6 +500,7 @@ class Documents:
         self._new_share()
         share = self._store.get_state(SHARE_KEY)
         fresh = self._first_look()
+        texts_known = self._store.get_state(TEXT_LOOK_KEY) == "1"  # else the text files found were there all along
         known = {file.path: file for file in self._store.doc_files()}
         gone = [file.id for path, file in known.items() if path not in listed]
         self._store.remove_doc_files(gone)
@@ -412,9 +516,13 @@ class Documents:
         todo.sort(key=lambda item: item.mtime_ns, reverse=True)  # the newest first, should the time run out
         started = time.monotonic()
         read = 0
+        waiting = 0  # PDFs left for the next look: the helper is missing or broken (text files are still read)
         new: list[DocFile] = []
         for index, item in enumerate(todo):
-            left = Look(tuple(new), read, len(gone), len(todo) - index, "", fresh, cut=True)
+            if waiting and not is_text(item.path):
+                waiting += 1
+                continue
+            left = Look(tuple(new), read, len(gone), len(todo) - index + waiting, "", fresh, cut=True)
             spent = time.monotonic() - started
             if (stop is not None and stop()) or (budget is not None and spent >= budget):
                 return self._looked(left)
@@ -424,18 +532,28 @@ class Documents:
                 return self._looked(left)
             try:
                 self._retried.add(item.path)  # read in this run: a timeout is not tried again until the next start
-                announced = self._first_look()  # a share begun since (a save saw it) is a first look too
-                file = await self._index(item, announced=announced)
-            except HelperError:  # the helper is missing or broken: nothing more can be read now
-                return self._looked(Look(tuple(new), read, len(gone), len(todo) - index, "", fresh))
+                # a share begun since (a save saw it) is a first look too
+                announced = self._first_look() or (is_text(item.path) and not texts_known)
+                found = await _unless_stopped(self._index(item, announced=announced), stop)
+            except HelperError:  # the helper is missing or broken: no more PDFs can be read now
+                waiting += 1
+                continue
             finally:
                 self._lock.release()
+            if found is None:  # a call or the lock began mid-read: the helper stopped, the file read at the next look
+                self._retried.discard(item.path)
+                log.info("documents: a read stopped: a call or the lock began")
+                return self._looked(left)
+            file = found
             read += 1
             if item.path not in known and not announced:
                 new.append(file)
+        self._store.set_state(TEXT_LOOK_KEY, "1")  # every text file read: from now on a new one is new
+        if waiting:
+            return self._looked(Look(tuple(new), read, len(gone), waiting, "", fresh))
         self._status.ok(PART)
         if fresh and self._store.get_state(SHARE_KEY) == share:
-            self._store.delete_state(FIRST_LOOK_KEY)  # the whole folder read: from now on a new PDF is new
+            self._store.delete_state(FIRST_LOOK_KEY)  # the whole folder read: from now on a new document is new
         return self._looked(Look(tuple(new), read, len(gone), 0, "", fresh))
 
     def _looked(self, look: Look) -> Look:
@@ -472,7 +590,8 @@ class Documents:
         return Look(problem=problem)
 
     def _list(self) -> tuple[dict[str, Listed], str, str]:
-        """The folder's PDFs (name, size, change time; never through a link, never a hidden name), why it cannot be
+        """The folder's documents, PDFs and text files by their name's ending (`SUFFIXES`: name, size, change time;
+        never through a link, never a hidden name), why it cannot be
         listed ("not_shared": missing, not a folder, a link, or closed to her; "refused": macOS itself refuses, EPERM,
         its privacy protection of Documents, Desktop and Downloads) and the error's code name ("" when listed). An error
         that passes (EMFILE, EIO) has a code name and no problem. One folder open at a time."""
@@ -500,7 +619,7 @@ class Documents:
                                 if depth < MAX_DEPTH:
                                     folders.append((here / entry.name, depth + 1))
                                 continue
-                            if not entry.name.lower().endswith(".pdf") or not entry.is_file(follow_symlinks=False):
+                            if not entry.name.lower().endswith(SUFFIXES) or not entry.is_file(follow_symlinks=False):
                                 continue
                             info = entry.stat(follow_symlinks=False)
                         except OSError:
@@ -516,7 +635,7 @@ class Documents:
             finally:
                 os.close(fd)
         if skipped:
-            log.warning("documents: %d PDF(s) over the %d a look reads were left out", skipped, MAX_FILES)
+            log.warning("documents: %d document(s) over the %d a look reads were left out", skipped, MAX_FILES)
         return found, "", ""
 
     def _new_share(self) -> bool:
@@ -550,12 +669,15 @@ class Documents:
         return text if _TOKEN.fullmatch(text) else ""
 
     async def _index(self, item: Listed, *, announced: bool, source: str = "folder") -> DocFile:
-        """Read one file into the index (a row with why when it cannot be read); HelperError when the helper itself
-        is missing or broken (no row: the next look tries again)."""
+        """Read one file into the index (a row with why when it cannot be read): a text file by the bridge itself, a
+        PDF by the helper; HelperError when the helper itself is missing or broken (no row: the next look tries
+        again)."""
         path = self.folder / item.path
         reading: Reading | None = None
         error = ""
-        if item.size > MAX_BYTES:
+        if is_text(item.path):
+            reading, error = self._read_text(item)
+        elif item.size > MAX_BYTES:
             error = "too_big"
         elif not _openable(path):
             error = "no_access"
@@ -582,26 +704,60 @@ class Documents:
         assert found is not None
         return found
 
-    # a PDF the user sent
+    def _read_text(self, item: Listed) -> tuple[Reading | None, str]:
+        """A text file's pages (`text_pages`), or why not: "text_too_big", "no_access" (she may not open it, or it is
+        no longer a file there), "not_text" or "text_too_many_pages"."""
+        if item.size > MAX_TEXT_BYTES:
+            return None, "text_too_big"
+        try:
+            data = self._bytes(item.path, MAX_TEXT_BYTES, "text_too_big")
+            texts = text_pages(data)
+        except DocumentError as exc:
+            return None, "no_access" if exc.code == "gone" else exc.code
+        except ValueError as exc:  # text_pages' code
+            return None, str(exc)
+        pages = tuple(DocPage(number, text[:PAGE_CHARS], False) for number, text in enumerate(texts, 1))
+        return Reading(pages, (), len(pages)), ""
 
-    async def save(self, data: bytes, sent_name: str, when: datetime) -> DocFile:
-        """Save a PDF the allowed user sent into the folder itself under a clean name with the date (never over
-        another file, never through a link, never into a folder: one her account made would be hers, and in it she
-        could rename or delete any file), then read it into the index; DocumentError when it is not saved."""
-        if len(data) > MAX_BYTES:
-            raise DocumentError("too_big")
-        if not data.startswith(PDF_START):
-            raise DocumentError("not_pdf")
-        name = clean_name(sent_name, when.astimezone(self._tz).date())
-        self._new_share()  # the index belongs to this share before a file joins it (a first look stays one)
-        item = self._write(name, data)
-        file = await self._index_saved(item)
-        log.info("documents: a sent PDF saved, %d bytes, %d pages", len(data), file.pages)
+    # a document the user sent
+
+    async def save(self, data: bytes, sent_name: str, when: datetime, *, suffix: str = ".pdf") -> DocFile:
+        """Save a document the allowed user sent into the folder itself under a clean name with the date and
+        `suffix`, its ending (".pdf", or ".txt" or ".md" for a text file: `gate.document_suffix`), never over another
+        file, never through a link, never into a folder (one her account made would be hers, and in it she could
+        rename or delete any file), then read it into the index; DocumentError when it is not saved."""
+        item = self.write(data, sent_name, when, suffix=suffix)
+        file = await self.index_saved(item)
+        log.info("documents: a sent document saved, %d bytes, %d pages", len(data), file.pages)
         return file
 
-    async def _index_saved(self, item: Listed) -> DocFile:
-        """Read a saved PDF into the index, once the document being read (or the warm-up) is done, within
-        SAVE_WAIT_SECONDS; else, or without the helper, saved but read at the next look (never announced)."""
+    def write(self, data: bytes, sent_name: str, when: datetime, *, suffix: str = ".pdf") -> Listed:
+        """`save`'s first step, with no wait in it: the document written and its row in the index, as one to read at
+        the next look and never announced, before it is read: a read cut off by a stop is done by the next look, and
+        the document is never announced as new (review I15). A PDF starts with `PDF_START`, a text file is one
+        (`text_pages`), each within its limit (MAX_BYTES, MAX_TEXT_BYTES)."""
+        if suffix not in SUFFIXES:
+            raise ValueError(f"no document ending: {suffix}")
+        if suffix in TEXT_SUFFIXES:
+            if len(data) > MAX_TEXT_BYTES:
+                raise DocumentError("text_too_big")
+            try:
+                text_pages(data)
+            except ValueError as exc:  # "not_text" or "text_too_many_pages"
+                raise DocumentError(str(exc)) from None
+        elif len(data) > MAX_BYTES:
+            raise DocumentError("too_big")
+        elif not data.startswith(PDF_START):
+            raise DocumentError("not_pdf")
+        name = clean_name(sent_name, when.astimezone(self._tz).date(), suffix)
+        self._new_share()  # the index belongs to this share before a file joins it (a first look stays one)
+        item = self._write(name, data)
+        self._read_later(item)
+        return item
+
+    async def index_saved(self, item: Listed) -> DocFile:
+        """Read a saved document into the index, once the document being read (or the warm-up) is done, within
+        SAVE_WAIT_SECONDS; else, or a PDF without the helper, saved but read at the next look (never announced)."""
         try:
             await asyncio.wait_for(self._lock.acquire(), SAVE_WAIT_SECONDS)
         except TimeoutError:
@@ -625,24 +781,24 @@ class Documents:
         try:
             folder = os.open(self.folder, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         except OSError as exc:
-            log.warning("documents: the folder cannot be opened to save a PDF (%s)", _why(exc))
+            log.warning("documents: the folder cannot be opened to save a document (%s)", _why(exc))
             raise DocumentError(_not_saved(exc)) from None
         try:
-            stem = name[:-4]
+            stem, _, ending = name.rpartition(".")
             for number in range(1, 100):
-                candidate = name if number == 1 else f"{stem} ({number}).pdf"
+                candidate = name if number == 1 else f"{stem} ({number}).{ending}"
                 try:
                     fd = os.open(candidate, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=folder)
                 except FileExistsError:  # a file or a link of that name: never written over or through
                     continue
                 except OSError as exc:
-                    log.warning("documents: a PDF cannot be written (%s)", _why(exc))
+                    log.warning("documents: a document cannot be written (%s)", _why(exc))
                     raise DocumentError(_not_saved(exc)) from None
                 try:
                     _write_all(fd, data)
                     info = os.fstat(fd)
-                except OSError as exc:  # the disk is full, or it failed: no half PDF is left behind
-                    log.warning("documents: a PDF could not be written whole (%s): removed", _why(exc))
+                except OSError as exc:  # the disk is full, or it failed: no half document is left behind
+                    log.warning("documents: a document could not be written whole (%s): removed", _why(exc))
                     _drop(fd, candidate, folder)
                     raise DocumentError("failed") from None
                 finally:
@@ -653,10 +809,27 @@ class Documents:
             os.close(folder)
 
     def read_file(self, file: DocFile) -> bytes:
-        """A document's bytes for /docs send N: each folder on the way and the file opened without following a link,
-        a regular file of at most MAX_BYTES that starts as a PDF; DocumentError ("gone", "too_big", "not_pdf")."""
+        """A document's bytes for /docs send N (`_bytes`): a PDF of at most MAX_BYTES that starts as one, or a text
+        file of at most MAX_TEXT_BYTES that is still one; DocumentError ("gone", "too_big", "not_pdf",
+        "text_too_big", "not_text")."""
+        if not is_text(file.path):
+            data = self._bytes(file.path, MAX_BYTES, "too_big")
+            if not data.startswith(PDF_START):
+                raise DocumentError("not_pdf")
+            return data
+        data = self._bytes(file.path, MAX_TEXT_BYTES, "text_too_big")
+        try:
+            text_pages(data)
+        except ValueError as exc:  # one with too many pages to read is still a text file to send back
+            if str(exc) == "not_text":
+                raise DocumentError("not_text") from None
+        return data
+
+    def _bytes(self, path: str, limit: int, too_big: str) -> bytes:
+        """A file of the folder: each folder on the way and the file opened without following a link, a regular file
+        of at most `limit` bytes; DocumentError "gone", or `too_big` past the limit."""
         flags = os.O_RDONLY | os.O_NOFOLLOW
-        parts = Path(file.path).parts
+        parts = Path(path).parts
         try:
             here = os.open(self.folder, flags | os.O_DIRECTORY)
         except OSError:
@@ -675,13 +848,11 @@ class Documents:
             info = os.fstat(handle.fileno())
             if not stat.S_ISREG(info.st_mode):
                 raise DocumentError("gone")
-            if info.st_size > MAX_BYTES:
-                raise DocumentError("too_big")
-            data = handle.read(MAX_BYTES + 1)
-        if len(data) > MAX_BYTES:
-            raise DocumentError("too_big")
-        if not data.startswith(PDF_START):
-            raise DocumentError("not_pdf")
+            if info.st_size > limit:
+                raise DocumentError(too_big)
+            data = handle.read(limit + 1)
+        if len(data) > limit:
+            raise DocumentError(too_big)
         return data
 
     # what the tools and /docs read
@@ -713,7 +884,8 @@ class Documents:
             found = [file for file in files if match(file)]
             if found:
                 return found
-        words = {word for word in re.findall(r"[^\W_]+", fold(asked)) if word != "pdf" and not word.isdecimal()}
+        endings = {ending.lstrip(".") for ending in SUFFIXES}  # "pdf", "txt", "md": no word of a name
+        words = {word for word in re.findall(r"[^\W_]+", fold(asked)) if word not in endings and not word.isdecimal()}
         if not words:
             return []
         found = [file for file in files if words <= _words(file.path)]
@@ -765,9 +937,10 @@ class Documents:
             blocks.append(line)
         return "\n".join(blocks)
 
-    def read_text(self, document: str, page: int, last_page: int | None = None) -> str:
+    def read_text(self, document: str, page: int, last_page: int | None = None, *, pages: int = READ_PAGES) -> str:
         """read_document's result: one page, or on to `last_page` (a section that goes on past its page), at most
-        `READ_PAGES` pages and never past the last one; each page capped (outside text)."""
+        `pages` pages (`SMALL_READ_PAGES` under a 32k context: Tools.read_pages) and never past the last one; each page
+        capped (outside text)."""
         if last_page is not None and last_page < page:
             raise ValueError("last_page must be the page or a later one")
         matching = self.find_all(document)
@@ -782,10 +955,11 @@ class Documents:
                 name=file.path, why=prompts.DOCUMENT_ERRORS.get(file.error, file.error)
             )
         asked = page if last_page is None else last_page
-        last = max(page, min(asked, page + READ_PAGES - 1, file.pages))
+        last = max(page, min(asked, page + pages - 1, file.pages))
         text = "\n\n".join(self._page_text(file, number) for number in range(page, last + 1))
         if asked > last < file.pages:
-            text += "\n" + prompts.DOCUMENT_READ_ON.format(pages=READ_PAGES, next=last + 1)
+            read_on = prompts.DOCUMENT_READ_ON_ONE if pages == 1 else prompts.DOCUMENT_READ_ON
+            text += "\n" + read_on.format(pages=pages, next=last + 1)
         elif last < file.pages:
             text += "\n" + prompts.DOCUMENT_GOES_ON.format(next=last + 1)
         return text
@@ -811,7 +985,7 @@ class Documents:
     # code's note about new documents
 
     def announcement(self) -> tuple[str, list[int]]:
-        """The note naming the PDFs found in the folder since the last note ("" when none), and their numbers."""
+        """The note naming the documents found in the folder since the last note ("" when none), and their numbers."""
         files = sorted(self._store.unannounced_doc_files(), key=lambda file: file.path.casefold())
         if not files:
             return "", []
@@ -826,12 +1000,12 @@ class Documents:
         self._store.mark_doc_files_announced(file_ids)
 
     def unannounced(self) -> list[DocFile]:
-        """The PDFs found in the folder that no note named yet (nor /docs, nor an answer)."""
+        """The documents found in the folder that no note named yet (nor /docs, nor an answer)."""
         return self._store.unannounced_doc_files()
 
 
 def saved_note(file: DocFile) -> str:
-    """Code's note after a sent PDF was saved: where, and how many pages were read (or why none)."""
+    """Code's note after a sent document was saved: where, and how many pages were read (or why none)."""
     if file.error:
         return prompts.DOCUMENT_SAVED_UNREAD.format(
             path=file.path, why=prompts.DOCUMENT_ERRORS.get(file.error, file.error)
@@ -851,14 +1025,15 @@ def _write_all(fd: int, data: bytes) -> None:
 
 
 def _drop(fd: int, name: str, folder: int) -> None:
-    """A half-written PDF of hers: emptied, then removed. Her account may add files to the folder, never remove one
-    (that right would reach yours too): in her own user an empty file may stay, which the next look names as no PDF."""
+    """A half-written document of hers: emptied, then removed. Her account may add files to the folder, never remove
+    one (that right would reach yours too): in her own user an empty file may stay, which the next look names as no
+    PDF (an empty text file is one empty page)."""
     with contextlib.suppress(OSError):
         os.ftruncate(fd, 0)
     try:
         os.unlink(name, dir_fd=folder)
     except OSError as exc:
-        log.warning("documents: the half-written PDF could not be removed (%s): it is empty", _why(exc))
+        log.warning("documents: the half-written document could not be removed (%s): it is empty", _why(exc))
 
 
 def _closed(exc: OSError) -> str:
@@ -870,7 +1045,7 @@ def _closed(exc: OSError) -> str:
 
 
 def _not_saved(exc: OSError) -> str:
-    """Why a sent PDF cannot be written: as `_closed`, and "failed" for an error that passes."""
+    """Why a sent document cannot be written: as `_closed`, and "failed" for an error that passes."""
     return _closed(exc) or "failed"
 
 

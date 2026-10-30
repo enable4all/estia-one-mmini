@@ -1,9 +1,10 @@
-#!/usr/bin/env bash
+#!/bin/bash
 # Sign in one mailbox for the mail feature (device code): run on the Mac, open the shown link on any
 # device and sign in as that mailbox's user. Works while the bridge is running. When the mailbox's calendar is
 # in [[calendar.sources]], the sign-in asks for Calendars.Read too; --mail-only signs in mail alone (for an
 # organisation where an administrator must approve Calendars.Read first).
 set -euo pipefail
+PATH="/usr/bin:/bin:/usr/sbin:/sbin:$PATH"  # the Mac's own tools first, then your PATH's (uv, Homebrew's)
 here="$(cd "$(dirname "$0")" && pwd)"  # before the cd: $0 may be relative to where it was started
 cd "$here/.."
 usage="usage: scripts/mail-login.sh <mailbox address> [--mail-only]"

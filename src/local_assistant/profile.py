@@ -8,6 +8,7 @@ against the existing facts). Spec section 6.
 from __future__ import annotations
 
 import dataclasses
+import json
 import logging
 import math
 import re
@@ -16,7 +17,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Literal
 
-from local_assistant import prompts
+from local_assistant import prompts, signal_text
 from local_assistant.language import ENGLISH, function_words
 from local_assistant.store import Fact, SourceKind, Store, fold
 
@@ -24,6 +25,9 @@ log = logging.getLogger(__name__)
 
 Action = Literal["add", "replace", "remove"]
 NO_LEARN_KEY = "no_learn_message_ids"  # messages whose facts were forgotten: background learning skips them
+# the last quiet time's changes to her notes (JSON: `_Kept`): the next reply's note and /profile new (0.9.8)
+QUIET_KEY = "quiet_time_changes"
+QUIET_NAMED = 3  # the quiet-time note names at most this many; /profile new lists them all
 # the user's own facts ("remember that …", /learn): idle learning ("chat") may add next to them, never change them
 _USERS_OWN: frozenset[SourceKind] = frozenset({"remember", "link"})
 
@@ -77,6 +81,9 @@ class ApplyResult:
     replaced: list[int] = field(default_factory=list)
     removed: list[int] = field(default_factory=list)
     duplicates: list[str] = field(default_factory=list)
+    # the facts kept already that those duplicates repeat (number, kept words); none for one that repeats another new
+    # fact of the same batch
+    repeated: list[tuple[int, str]] = field(default_factory=list)
     rejected: list[tuple[Op, str]] = field(default_factory=list)
     kept: list[int] = field(default_factory=list)  # the user's own facts that learning wanted to change
     moved: list[int] = field(default_factory=list)  # the user's facts moved into her notes to make room
@@ -86,6 +93,64 @@ class ApplyResult:
     @property
     def changed(self) -> bool:
         return bool(self.added or self.replaced or self.removed or self.moved or self.promoted)
+
+
+@dataclass(frozen=True)
+class QuietTime:
+    """The last quiet time's changes to her notes, as they are now (0.9.8, owner, 26 Oct: "only display what happened
+    in the last quiet time"): `noted`, the notes added or updated that are still there, in the order written ("Added
+    #41: …"); `removed`, the notes its passes took out ("Removed: …", no number); `told`: its note went out."""
+
+    noted: tuple[str, ...] = ()
+    removed: tuple[str, ...] = ()
+    told: bool = True
+
+
+@dataclass(frozen=True)
+class _Kept:
+    """A quiet time as the state keeps it (QUIET_KEY): each note added or updated as ("add" or "replace", its number),
+    the numbers of the notes removed (their words stay in the change log), and whether its note went out."""
+
+    noted: tuple[tuple[str, int], ...] = ()
+    removed: tuple[int, ...] = ()
+    told: bool = True
+
+    def dumps(self) -> str:
+        return json.dumps(
+            {"noted": [list(entry) for entry in self.noted], "removed": list(self.removed), "told": self.told}
+        )
+
+
+def _kept(raw: str | None) -> _Kept:
+    """The kept quiet time; none (told) when it is missing or unreadable."""
+    try:
+        data = json.loads(raw or "")
+    except ValueError:
+        return _Kept()
+    if not isinstance(data, dict):
+        return _Kept()
+    noted, removed, told = data.get("noted"), data.get("removed"), data.get("told")
+    if not (isinstance(noted, list) and isinstance(removed, list) and isinstance(told, bool)):
+        return _Kept()
+    pairs = [
+        (entry[0], entry[1])
+        for entry in noted
+        if isinstance(entry, list) and len(entry) == 2 and entry[0] in ("add", "replace") and type(entry[1]) is int
+    ]
+    if len(pairs) != len(noted) or any(type(number) is not int for number in removed):
+        return _Kept()
+    return _Kept(tuple(pairs), tuple(removed), told)
+
+
+def quiet_note(quiet: QuietTime | None) -> str:
+    """The note with her next reply after learning (0.9.8, approved 26 Oct): at most QUIET_NAMED of the notes added or
+    updated, by number and whole, then how many more (/profile new lists them), then where they are kept; "" when none
+    is left to name (a removal alone is no new thing: review O2)."""
+    if quiet is None or not quiet.noted:
+        return ""
+    more = len(quiet.noted) - QUIET_NAMED
+    lines = [*quiet.noted[:QUIET_NAMED], *([prompts.QUIET_MORE.format(count=more)] if more > 0 else [])]
+    return prompts.fact_note(prompts.QUIET_HEADER, lines, prompts.QUIET_CLOSING)
 
 
 def check_fact(text: str, max_chars: int = 300, *, strict: bool = False, allowed_url: str | None = None) -> str | None:
@@ -120,7 +185,38 @@ def check_fact(text: str, max_chars: int = 300, *, strict: bool = False, allowed
         for url in _URL.findall(normal):
             if not page or url.rstrip("/.,;") != page:
                 return "link not from the learned page"
+        # any other run a phone may make tappable (www., a bare name on a real ending, as signal_text.unlinked reads
+        # them), never only one with http(s):// (second review of 0.9.8, redteam-02)
+        rest = _sent_link(allowed_url).sub(" ", normal)
+        if signal_text.unlinked(rest) != rest:
+            return "link not from the learned page"
     return None
+
+
+_NEVER_SENT = re.compile(r"(?!)")
+
+
+def _sent_link(allowed_url: str | None) -> re.Pattern[str]:
+    """The link the user sent as a fact may write it, with or without its scheme and closing slash, as a whole run
+    (never the start of a longer link: "…/alex-examplex")."""
+    page = (allowed_url or "").strip().rstrip("/")
+    if not page:
+        return _NEVER_SENT
+    bare = re.sub(r"^https?://", "", page, flags=re.IGNORECASE)
+    forms = "|".join(re.escape(form) for form in sorted({page, bare}, key=len, reverse=True))
+    return re.compile(rf"(?<![^\s(\[\"'])(?:https?://)?(?:{forms})/?(?=[.,;:!?)\]\"']*(?:\s|$))", re.IGNORECASE)
+
+
+def shown_link_fact(text: str, allowed_url: str | None) -> str:
+    """A fact from a learned page as a note of code's shows it: every link left out (`signal_text.unlinked`) but the
+    link the user sent, which stays as it is."""
+    pattern = _sent_link(allowed_url)
+    pieces: list[str] = []
+    kept = 0
+    for match in pattern.finditer(text):
+        pieces += [signal_text.unlinked(text[kept : match.start()]), match.group(0)]
+        kept = match.end()
+    return "".join([*pieces, signal_text.unlinked(text[kept:])])
 
 
 def _norm(text: str) -> str:
@@ -196,6 +292,11 @@ class Profile:
     @property
     def notes_max_chars(self) -> int:
         return self._notes_max
+
+    @property
+    def fact_max_chars(self) -> int:
+        """One fact's limit."""
+        return self._fact_max
 
     @property
     def notes_per_message(self) -> int:
@@ -310,6 +411,13 @@ class Profile:
             }
             others.update(_norm(a.text) for a in adds)
             if _norm(text) in others:
+                repeated = [
+                    (fid, t)
+                    for fid, t in final.items()
+                    if _norm(t) == _norm(text)
+                    and fid not in removing
+                    and not (op.action == "replace" and fid == op.fact_id)
+                ]
                 note = next(
                     (fid for fid, t in final.items() if _norm(t) == _norm(text) and fid not in mine | set(promotes)),
                     None,
@@ -324,11 +432,15 @@ class Profile:
                         op, action="remove", reason="merged into an existing fact"
                     )
                 result.duplicates.append(text)
+                result.repeated += repeated[:1]
                 continue
             if op.action == "add":
                 adds.append(dataclasses.replace(op, text=text))
             elif op.fact_id not in final:
                 result.rejected.append((op, f"no fact #{op.fact_id}"))
+            elif _norm(text) == _norm(original[op.fact_id]):  # its own words again: nothing changes, nothing is named
+                final[op.fact_id] = original[op.fact_id]
+                replaces.pop(op.fact_id, None)
             else:
                 final[op.fact_id] = text
                 replaces[op.fact_id] = dataclasses.replace(op, text=text)
@@ -386,8 +498,9 @@ class Profile:
         return [fact for fact in facts if all(word in fact.text.casefold() for word in words)]
 
     def forget(self, fact_id: int, *, source_message_id: int | None = None, blank_log: bool = True) -> Fact | None:
-        """Remove a fact. The user's own /forget also blanks its text in the change log; a removal by
-        Gemma (blank_log=False) keeps the text there, so an injected forget can be undone."""
+        """Remove a fact. The user's own /forget also blanks its text in the change log, and the words of the notes the
+        last quiet time removed leave /profile new (kept there only to undo a merge); a removal by Gemma
+        (blank_log=False) keeps the text there, so an injected forget can be undone."""
         fact = next((f for f in self.facts() if f.id == fact_id), None)
         if fact is None:
             return None
@@ -395,6 +508,9 @@ class Profile:
             self._store.delete_fact(fact_id)
             if blank_log:
                 self._store.blank_changes(fact_id)
+                kept = _kept(self._store.get_state(QUIET_KEY))
+                if kept.removed:
+                    self._store.set_state(QUIET_KEY, dataclasses.replace(kept, removed=()).dumps())
                 self._store.log_change(
                     fact_id, "remove", None, None, source_message_id, "forgotten at the user's request"
                 )
@@ -430,6 +546,56 @@ class Profile:
             if fact.source_message_id is not None:  # as with forget: its message must not teach the old words back
                 self._skip_learning(fact.source_message_id)
         return None
+
+    def record_quiet(self, result: ApplyResult) -> None:
+        """A learning pass's changes to her notes, for the next reply's note and /profile new: they join the quiet time
+        whose note has not gone out yet; once it has, a pass that adds or updates a note starts a new one, and a pass
+        that only removes joins the told one (it sends no note of its own). A note added and removed before its note
+        went out is in neither list; one its note named shows as removed."""
+        if not (result.added or result.replaced or result.removed):
+            return
+        kept = _kept(self._store.get_state(QUIET_KEY))
+        if kept.told and (result.added or result.replaced):
+            kept = _Kept(told=False)
+        gone, listed = set(result.removed), {number for _, number in kept.noted}
+        unseen = set() if kept.told else {number for action, number in kept.noted if action == "add"}
+        noted = [entry for entry in kept.noted if entry[1] not in gone]
+        noted += [("replace", number) for number in result.replaced if number not in listed]
+        noted += [("add", number) for number in result.added]
+        removed = (*kept.removed, *(number for number in result.removed if number not in unseen))
+        self._store.set_state(QUIET_KEY, _Kept(tuple(noted), removed, told=kept.told).dumps())
+
+    def last_quiet(self, *, notes_only: bool = False) -> QuietTime:
+        """The last quiet time's changes as they are now: a note fixed since shows its new words, one forgotten is left
+        out; a removed note shows the words the change log kept of it. `notes_only`: only the ones still among her
+        notes (a note the user made theirs since, by /fix or "remember", is left out)."""
+        kept = _kept(self._store.get_state(QUIET_KEY))
+        texts = {fact.id: fact.text for fact in (self.notes() if notes_only else self.facts())}
+        lines = {"add": prompts.QUIET_ADDED, "replace": prompts.QUIET_UPDATED}
+        noted = tuple(
+            lines[action].format(number=number, text=texts[number]) for action, number in kept.noted if number in texts
+        )
+        removed = tuple(
+            prompts.QUIET_REMOVED.format(text=words)
+            for number in kept.removed
+            if (words := self._removed_words(number))
+        )
+        return QuietTime(noted, removed, kept.told)
+
+    def tell_quiet(self) -> QuietTime | None:
+        """The quiet time whose note has not gone out yet, now told (with this reply); None when there is none. The reply
+        ends that quiet time also when nothing is left to name."""
+        kept = _kept(self._store.get_state(QUIET_KEY))
+        if kept.told:
+            return None
+        quiet = self.last_quiet(notes_only=True)  # its closing says "in my notes, not in your facts"
+        self._store.set_state(QUIET_KEY, dataclasses.replace(kept, told=True).dumps())
+        return quiet
+
+    def _removed_words(self, fact_id: int) -> str:
+        """A removed note's words, as its removal kept them in the change log ("" when there are none)."""
+        removal = next((change for change in reversed(self._store.changes(fact_id)) if change.action == "remove"), None)
+        return (removal.old_text or "") if removal is not None else ""
 
     def _skip_learning(self, message_id: int) -> None:
         skipped = self.no_learn_ids() | {message_id}

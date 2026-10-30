@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import sqlite3
 from collections.abc import Callable
 from typing import Any
 
@@ -11,7 +12,7 @@ from local_assistant.context import SNAPSHOT_KEY, ContextBuilder
 from local_assistant.fetcher import Page
 from local_assistant.gemma import Completion
 from local_assistant.profile import Profile
-from local_assistant.profiler import FAILURES_KEY, LAST_LEARNED_KEY, LAST_RUN_KEY, UNANNOUNCED_KEY, LearnError, Profiler
+from local_assistant.profiler import FAILURES_KEY, LAST_LEARNED_KEY, LAST_RUN_KEY, LearnError, Profiler
 from local_assistant.store import Store
 from tests.conftest import ME, T0, TZ
 from tests.fakes.fake_gemma import FakeGemma, text
@@ -139,6 +140,34 @@ async def test_over_the_cap_asks_for_one_merged_batch(store: Store) -> None:
     assert store.get_state(LAST_LEARNED_KEY) == str(message)
 
 
+async def test_a_failed_check_of_whether_a_pass_is_due_never_ends_the_loop(store: Store) -> None:
+    """Review D13 (0.9.7): due() reads the database; one error there is logged and the next poll asks again (a task of
+    the bridge's task group that raises takes the whole bridge down)."""
+    clock = Clock()
+    gemma = FakeGemma(text(json.dumps({"operations": []})))
+    _, _, profiler = make(store, gemma, clock)
+    user(store, "I have a cat.", T0)
+    clock.now += 1_800
+    real = profiler.has_work
+    failures = [2]
+
+    def has_work() -> bool:
+        if failures[0]:
+            failures[0] -= 1
+            raise sqlite3.OperationalError("database is locked")
+        return real()
+
+    profiler.has_work = has_work  # type: ignore[method-assign]
+    runner = asyncio.create_task(profiler.run_forever())
+    try:
+        await until(lambda: len(gemma.calls) == 1)
+        assert failures == [0] and not runner.done()
+    finally:
+        runner.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await runner
+
+
 async def test_new_activity_aborts_a_running_pass(store: Store) -> None:
     clock = Clock()
     pending: asyncio.Future[Completion] = asyncio.get_running_loop().create_future()
@@ -177,6 +206,23 @@ async def test_summary_when_the_window_is_long(store: Store) -> None:
     transcript = gemma.calls[0]["messages"][1]["content"]
     assert "\nEstia: 1 y" in transcript and "Gemma:" not in transcript  # the assistant's name, not the model's
     assert store.get_state(SNAPSHOT_KEY) is not None
+
+
+async def test_a_small_context_summarises_a_shorter_window(store: Store) -> None:
+    """The 16 GB tier's 16,384 tokens (review I24): the summary comes once the history passes the room the context
+    leaves it, never only at 12,000 tokens, which that context cannot hold beside the rules and the tools."""
+    gemma = FakeGemma(text("They planned a trip to Lisbon in May."))
+    profile = Profile(store)
+    context = ContextBuilder(store, profile, TZ, rules="A rule of hers.\n" * 900, context_tokens=16_384)
+    context.reserve([{"type": "function", "function": {"description": "d" * 15_000}}], reply_tokens=600)
+    profiler = Profiler(store, profile, context, gemma, TZ, poll_seconds=0.01, clock=Clock())
+    ids = []
+    for i in range(16):  # about 4,000 tokens: under 12,000, over the room this context leaves
+        if i % 2 == 0:
+            ids.append(user(store, f"{i} " + "x" * 200, T0 + i))
+        else:
+            ids.append(gemma_said(store, f"{i} " + "y" * 1_500, ids[-1], T0 + i))
+    assert await profiler.summarize_if_needed()
 
 
 async def test_no_summary_for_a_short_window(store: Store) -> None:
@@ -384,9 +430,37 @@ async def test_background_learning_is_counted_for_the_next_reply(store: Store) -
             op("add", text_="The user has a dog called Bo.", source_message_id=message),
         )
     )
-    _, _, profiler = make(store, gemma)
+    profile, _, profiler = make(store, gemma)
     await profiler.learn()
-    assert store.get_state(UNANNOUNCED_KEY) == "2"
+    assert profile.last_quiet().noted == (
+        "Added #1: The user has a cat called Miso.",
+        "Added #2: The user has a dog called Bo.",
+    )
+
+
+async def test_only_new_and_updated_notes_count_as_new_things(store: Store) -> None:
+    """Review O2 (0.9.7): the quiet-time note names the notes added or updated, never the ones tidied away (a removal
+    is no new thing); /profile new lists those apart (0.9.8)."""
+    message = user(store, "I moved to Utrecht; the dog is called Bo now.", T0)
+    seeded = Profile(store)
+    [city], [old], [dup] = (
+        seeded.add(text_, source_kind="chat").added
+        for text_ in ("The user lives in Amsterdam.", "The user's dog is called Rex.", "The user has a dog.")
+    )
+    gemma = FakeGemma(
+        ops(
+            op("replace", fact_id=city, text_="The user lives in Utrecht.", source_message_id=message),
+            op("remove", fact_id=old, source_message_id=message),
+            op("remove", fact_id=dup, source_message_id=message),
+            op("add", text_="The user's dog is called Bo.", source_message_id=message),
+        )
+    )
+    profile, _, profiler = make(store, gemma)
+    await profiler.learn()
+    assert [fact.text for fact in profile.notes()] == ["The user lives in Utrecht.", "The user's dog is called Bo."]
+    quiet = profile.last_quiet()
+    assert quiet.noted == ("Updated #1: The user lives in Utrecht.", "Added #4: The user's dog is called Bo.")
+    assert quiet.removed == ("Removed: The user's dog is called Rex.", "Removed: The user has a dog.")
 
 
 async def test_learn_page_saves_new_facts_and_skips_known_ones(store: Store) -> None:
@@ -418,6 +492,25 @@ async def test_learn_page_saves_new_facts_and_skips_known_ones(store: Store) -> 
     )
     assert "Location: Amsterdam, NL" in call["messages"][1]["content"]
     assert "#1: The user speaks English and Spanish." in call["messages"][1]["content"]
+
+
+async def test_learn_page_keeps_only_the_link_the_user_sent_never_where_it_led(store: Store) -> None:
+    """Second review of 0.9.8, redteam-02: a redirect's target is the page's choice, never the user's."""
+    page = Page(
+        url="https://www.example.org/alex",
+        final_url="https://evil.example/landing",
+        title="Alex",
+        text="Site: https://www.example.org/alex",
+        content_type="text/html",
+    )
+    facts = ["Alex's site is https://www.example.org/alex", "Alex's login page is https://evil.example/landing"]
+    gemma = FakeGemma(text(json.dumps({"facts": facts})))
+    profile, _, profiler = make(store, gemma)
+    result = await profiler.learn_page(page, None, store.add_document(page.url, "Alex", page.text, None))
+    assert [fact.text for fact in profile.facts()] == ["Alex's site is https://www.example.org/alex"]
+    assert len(result.rejected) == 1
+    content = gemma.calls[0]["messages"][1]["content"]
+    assert "URL: https://www.example.org/alex" in content and "evil.example" not in content
 
 
 async def test_learn_page_rejects_planted_instructions(store: Store) -> None:
@@ -469,7 +562,7 @@ async def test_learning_keeps_the_users_own_facts_and_counts_only_real_changes(s
         ("The user plays piano.", "remember"),
         ("The user has a cat called Miso.", "chat"),
     ]
-    assert store.get_state(UNANNOUNCED_KEY) == "1"
+    assert profile.last_quiet().noted == ("Added #2: The user has a cat called Miso.",)  # never the user's fact
     assert store.get_state(LAST_LEARNED_KEY) == str(later)
 
 

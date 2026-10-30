@@ -1,3 +1,4 @@
+import json
 from datetime import datetime
 from pathlib import Path
 
@@ -221,6 +222,40 @@ def test_empty_day_and_long_lists(tmp_path: Path, store: Store) -> None:
     assert text.endswith("…and 3 more")
 
 
+def test_mail_not_sorted_yet_is_counted_never_called_nothing(tmp_path: Path, store: Store) -> None:
+    """Review O8 (0.9.7): with the sorter behind or down, unsorted mail from people the user does not write to was not
+    counted, and the digest said "Mail: nothing needs you today."; each is now counted on a line of its own, in the
+    digest and in the mail tool's answer (those it already lists are not counted again)."""
+    digest = make(tmp_path, store, Clock(DIGEST_TIME))
+    for n in range(12):
+        add(
+            store,
+            f"u{n}",
+            None,
+            "",
+            f"2026-10-08T0{n % 7}:00:00+00:00",
+            sender=f"Shop {n}",
+            address=f"s{n}@shop.example",
+        )
+    assert digest.digest_part() == "Mail: nothing sorted needs you today.\n\n12 mails not sorted yet."
+    assert digest.compose() == "Mail: nothing sorted needs you today.\n12 mails not sorted yet."
+    add(store, "g1", "reply", "Asks about Friday.", "2026-10-08T06:00:00+00:00")
+    part = digest.digest_part()
+    assert part.startswith("**Mail (family)**\nNeeds a reply:\n1. Anna Smith: Asks about Friday. (today)")
+    assert part.endswith("\n\n12 mails not sorted yet.")
+    assert digest.compose().endswith("\n12 mails not sorted yet.")
+
+
+def test_one_unsorted_mail_and_none_listed_twice(tmp_path: Path, store: Store) -> None:
+    digest = make(tmp_path, store, Clock(DIGEST_TIME))
+    add(store, "u1", None, "", "2026-10-08T06:00:00+00:00", sender="Shop", address="s@shop.example")
+    old = "2026-09-01T06:00:00+00:00"  # outside the reply window: not the digest's
+    add(store, "u2", None, "", old, sender="Shop", address="s@shop.example")
+    assert digest.digest_part().endswith("\n\n1 mail not sorted yet.")
+    store.set_mail_label(1, "noise", "A sale.")
+    assert digest.digest_part() == "Mail: nothing needs you today."
+
+
 def test_numbers_stay_for_the_day_and_restart_the_next(tmp_path: Path, store: Store) -> None:
     clock = Clock(DIGEST_TIME)
     numbers = MailNumbers(store, TZ, clock)
@@ -228,10 +263,21 @@ def test_numbers_stay_for_the_day_and_restart_the_next(tmp_path: Path, store: St
         add(store, "g1", "reply", "A.", "2026-10-08T06:00:00+00:00"),
         add(store, "g2", "reply", "B.", "2026-10-08T06:00:00+00:00"),
     )
-    assert (numbers.number(a), numbers.number(b), numbers.number(a)) == (1, 2, 1)
-    assert numbers.mail_id(2) == b and numbers.mail_id(9) is None
+    first, second = store.mail(a), store.mail(b)
+    assert (numbers.number(first), numbers.number(second), numbers.number(first)) == (1, 2, 1)
+    assert numbers.mail_key(2) == ("family", "g2") and numbers.mail_key(9) is None
     clock.now += 86_400
-    assert numbers.number(b) == 1
+    assert numbers.number(second) == 1
+
+
+def test_an_older_releases_numbers_name_no_mail(tmp_path: Path, store: Store) -> None:
+    """Bare row ids (before 0.9.7) may name another mail since (review I28): today's numbers start again."""
+    clock = Clock(DIGEST_TIME)
+    a = add(store, "g1", "reply", "A.", "2026-10-08T06:00:00+00:00")
+    store.set_state("mail:numbers", json.dumps({"day": "2026-10-08", "ids": [a]}))
+    numbers = MailNumbers(store, TZ, clock)
+    assert numbers.mail_key(1) is None
+    assert numbers.number(store.mail(a)) == 1
 
 
 # a call's glance: the day's mail as numbers only, never a sender, subject or summary (no outside text on the call)

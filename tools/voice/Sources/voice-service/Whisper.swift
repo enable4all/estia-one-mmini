@@ -2,6 +2,7 @@
 // against its sha256 (`WhisperModel`; about 0.6 s for the 1.6 GB). Missing files are downloaded at the pinned commit
 // (the first start, or a download that stopped); then WhisperKit loads only from those checked folders: no listing of
 // the repository, no download, no request to Hugging Face.
+import AVFoundation
 import Foundation
 import VoiceCore
 import WhisperKit
@@ -23,4 +24,34 @@ func downloadPinned(_ pin: HubPin, models: URL) async throws {
 func whisperConfig(models: URL) -> WhisperKitConfig {
     WhisperKitConfig(
         modelFolder: WhisperModel.files.location(in: models).path, tokenizerFolder: models, load: true, download: false)
+}
+
+/// Whisper's input for a clip, and the clip's length in seconds. A 16 kHz mono 16-bit WAV (every call turn: the bridge's
+/// `pcm48_to_wav16k`) goes to `samples` in memory and never touches the disk (review C5). Any other audio (a voice
+/// note, a shared file) goes to `file` as a private file in `temp` (0600, in her 0700 folder) that lives only for the
+/// transcription; a leftover after a crash goes at the next start. Over `Limits.maxAudioSeconds`: `tooLong`.
+func transcribeClip(
+    _ audio: Data, kind: String, temp: URL,
+    samples: ([Float]) async throws -> [TranscriptionResult],
+    file: (String) async throws -> [TranscriptionResult]
+) async throws -> (results: [TranscriptionResult], duration: Double) {
+    if let pcm = pcm16kMonoSamples(audio) {
+        let duration = Double(pcm.count) / 16_000
+        guard duration <= Limits.maxAudioSeconds else { throw VoiceError.tooLong }
+        return (try await samples(pcm), duration)
+    }
+    let path = temp.appendingPathComponent("\(UUID().uuidString).\(kind)")
+    guard FileManager.default.createFile(atPath: path.path, contents: audio, attributes: [.posixPermissions: 0o600]) else {
+        throw VoiceError.failed
+    }
+    defer { try? FileManager.default.removeItem(at: path) }
+    let duration: Double
+    do {
+        let audioFile = try AVAudioFile(forReading: path)
+        duration = Double(audioFile.length) / audioFile.fileFormat.sampleRate
+    } catch {
+        throw VoiceError.unreadable
+    }
+    guard duration <= Limits.maxAudioSeconds else { throw VoiceError.tooLong }
+    return (try await file(path.path), duration)
 }

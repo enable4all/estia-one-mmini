@@ -23,15 +23,19 @@ used to find her account.
 
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import json
 import os
 import pwd
 import re
+import select
 import shlex
 import stat
 import subprocess
 import tempfile
+import termios
+import textwrap
 import time
 import unicodedata
 from collections.abc import Callable, Collection, Mapping, Sequence
@@ -87,12 +91,43 @@ NUCLEAR = f"{HARDEN} --nuclear"
 # the two security levels, by name (owner, 14 Oct: never "default"): setup's security step, and --nuclear on top of it
 HARDENED = "hardened"
 NUCLEAR_LEVEL = "nuclear"
-# one neutral line for the nuclear option, outside it (harden at the hardened level; doctor with the firewall off)
-NUCLEAR_ITEMS = "the firewall, stealth mode, python3 and ruby off the firewall's list, and the keychain lock"
-NUCLEAR_LINE = (
-    f"the {NUCLEAR_LEVEL} level: {NUCLEAR_ITEMS}: only with {NUCLEAR}, only for deeply technical users; it may stop "
-    "other services on this Mac"
-)
+
+
+# one neutral line for the nuclear option, outside it (harden at the hardened level; doctor with the firewall off), in
+# the owner's words (20 Oct: the same in setup, GUIDE.md, SECURITY.md and the AI's briefing; checked: no --setblockall,
+# the signed-software settings untouched, and the application firewall filters only incoming connections). Review of
+# 0.9.7, X3: signed programs get through only while macOS's own allow-signed setting is on, which harden never sets
+def nuclear_line(name: str) -> str:
+    """The nuclear level in the owner's words, with her name (the config's; the docs and harden say Estia)."""
+    return (
+        f"The nuclear level, only for deeply technical users and best on a Mac used for {name} alone: the Mac's "
+        "firewall on, with each program that other machines reach asked about one by one; python3 and ruby off its "
+        "list; stealth mode and the keychain lock, each asked first. Outgoing connections and remote login (SSH) are "
+        "never blocked, nor are signed programs while macOS's own setting lets signed software through (as on a new "
+        "Mac)."
+    )
+
+
+NUCLEAR_LINE = nuclear_line("Estia")
+NUCLEAR_HOW = f"Only with {NUCLEAR}; it may stop other services on this Mac."
+TERMINAL = 135  # columns: every line the owner reads in a terminal fits (owner, 20 Oct)
+
+
+def terminal_text(text: str, lead: int) -> str:
+    """`text` split to fit TERMINAL columns after a first line's `lead` characters (its mark and part, "○ Firewall: "),
+    each later line indented by two spaces; never inside a word, nor between a command and its flags (" --")."""
+    glued = text.replace(" --", "\N{NO-BREAK SPACE}--")  # textwrap splits only at ASCII white space
+    wrapped = textwrap.fill(
+        glued,
+        TERMINAL,
+        initial_indent=" " * lead,
+        subsequent_indent="  ",
+        break_on_hyphens=False,
+        break_long_words=False,
+    )
+    return wrapped[lead:].replace("\N{NO-BREAK SPACE}--", " --")
+
+
 # the SSH drop-in that harden installs: read before macOS's own 100-macos.conf (sshd takes the first value it reads)
 SSH_DROP_IN_PATH = Path("/etc/ssh/sshd_config.d/000-estia-keys-only.conf")
 SSH_DROP_IN = (
@@ -159,6 +194,10 @@ def tool_root() -> Path:
     return Path(value) if value else Path("/")
 
 
+# an AI-run's guard (setup_ai.guarded): called with each argv just before Host.run starts it, it refuses sudo there
+SUDO_GUARD: Callable[[Sequence[str]], None] | None = None
+
+
 class Host:
     """Runs fixed argv (absolute tools, no shell) and reads files under `root`. Under another root the system tools are
     refused and printed; in a dry run every change is printed instead of run (reads still run)."""
@@ -196,12 +235,15 @@ class Host:
         if refused or (self.dry_run and not read_only):
             self.say("would run: " + " ".join(shown if shown is not None else argv))
             return 0, ""
+        if SUDO_GUARD is not None:
+            SUDO_GUARD(argv)
         try:
             done = subprocess.run(
                 list(argv),
                 input=input,
                 capture_output=True,
                 text=True,
+                errors="replace",  # a byte that is not UTF-8 (a log line of hers) never stops a step
                 cwd=cwd,
                 env=env,
                 timeout=timeout,
@@ -346,13 +388,14 @@ def stealth(host: Host) -> Check:
     )
 
 
-def doctor_firewall(host: Host) -> Check:
+def doctor_firewall(host: Host, name: str = "Estia") -> Check:
     """Doctor's firewall line: on, it is fine (its listener lines follow); off or unreadable, one neutral line naming
-    the nuclear option, never a "!" or a "✗" (it may stop other services on this Mac)."""
+    the nuclear option (with her name), never a "!" or a "✗" (it may stop other services on this Mac)."""
     on, _ = _firewall_on(host)
     if not on:
         state = "off" if on is False else "could not be read"
-        return Check("firewall", "info", "Firewall", f"{state}. {NUCLEAR_LINE[0].upper()}{NUCLEAR_LINE[1:]}")
+        text = terminal_text(f"{state}. {nuclear_line(name)} {NUCLEAR_HOW}", len("○ Firewall: "))
+        return Check("firewall", "info", "Firewall", text)
     hidden = _stealth_on(host)
     text = "on, with stealth mode: no answer to ping" if hidden else "on (stealth mode off: the Mac answers ping)"
     return Check("firewall", "ok", "Firewall", text)
@@ -906,10 +949,13 @@ def sudoers(host: Host, contents: dict[str, str | None] | None = None) -> Check:
 
 VISUDO = "/usr/sbin/visudo"
 PASSWORDLESS = "Passwordless sudo"
-# Defaults that skip your password, or let one sign-in count for every program of yours (any of them then is root)
+# Defaults that skip your password, or let one sign-in count beyond its Terminal window (any program it covers then is
+# root). Only sudo's own tty is kept: Apple and NIST's macOS Security Compliance Project (mSCP) rule
+# os_sudoers_timestamp_type_configure (CIS 5.5, DISA APPL-27-004060) refuses timestamp_type global and ppid
 _SUDO_DEFAULTS = {
     "!authenticate": "sudo asks no password at all (!authenticate)",
     "timestamp_type=global": "one sudo sign-in counts for every program of yours (timestamp_type=global)",
+    "timestamp_type=ppid": "one sudo sign-in counts for every program started by the same program (timestamp_type=ppid)",
     "!tty_tickets": "one sudo sign-in counts for every program of yours (!tty_tickets)",
 }
 # how long one sudo sign-in lasts in its Terminal window: sudo's own default is 5 minutes; a negative value never ends
@@ -1218,14 +1264,19 @@ def read_json(path: Path, limit: int = JSON_LIMIT) -> Any:
 
 
 def signal_listed(signal_data: Path, number: str) -> list[dict[str, Any]]:
-    """accounts.json's entries for the number (every entry without one). Raises FileNotFoundError when there is no
-    list, OSError or ValueError when it cannot be read."""
+    """accounts.json's entries for her account (every entry without one): a number by its number, an account without
+    a number by its Account ID (signal-cli lists its ACI as `uuid`, in lower case, and no number). Raises
+    FileNotFoundError when there is no list, OSError or ValueError when it cannot be read."""
     listed = read_json(signal_data / "data" / "accounts.json")
     accounts = listed.get("accounts", []) if isinstance(listed, dict) else None
     if not isinstance(accounts, list):
         raise ValueError("accounts.json: no list of accounts")
     entries = [entry for entry in accounts if isinstance(entry, dict)]
-    return [entry for entry in entries if entry.get("number") == number] if number else entries
+    if not number:
+        return entries
+    if is_account_id(number):
+        return [entry for entry in entries if str(entry.get("uuid", "")).lower() == number.lower()]
+    return [entry for entry in entries if entry.get("number") == number]
 
 
 def account_file(signal_data: Path, entry: dict[str, Any]) -> dict[str, Any] | None:
@@ -1262,24 +1313,36 @@ def registration_lock(signal_data: Path, number: str) -> bool | None:
 
 
 NO_ACCOUNT = "no Signal account for her number yet"
+# an account without a number: no SMS code can register it elsewhere, so no Registration Lock is needed (and Signal
+# Login has no Signal PIN); only its Recovery key takes it over (doctor's and harden's ✓ line; harden offers no PIN)
+NUMBERLESS_LOCK = (
+    "not needed: her account has no number, so no SMS code can register it elsewhere; only her Recovery key can. "
+    "Keep it in your password manager."
+)
 
 
-def registration_lock_state(signal_data: Path, number: str) -> Literal["on", "off", "none", "unknown"]:
+def registration_lock_state(signal_data: Path, number: str) -> Literal["on", "off", "none", "unknown", "numberless"]:
     """ "on" or "off"; "none" when signal-cli holds no account for the number yet (nothing registered here);
-    "unknown" when its account file cannot be read. Never the PIN."""
+    "unknown" when its account file cannot be read; "numberless" for an account without a number (signal-cli lists
+    it with no number). Never the PIN."""
     try:
-        if not signal_listed(signal_data, number):
-            return "none"
+        listed = signal_listed(signal_data, number)
     except FileNotFoundError:
         return "none"
     except (OSError, ValueError):
         return "unknown"
+    if not listed:
+        return "none"
+    if len(listed) == 1 and not listed[0].get("number"):
+        return "numberless"
     state = registration_lock(signal_data, number)
     return "unknown" if state is None else "on" if state else "off"
 
 
 def registration_lock_check(home: Path, number: str = "") -> Check:
     state = registration_lock_state(home / ".local" / "share" / "signal-cli", number)
+    if state == "numberless":
+        return Check("registration_lock", "ok", "Registration Lock", NUMBERLESS_LOCK)
     if state == "on":
         return Check(
             "registration_lock",
@@ -1312,15 +1375,420 @@ def registration_lock_check(home: Path, number: str = "") -> Check:
     )
 
 
+# ------------------------------------------------------------------ an account without a number ("Signal Login")
+# Made once in Signal for Android; signal-cli takes it over with its Account ID (the account's ACI, a UUID) and its
+# Recovery key (`register` with `recoveryKey`, over JSON-RPC on stdin). Both are read and checked here, for setup and
+# for `estia signal-login`, whose reading runs as root from the tools (her user cannot open your terminal). Nothing
+# here prints a key or a whole ID.
+
+TTY = "/dev/tty"  # the person's own terminal: a key is read from it, never from stdin
+# Signal shows the Recovery key in upper case with these characters swapped for symbols, so the letter O and the digit
+# 0 are never mixed up (Signal for Android's CHARACTER_DISPLAY_MAP, 'O' to '#' and '0' to '='; its comment says pairs
+# may be added): each one read back here, shown symbol to stored character (in lower case). The one table: checked
+# against Signal-Android's main on 25 Oct 2026 (16f1384, 22 Oct; the file last changed in bdefc274, 29 May 2026), and
+# again before each release (docs/agents/docs-release.md). Signal's own reader drops a symbol it does not know
+# (`removeIllegalCharacters`); this one refuses it. signal-cli 0.14.9's copy (models-jvm 2.15.3_unofficial_154) has the
+# same two pairs.
+# https://github.com/signalapp/Signal-Android/blob/16f138410a4ab940864a2791ae281dd1b2318611/core/models-jvm/src/main/java/org/signal/core/models/AccountEntropyPool.kt
+KEY_SYMBOLS: Mapping[str, str] = {"#": "o", "=": "0"}
+KEY_LENGTH = 64  # AccountEntropyPool.LENGTH: 64 of a to z and 0 to 9
+# what a key is kept with between its groups (a password manager, a note): left out only beside exactly 64 key
+# characters, where none of them can be one; beside more or fewer, each is refused as a symbol Signal does not use
+KEY_SEPARATORS = frozenset("-._")
+# Unicode's Default_Ignorable_Code_Point (DerivedCoreProperties.txt, Unicode 18.0.0: 4,174 code points), the
+# characters a text shows as nothing: the soft hyphen, the zero-width space, non-joiner and joiner, the direction
+# marks, embeddings and isolates, the word joiner, the variation selectors, the byte order mark, the tags. A paste may
+# bring them; none is a letter, a digit or a display symbol, so leaving them out never changes a key.
+# https://www.unicode.org/Public/18.0.0/ucd/DerivedCoreProperties.txt
+INVISIBLE_RANGES: tuple[tuple[int, int], ...] = (
+    (0x00AD, 0x00AD),
+    (0x034F, 0x034F),
+    (0x061C, 0x061C),
+    (0x115F, 0x1160),
+    (0x17B4, 0x17B5),
+    (0x180B, 0x180F),
+    (0x200B, 0x200F),
+    (0x202A, 0x202E),
+    (0x2060, 0x206F),
+    (0x3164, 0x3164),
+    (0xFE00, 0xFE0F),
+    (0xFEFF, 0xFEFF),
+    (0xFFA0, 0xFFA0),
+    (0xFFF0, 0xFFF8),
+    (0x1BCA0, 0x1BCA3),
+    (0x1D173, 0x1D17A),
+    (0xE0000, 0xE0FFF),
+)
+ID_DIGITS = 32  # an ACI is a UUID: 32 hex digits
+_ACCOUNT_ID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+# Signal's username (libsignal, rust/usernames/src/username.rs): a nickname of 3 to 32 of a to z, 0 to 9 and _, never
+# a digit first (any case), a dot, and 2 to 9 digits, never zero and with no 0 first past two digits
+_USERNAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{2,31}\.(?:0[1-9]|[1-9][0-9]{1,8})")
+GRACE_SECONDS = 0.3  # a blank line ends a hidden read once no more of a paste arrives within this time
+KEEP_BOTH = (
+    "Keep the Account ID and the Recovery key in your password manager: without both, the account cannot move to "
+    "another Mac, and no number, SMS code or PIN brings it back."
+)
+# "Register without number" is on the phone-number screen, which shows only where Signal is not set up; one Signal app
+# holds one account (review, 23 Oct: the phone with your own Signal would lose it). The same words in every doc.
+NUMBERLESS_PHONE = (
+    "The phone for it is a spare or borrowed one where Signal is not set up yet, never the phone with your own "
+    "Signal: one Signal app holds one account."
+)
+# A Signal Account (the owner's name for it, 28 Oct); Signal for Android names it Signal Login: its purchase screen's
+# title, with a "Pay $2.99" button (the price as Google Play gives it) and "One-time purchase", after "Register without
+# number" on the phone-number screen (Signal-Android's feature/registration strings, SignalLoginPaymentScreen, checked
+# 28 Oct 2026 on main 6e9dddc, the file last changed in 973499a, 7 Oct), so the step names that screen
+# https://github.com/signalapp/Signal-Android/blob/6e9dddc01f1b26e608ac683807c51e139c141ed2/feature/registration/src/main/res/values/strings.xml
+NUMBERLESS_STEPS = (  # setup's and `estia signal-login`'s list of the phone's part, in the same words; lines of 88
+    "A Signal Account without a number is made once in Signal for Android,\n"
+    "on a phone with Google Play (iPhone not yet).\n"
+    + textwrap.fill(f"{NUMBERLESS_PHONE} On that phone:", 88)
+    + "\n  1. Install Signal 8.31.2 or later.\n"
+    '     Where it asks for a phone number, tap "Register without number".\n'
+    '  2. On the "Signal Login" screen, tap Pay ($2.99 or EUR 3.49, once, in Google Play).\n'
+    "  3. Signal shows her Account ID and her Recovery key.\n"
+    + textwrap.fill(KEEP_BOTH, 88, initial_indent="     ", subsequent_indent="     ")
+    + "\n  4. That is all on the phone: moving the account to this Mac logs Signal on the phone\n"
+    "     out. Her username is set here, on the Mac."
+)
+OLD_NUMBER_KEPT = "Her old number's account stays on this Mac as it was, unused: never unregistered, never deleted."
+OLD_ACCOUNT_KEPT = "Her old account stays on this Mac as it was, unused: never unregistered, never deleted."
+# review of 0.9.7, S13: the old account is never online again (owner, 23 Oct: "just stop using it"), so a number's
+# Registration Lock lapses after 7 days offline and the number's next holder can register it; an old account without
+# a number is taken only with its Recovery key (after a break-in, assume it was copied). `estia signal-login`'s last
+# lines and SECURITY.md's known gaps say what to do about her old chat.
+OLD_NUMBER_RISK = (
+    "Her old number's Registration Lock lapses after 7 days offline: whoever gets that number next can write to you "
+    "from her old chat. Delete or block that chat on your phone and never trust it again; keep the SIM if you can."
+)
+OLD_ACCOUNT_RISK = (
+    "Whoever holds her old account's Recovery key can still write to you from her old chat. Delete or block that chat "
+    "on your phone and never trust it again."
+)
+SIGNAL_LOGIN_INTRO = (  # `estia signal-login`'s first lines, before the phone's steps (root cannot tell which she had)
+    "Her Signal account moves to one without a number.\n  " + OLD_ACCOUNT_KEPT + "\n"
+    "  She is stopped only while the account moves, then starts again."
+)
+# root's line when the questions stop (q, or no terminal): any account, with a number or without
+SIGNAL_LOGIN_STOPPED = "Stopped: nothing changed; she runs on her account as before."
+ID_ASK = "Her Account ID (hidden: nothing shows while you type or paste; q stops): "
+KEY_ASK = (  # the read ends at the Enter after the key's last line (review, 23 Oct: "a blank line ends it" sent one
+    # more Enter, which waited for the next question); an empty line still ends one typed short
+    "Her Recovery key, typed as Signal shows it, # and = too; several lines are fine, and Enter after its last line\n"
+    "  ends it (hidden: nothing shows while you type or paste; q stops): "
+)
+USERNAME_ASK = "Her username in Signal: a name, a dot and two or more digits, like estia.42 (q stops):"
+# signal-cli's manual (register --totp): "If automatic account recovery reports that a TOTP token is required, rerun
+# register with both --recovery-key and --totp" (review S7); asked last in `estia signal-login`, Enter for none
+TOTP_DIGITS = 6
+TOTP_QUESTION = (  # visible; Enter is no
+    "Six-digit code: only when a try before said Signal asks for one. Yes asks for it, hidden; no moves the account\n"
+    "  without it. Recommendation: no, unless Signal asked. [y/N]"
+)
+TOTP_ASK = "The six-digit code (hidden: nothing shows while you type; q stops): "
+TOTP_BAD = "The code has six digits, as Signal asked for it. Type it again."
+
+
+def totp_code(typed: str) -> str:
+    """The six-digit code Signal may ask for before it moves an account without a number, spaces dropped; "" for
+    none. ValueError (TOTP_BAD, never the code) for anything else."""
+    digits = "".join(typed.split())
+    if digits and not (len(digits) == TOTP_DIGITS and digits.isascii() and digits.isdigit()):
+        raise ValueError(TOTP_BAD)
+    return digits
+
+
+ID_BAD = (
+    "That is not an Account ID: Signal's has 32 digits and letters a to f, in groups with dashes ({count} read, "
+    "without the dashes, spaces and line breaks). Type it again."
+)
+# the key's reading, in the words the setup docs use too (owner, 25 Oct: "shall we be more relaxed on that")
+KEY_LEFT_OUT = (
+    "Spaces, line breaks and the invisible characters a paste may bring are left out; so are dashes, dots and "
+    "underscores (- . _), but only when exactly 64 letters, digits, # and = remain without them."
+)
+KEY_NEVER_GUESSED = (
+    "Any other symbol is refused and named with its place, never left out or guessed: a wrong key sent to Signal "
+    "counts toward its limit on registrations."
+)
+# review of P1, R2-S1: a whole note pasted at the key question read as exactly 64 once its rest was dropped
+KEY_PASTED_AFTER = (
+    "What is pasted after the key is counted too: a paste longer than the key, such as a whole note with the Account "
+    "ID, is refused with the count."
+)
+KEY_STRAY = (
+    "Character {position} of the {count} read is {symbol}, which Signal does not use in a key (spaces, line breaks "
+    "and invisible characters are not counted). Type the key again as Signal shows it: letters, digits, # and =."
+)
+# a refused letter or digit (a fullwidth, Cyrillic or other look-alike, the Kelvin sign) by its kind only: it is most
+# likely the key's own character typed another way, so neither it nor its name is shown (review of P1, R2-S2)
+KEY_LOOKALIKE = "a letter or digit from another alphabet or a fullwidth form"
+KEY_SEPARATOR = (
+    "Character {position} of the {count} read is {symbol}: dashes, dots and underscores are left out only when "
+    "exactly 64 letters, digits, # and = remain without them, and this key has {keyed}. Type it again as Signal "
+    "shows it."
+)
+KEY_COUNT = (
+    "That key has {count} characters; Signal's has 64 (spaces, line breaks and invisible characters do not count). "
+    "Type it again as Signal shows it."
+)
+# each Enter below the count, in plain lines (signal-key-short-enter-silent, round 1): a key one character short, or
+# typed on the Greek layout, waited for more with nothing on screen, and the next try was added to the first
+KEY_SO_FAR = "\n  {have} of {needed} so far: type the next line, or Enter on an empty line to end here.\n"
+KEY_NONE_COUNTED = (
+    "\n  {have} of {needed} so far: none of that line counts (the keyboard may be on Greek: switch it to ABC).\n"
+    "  Type it again, or Enter on an empty line to end here.\n"
+)
+USERNAME_BAD = (
+    "That does not fit Signal's form for a username: 3 to 32 letters, digits or _ (never a digit first), a dot, then "
+    "two or more digits (never 00, and no 0 first in three or more)."
+)
+
+
+def key_character(char: str) -> bool:
+    """A character a Recovery key is typed with: a to z and 0 to 9 in any case, or one of Signal's display symbols."""
+    return (char.isascii() and char.isalnum()) or char in KEY_SYMBOLS
+
+
+def id_character(char: str) -> bool:
+    """A hex digit of an Account ID, in any case."""
+    return char.isascii() and char in "0123456789abcdefABCDEF"
+
+
+def invisible(char: str) -> bool:
+    """A character a text shows as nothing (`INVISIBLE_RANGES`: Unicode's Default_Ignorable_Code_Point)."""
+    code = ord(char)
+    return any(first <= code <= last for first, last in INVISIBLE_RANGES)
+
+
+def shown_symbol(char: str) -> str:
+    """A symbol as a refusal names it: itself in quotes with its Unicode name in small letters, or, when it does not
+    show on its own (a control character, a combining mark, a private one), its code (U+0301) and its name if it has
+    one. Never more than that one character, and never a letter or digit (`KEY_LOOKALIKE`, its kind only: it may be
+    one of the key's own)."""
+    if unicodedata.category(char)[0] in "LN":
+        return KEY_LOOKALIKE
+    name = unicodedata.name(char, "").lower()
+    if char.isprintable() and not unicodedata.category(char).startswith("M"):
+        return f'"{char}" ({name})' if name else f'"{char}"'
+    code = f"U+{ord(char):04X}"
+    return f"{code} ({name})" if name else code
+
+
+def recovery_key(text: str) -> str:
+    """The Recovery key as Signal stores it, from any way it was typed or pasted: every kind of space, line break and
+    invisible character (`invisible`) left out, dashes, dots and underscores too when exactly 64 key characters remain
+    without them (`KEY_SEPARATORS`), Signal's display symbols read back (`KEY_SYMBOLS`), in lower case. Exactly 64 of a
+    to z and 0 to 9; else ValueError with a line that says why: a symbol Signal does not use, named with where it is
+    and how many were read (a separator beside more or fewer than 64 too, with that count), or the count. A symbol is
+    never dropped or guessed (a wrong key costs a registration Signal counts), and the line never holds the key or a
+    letter or digit of it (`shown_symbol`)."""
+    read = [char for char in text if not char.isspace() and not invisible(char)]
+    keyed = sum(map(key_character, read))
+    for position, char in enumerate(read, 1):
+        if not key_character(char) and char not in KEY_SEPARATORS:
+            raise ValueError(KEY_STRAY.format(position=position, count=len(read), symbol=shown_symbol(char)))
+    if keyed != KEY_LENGTH:
+        for position, char in enumerate(read, 1):
+            if char in KEY_SEPARATORS:
+                symbol = shown_symbol(char)
+                raise ValueError(KEY_SEPARATOR.format(position=position, count=len(read), symbol=symbol, keyed=keyed))
+        raise ValueError(KEY_COUNT.format(count=keyed))
+    return "".join(KEY_SYMBOLS.get(char, char) for char in read if key_character(char)).lower()
+
+
+def account_id(text: str) -> str:
+    """The Account ID (her account's ACI) as signal-cli and the config hold it, a UUID in lower case, from any way it
+    was typed: any case, with or without its dashes, spaces and line breaks left out. ValueError with a line that says
+    why, never the ID."""
+    digits = [char for char in text if not char.isspace() and char != "-"]
+    if len(digits) != ID_DIGITS or not all(id_character(char) for char in digits):
+        raise ValueError(ID_BAD.format(count=len(digits)))
+    plain = "".join(digits).lower()
+    return f"{plain[:8]}-{plain[8:12]}-{plain[12:16]}-{plain[16:20]}-{plain[20:]}"
+
+
+def is_account_id(account: str) -> bool:
+    """Her account (the config's `bot_number`) is an Account ID, a UUID, not a phone number."""
+    return _ACCOUNT_ID.fullmatch(account) is not None
+
+
+def shown_account(account: str) -> str:
+    """Her account as a line on screen may name it: a number as today; an Account ID never in full, named as the
+    route cards name it (a Signal Account; second deep scan)."""
+    return f"the Signal Account ending in {account[-4:]}" if is_account_id(account) else account
+
+
+def username(text: str) -> str:
+    """Her username as typed (spaces around it left out), when it has Signal's form; else ValueError."""
+    answer = text.strip()
+    if _USERNAME.fullmatch(answer) is None:
+        raise ValueError(USERNAME_BAD)
+    return answer
+
+
+def read_hidden_lines(prompt: str, needed: int, counted: Callable[[str], bool], tty: str = TTY) -> str:
+    """Hidden lines from the terminal itself, never from stdin, until `needed` characters that `counted` takes have
+    come by a line's end, or a blank line ends it: Signal shows the Recovery key on several lines, and a paste of it
+    arrives whole, blank lines between its groups and all (a blank line ends the read only once nothing more of a
+    paste follows, `GRACE_SECONDS`). The line mode and the echo are off meanwhile: nothing shows, Backspace and Ctrl-U
+    edit the line being typed, a terminal's escape sequences are left out, Ctrl-C stops as usual, and "q" alone on the
+    first line comes back as "q". Ctrl-D on an empty line raises EOFError, no terminal OSError. What was typed or
+    pasted after the end is read too, so none of it reaches the shell afterwards (a shell's `read` takes one line and
+    leaves the rest to run as commands), and it is counted: when it holds a character `counted` takes, it comes back
+    after the lines, on a line of its own, so a paste longer than the key is refused with the count, never cut to fit
+    (review of P1, R2-S1: a whole note, the Account ID before the key, read as exactly 64). The terminal's mode is
+    always put back."""
+    fd = os.open(tty, os.O_RDWR | os.O_NOCTTY)
+    try:
+        before = termios.tcgetattr(fd)
+        quiet = termios.tcgetattr(fd)
+        quiet[3] &= ~(termios.ICANON | termios.ECHO)
+        quiet[6][termios.VMIN] = 1
+        quiet[6][termios.VTIME] = 0
+        termios.tcsetattr(fd, termios.TCSAFLUSH, quiet)
+        rest = bytearray()  # what came after the line that ended the read
+        try:
+            os.write(fd, prompt.encode())
+            text = _hidden_lines(fd, needed, counted, rest)
+        finally:
+            rest += _drain(fd)
+            termios.tcsetattr(fd, termios.TCSAFLUSH, before)
+            os.write(fd, b"\n")
+    finally:
+        os.close(fd)
+    after = _typed(bytes(rest))
+    return f"{text}\n{after}" if text != "q" and any(map(counted, after)) else text
+
+
+def _waiting(fd: int, seconds: float) -> bool:
+    return bool(select.select([fd], [], [], seconds)[0])
+
+
+def _drain(fd: int) -> bytes:
+    """Read what is still arriving (the rest of a paste), for at most a few seconds, so the shell never gets it; the
+    bytes read, for the caller to count."""
+    read = bytearray()
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline and _waiting(fd, GRACE_SECONDS):
+        chunk = os.read(fd, 4096)
+        if not chunk:
+            break
+        read += chunk
+    return bytes(read)
+
+
+def _typed(data: bytes) -> str:
+    """What bytes typed or pasted show, as the hidden read takes a line's: a terminal's escape sequences and control
+    bytes left out (tabs kept), each line end a line feed."""
+    kept = bytearray()
+    escape = False
+    for byte in data:
+        if escape:
+            escape = byte in b"[0123456789;?" or not 0x40 <= byte <= 0x7E
+        elif byte == 0x1B:
+            escape = True
+        elif byte in (0x0A, 0x0D):
+            kept.append(0x0A)
+        elif 0x20 <= byte != 0x7F or byte == 0x09:  # never Backspace's DEL
+            kept.append(byte)
+    return kept.decode("utf-8", errors="replace").strip()
+
+
+def _hidden_lines(fd: int, needed: int, counted: Callable[[str], bool], rest: bytearray) -> str:
+    """The lines read until `needed` counted characters came by a line's end (or a blank line ended it); what came
+    after that line in the same read goes into `rest`. A line typed by hand that leaves the count short (nothing more
+    of a paste follows it) is answered on the terminal with how many came and what ends the read (`KEY_SO_FAR`; a
+    line that counts for nothing names the keyboard, `KEY_NONE_COUNTED`): never a silent wait."""
+    lines: list[str] = []
+    line = bytearray()
+    escape = False  # inside a terminal's escape sequence (an arrow key, a paste's brackets): left out
+    while True:
+        chunk = os.read(fd, 4096)
+        if not chunk:
+            raise EOFError
+        for at, byte in enumerate(chunk):
+            if escape:
+                escape = byte in b"[0123456789;?" or not 0x40 <= byte <= 0x7E
+            elif byte == 0x1B:
+                escape = True
+            elif byte in (0x0A, 0x0D):
+                text = line.decode("utf-8", errors="replace")
+                line.clear()
+                if not lines and text.strip().lower() == "q":
+                    return "q"
+                if text.strip():
+                    lines.append(text)
+                    have = sum(map(counted, "".join(lines)))
+                    if have >= needed:
+                        rest += chunk[at + 1 :]
+                        return "\n".join(lines)
+                    if at == len(chunk) - 1 and not _waiting(fd, GRACE_SECONDS):  # typed, not a paste still arriving
+                        hint = KEY_SO_FAR if any(map(counted, text)) else KEY_NONE_COUNTED
+                        os.write(fd, hint.format(have=have, needed=needed).encode())
+                elif lines and at == len(chunk) - 1 and not _waiting(fd, GRACE_SECONDS):
+                    return "\n".join(lines)  # a blank line, and no more of a paste
+            elif byte == 0x04 and not line and not lines:  # Ctrl-D on an empty line
+                raise EOFError
+            elif byte in (0x08, 0x7F):
+                while line and line.pop() & 0xC0 == 0x80:  # a continuation byte: the character goes on
+                    pass
+            elif byte == 0x15:  # Ctrl-U: the line so far
+                line.clear()
+            elif byte >= 0x20 or byte == 0x09:
+                line.append(byte)
+
+
+def _flush(fd: int) -> None:
+    with contextlib.suppress(termios.error):  # not a terminal: nothing typed ahead to drop
+        termios.tcflush(fd, termios.TCIFLUSH)
+
+
+def flush_typed(tty: str = TTY) -> None:
+    """Drop what was typed on the terminal before a question shows: a hidden read ends at the line end of its last
+    needed character, so an Enter pressed after it (a blank line, while signal-cli works) would otherwise answer the
+    next question with nothing. No terminal: nothing to drop."""
+    try:
+        fd = os.open(tty, os.O_RDWR | os.O_NOCTTY)
+    except OSError:
+        return
+    try:
+        _flush(fd)
+    finally:
+        os.close(fd)
+
+
+def ask_tty(question: str, tty: str = TTY) -> str:
+    """One visible answer from the terminal itself, in its usual line mode (root's reading for `estia signal-login`,
+    whose output goes to her on a pipe). What was typed before the question showed is dropped (`flush_typed`); an
+    Enter alone gives "", the end of input (Ctrl-D) raises EOFError."""
+    fd = os.open(tty, os.O_RDWR | os.O_NOCTTY)
+    try:
+        _flush(fd)
+        os.write(fd, f"{question} ".encode())
+        answer = bytearray()
+        while not answer.endswith(b"\n"):
+            chunk = os.read(fd, 1024)
+            if not chunk:
+                if not answer:
+                    raise EOFError
+                break
+            answer += chunk
+        return answer.decode("utf-8", errors="replace").strip()
+    finally:
+        os.close(fd)
+
+
 # ------------------------------------------------------------------ the sets
 
 
-def level_checks(host: Host, home: Path, bot_number: str = "") -> list[Check]:
+def level_checks(host: Host, home: Path, bot_number: str = "", name: str = "Estia") -> list[Check]:
     """What the security level is read from (read-only, as doctor and the bridge run them): the firewall, SSH, her
     file modes, her Registration Lock and the firewall's list (doctor shows no line of its own for the list: outside
-    the nuclear option it is never a "!")."""
+    the nuclear option it is never a "!"); `name` is hers, for the firewall's line."""
     return [
-        doctor_firewall(host),
+        doctor_firewall(host, name),
         ssh_password(host),
         _shown(data_modes(home)),
         registration_lock_check(home, bot_number),
@@ -1388,12 +1856,14 @@ def level_check(checks: Sequence[Check]) -> Check:
     )
 
 
-def doctor_checks(host: Host, home: Path, bot_number: str = "", *, sudo: Check | None = None) -> list[Check]:
+def doctor_checks(
+    host: Host, home: Path, bot_number: str = "", *, sudo: Check | None = None, name: str = "Estia"
+) -> list[Check]:
     """Doctor's lines: the firewall (on: fine, with a line for each listener it does not let through; off: one
     neutral line naming the nuclear option), SSH passwords, FileVault, her file modes, her Registration Lock and, when
     it could be read (`sudo`: `owner_sudo` as you, `sudo_listing` of root's listing for her doctor), passwordless sudo,
     then the security level they make. Read-only; the fixes name scripts/harden.sh, and nothing is applied."""
-    firewall, ssh, modes, lock, apps = level_checks(host, home, bot_number)
+    firewall, ssh, modes, lock, apps = level_checks(host, home, bot_number, name)
     read = [sudo] if sudo is not None else []
     return [
         firewall,

@@ -2,49 +2,78 @@
 
 from __future__ import annotations
 
+from local_assistant.prompts.ollama import OLLAMA_APP_LIMITS
+
 # fmt: off
 __all__ = [
-    "DOCTOR_ADMIN", "DOCTOR_ALWAYS_ON_ALIVE", "DOCTOR_ALWAYS_ON_ALIVE_ONLY", "DOCTOR_ALWAYS_ON_EXIT",
+    "CONFIG_WHERE", "DOCTOR_ADMIN", "DOCTOR_ALWAYS_ON_ALIVE", "DOCTOR_ALWAYS_ON_ALIVE_ONLY", "DOCTOR_ALWAYS_ON_EXIT",
     "DOCTOR_ALWAYS_ON_MISSING", "DOCTOR_ALWAYS_ON_NONE_YET", "DOCTOR_ALWAYS_ON_NOT_LOADED",
     "DOCTOR_ALWAYS_ON_RESTARTING", "DOCTOR_ALWAYS_ON_SILENT", "DOCTOR_ALWAYS_ON_SILENT_SINCE",
     "DOCTOR_ALWAYS_ON_STOPPED", "DOCTOR_ALWAYS_ON_STOPPED_NEVER", "DOCTOR_ALWAYS_ON_UNREAD", "DOCTOR_BARGE_UNREAD",
-    "DOCTOR_BARGE_UNREAD_FIX", "DOCTOR_DETECTOR_FALLS", "DOCTOR_DETECTOR_LOADING", "DOCTOR_DETECTOR_LOADING_FIX",
+    "DOCTOR_BARGE_UNREAD_FIX", "DOCTOR_CALLS_BUILDS_FIX_OWN", "DOCTOR_CALLS_JAVA_FIX_OWN", "DOCTOR_CALL_HELPER_OLD", "DOCTOR_CALL_HELPER_OLD_FIX_OWN", "DOCTOR_DETECTOR_FALLS", "DOCTOR_DETECTOR_LOADING", "DOCTOR_DETECTOR_LOADING_FIX",
     "DOCTOR_DETECTOR_OLD", "DOCTOR_DETECTOR_SILENT", "DOCTOR_DETECTOR_UNAVAILABLE", "DOCTOR_DETECTOR_UNAVAILABLE_FIX",
     "DOCTOR_DEVICES_NOT_COUNTED", "DOCTOR_DOCUMENTS_BUILD_FIX", "DOCTOR_DOCUMENTS_CLOSED", "DOCTOR_DOCUMENTS_HERS",
-    "DOCTOR_DOCUMENTS_HERS_FIX", "DOCTOR_DOCUMENTS_MAKE_FIX", "DOCTOR_DOCUMENTS_MISSING",
-    "DOCTOR_DOCUMENTS_MKDIR_FIX", "DOCTOR_DOCUMENTS_NOT_BUILT", "DOCTOR_DOCUMENTS_NOT_KB",
-    "DOCTOR_DOCUMENTS_NO_HELPER", "DOCTOR_DOCUMENTS_OK", "DOCTOR_DOCUMENTS_REBUILD_FIX", "DOCTOR_DOCUMENTS_REFUSED",
-    "DOCTOR_DOCUMENTS_REFUSED_FIX", "DOCTOR_DOCUMENTS_REFUSED_KB_FIX", "DOCTOR_DOCUMENTS_SHARE_FIX",
-    "DOCTOR_DOCUMENTS_UNSHARED", "DOCTOR_DOCUMENTS_WHY_HOME", "DOCTOR_EVENING_CONFIG", "DOCTOR_EVENING_GONE",
-    "DOCTOR_EVENING_OFF", "DOCTOR_EVENING_OFF_BY_USER", "DOCTOR_EVENING_TYPED", "DOCTOR_EVENING_UNUSED",
-    "DOCTOR_EVENING_UNUSED_FIX", "DOCTOR_HISTORY_FIX", "DOCTOR_HISTORY_KEPT", "DOCTOR_HISTORY_NOT_YET",
-    "DOCTOR_HISTORY_PRUNED", "DOCTOR_HOME_USUAL_NAMES", "DOCTOR_HOST_FAILED", "DOCTOR_INITIATIVE_FIX",
+    "DOCTOR_DOCUMENTS_HERS_FIX", "DOCTOR_DOCUMENTS_MAKE_FIX", "DOCTOR_DOCUMENTS_MISSING", "DOCTOR_DOCUMENTS_MKDIR_FIX",
+    "DOCTOR_DOCUMENTS_NOT_BUILT", "DOCTOR_DOCUMENTS_NOT_KB", "DOCTOR_DOCUMENTS_NO_HELPER", "DOCTOR_DOCUMENTS_OK",
+    "DOCTOR_DOCUMENTS_REBUILD_FIX", "DOCTOR_DOCUMENTS_REFUSED", "DOCTOR_DOCUMENTS_REFUSED_FIX",
+    "DOCTOR_DOCUMENTS_REFUSED_KB_FIX", "DOCTOR_DOCUMENTS_SHARE_FIX", "DOCTOR_DOCUMENTS_UNSHARED",
+    "DOCTOR_DOCUMENTS_WHY_HOME", "DOCTOR_EVENING_CONFIG", "DOCTOR_EVENING_GONE", "DOCTOR_EVENING_OFF",
+    "DOCTOR_EVENING_OFF_BY_USER", "DOCTOR_EVENING_TYPED", "DOCTOR_EVENING_UNUSED", "DOCTOR_EVENING_UNUSED_FIX",
+    "DOCTOR_HISTORY_FIX", "DOCTOR_HISTORY_KEPT", "DOCTOR_HISTORY_NOT_YET", "DOCTOR_HISTORY_PRUNED",
+    "DOCTOR_HOME_NUMBER", "DOCTOR_HOME_USUAL_NAMES", "DOCTOR_HOST_FAILED", "DOCTOR_INITIATIVE_FIX",
     "DOCTOR_INITIATIVE_OFF", "DOCTOR_INITIATIVE_OFF_BY_USER", "DOCTOR_INTERRUPT_OLD", "DOCTOR_INTERRUPT_OLD_FIX",
-    "DOCTOR_MODEL_BUILD", "DOCTOR_MODEL_CLOUD", "DOCTOR_MODEL_PROMPT", "DOCTOR_MODEL_PROMPT_FIX",
-    "DOCTOR_MODEL_PROMPT_FIX_HERS", "DOCTOR_MODEL_PROMPT_OTHER_FIX", "DOCTOR_MODEL_TAG", "DOCTOR_OLLAMA_DOWN_FIX",
-    "DOCTOR_OLLAMA_JOB_FIX", "DOCTOR_OLLAMA_NOT_LOADED_FIX", "DOCTOR_OLLAMA_OK", "DOCTOR_OLLAMA_OLD",
-    "DOCTOR_OLLAMA_SERVICE_CHANGED", "DOCTOR_OLLAMA_SERVICE_FIX", "DOCTOR_OLLAMA_SETUP_FIX",
-    "DOCTOR_OLLAMA_UPDATE_FIX", "DOCTOR_OWN_EDIT", "DOCTOR_OWN_USER_CONFIG", "DOCTOR_PICTURE_BAD",
-    "DOCTOR_PICTURE_ESTIA", "DOCTOR_PICTURE_FIX", "DOCTOR_PICTURE_LETTER", "DOCTOR_PICTURE_NONE",
-    "DOCTOR_PICTURE_OWN", "DOCTOR_PIN_CHANGED", "DOCTOR_PIN_CHANGED_FIX", "DOCTOR_PIN_FIX", "DOCTOR_PIN_FIX_UNKNOWN",
-    "DOCTOR_PIN_NONE", "DOCTOR_PIN_OK", "DOCTOR_PIN_UNREAD", "DOCTOR_POWER_FIX", "DOCTOR_POWER_NO_RESTART",
-    "DOCTOR_POWER_OFF", "DOCTOR_POWER_OK", "DOCTOR_POWER_SLEEPS", "DOCTOR_PROJECTS_CLOSED", "DOCTOR_PROJECTS_EMPTY",
-    "DOCTOR_PROJECTS_MISSING", "DOCTOR_PROJECTS_NONE_READ", "DOCTOR_PROJECTS_OK", "DOCTOR_PROJECTS_ROOT_FIX",
-    "DOCTOR_PROJECTS_SHARE_FIX", "DOCTOR_PROJECTS_SOME", "DOCTOR_REMINDERS_FIX", "DOCTOR_REMINDERS_NONE",
-    "DOCTOR_REMINDERS_STUCK", "DOCTOR_SAFETY_UNCHANGED", "DOCTOR_SIGNAL_CLI_FIX", "DOCTOR_SIGNAL_CLI_OTHER",
-    "DOCTOR_SIGNAL_UNFINISHED", "DOCTOR_SIGNAL_UNFINISHED_FIX", "DOCTOR_SOUL_CALM_OFF", "DOCTOR_SOUL_NOTHING",
-    "DOCTOR_SOUL_NO_CALLS", "DOCTOR_SOUL_NO_TEXTS", "DOCTOR_SOUL_PARTS", "DOCTOR_TEXT_ONLY", "DOCTOR_TOOLS_HERS",
-    "DOCTOR_TURN_LOADING", "DOCTOR_TURN_LOADING_FIX", "DOCTOR_TURN_OLD", "DOCTOR_TURN_SILENT",
-    "DOCTOR_TURN_UNAVAILABLE", "DOCTOR_TURN_UNAVAILABLE_FIX", "DOCTOR_VOICE_LACKS", "DOCTOR_VOICE_LOG",
-    "DOCTOR_VOICE_MODELS", "DOCTOR_VOICE_REINSTALL", "DOCTOR_VOICE_RESTART_OWN", "DOCTOR_VOICE_SILENT",
-    "DOCTOR_VOICE_TOO_OLD", "DOCTOR_YOUTUBE_DEPLOY_FIX", "DOCUMENTS_REFUSED_KB", "LINKED_FIX", "LINKED_LABEL",
-    "LINKED_MORE", "LINKED_ONE", "MODEL_CLOUD_LINE", "MODEL_LABEL", "MODEL_PAUSED_FIX", "MODEL_PAUSED_LINE",
-    "PART_FAILING", "PART_FIXES", "PART_LABELS", "PART_LABELS_PLAIN", "PART_REASONS", "PART_SET_UP_AGAIN",
-    "PART_UNTESTED", "PART_VERBS", "PART_WARNING", "PART_WORKING", "SAFETY_NUMBER_CHANGED", "SAFETY_NUMBER_FIX",
-    "SAFETY_NUMBER_LABEL", "SETUP_MODEL_FIX", "model_build_fix", "model_cloud_fix",
+    "DOCTOR_MODEL_BUILD", "DOCTOR_MODEL_CLOUD", "DOCTOR_MODEL_CONTEXT", "DOCTOR_MODEL_CONTEXT_FIX",
+    "DOCTOR_MODEL_PROMPT", "DOCTOR_MODEL_PROMPT_FIX", "DOCTOR_MODEL_PROMPT_FIX_HERS", "DOCTOR_MODEL_PROMPT_OTHER_FIX",
+    "DOCTOR_MODEL_TAG", "DOCTOR_OLLAMA_APP", "DOCTOR_OLLAMA_APP_DOWN_FIX", "DOCTOR_OLLAMA_DOWN_FIX",
+    "DOCTOR_OLLAMA_HERS_OK", "DOCTOR_OLLAMA_JOB_FIX", "DOCTOR_OLLAMA_NOT_LOADED_FIX",
+    "DOCTOR_OLLAMA_OK", "DOCTOR_OLLAMA_OLD", "DOCTOR_OLLAMA_SERVICE_CHANGED", "DOCTOR_OLLAMA_SERVICE_FIX",
+    "DOCTOR_OLLAMA_SETUP_FIX", "DOCTOR_OLLAMA_UPDATE_FIX", "DOCTOR_OWN_EDIT", "DOCTOR_OWN_USER_CONFIG",
+    "DOCTOR_PICTURE_BAD", "DOCTOR_PICTURE_ESTIA", "DOCTOR_PICTURE_FIX", "DOCTOR_PICTURE_NONE", "DOCTOR_PICTURE_OWN",
+    "DOCTOR_PIN_CHANGED", "DOCTOR_PIN_CHANGED_FIX", "DOCTOR_PIN_FIX", "DOCTOR_PIN_FIX_UNKNOWN", "DOCTOR_PIN_NONE",
+    "DOCTOR_PIN_OK", "DOCTOR_PIN_UNREAD", "DOCTOR_POCKET_CHANGED", "DOCTOR_POCKET_CHANGED_FIX",
+    "DOCTOR_POCKET_ENGLISH_OK", "DOCTOR_POCKET_LANGUAGE_CHANGED", "DOCTOR_POCKET_LANGUAGE_CHANGED_FIX", "DOCTOR_POCKET_LANGUAGE_FETCHING",
+    "DOCTOR_POCKET_LANGUAGE_IDLE", "DOCTOR_POCKET_LANGUAGE_LOADING", "DOCTOR_POCKET_LANGUAGE_NOT_YET",
+    "DOCTOR_POCKET_LANGUAGE_OLD", "DOCTOR_POCKET_LANGUAGE_UNAVAILABLE", "DOCTOR_POCKET_LOADING",
+    "DOCTOR_POCKET_LOG_FIX", "DOCTOR_POCKET_MISSING", "DOCTOR_POCKET_MISSING_FIX", "DOCTOR_POCKET_NO_PROGRAM",
+    "DOCTOR_POCKET_NO_SHIPPED", "DOCTOR_POCKET_NO_VERA", "DOCTOR_POCKET_NO_VERA_FIX", "DOCTOR_POCKET_OK", "DOCTOR_POCKET_OLD", "DOCTOR_POCKET_PROGRAM_CHANGED", "DOCTOR_POCKET_PROGRAM_FIX", "DOCTOR_POCKET_SHIPPED_CHANGED",
+    "DOCTOR_POCKET_UNAVAILABLE", "DOCTOR_POCKET_UNREAD", "DOCTOR_POCKET_UNREAD_FIX", "DOCTOR_POWER_ADAPTER_OK", "DOCTOR_POWER_BATTERY", "DOCTOR_POWER_FIX",
+    "DOCTOR_POWER_LAPTOP", "DOCTOR_POWER_LAPTOP_FIX", "DOCTOR_POWER_LAPTOP_OK", "DOCTOR_POWER_NO_RESTART", "DOCTOR_POWER_OFF", "DOCTOR_POWER_OK", "DOCTOR_POWER_SLEEPS", "DOCTOR_PROJECTS_CLOSED",
+    "DOCTOR_PROJECTS_EMPTY", "DOCTOR_PROJECTS_MISSING", "DOCTOR_PROJECTS_NONE_READ", "DOCTOR_PROJECTS_OK",
+    "DOCTOR_PROJECTS_ROOT_FIX", "DOCTOR_PROJECTS_SHARE_FIX", "DOCTOR_PROJECTS_SOME", "DOCTOR_REMINDERS_FIX",
+    "DOCTOR_REMINDERS_NONE", "DOCTOR_REMINDERS_STUCK", "DOCTOR_SAFETY_UNCHANGED", "DOCTOR_SIGNAL_ACCOUNT_BY_HAND",
+    "DOCTOR_SIGNAL_ACCOUNT_FIX", "DOCTOR_SIGNAL_ACCOUNT_NONE", "DOCTOR_SIGNAL_ACCOUNT_OK",
+    "DOCTOR_SIGNAL_ACCOUNT_UNFINISHED", "DOCTOR_SIGNAL_CLI_ESTIA_FIX", "DOCTOR_SIGNAL_CLI_FIX",
+    "DOCTOR_SIGNAL_CLI_JAVA", "DOCTOR_SIGNAL_CLI_NEWER", "DOCTOR_SIGNAL_CLI_OLD", "DOCTOR_SIGNAL_CLI_OTHER",
+    "DOCTOR_SIGNAL_CLI_RELEASED", "DOCTOR_SIGNAL_CLI_TWO", "DOCTOR_SIGNAL_CLI_TWO_FIX", "DOCTOR_SIGNAL_CLI_UNKNOWN",
+    "DOCTOR_SIGNAL_CLI_UPDATE", "DOCTOR_SIGNAL_DOWN", "DOCTOR_SIGNAL_DOWN_FIX", "DOCTOR_SIGNAL_DOWN_SINCE",
+    "DOCTOR_SIGNAL_LIMITED", "DOCTOR_SIGNAL_LIMITED_CAPTCHA", "DOCTOR_SIGNAL_LIMITED_FIX",
+    "DOCTOR_SIGNAL_LOGGED_OUT_FIX", "DOCTOR_SIGNAL_TOO_OLD_FIX", "DOCTOR_SIGNAL_UNFINISHED",
+    "DOCTOR_SIGNAL_UNFINISHED_FIX", "DOCTOR_SOUL_CALM_OFF", "DOCTOR_SOUL_NOTHING", "DOCTOR_SOUL_NO_CALLS",
+    "DOCTOR_SOUL_NO_TEXTS", "DOCTOR_SOUL_PARTS", "DOCTOR_TEXT_ONLY", "DOCTOR_TOOLS_HERS", "DOCTOR_TURN_LOADING",
+    "DOCTOR_TURN_LOADING_FIX", "DOCTOR_TURN_OLD", "DOCTOR_TURN_SILENT", "DOCTOR_TURN_UNAVAILABLE",
+    "DOCTOR_TURN_UNAVAILABLE_FIX", "DOCTOR_VOICE_LACKS", "DOCTOR_VOICE_LOG", "DOCTOR_VOICE_MODELS",
+    "DOCTOR_VOICE_REINSTALL", "DOCTOR_VOICE_RESTART_OWN", "DOCTOR_VOICE_SILENT", "DOCTOR_VOICE_TOO_OLD",
+    "DOCTOR_WEB_KEY_FIX", "DOCTOR_WEB_KEY_FIX_OWN", "DOCTOR_YOUTUBE_DEPLOY_FIX", "DOCUMENTS_REFUSED_KB", "LINKED_FIX", "LINKED_LABEL", "LINKED_MORE", "LINKED_ONE",
+    "MODEL_CLOUD_LINE", "MODEL_LABEL", "MODEL_PAUSED_FIX", "MODEL_PAUSED_LINE", "PART_FAILING", "PART_FIXES",
+    "PART_LABELS", "PART_LABELS_PLAIN", "PART_REASONS", "PART_SET_UP_AGAIN", "PART_UNTESTED", "PART_VERBS",
+    "PART_WARNING", "PART_WORKING", "SAFETY_NUMBER_CHANGED", "SAFETY_NUMBER_FIX", "SAFETY_NUMBER_LABEL",
+    "SETUP_MODEL_FIX", "SHARED_ACCOUNTS", "SHARED_ACCOUNTS_FIX", "SIGNAL_DOWN_LABEL", "SIGNAL_FAILURE_WORDS",
+    "SIGNAL_LIMIT_LABEL", "model_build_fix", "model_cloud_fix",
 ]
 # fmt: on
 
+# where her config is (setup docs review, 25 Oct: "in config.toml" sent you to your home after the move took it away;
+# ownuser.HOME and HER_CONFIG, opened with `estia config`): doctor's fixes and the calendar's reasons
+CONFIG_WHERE = (
+    "~/.config/local-assistant/config.toml; in her own macOS account /var/estia/.config/local-assistant/config.toml, "
+    "opened with /usr/bin/sudo /usr/local/estia/bin/estia config"
+)
+# review I3 (owner, 21 Oct: warn now, separate per account later): the docs' words (tests/test_docs.py pins them)
+SHARED_ACCOUNTS = (
+    "Several allowed accounts share one chat history, the profile and its notes, mail, calendars, "
+    "documents, the morning digest and the last location sent, and each one can change or remove the others' facts."
+)
+SHARED_ACCOUNTS_FIX = "keep in allowed_acis only people who may see all of it (setup_assistant.md, 2.4)"
 DOCTOR_REMINDERS_NONE = "none yet"
 DOCTOR_REMINDERS_STUCK = " · {count} stuck"
 DOCTOR_REMINDERS_FIX = "/reminders in Signal shows what failed and why; bridge.log has the details (ids only)"
@@ -72,9 +101,8 @@ DOCTOR_YOUTUBE_DEPLOY_FIX = (
     "{deploy} (if it says the root-run tools differ: read the diff, run {deploy} --update-tools, then {deploy} again)"
 )
 # doctor's Profile picture line ({file}: the picture's file name; {path}, {problem}: why it cannot be used; {name}: hers)
-DOCTOR_PICTURE_ESTIA = "Estia's e. (docs/brand/estia-avatar.png)"
+DOCTOR_PICTURE_ESTIA = "Estia's mark (docs/brand/estia-avatar.png)"
 DOCTOR_PICTURE_OWN = "{file}"
-DOCTOR_PICTURE_LETTER = "her letter, {letter}. (docs/brand/letters/{letter}.png)"  # a name other than Estia
 DOCTOR_PICTURE_NONE = "none set (Signal keeps the one it has)"
 DOCTOR_PICTURE_BAD = "{path}: {problem}; {name} runs without it (Signal keeps the one it has)"
 DOCTOR_PICTURE_FIX = 'set avatar in the config to a PNG or JPEG of at most 5 MB (or "" for none), then restart'
@@ -127,6 +155,81 @@ DOCTOR_TURN_UNAVAILABLE_FIX = (
     " could not be set aside: delete {folder} first{rights}"
 )
 DOCTOR_TURN_SILENT = "not ready: turns end after the full pause until it is"
+# doctor's Pocket TTS voices line (with [voice]): the English voices' files against their pins (voice.pocket_files) on
+# the Mac's model (owner, 26 Oct: the 100M beside Gemma 4 26B, the 18M beside 12B; {size}: 100M or 18M, {voices}: its
+# voices) and its state in the voice service's health; whatever stops them, Kokoro says her lines meanwhile ({stand_in}:
+# am_michael for alba and michael, af_heart for the others, `config.kokoro_stand_in`); while Pocket TTS is not there,
+# its limit on a call in the docs' words (owner, 28 Oct: "yes to both", words-04; calls.py's `_KokoroTurn`), the line
+# split to fit the terminal (doctor's `_pocket`)
+DOCTOR_POCKET_ENGLISH_OK = "Pocket TTS ready on its {size} model ({voices}); its files are the pinned ones"
+DOCTOR_POCKET_OK = "Pocket TTS ready; its files are the pinned ones"  # a language's (jane's)
+DOCTOR_POCKET_MISSING = (  # {size}: the model's files in MB (250 the 100M's, 130 the 18M's)
+    "not fetched yet (about {size} MB, at the voice service's start): Kokoro's {stand_in} says her lines meanwhile"
+    " (on a call, one line each time she answers; the rest comes as a Signal text)"
+)
+# the config's voice vera on a Mac with the 18M model (owner, 26 Oct: "vera stays on the 100M only"): heart, the
+# default (owner, 29 Oct), speaks there
+DOCTOR_POCKET_NO_VERA = "the config's voice vera speaks only on a Mac with 32 GB of memory or more: heart speaks here"
+DOCTOR_POCKET_NO_VERA_FIX = 'pick another with /voice (/voices lists them), or set [voice] voice = "heart"'
+# jane in the language in use (owner, 25 Oct: Spanish, Italian, Portuguese, Dutch, German or French, each its own model
+# of Pocket TTS, fetched only for the language in use); {language}: its English name
+DOCTOR_POCKET_LANGUAGE_NOT_YET = "not fetched yet: fetched the first time she speaks {language} (about 227 MB); until then Supertonic-3's F1 speaks it"
+DOCTOR_POCKET_LANGUAGE_IDLE = "fetched; checked again the first time she speaks {language} after a start"
+DOCTOR_POCKET_LANGUAGE_FETCHING = "being fetched (about 227 MB): Supertonic-3's F1 speaks {language} meanwhile"
+DOCTOR_POCKET_LANGUAGE_LOADING = "loading: Supertonic-3's F1 speaks {language} until it is ready"
+DOCTOR_POCKET_LANGUAGE_UNAVAILABLE = (
+    "unavailable (a download or a run failed; tried again when she next speaks {language} after a wait): Supertonic-3's"
+    " F1 speaks it meanwhile"
+)
+DOCTOR_POCKET_LANGUAGE_OLD = (
+    "the voice service is older than jane's {language}: Supertonic-3's F1 speaks it until it is updated"
+)
+DOCTOR_POCKET_LANGUAGE_CHANGED = "its files are not the pinned ones: never run; Supertonic-3's F1 speaks {language}"
+# a language's model is checked only once a line is asked in it, never at the voice service's start ({folder}: its own)
+DOCTOR_POCKET_LANGUAGE_CHANGED_FIX = (
+    "see {log} for why; after {restart}, the first line she speaks in {language} (a voice note or a call; she asks one"
+    " herself when she starts) sets the changed files aside and fetches them again; files that could not be set aside:"
+    " delete {folder} first{rights}"
+)
+DOCTOR_POCKET_MISSING_FIX = "wait a few minutes and run doctor again; if it stays, see {log}"
+DOCTOR_POCKET_LOADING = (
+    "loading: Kokoro's {stand_in} says her lines until it is ready (on a call, one line each time she answers; the"
+    " rest comes as a Signal text)"
+)
+DOCTOR_POCKET_UNAVAILABLE = (
+    "unavailable (a download or a run failed; tried again by itself): Kokoro's {stand_in} says her lines meanwhile"
+    " (on a call, one line each time she answers; the rest comes as a Signal text)"
+)
+DOCTOR_POCKET_LOG_FIX = "see {log} for why"
+DOCTOR_POCKET_OLD = "the voice service is older than Pocket TTS: Kokoro's {stand_in} says her lines until it is updated"
+DOCTOR_POCKET_CHANGED = "its files are not the pinned ones: never run; Kokoro's {stand_in} says her lines"
+DOCTOR_POCKET_CHANGED_FIX = (
+    "see {log} for why; the voice service sets them aside and fetches them again when it starts again: {restart};"
+    " files that could not be set aside: delete {folder} first{rights}"
+)
+DOCTOR_POCKET_NO_PROGRAM = "its program is not in her release yet: Kokoro's {stand_in} says her lines meanwhile"
+# heart's voice file for the Mac's model (owner, 27 Oct: the 100M's, `voice.POCKET_SHIPPED`; 29 Oct: the 18M's,
+# `voice.POCKET_SHIPPED_18M`), shipped in the voice service's own bundle in her release: without it only heart's lines
+# are Kokoro's (the review of 27 Oct, swift-voice-2: her other Pocket voices speak as before); {file}: its name
+# (heart.safetensors or heart-18m.safetensors), {stand_in}: heart's stand-in, af_heart
+DOCTOR_POCKET_NO_SHIPPED = (
+    "Heart's voice file ({file}) is not in her release yet: Kokoro's {stand_in} says only heart's lines meanwhile"
+)
+DOCTOR_POCKET_SHIPPED_CHANGED = (
+    "Heart's voice file ({file}) in her release is not the pinned one: never run; Kokoro's {stand_in} says only"
+    " heart's lines"
+)
+DOCTOR_POCKET_PROGRAM_CHANGED = (
+    "its program in her release is not the pinned one: never run; Kokoro's {stand_in} says her lines"
+)
+DOCTOR_POCKET_PROGRAM_FIX = (
+    "an update puts the pinned one there: {deploy} (if it says the root-run tools differ: read the diff, run {deploy}"
+    " --update-tools, then {deploy} again)"
+)
+DOCTOR_POCKET_UNREAD = "its files could not be read by this account (they are the voice service's)"
+DOCTOR_POCKET_UNREAD_FIX = (
+    "run doctor as the account that runs the voice service ({estia} doctor in her own macOS account)"
+)
 # doctor's Calls setting line: an older wording of what stops her, still read ({old}: the line, {new}: the new one)
 DOCTOR_INTERRUPT_OLD = "{old} still works"
 DOCTOR_INTERRUPT_OLD_FIX = "write {new} in [calls] instead"
@@ -134,7 +237,7 @@ DOCTOR_BARGE_UNREAD = "{barge} is not read: {new} wins"
 DOCTOR_BARGE_UNREAD_FIX = "remove barge from [calls]"
 
 # doctor's lines for the hardening (the Mac's own checks come with their words from hostsec and ownuser)
-DOCTOR_OWN_USER_CONFIG = "she runs as her own user: /usr/bin/sudo /usr/local/estia/bin/estia doctor"
+DOCTOR_OWN_USER_CONFIG = "she runs as her own macOS account: /usr/bin/sudo /usr/local/estia/bin/estia doctor"
 # doctor's "Always on": alive, not just installed (launchd's state and last exit code, the bridge's last sign of life)
 DOCTOR_ALWAYS_ON_UNREAD = "installed; whether it runs could not be read"
 DOCTOR_ALWAYS_ON_ALIVE = "running, last sign of life {when}"
@@ -150,18 +253,110 @@ DOCTOR_ALWAYS_ON_NOT_LOADED = "installed, not loaded: launchd does not run it"
 DOCTOR_ALWAYS_ON_MISSING = "not installed yet (try scripts/run.sh first)"
 # in her own user: her config is edited as her, and the bridge restarted through her wrapper
 DOCTOR_OWN_EDIT = (
-    "; in her own user: /usr/bin/sudo /usr/local/estia/bin/estia config, then /usr/bin/sudo /usr/local/estia/bin/estia "
+    "; in her own macOS account: /usr/bin/sudo /usr/local/estia/bin/estia config, then /usr/bin/sudo /usr/local/estia/bin/estia "
     "restart"
 )
 # doctor's Signal number and signal-cli lines: a registration never verified, and a version the code was not written for
 DOCTOR_SIGNAL_UNFINISHED = "signal-cli lists the bot's number, but its registration did not finish (no SMS code)"
 DOCTOR_SIGNAL_UNFINISHED_FIX = "register it again, with the SMS code: setup_assistant.md, 2.3"
+# her account without a number (Signal Login): the line is "Signal account", and it never names the Account ID
+DOCTOR_SIGNAL_ACCOUNT_OK = "her account without a number is registered with signal-cli"
+DOCTOR_SIGNAL_ACCOUNT_NONE = "signal-cli has no account for the Account ID in bot_number"
+DOCTOR_SIGNAL_ACCOUNT_UNFINISHED = "signal-cli lists her account without a number, but moving it here did not finish"
+DOCTOR_SIGNAL_ACCOUNT_FIX = (  # in her own macOS account
+    "move the account to this Mac with its Account ID and Recovery key: /usr/bin/sudo /usr/local/estia/bin/estia "
+    "signal-login (setup_assistant.md, 2.3, B)"
+)
+# before her own macOS account: setup skips its account step once a config is set up, and signal-login needs her own
+# account (review S10), so the fix is the by-hand JSON-RPC steps
+DOCTOR_SIGNAL_ACCOUNT_BY_HAND = (
+    "move the account to this Mac by hand with its Account ID and Recovery key, with the bridge stopped "
+    "(setup_assistant.md, 2.3, B: the by-hand register request), then scripts/doctor.sh again"
+)
+# signal-cli not connected for minutes (review S2): logged out by Signal it ends at every start, and /status cannot be
+# reached; status.json keeps since when, the restarts and the kind of the last end (part_status.SIGNAL_FAILURES)
+SIGNAL_DOWN_LABEL = "Signal connection"
+DOCTOR_SIGNAL_DOWN = "not connected to Signal for {minutes} min (restarts since: {restarts}; the last end: {failure})"
+DOCTOR_SIGNAL_DOWN_SINCE = "not connected to Signal since {when} (restarts since: {restarts}; the last end: {failure})"
+SIGNAL_FAILURE_WORDS = {
+    "not registered": "her account is no longer registered on this Mac",
+    "authorization failed": "Signal refused her account's sign-in",
+    "client too old": "Signal refused her signal-cli as too old",
+    "not started": "signal-cli did not start",
+    "exited": "signal-cli stopped",
+}
+DOCTOR_SIGNAL_LOGGED_OUT_FIX = (
+    "Signal logged her out: another device registered her account, or Signal ended her registration "
+    "(setup_assistant.md, 7. Operations, 'Signal logged her out'); what signal-cli said, by kind: {logs}"
+)
+DOCTOR_SIGNAL_TOO_OLD_FIX = "Upgrade signal-cli (setup_assistant.md, 7. Operations, 'Upgrade signal-cli'); what signal-cli said, by kind: {logs}"
+DOCTOR_SIGNAL_DOWN_FIX = "what signal-cli said, by kind: {logs}"
+# Signal's wait (review S4): a captcha asked for, or a rate limit longer than 10 s; no send or resend until then
+SIGNAL_LIMIT_LABEL = "Signal limit"
+DOCTOR_SIGNAL_LIMITED = "Signal limits her sending until {when}: nothing is sent until then"
+DOCTOR_SIGNAL_LIMITED_CAPTCHA = (
+    "Signal asks for a captcha before she sends more, or a wait until {when}: nothing is sent until then"
+)
+DOCTOR_SIGNAL_LIMITED_FIX = (
+    "setup_assistant.md, 7. Operations, 'Signal limits her messages' (solving the captcha is not built in: the wait "
+    "is the way for now)"
+)
 DOCTOR_SIGNAL_CLI_OTHER = (
-    "{version}: Estia is written for signal-cli 0.14.x; another version may fail to register or receive"
+    "{version}: Estia is written for signal-cli {series}.x; another version may fail to register or receive"
+)
+DOCTOR_SIGNAL_CLI_NEWER = (
+    "{version}: newer than Estia supports (signal-cli {series}.x); it may fail to register or receive"
+)
+# a signal-cli this Estia does not know yet (newer than it supports, or a release day not in its table)
+DOCTOR_SIGNAL_CLI_ESTIA_FIX = (
+    "update Estia first (git pull; in her own macOS account, then /usr/bin/sudo /usr/local/estia/bin/estia-deploy); "
+    "if it still says this, wait for the next Estia release"
+)
+DOCTOR_SIGNAL_CLI_RELEASED = "{text}, released {day}"
+DOCTOR_SIGNAL_CLI_JAVA = "{text} (the Java build she runs for calls)"
+DOCTOR_SIGNAL_CLI_UNKNOWN = "{text}: release day unknown to this Estia, so its age cannot be told"
+# with calls the bridge runs the Java build, setup and signal-login Homebrew's: both read her one Signal data folder
+# the Calls line's fixes in her own macOS account: the builds and Java reach her release only with the update (a
+# Homebrew java_home would fail her programs' check)
+DOCTOR_CALLS_BUILDS_FIX_OWN = (
+    "in your checkout: tools/call-tunnel/install-signal-cli-jvm.sh and tools/call-tunnel/build.sh{java}, then "
+    "/usr/bin/sudo /usr/local/estia/bin/estia-deploy (it copies them into her release)"
+)
+# the call helper built from other sources than this Estia's tools/call-tunnel (build.sh's stamp beside it), or
+# before Estia noted them: a later Estia's local.patch (second deep scan, signal-06)
+DOCTOR_CALL_HELPER_OLD = "not built from this Estia's sources (tools/call-tunnel), or built before Estia noted them"
+DOCTOR_CALL_HELPER_OLD_FIX_OWN = (
+    "in your checkout: tools/call-tunnel/build.sh, then /usr/bin/sudo /usr/local/estia/bin/estia-deploy (it copies "
+    "it into her release)"
+)
+DOCTOR_CALLS_JAVA_FIX_OWN = (
+    "brew install openjdk, then /usr/bin/sudo /usr/local/estia/bin/estia-deploy (it copies it into her release)"
+)
+DOCTOR_SIGNAL_CLI_TWO = (
+    "the Java build she runs for calls is {jvm}, Homebrew's (setup and signal-login) {native}: two versions on her one "
+    "Signal data folder, which setup_assistant.md keeps on one"
+)
+DOCTOR_SIGNAL_CLI_TWO_FIX = (
+    "one version for both: the Java build of Homebrew's version, then brew pin signal-cli (setup_assistant.md, 3, "
+    "Calls, step 2; the newest Java build is the one she runs); in her own macOS account, then "
+    "/usr/bin/sudo /usr/local/estia/bin/estia-deploy (it copies both into her release)"
+)
+DOCTOR_SIGNAL_CLI_OLD = (
+    "{text}: over three months old; signal-cli says a release that old may not work correctly with Signal's servers"
+)
+# with calls setup pins Homebrew's signal-cli, and brew upgrade skips a pinned formula: unpin first, pin again after
+# the Java build of the new version (second deep scan, signal-02; setup_assistant.md, 7, Upgrade signal-cli)
+DOCTOR_SIGNAL_CLI_UPDATE = (
+    "brew unpin signal-cli, then brew upgrade signal-cli (while Homebrew's is {series}.x); with calls, then "
+    "tools/call-tunnel/install-signal-cli-jvm.sh <its new version> and brew pin signal-cli again (setup_assistant.md, "
+    "7, Upgrade signal-cli); in her own macOS account, then /usr/bin/sudo /usr/local/estia/bin/estia-deploy (it copies "
+    "them into her release)"
 )
 DOCTOR_SIGNAL_CLI_FIX = (
-    "install signal-cli 0.14.x (brew install signal-cli while Homebrew's is 0.14.x); in her own user, then "
-    "/usr/bin/sudo /usr/local/estia/bin/estia-deploy (it copies it into her release)"
+    "install signal-cli {series}.x: brew unpin signal-cli, then brew upgrade signal-cli; with calls, then "
+    "tools/call-tunnel/install-signal-cli-jvm.sh <its new version> and brew pin signal-cli again (setup_assistant.md, "
+    "7, Upgrade signal-cli); in her own macOS account, then /usr/bin/sudo /usr/local/estia/bin/estia-deploy (it copies "
+    "them into her release)"
 )
 # doctor's Power line (pmset): a Mac that sleeps, or stays off after a power cut, stops her (setup_assistant.md, 2.8)
 DOCTOR_POWER_OK = "no sleep, and the Mac starts again after a power failure"
@@ -170,6 +365,24 @@ DOCTOR_POWER_NO_RESTART = "it stays off after a power failure"
 DOCTOR_POWER_OFF = "{problems}: she stops with it"
 DOCTOR_POWER_FIX = (
     "/usr/bin/sudo /usr/bin/pmset -a sleep 0 autorestart 1, or System Settings → Energy (setup_assistant.md, 2.8)"
+)
+# web search without a key (on by default; setup lets the key wait): the ways that ask for the key itself, hidden
+DOCTOR_WEB_KEY_FIX = (
+    "scripts/setup.sh --extras, then Web search: it asks for Ollama's key (ollama.com/settings/keys), hidden"
+)
+DOCTOR_WEB_KEY_FIX_OWN = (
+    "/usr/bin/sudo /usr/local/estia/bin/estia secret set web.env OLLAMA_API_KEY "
+    "(Ollama's key from ollama.com/settings/keys, at a hidden prompt)"
+)
+# a laptop (pmset names no autorestart): no start after a power failure is promised, and its lid can stop her
+DOCTOR_POWER_LAPTOP = "on a laptop, a closed lid without an external display still stops her"
+DOCTOR_POWER_LAPTOP_OK = f"no sleep in the settings in use; {DOCTOR_POWER_LAPTOP}"
+# a laptop's power adapter and battery read apart (pmset -g custom; second deep scan, macos-laptop-power-ac-only)
+DOCTOR_POWER_ADAPTER_OK = "no sleep on the power adapter"
+DOCTOR_POWER_BATTERY = "on battery the Mac sleeps after {minutes} min: keep it plugged in"
+DOCTOR_POWER_LAPTOP_FIX = (
+    "/usr/bin/sudo /usr/bin/pmset -c sleep 0 (plugged in), or System Settings → Battery → Options; "
+    "keep it plugged in, the lid open (setup_assistant.md, 2.8)"
 )
 # doctor's Your home line (share.OPEN_TEXT): as her it cannot list your home, so it looks the usual names up one by one
 DOCTOR_HOME_USUAL_NAMES = " (the usual names only: her account cannot list your home)"
@@ -257,7 +470,7 @@ LINKED_LABEL = "Her Signal account"
 LINKED_ONE = "1 device: this Mac (checked {when})"
 LINKED_MORE = "{count} devices, only this Mac expected (checked {when})"
 LINKED_FIX = (
-    "a device was linked to her number: list it with /usr/bin/sudo /usr/local/estia/bin/estia signal listDevices, remove it "
+    "a device was linked to her Signal account: list it with /usr/bin/sudo /usr/local/estia/bin/estia signal listDevices, remove it "
     "with /usr/bin/sudo /usr/local/estia/bin/estia signal removeDevice -d N, then follow SECURITY.md, "
     '"If the Mac is compromised"'
 )
@@ -272,6 +485,10 @@ MODEL_CLOUD_LINE = "answers paused since {when}: {model} is an Ollama cloud mode
 # the model for this Mac's memory (16 or 24 GB: setup.GEMMA_12B; 32 GB or more: setup.GEMMA_26B), as setup picks it
 SETUP_MODEL_FIX = "scripts/setup.sh (it downloads the model that fits this Mac's memory and makes local-worker from it)"
 DOCTOR_OLLAMA_OK = "{version} answers ({program}), with its JSON-schema library"
+DOCTOR_OLLAMA_HERS_OK = "{version} answers ({program}): her own, as {user}, with its JSON-schema library"
+# the Ollama app, chosen at setup (config: ollama = "app"; owner, 29 Oct): a "!" with its limits, in one line
+DOCTOR_OLLAMA_APP = f"the Ollama app {{version}} answers ({{program}}), as chosen at setup: {OLLAMA_APP_LIMITS}"
+DOCTOR_OLLAMA_APP_DOWN_FIX = "open the Ollama app (it runs only while someone is logged in)"
 DOCTOR_OLLAMA_OLD = "{version} answers: older than {needed}, the first with JSON-schema output on the MLX engine"
 DOCTOR_OLLAMA_DOWN_FIX = "/usr/bin/sudo /bin/launchctl kickstart -k system/{label} (setup's background service)"
 DOCTOR_OLLAMA_NOT_LOADED_FIX = (
@@ -294,6 +511,12 @@ DOCTOR_MODEL_TAG = (
 )
 DOCTOR_MODEL_BUILD = "{model} is made from {source}: " + DOCTOR_MODEL_TAG.removeprefix("{model} is ")
 
+# her model's own context window is smaller than the config counts (doctor's Model context line; review I24)
+DOCTOR_MODEL_CONTEXT = (
+    "{model} was made with a context window of {model_tokens} tokens, less than the {tokens} her config counts on "
+    "(32768 without context_tokens): Ollama cuts a longer prompt without a word, so a long chat loses its start unseen"
+)
+DOCTOR_MODEL_CONTEXT_FIX = "put context_tokens = {tokens} at the top of the config, then restart her"
 # her model gets Ollama's prompt for Gemma 4's small models (doctor's Model prompt line; ollama_build.gets_small_prompt)
 DOCTOR_MODEL_PROMPT = (
     "{model} gets Ollama's prompt for Gemma 4's small models, not Google's prompt for 12B and larger: some answers "
@@ -338,6 +561,9 @@ MODEL_PAUSED_FIX = (
     "model yourself, then restart her"
 )
 
+# [maps] home with a house number: kept and used (never refused); the map gets it without the number
+DOCTOR_HOME_NUMBER = "the home area needs only the street and the city"
+
 # What each part last did for real (part_status), in doctor and /status: written by code, never by Gemma.
 PART_LABELS = {
     "voice": "Voice",
@@ -345,7 +571,8 @@ PART_LABELS = {
     "calendar": "Calendar ({name})",  # one line per calendar
     "devices": "Lights and plugs",
     "web": "Web search",
-    "places": "Places",
+    "places": "Google Maps",
+    "osm": "OpenStreetMap",
     "spotify": "Spotify",
     "youtube": "YouTube",
     "documents": "Documents",
@@ -401,11 +628,11 @@ PART_FIXES = {
     "calendar/refused": "check that the app registration has Calendars.Read (setup_assistant.md, Calendar)",
     "calendar/no_password": "scripts/set-calendar-password.sh {name}",
     "calendar/password_refused": (
-        "a new app-specific password, then scripts/set-calendar-password.sh {name} (or check user in config.toml)"
+        f"a new app-specific password, then scripts/set-calendar-password.sh {{name}} (or check user in {CONFIG_WHERE})"
     ),
     "calendar/no_calendar": (
-        "check caldav and calendar in config.toml: the server's address and the calendar's name as the calendar app "
-        "shows it"
+        "check caldav and calendar, the server's address and the calendar's name as the calendar app shows it, in "
+        f"{CONFIG_WHERE}"
     ),
     "voice/no_answer": "check the voice service (scripts/install-voice-daemon.sh)",
     "voice/refused": "check the voice service (scripts/install-voice-daemon.sh)",
@@ -427,11 +654,11 @@ PART_FIXES = {
     "places/refused": "check the key and its APIs: scripts/setup-google-maps.sh",
     "spotify/sign_in": "scripts/spotify-login.sh",
     "spotify/refused": "scripts/spotify-login.sh",
-    "youtube/helper_missing": "cd tools/youtube && uv sync --frozen (in her own user a deploy builds it: see doctor)",
+    "youtube/helper_missing": "cd tools/youtube && uv sync --frozen (in her own macOS account a deploy builds it: see doctor)",
     "youtube/refused": "wait: YouTube refuses this Mac for a while after many requests or a bot check",
     "youtube/bad_answer": "YouTube may have changed: a newer pinned version of tools/youtube may be needed (bridge.log)",
     "documents/not_shared": (
-        "in her own user, as you (no admin rights): scripts/share-documents.sh (it makes ~/Estia-KB when missing); "
+        "in her own macOS account, as you (no admin rights): scripts/share-documents.sh (it makes ~/Estia-KB when missing); "
         "before it: mkdir -p ~/Estia-KB"
     ),
     "documents/os_refused": (
@@ -442,12 +669,12 @@ PART_FIXES = {
     "documents/os_refused/estia_kb": (
         f"{DOCUMENTS_REFUSED_KB}: bridge.log names the refusal (EPERM); SECURITY.md, known gaps"
     ),
-    "documents/helper_missing": f"{DOCTOR_DOCUMENTS_BUILD_FIX} (in her own user a deploy builds it: see doctor)",
+    "documents/helper_missing": f"{DOCTOR_DOCUMENTS_BUILD_FIX} (in her own macOS account a deploy builds it: see doctor)",
     # her start's warm-up failed, or Vision failed on a page (live, 15 Oct: under her account, before helper_env gave
     # Foundation its home): text pages are still read
     "documents/ocr_unavailable": (
         "restart her: each start tries text recognition again and reads again the scanned pages it skipped (in her "
-        "own user: /usr/bin/sudo /usr/local/estia/bin/estia restart); bridge.log names the failure"
+        "own macOS account: /usr/bin/sudo /usr/local/estia/bin/estia restart); bridge.log names the failure"
     ),
     "sign_in": "sign in again (setup_assistant.md)",
     "no_answer": "check the service and the Mac's internet connection",

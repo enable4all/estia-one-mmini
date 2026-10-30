@@ -1,0 +1,40 @@
+data: {"id":"chatcmpl-525","object":"chat.completion.chunk","created":1792681710,"model":"local-worker","system_fingerprint":"fp_ollama","choices":[{"index":0,"delta":{"role":"assistant","content":"Yes"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-525","object":"chat.completion.chunk","created":1792681710,"model":"local-worker","system_fingerprint":"fp_ollama","choices":[{"index":0,"delta":{"content":","},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-525","object":"chat.completion.chunk","created":1792681710,"model":"local-worker","system_fingerprint":"fp_ollama","choices":[{"index":0,"delta":{"content":" Ajax"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-525","object":"chat.completion.chunk","created":1792681710,"model":"local-worker","system_fingerprint":"fp_ollama","choices":[{"index":0,"delta":{"content":" won"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-525","object":"chat.completion.chunk","created":1792681710,"model":"local-worker","system_fingerprint":"fp_ollama","choices":[{"index":0,"delta":{"content":" "},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-525","object":"chat.completion.chunk","created":1792681710,"model":"local-worker","system_fingerprint":"fp_ollama","choices":[{"index":0,"delta":{"content":"2"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-525","object":"chat.completion.chunk","created":1792681710,"model":"local-worker","system_fingerprint":"fp_ollama","choices":[{"index":0,"delta":{"content":"-"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-525","object":"chat.completion.chunk","created":1792681710,"model":"local-worker","system_fingerprint":"fp_ollama","choices":[{"index":0,"delta":{"content":"1"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-525","object":"chat.completion.chunk","created":1792681710,"model":"local-worker","system_fingerprint":"fp_ollama","choices":[{"index":0,"delta":{"content":" on"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-525","object":"chat.completion.chunk","created":1792681710,"model":"local-worker","system_fingerprint":"fp_ollama","choices":[{"index":0,"delta":{"content":" Sunday"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-525","object":"chat.completion.chunk","created":1792681710,"model":"local-worker","system_fingerprint":"fp_ollama","choices":[{"index":0,"delta":{"content":","},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-525","object":"chat.completion.chunk","created":1792681710,"model":"local-worker","system_fingerprint":"fp_ollama","choices":[{"index":0,"delta":{"content":" according"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-525","object":"chat.completion.chunk","created":1792681710,"model":"local-worker","system_fingerprint":"fp_ollama","choices":[{"index":0,"delta":{"content":" to"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-525","object":"chat.completion.chunk","created":1792681710,"model":"local-worker","system_fingerprint":"fp_ollama","choices":[{"index":0,"delta":{"content":" nos"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-525","object":"chat.completion.chunk","created":1792681710,"model":"local-worker","system_fingerprint":"fp_ollama","choices":[{"index":0,"delta":{"content":"."},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-525","object":"chat.completion.chunk","created":1792681710,"model":"local-worker","system_fingerprint":"fp_ollama","choices":[{"index":0,"delta":{"content":"nl"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-525","object":"chat.completion.chunk","created":1792681710,"model":"local-worker","system_fingerprint":"fp_ollama","choices":[{"index":0,"delta":{"content":"."},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-525","object":"chat.completion.chunk","created":1792681710,"model":"local-worker","system_fingerprint":"fp_ollama","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: {"id":"chatcmpl-525","object":"chat.completion.chunk","created":1792681710,"model":"local-worker","system_fingerprint":"fp_ollama","choices":[],"usage":{"prompt_tokens":6889,"prompt_tokens_details":{"cached_tokens":6716},"completion_tokens":21,"total_tokens":6910},"timings":{"prompt_n":6889,"prompt_ms":197,"prompt_per_token_ms":0.02859631296269415,"prompt_per_second":34969.543147208125,"predicted_n":21,"predicted_ms":622,"predicted_per_token_ms":29.61904761904762,"predicted_per_second":33.762057877813504}}
+
+data: [DONE]
+

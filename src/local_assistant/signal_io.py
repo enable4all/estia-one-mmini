@@ -2,7 +2,8 @@
 
 Only this module talks to signal-cli, and it refuses to send anything to an account
 outside the allowlist, so a bug or a prompt injection cannot message third parties.
-signal-cli's own log lines (stderr) go into the bridge log.
+signal-cli's own log lines (stderr) go into the bridge log summed up (`stderr_line`), and an error is logged by its type
+and code (`shown_error`): signal-cli's words can name a number, an account or a captcha's challenge token.
 """
 
 from __future__ import annotations
@@ -17,7 +18,7 @@ import os
 import re
 import time
 import urllib.parse
-from collections.abc import AsyncIterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -27,18 +28,127 @@ from local_assistant.signal_text import valid
 log = logging.getLogger(__name__)
 
 UNTRUSTED_KEY_ERROR = -4  # signal-cli SignalJsonRpcCommandHandler.UNTRUSTED_KEY_ERROR
+RATE_LIMIT_ERROR = -5  # its RATELIMIT_ERROR: Signal's server limits her sending for now
+CAPTCHA_REJECTED_ERROR = -6  # its CAPTCHA_REJECTED_ERROR: Signal refused the captcha given
+RATE_LIMIT_WAIT_S = 10.0  # a rate limit that lifts within this is waited out before the next try; a longer one is not
+CAPTCHA_STEPS = "setup_assistant.md, 7. Operations, 'Signal limits her messages'"
 
 
 class SignalError(Exception):
-    """signal-cli reported an error, did not answer, or is not running."""
+    """signal-cli reported an error, did not answer, or is not running. Its text is code's own words only: signal-cli's
+    own (they can name the recipient's number or account and a captcha's challenge token) are kept in `detail`, never
+    in the text a traceback prints (review S1)."""
 
-    def __init__(self, message: str, code: int | None = None) -> None:
+    def __init__(self, message: str, code: int | None = None, *, detail: str = "") -> None:
         super().__init__(message)
         self.code = code
+        self.detail = detail  # signal-cli's words: never logged, never shown
+
+    def wait(self, pause: float) -> float | None:
+        """Seconds to wait before the next try of what failed (`pause`, the caller's own), None for no try now."""
+        return pause
 
 
 class UntrustedIdentityError(SignalError):
     """The recipient's safety number changed and has not been confirmed (signal-cli trust)."""
+
+
+class RateLimitError(SignalError):
+    """Signal's server refused for now (-5): `retry_after` seconds when it said; `proof_required` when it asks for a
+    captcha first (a challenge came), lifted by a solved captcha or after that wait: no try now either way."""
+
+    def __init__(
+        self,
+        message: str,
+        code: int | None = None,
+        *,
+        retry_after: float | None = None,
+        proof_required: bool = False,
+        detail: str = "",
+    ) -> None:
+        super().__init__(message, code, detail=detail)
+        self.retry_after = retry_after
+        self.proof_required = proof_required
+
+    def wait(self, pause: float) -> float | None:
+        if self.proof_required or (self.retry_after or 0) > RATE_LIMIT_WAIT_S:
+            return None
+        return pause if self.retry_after is None else self.retry_after
+
+
+class CaptchaRejectedError(SignalError):
+    """Signal refused the captcha given (-6): a new one is needed, so no try now."""
+
+    def wait(self, pause: float) -> float | None:
+        return None
+
+
+def shown_error(exc: BaseException) -> str:
+    """An error for the log: its type and, for signal-cli's, its JSON-RPC code. Never its words: signal-cli's message
+    can name the recipient's number or account, and for a captcha request the challenge token (0.14.9: 'CAPTCHA proof
+    required for sending to "%s", … with challenge token "%s"'); NotAllowedError's names the recipient."""
+    code = exc.code if isinstance(exc, SignalError) else None
+    return type(exc).__name__ + (f" (code {code})" if code is not None else "")
+
+
+# signal-cli's stderr, summed up (review S1): its log lines ("WARN  SendHelper - …", `--scrub-log` does not reach a
+# challenge token) and its plain error lines ("User <number> is not registered.") name numbers, accounts and tokens.
+# Logged: the level, the class that logged, the first kind below its words match and the exceptions it names.
+_LOG_LINE = re.compile(r"^(ERROR|WARN|INFO|DEBUG|TRACE)\s+([A-Za-z0-9_$.]{1,60})\s+-\s+(.*)$")
+_FRAME = re.compile(r"^(?:at\s|\.\.\.\s\d+\s(?:more|common))")  # a Java stack frame, "... 12 more"
+_EXCEPTION = re.compile(r"\b[A-Z][A-Za-z0-9]{0,60}(?:Exception|Error)\b")
+STDERR_KINDS = (  # (kind, its words): the account's own state first
+    ("not registered", re.compile(r"\bis not registered\b|\bNotRegisteredException\b", re.IGNORECASE)),
+    ("authorization failed", re.compile(r"authori[sz]ation failed|AUTHENTICATION_FAILED", re.IGNORECASE)),
+    ("client too old", re.compile(r"DeprecatedVersion|deprecated version|\[499\]", re.IGNORECASE)),
+    ("captcha asked", re.compile(r"proof required|ProofRequired|captcha", re.IGNORECASE)),
+    ("rate limit", re.compile(r"rate limit|RateLimit", re.IGNORECASE)),
+)
+ACCOUNT_KINDS = frozenset({"not registered", "authorization failed", "client too old"})  # her account, not a send
+
+
+def stderr_line(line: str) -> tuple[str, str | None]:
+    """One line of signal-cli's stderr as the log keeps it, and its kind (STDERR_KINDS) when its words name one:
+    ("signal-cli: WARN SendHelper: captcha asked (ProofRequiredException; 190 characters not logged)", "captcha
+    asked"). A stack frame or an empty line: ("", None). Never a word of its message."""
+    text = line.strip()
+    if not text or _FRAME.match(text):
+        return "", None
+    found = _LOG_LINE.match(text)
+    source = f"{found.group(1)} {found.group(2)}: " if found else ""
+    words = found.group(3) if found else text
+    kind = next((name for name, pattern in STDERR_KINDS if pattern.search(words)), None)
+    exceptions = list(dict.fromkeys(_EXCEPTION.findall(words)))[:3]
+    extra = "; ".join([", ".join(exceptions)] if exceptions else [])
+    left_out = f"{len(text)} characters not logged"
+    return f"signal-cli: {source}{kind or 'a line'} ({extra + '; ' if extra else ''}{left_out})", kind
+
+
+def rate_limited(message: str, data: object) -> RateLimitError:
+    """A -5 answer as its error: the longest `retryAfterSeconds` of the send's results and whether one carries a
+    challenge (`token`: Signal wants a captcha), read from the error's data; logged without the token."""
+    response = data.get("response") if isinstance(data, dict) else None
+    results = response.get("results") if isinstance(response, dict) else None
+    rows = [row for row in results if isinstance(row, dict)] if isinstance(results, list) else []
+    waits = [float(row["retryAfterSeconds"]) for row in rows if isinstance(row.get("retryAfterSeconds"), int | float)]
+    error = RateLimitError(
+        "Signal limits her sending",
+        RATE_LIMIT_ERROR,
+        retry_after=max(waits, default=None),
+        proof_required=any(row.get("token") for row in rows),
+        detail=message,
+    )
+    if error.proof_required:  # lifted by a captcha, or after Signal's wait (signal-cli: "or wait N seconds")
+        log.error(
+            "signal-cli: Signal asks for a captcha before she sends more%s; her messages stop until then (%s)",
+            f", or after {error.retry_after:.0f} s" if waits else "",
+            CAPTCHA_STEPS,
+        )
+    else:
+        log.warning(
+            "signal-cli: Signal limits her sending (rate limit%s)", f", {error.retry_after:.0f} s" if waits else ""
+        )
+    return error
 
 
 # One JSON line can carry a whole photo as base64 (20 MB → 26.7 MB), see getAttachment.
@@ -113,19 +223,39 @@ def signal_cli_command(
     ]
 
 
+def signal_data() -> Path:
+    """signal-cli's data folder under $HOME, the folder signal-cli uses by default, named on every command of hers
+    (the bridge's, `estia signal`, `signal-login`, the Registration Lock): her own user's account record keeps
+    /var/empty as home, where Java would look."""
+    return Path.home() / ".local" / "share" / "signal-cli"
+
+
+def jvm_opts(home: Path | None) -> str:
+    """JAVA_OPTS for the JVM signal-cli: IPv4, and `home` as Java's user.home (JAVA_OPTS splits on spaces: a home
+    with a space stays out; signal-cli's data folder is given with --config anyway)."""
+    return IPV4 + (f" -Duser.home={home}" if home is not None and not any(c.isspace() for c in str(home)) else "")
+
+
 def call_env(*, java_home: Path | None, tunnel: Path, socket_dir: Path, home: Path | None = None) -> dict[str, str]:
     """What the JVM signal-cli and the call helper it starts per call need, on top of the bridge's environment:
     Java (none given: the launcher looks for `java` itself), IPv4, our signal-call-tunnel build in pipe mode
-    (audio over a Unix socket in a private folder). `home` becomes Java's user.home (JAVA_OPTS splits on spaces:
-    a home with a space stays out; signal-cli's data folder is given with --config anyway)."""
-    user_home = f" -Duser.home={home}" if home is not None and not any(c.isspace() for c in str(home)) else ""
+    (audio over a Unix socket in a private folder). `home` becomes Java's user.home (`jvm_opts`)."""
     return {
         **({"JAVA_HOME": str(java_home)} if java_home is not None else {}),
-        "JAVA_OPTS": IPV4 + user_home,
+        "JAVA_OPTS": jvm_opts(home),
         "SIGNAL_CALL_TUNNEL_BIN": str(tunnel),
         "SIGNAL_CALL_TUNNEL_AUDIO_MODE": "pipe",
         "SIGNAL_CALL_TUNNEL_SOCKET_DIR": str(socket_dir),
     }
+
+
+ATTACHMENT_BYTES_PER_SECOND = 200_000  # a send with a file gets 1 s more per 200 KB (review O9: a 25 MB PDF, 185 s)
+
+
+def attachment_timeout(base: float, size: int) -> float:
+    """The time signal-cli gets for a send with a file of `size` bytes: the request limit plus 1 s per 200 KB, so a slow
+    upload is not reported failed while signal-cli may still deliver it (a retry would send it twice)."""
+    return base + size / ATTACHMENT_BYTES_PER_SECOND
 
 
 # Put on the call-event stream when signal-cli stops: its calls (and their helpers) are gone.
@@ -165,10 +295,25 @@ class SignalClient:
         self._supervisor: asyncio.Task[None] | None = None
         self._stopping = False
         self.restarts = 0
+        self._watchers: list[Callable[[bool, str], None]] = []
+        self._run_failure = ""  # what this run's stderr said of her account (ACCOUNT_KINDS), if anything
 
     @property
     def ready(self) -> bool:
         return self._ready.is_set()
+
+    def watch(self, callback: Callable[[bool, str], None]) -> None:
+        """`callback(ready, failure)` each time signal-cli is ready (subscribed; failure "") and each time a run of it
+        ends while not stopping (failure: what its stderr said of her account, `ACCOUNT_KINDS`, or "exited"; never
+        its words). Logged out by Signal it ends at every start, restarted up to every `backoff_max` (review S2)."""
+        self._watchers.append(callback)
+
+    def _tell(self, ready: bool, failure: str) -> None:
+        for callback in self._watchers:
+            try:
+                callback(ready, failure)
+            except Exception:  # a watcher never stops signal-cli
+                log.exception("signal-cli: a watcher failed")
 
     async def start(self) -> None:
         """Start supervising signal-cli and wait until it is subscribed (TimeoutError if it never is)."""
@@ -251,14 +396,16 @@ class SignalClient:
             raise SignalError("send returned no timestamp")
         return timestamp
 
-    async def send_document(self, aci: str, data: bytes, filename: str) -> int:
-        """Send a PDF back to the allowed user who asked (/docs send N): signal-cli 0.14.9's send takes
-        "attachments" as paths or RFC 2397 data links with a URL-encoded filename parameter. The bytes go inline, so
-        signal-cli opens no file in the documents folder (nothing a link swapped in could redirect)."""
+    async def send_document(self, aci: str, data: bytes, filename: str, media_type: str = "application/pdf") -> int:
+        """Send a document back to the allowed user who asked (/docs send N), as `media_type` (a PDF's, or a text
+        file's: documents.media_type): signal-cli 0.14.9's send takes "attachments" as paths or RFC 2397 data links
+        with a URL-encoded filename parameter. The bytes go inline, so signal-cli opens no file in the documents folder
+        (nothing a link swapped in could redirect)."""
         self._check_allowed(aci)
         name = urllib.parse.quote(filename, safe="")
-        link = f"data:application/pdf;filename={name};base64,{base64.b64encode(data).decode('ascii')}"
-        result = await self.request("send", {"recipient": [aci], "attachments": [link]})
+        link = f"data:{media_type};filename={name};base64,{base64.b64encode(data).decode('ascii')}"
+        limit = attachment_timeout(self._request_timeout, len(data))
+        result = await self.request("send", {"recipient": [aci], "attachments": [link]}, answer_within=limit)
         timestamp = result.get("timestamp") if isinstance(result, dict) else None
         if not isinstance(timestamp, int):
             raise SignalError("send returned no timestamp")
@@ -293,18 +440,22 @@ class SignalClient:
         except binascii.Error as exc:
             raise SignalError("getAttachment returned invalid base64") from exc
 
-    async def request(self, method: str, params: dict[str, Any] | None = None) -> Any:
+    async def request(
+        self, method: str, params: dict[str, Any] | None = None, *, answer_within: float | None = None
+    ) -> Any:
+        """One JSON-RPC request; `answer_within`: its answer's limit in seconds, when not the request limit (a send with
+        a file)."""
         try:
             await asyncio.wait_for(self._ready.wait(), self._request_timeout)
         except TimeoutError as exc:
             raise SignalError("signal-cli is not running") from exc
-        return await self._call(method, params or {})
+        return await self._call(method, params or {}, answer_within=answer_within)
 
     def _check_allowed(self, aci: str) -> None:
         if aci.lower() not in self._allowed:
-            raise NotAllowedError(f"recipient {aci} is not on the allowlist")
+            raise NotAllowedError("the recipient is not on the allowlist")  # never named: a traceback prints it
 
-    async def _call(self, method: str, params: dict[str, Any]) -> Any:
+    async def _call(self, method: str, params: dict[str, Any], *, answer_within: float | None = None) -> Any:
         proc = self._proc
         if proc is None or proc.stdin is None:
             raise SignalError("signal-cli is not running")
@@ -316,7 +467,7 @@ class SignalClient:
         try:
             proc.stdin.write(line.encode() + b"\n")
             await proc.stdin.drain()
-            return await asyncio.wait_for(future, self._request_timeout)
+            return await asyncio.wait_for(future, self._request_timeout if answer_within is None else answer_within)
         except TimeoutError as exc:
             raise SignalError(f"signal-cli did not answer {method}") from exc
         except (BrokenPipeError, ConnectionResetError) as exc:
@@ -333,15 +484,19 @@ class SignalClient:
             except asyncio.CancelledError:
                 raise
             except SignalError as exc:
-                log.warning("signal-cli: %s", exc)
-            except Exception:
-                log.exception("signal-cli failed")
+                log.warning("signal-cli: %s", shown_error(exc))
+            except OSError as exc:  # its program could not be started
+                self._run_failure = self._run_failure or "not started"
+                log.error("signal-cli failed: %s", shown_error(exc))
+            except Exception as exc:  # never its traceback's words either
+                log.error("signal-cli failed: %s", shown_error(exc))
             self._ready.clear()
             self._fail_pending(SignalError("signal-cli exited"))
             if self._calls:
                 self._call_events.put_nowait(dict(RESTART_ENDS_CALLS))
             if self._stopping:
                 break
+            self._tell(False, self._run_failure or "exited")
             if time.monotonic() - started >= self._stable_after:
                 delay = self._backoff_start
             self.restarts += 1
@@ -350,6 +505,7 @@ class SignalClient:
             delay = min(delay * 2, self._backoff_max)
 
     async def _run_once(self) -> None:
+        self._run_failure = ""
         self._proc = await asyncio.create_subprocess_exec(
             *self._command,
             stdin=asyncio.subprocess.PIPE,
@@ -368,15 +524,18 @@ class SignalClient:
                 try:
                     await self._call("subscribeCallEvents", {})
                 except SignalError as exc:
-                    log.warning("signal-cli: no call events (%s); calls are off until it restarts", exc)
+                    log.warning("signal-cli: no call events (%s); calls are off until it restarts", shown_error(exc))
             await self._call("subscribeReceive", {})
             self._ready.set()
             log.info("signal-cli ready (pid %s)", self._proc.pid)
+            self._tell(True, "")
             await reader
         finally:
             reader.cancel()
-            stderr.cancel()
             await self._terminate()
+            with contextlib.suppress(TimeoutError, asyncio.CancelledError):  # its last lines say why it ended
+                await asyncio.wait_for(asyncio.shield(stderr), 1.0)
+            stderr.cancel()
 
     async def _read(self, proc: asyncio.subprocess.Process) -> None:
         if proc.stdout is None:
@@ -401,7 +560,11 @@ class SignalClient:
         if proc.stderr is None:
             return
         while line := await proc.stderr.readline():
-            log.info("signal-cli: %s", line.decode(errors="replace").rstrip()[:500])
+            text, kind = stderr_line(line.decode(errors="replace"))
+            if kind in ACCOUNT_KINDS:
+                self._run_failure = kind
+            if text:
+                log.info("%s", text)
 
     def _dispatch(self, obj: dict[str, Any]) -> None:
         if "id" in obj and obj.get("method") is None:
@@ -413,8 +576,12 @@ class SignalClient:
                 code = error.get("code")
                 code = code if isinstance(code, int) else None
                 message = str(error.get("message", "signal-cli error"))
-                error_type = UntrustedIdentityError if code == UNTRUSTED_KEY_ERROR else SignalError
-                future.set_exception(error_type(message, code))
+                if code == RATE_LIMIT_ERROR:
+                    future.set_exception(rate_limited(message, error.get("data")))
+                    return
+                typed = {UNTRUSTED_KEY_ERROR: UntrustedIdentityError, CAPTCHA_REJECTED_ERROR: CaptchaRejectedError}
+                words = "signal-cli refused the request" + (f" (code {code})" if code is not None else "")
+                future.set_exception(typed.get(code or 0, SignalError)(words, code, detail=message))
             else:
                 future.set_result(obj.get("result"))
             return

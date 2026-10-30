@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash
 # The Mac's security step around her: each setting with its state and one line on why; on your yes it is applied
 # (your Mac password when first needed): SSH with keys only, no passwordless sudo, her files private, her
 # Registration Lock. What only you can change (FileVault, automatic login, the screen lock, security responses, other
@@ -9,6 +9,7 @@
 #                                keychain lock: it may stop other services on this Mac (it says how, then asks each)
 #   scripts/harden.sh --new-pin  also a new Registration Lock PIN while the lock is on (after a compromise)
 set -euo pipefail
+PATH="/usr/bin:/bin:/usr/sbin:/sbin:$PATH"  # the Mac's own tools first, then your PATH's (uv, Homebrew's)
 repo="$(cd "$(dirname "$0")/.." && pwd)"
 python="$repo/.venv/bin/python"
 [[ $EUID -ne 0 ]] || { echo "run it as yourself: it asks for sudo once, before it changes anything" >&2; exit 2; }

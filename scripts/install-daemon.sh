@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash
 # Always on, run by the user (asks for sudo): she runs as her own hidden user _estia, from a root-owned release in
 # /usr/local/estia, and starts at boot without a login.
 #   First time, or from an install that runs as you: the move into her own user (scripts/migrate-to-own-user.sh).
@@ -6,6 +6,7 @@
 # Undo, within 7 days of moving an install that ran as you: scripts/migrate-to-own-user.sh --rollback (a first
 # install has nothing to go back to: her only copy is in /var/estia)
 set -euo pipefail
+PATH="/usr/bin:/bin:/usr/sbin:/sbin:$PATH"  # the Mac's own tools first, then your PATH's (uv, Homebrew's)
 here="$(cd "$(dirname "$0")" && pwd)"  # before any cd: $0 may be relative to where it was started
 repo="$(cd "$here/.." && pwd)"
 cd "$repo"

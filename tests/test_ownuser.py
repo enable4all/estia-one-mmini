@@ -5,10 +5,11 @@ import json
 import os
 import plistlib
 import shutil
+import signal
 import stat
 import subprocess
 import time
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -109,7 +110,7 @@ def test_the_plists_render_with_her_values(tmp_path: Path, label: str) -> None:
     log = "/var/log/estia/" + {"bridge": "launchd.log", "voice": "voice.log"}[label]
     assert (
         plist["StandardOutPath"] == plist["StandardErrorPath"] == log
-    )  # launchd opens it as root: never in her folder
+    )  # in root's folder, never hers: no link can be planted at its name (launchd opens it as her)
     assert plist["Umask"] == 63
     if label == "bridge":
         assert (
@@ -139,6 +140,10 @@ def installed(root: Path, *, user: str = ROLE_USER, program: str = "/usr/local/e
         "GroupName": user,
         "ProgramArguments": [program],
         "EnvironmentVariables": {"HOME": "/var/estia", "CFFIXED_USER_HOME": "/var/estia"},
+        "Umask": 63,
+        "RunAtLoad": True,
+        "KeepAlive": True,
+        "ThrottleInterval": 30,
     }
     (daemons / "com.local-assistant.bridge.plist").write_bytes(plistlib.dumps(plist))
     (daemons / "com.local-assistant.bridge.plist").chmod(0o644)
@@ -175,6 +180,54 @@ def test_a_finished_install_is_ok(tmp_path: Path, as_her: None) -> None:
     installed(tmp_path)
     found = by_key(ownuser.install_checks(tmp_path))
     assert {key: check.status for key, check in found.items()} == {"own_user": "ok", "code": "ok", "plists": "ok"}
+
+
+def root_tools(root: Path, release: Path, python: str = "3.13.9") -> Path:
+    """The root-run tools as the first release installed them: its tool files and a Python of their own."""
+    from local_assistant.deploy import TOOL_FILES
+
+    tools = root / "usr/local/estia/tools"
+    for folder in (release, tools):
+        for rel in TOOL_FILES:
+            (folder / rel).parent.mkdir(parents=True, exist_ok=True)
+            (folder / rel).write_text(f"# {rel}\n")
+        interp = folder / f"python/cpython-{python}-macos-aarch64-none/bin/python3.13"
+        interp.parent.mkdir(parents=True, exist_ok=True)
+        interp.write_text("#!/bin/sh\n")
+    (tools / "tools.json").write_text(json.dumps({"release": release.name}))
+    return tools
+
+
+def test_root_run_tools_that_are_not_the_live_releases_are_named(tmp_path: Path, as_her: None) -> None:
+    """A release that changed a root-run file or their Python says so once, at its deploy: doctor names it until
+    --update-tools takes it, so root never runs a stale copy unseen (review I22)."""
+    release = installed(tmp_path)
+    tools = root_tools(tmp_path, release)
+    assert "tools" not in by_key(ownuser.install_checks(tmp_path))  # the same: no line
+    (release / "scripts/estia").write_text("# changed\n")
+    old = release / "python/cpython-3.13.9-macos-aarch64-none"
+    old.rename(release / "python/cpython-3.13.12-macos-aarch64-none")
+    check = by_key(ownuser.install_checks(tmp_path))["tools"]
+    assert check.status == "warn" and check.part == "Root-run tools"
+    assert "scripts/estia" in check.text and "Python 3.13.9 → 3.13.12" in check.text
+    assert check.fix.startswith("/usr/bin/sudo /usr/local/estia/bin/estia-deploy --update-tools")
+    assert (tools / "scripts/estia").read_text() == "# scripts/estia\n"  # read only
+
+
+@pytest.mark.parametrize("where", ["release", "tools"])
+def test_a_python_that_runs_a_file_at_every_start_is_named(tmp_path: Path, as_her: None, where: str) -> None:
+    """A .pth file in the live release's Python of the same version (your account builds it) never reaches the tools,
+    and doctor names it, as it names one in the tools' own Python, which root runs (release review D1)."""
+    release = installed(tmp_path)
+    tools = root_tools(tmp_path, release)
+    site = (release if where == "release" else tools) / "python/cpython-3.13.9-macos-aarch64-none/lib/python3.13"
+    (site / "site-packages").mkdir(parents=True)
+    (site / "site-packages/planted.pth").write_text("import os\n")
+    check = by_key(ownuser.install_checks(tmp_path))["tools"]
+    assert check.status == "fail" and check.part == "Root-run tools", check
+    assert "site-packages/planted.pth" in check.text and "every start" in check.text
+    whose = "the live release's Python" if where == "release" else "their own Python"
+    assert whose in check.text, check.text
 
 
 def test_code_the_owner_can_change_is_a_failure(tmp_path: Path, as_her: None) -> None:
@@ -485,7 +538,11 @@ def test_the_preflight_stops_before_anything_changes(tmp_path: Path, no_user: No
     assert seen == [] and host.asked == []  # nothing built, nothing run
     text = "\n".join(said)
     assert "Nothing changed" in text
-    assert {"config": "scripts/setup.sh", "account": "registers", "verified": "registers"}[missing] in text
+    # her config set up, her Signal account gone: setup skips its Signal step there, so the fix names the way that
+    # works (c-5, round 3): her config renamed, then setup sets her Signal account up again
+    gone = "mv ~/.config/local-assistant ~/.config/local-assistant.old"
+    assert {"config": "scripts/setup.sh", "account": gone, "verified": gone}[missing] in text
+    assert "scripts/setup.sh registers it" not in text
 
 
 def test_a_number_counts_as_her_account_only_once_verified(tmp_path: Path) -> None:
@@ -665,6 +722,27 @@ def test_the_rollback_brings_back_her_old_setup_with_what_she_saved_since(tmp_pa
 
 
 @needs_plutil
+def test_the_rollback_removes_a_service_of_hers_added_after_the_move(tmp_path: Path, no_user: None) -> None:
+    """A move without the voice service, then the voice service installed as her (estia-deploy --voice): the
+    rollback stopped it but left its file, so it started as _estia again at the next boot (release review D7)."""
+    said: list[str] = []
+    move, _host, home, root = migration(tmp_path)
+    her_old_setup(home, root)
+    daemons = root / "Library/LaunchDaemons"
+    (daemons / f"{ownuser.VOICE}.plist").unlink()  # your setup had no voice service
+    assert move.run() == 0
+    voice = daemons / f"{ownuser.VOICE}.plist"
+    voice.write_bytes(plistlib.dumps({"Label": ownuser.VOICE, "UserName": ROLE_USER}))  # added since, as her
+    back, host2, _, _ = migration(tmp_path, mode="rollback", said=said)
+    assert back.rollback() == 0
+    assert (daemons / f"{ownuser.BRIDGE}.plist").read_bytes() == OLD_PLIST
+    assert not voice.exists(), "her voice service would start as _estia at the next boot"
+    assert (ownuser.LAUNCHCTL, "bootout", f"system/{ownuser.VOICE}") in host2.asked
+    assert not any(argv[:2] == (ownuser.LAUNCHCTL, "bootstrap") and ownuser.VOICE in argv[-1] for argv in host2.asked)
+    assert any(ownuser.VOICE in line and "removed" in line for line in said), said
+
+
+@needs_plutil
 def test_the_rollback_never_copies_a_program_of_hers_into_your_folders(tmp_path: Path, no_user: None) -> None:
     """Her vendor/ folder is code, never data (the move leaves it out too): a launcher planted there by her account
     would run as you, from your data folder, after the rollback."""
@@ -685,21 +763,61 @@ def test_the_rollback_never_copies_a_program_of_hers_into_your_folders(tmp_path:
     assert (home / "Library/Application Support/local-assistant/assistant.db").read_text() == "a week of messages"
 
 
+@needs_plutil
+@pytest.mark.parametrize("planted", ["program", "link"])
+def test_what_her_account_adds_after_the_check_never_reaches_your_folders(
+    tmp_path: Path, no_user: None, monkeypatch: pytest.MonkeyPatch, planted: str
+) -> None:
+    """The rollback checked her newer data, then copied it by name: a program or a link a process of hers still
+    running added in between reached your folders. What arrives is checked again before any of it is yours, and the
+    rollback stops (release review D4)."""
+    move, _host, home, root = migration(tmp_path)
+    her_old_setup(home, root)
+    assert move.run() == 0
+    her = root / "var/estia"
+    (her / ".local/share/signal-cli/data/111111.d/account.db").write_text("ratchet moved on")
+    said: list[str] = []
+    back, _host2, _, _ = migration(tmp_path, mode="rollback", said=said)
+    journals = back._stale_journals
+    late = her / ".local/share/signal-cli/data/late"
+
+    def plant_late(present: Sequence[str], owner: ownuser.Owner) -> list[Path]:
+        if planted == "program":  # after the check, before the copy: a process of hers that still runs
+            late.write_text("#!/bin/sh\n")
+            late.chmod(0o755)
+        else:
+            late.symlink_to(home / ".ssh")
+        return journals(present, owner)
+
+    monkeypatch.setattr(back, "_stale_journals", plant_late)
+    assert back.rollback() == 1
+    text = "\n".join(said)
+    assert not os.path.lexists(home / ".local/share/signal-cli/data/late"), text
+    assert (home / ".local/share/signal-cli/data/111111.d/account.db").read_text() == "signal"  # nothing copied
+    assert "data/late" in text and f"She runs as {ROLE_USER} again" in text, text
+    assert not [p for p in home.iterdir() if p.name.startswith(".estia-rollback")]  # its own copy removed
+    assert ownuser.moved(root)
+
+
 def plant(her: Path, home: Path, planted: str) -> Path:
-    """What her data never holds, put in her config folder: a program, a link out of her home or a FIFO."""
+    """What her data never holds, put in her config folder: a program, a link out of her home, a link that stays in
+    her home but leaves its folder (copied back into yours, it leads to your file of that name: review I37) or a
+    FIFO."""
     odd = her / ".config/local-assistant/hook"
     if planted == "program":
         odd.write_text("#!/bin/sh\n")
         odd.chmod(0o700)
     elif planted == "link":
         odd.symlink_to(home / ".ssh")
+    elif planted == "link in her home":
+        odd.symlink_to("../../.ssh/authorized_keys")
     else:
         os.mkfifo(odd)
     return odd
 
 
 @needs_plutil
-@pytest.mark.parametrize("planted", ["program", "link", "fifo"])
+@pytest.mark.parametrize("planted", ["program", "link", "link in her home", "fifo"])
 def test_the_rollback_refuses_her_newer_data_with_a_program_or_a_way_out_and_changes_nothing(
     tmp_path: Path, no_user: None, planted: str
 ) -> None:
@@ -767,7 +885,7 @@ def test_a_rollback_whose_copy_back_fails_starts_her_again_never_your_old_sessio
 
 
 @needs_plutil
-@pytest.mark.parametrize("planted", ["program", "link", "fifo"])
+@pytest.mark.parametrize("planted", ["program", "link", "link in her home", "fifo"])
 def test_a_failed_move_after_she_ran_defuses_what_her_data_never_holds_then_copies_it_back(
     tmp_path: Path, no_user: None, planted: str
 ) -> None:
@@ -797,6 +915,240 @@ def test_a_failed_move_after_she_ran_defuses_what_her_data_never_holds_then_copi
     assert any("/var/estia/.config/local-assistant/hook" in line and line.startswith("!") for line in said), said
     for label in ownuser.LABELS:
         assert (root / f"Library/LaunchDaemons/{label}.plist").read_bytes() == OLD_PLIST
+
+
+class LogsHost(RecordingHost):
+    """Her two logs, as `tail` read as her prints them (one with a terminal control code someone else chose)."""
+
+    def run(self, argv: Sequence[str], **kwargs: object) -> tuple[int, str]:
+        if list(argv[:4]) == [hostsec.SUDO, "-n", "-u", "_estia"] and "/usr/bin/tail" in argv:
+            self.asked.append(tuple(argv))
+            if argv[-1] == "/var/log/estia/launchd.log":
+                return 0, 'Traceback (most recent call last):\nlocal_assistant.config.ConfigError: [calls] "x"\x1b[2J\n'
+            if argv[-1] == "/var/estia/Library/Logs/local-assistant/bridge.log":
+                return 0, (
+                    "2026-10-28 10:00:01 INFO local_assistant.app: starting\n"
+                    "2026-10-28 10:00:02 ERROR local_assistant.signal_io: signal-cli ended (exit 1)\n"
+                    "2026-10-28 10:00:03 INFO local_assistant.app: waiting\n"
+                )
+        return super().run(argv, **kwargs)
+
+
+def test_a_failed_move_after_she_ran_shows_her_logs_before_her_old_setup_comes_back(
+    tmp_path: Path, no_user: None
+) -> None:
+    """Review host-move-logs: only the symptom was printed, and the restore takes her services away, so `estia logs`
+    refuses after. The cause is in her logs: the last lines of launchd.log and bridge.log's last errors, read as her
+    (what her account can read, nothing more), printable characters only, before her old setup comes back."""
+    said: list[str] = []
+    move, _host, home, root = migration(tmp_path, said=said)
+    host = LogsHost(root)
+    move.host = host
+    her_old_setup(home, root)
+    start = move._start
+
+    def started_then_failed(labels: list[str]) -> None:
+        start(labels)
+        raise RuntimeError("her bridge did not come up within 120 s")
+
+    move._start = started_then_failed  # type: ignore[method-assign]
+    assert move.run() == 1
+    reads = [
+        argv for argv in host.asked if argv[:4] == (hostsec.SUDO, "-n", "-u", "_estia") and "/usr/bin/tail" in argv
+    ]
+    assert all(argv[4:9] == ("-H", "--", "/usr/bin/env", "-i", "HOME=/var/estia") for argv in reads)
+    assert [argv[-1] for argv in reads] == [
+        "/var/log/estia/launchd.log",
+        "/var/estia/Library/Logs/local-assistant/bridge.log",
+    ]
+    text = "\n".join(said)
+    assert "\x1b" not in text and 'local_assistant.config.ConfigError: [calls] "x"?[2J' in text
+    assert "ERROR local_assistant.signal_io: signal-cli ended (exit 1)" in text and "INFO" not in text
+    failed = next(i for i, line in enumerate(said) if "Her old setup comes back" in line)
+    assert said[failed + 1].startswith("Her logs, read as her before her old setup comes back"), said[failed:]
+
+
+@pytest.mark.parametrize("cut", ["ctrl-c", "not utf-8"])
+def test_a_failure_while_her_logs_are_read_still_brings_her_old_setup_back(
+    tmp_path: Path, no_user: None, cut: str
+) -> None:
+    """Second deep scan, macos-move-logs-skip-restore: her logs were read before the restore and outside its guard, so
+    a second Ctrl-C (or an SSH drop's two hang-ups, or a log byte that is not UTF-8) there ended the script with a
+    traceback: her new services stayed loaded and her old folders held. The logs are read inside the restore's
+    guard, and anything that goes wrong there is left out."""
+    said: list[str] = []
+    move, _host, home, root = migration(tmp_path, said=said)
+    move.host = LogsHost(root)
+    her_old_setup(home, root)
+    start = move._start
+
+    def started_then_failed(labels: list[str]) -> None:
+        start(labels)
+        raise RuntimeError("her bridge did not come up within 120 s")
+
+    def logs_cut() -> None:
+        if cut == "ctrl-c":  # a second Ctrl-C, as the terminal sends it: raised here unless ignored
+            os.kill(os.getpid(), signal.SIGINT)
+            time.sleep(0.05)
+        else:
+            raise ValueError("'utf-8' codec can't decode byte 0xff in position 3")
+
+    move._start = started_then_failed  # type: ignore[method-assign]
+    move._say_her_logs = logs_cut  # type: ignore[method-assign]
+    try:
+        assert move.run() == 1
+    except KeyboardInterrupt:
+        pytest.fail("a Ctrl-C while her logs were read ended the move before her old setup came back")
+    for label in ownuser.LABELS:
+        assert (root / f"Library/LaunchDaemons/{label}.plist").read_bytes() == OLD_PLIST
+
+
+def test_a_move_that_fails_before_she_ran_reads_no_log(tmp_path: Path, no_user: None) -> None:
+    said: list[str] = []
+    move, _host, home, root = migration(tmp_path, said=said)
+    host = LogsHost(root)
+    move.host = host
+    her_old_setup(home, root)
+
+    def broken(voice: bool) -> None:
+        raise RuntimeError("gone")
+
+    move._install_plists = broken  # type: ignore[method-assign]
+    assert move.run() == 1
+    assert not any("/usr/bin/tail" in argv for argv in host.asked) and not any("Her logs" in line for line in said)
+
+
+def power_cut(move: ownuser.Migration, step: str) -> None:
+    """A hard stop (a power cut, a kernel panic, a SIGKILL) at `step`: no restore runs, nothing after it either."""
+
+    def stop(*_args: object) -> None:
+        raise KeyboardInterrupt("power cut")
+
+    setattr(move, step, stop)
+    move._restore = lambda labels: None  # type: ignore[method-assign]
+
+
+@needs_plutil
+@pytest.mark.parametrize("fresh", [False, True], ids=["older install", "first install"])
+def test_a_move_cut_off_after_the_hold_keeps_her_old_folders_on_record(
+    tmp_path: Path, no_user: None, fresh: bool
+) -> None:
+    """The record is written before each folder is held, not only at the end: after a hard stop doctor names the
+    held copy, remove-old deletes it, and an older install's rollback brings it back (review I18)."""
+    move, _host, home, root = migration(tmp_path)
+    her_old_setup(home, root, services=not fresh)
+    power_cut(move, "_start")
+    assert move.run() == 1
+    marker = ownuser.read_marker(root)
+    assert marker is not None and marker["moving"] is True and marker["fresh"] is fresh
+    held = [Path(target) for _source, target in marker["held"]]
+    assert len(held) == len(SECRET_FOLDERS) and all(path.is_dir() for path in held)
+    check = ownuser._rollback_check(root, time.time())
+    assert check is not None and "the move did not finish" in check.text
+    if fresh:
+        said: list[str] = []
+        assert migration(tmp_path, mode="rollback", said=said)[0].rollback() == 1
+        assert any("a first install has no rollback" in line for line in said), said
+        assert migration(tmp_path, mode="remove-old")[0].remove_old() == 0
+        assert not any(path.exists() for path in held)
+    else:
+        assert migration(tmp_path, mode="rollback")[0].rollback() == 0
+        assert (home / "Library/Application Support/local-assistant/assistant.db").is_file()
+
+
+@needs_plutil
+def test_a_move_cut_off_before_her_service_files_gives_your_folders_back_on_the_next_run(
+    tmp_path: Path, no_user: None
+) -> None:
+    """Cut between the hold and her service files: your old service files are still in place and your folders held.
+    The next run gives them back from the record first (it said "set her up first" before), then moves her."""
+    move, _host, home, root = migration(tmp_path)
+    her_old_setup(home, root)
+    power_cut(move, "_install_plists")
+    assert move.run() == 1
+    assert not (home / ".config/local-assistant/config.toml").exists() and not ownuser.moved(root)
+    said: list[str] = []
+    again = migration(tmp_path, said=said)[0]
+    assert again.run() == 0, said
+    assert any("did not finish" in line and "back in your home" in line for line in said), said
+    marker = ownuser.read_marker(root)
+    assert marker is not None and not marker.get("moving") and ownuser.moved(root)
+
+
+@needs_plutil
+def test_a_move_cut_off_between_its_record_and_a_hold_counts_only_the_folders_it_held(
+    tmp_path: Path, no_user: None
+) -> None:
+    """The record names the folder about to be held before the rename: a stop between the two leaves that folder in
+    your home, and the next run counts only the folders it gives back."""
+    move, _host, home, root = migration(tmp_path)
+    her_old_setup(home, root)
+    journal = move._journal
+    calls: list[int] = []
+
+    def then_stop(voice: bool, fresh: bool, held: Sequence[tuple[str, str]]) -> None:
+        journal(voice, fresh, held)
+        calls.append(1)
+        if len(calls) == 2:
+            raise KeyboardInterrupt("power cut")
+
+    move._journal = then_stop  # type: ignore[method-assign]
+    move._restore = lambda labels: None  # type: ignore[method-assign]
+    assert move.run() == 1
+    marker = ownuser.read_marker(root)
+    assert marker is not None and len(marker["held"]) == 2
+    said: list[str] = []
+    assert migration(tmp_path, said=said)[0].run() == 0, said
+    assert any("did not finish" in line and "(1 from" in line for line in said), said
+
+
+@needs_plutil
+@pytest.mark.parametrize("before", [None, {"owner": "alex", "moved_at": 1.0, "rolled_back": True}])
+def test_a_failed_move_that_gives_your_folders_back_leaves_the_record_as_it_was(
+    tmp_path: Path, no_user: None, before: dict[str, object] | None
+) -> None:
+    """The record written before each hold goes with the hold: a failed move whose restore gave every folder back
+    leaves the record from before it (none, or a rolled back move's), so doctor names no held copy and the next run
+    gives nothing back (review I18)."""
+    move, _host, home, root = migration(tmp_path)
+    her_old_setup(home, root)
+    path = root / "usr/local/estia/migration.json"
+    if before is not None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(before))
+    failing_start(move)
+    assert move.run() == 1
+    assert (home / ".config/local-assistant/config.toml").is_file()
+    assert ownuser.read_marker(root) == before
+    assert ownuser._rollback_check(root, time.time()) is None
+    said: list[str] = []
+    assert migration(tmp_path, said=said)[0].run() == 0, said
+    assert not any("did not finish" in line for line in said), said
+
+
+@needs_plutil
+def test_a_failed_move_whose_restore_leaves_a_folder_held_keeps_it_on_record(
+    tmp_path: Path, no_user: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A restore that could not give a folder back (it prints the commands) keeps that folder on record: doctor names
+    it and remove-old reaches it."""
+    move, _host, home, root = migration(tmp_path)
+    her_old_setup(home, root)
+    failing_start(move)
+    unhold = move._unhold
+
+    def first_only(held: list[tuple[str, str]]) -> None:
+        unhold(held[:1])
+        raise OSError("a folder on the way is a link")
+
+    monkeypatch.setattr(move, "_unhold", first_only)
+    assert move.run() == 1
+    marker = ownuser.read_marker(root)
+    assert marker is not None and marker["moving"] is True
+    still = [Path(target) for _source, target in marker["held"]]
+    assert len(still) == len(SECRET_FOLDERS) - 1 and all(path.is_dir() for path in still)
+    check = ownuser._rollback_check(root, time.time())
+    assert check is not None and "the move did not finish" in check.text
 
 
 @needs_plutil
@@ -975,6 +1327,188 @@ def test_a_second_try_uses_the_group_an_earlier_run_made(tmp_path: Path, no_user
     assert joined[-2].endswith("Password *") or any(line.endswith("Password *") for line in joined)
 
 
+class LiveDirectoryHost(DirectoryHost):
+    """The live Mac, as far as `make_account` sees it: every command answered by DirectoryHost, never run; `made`
+    says whether dscl finds her account afterwards."""
+
+    def __init__(self, root: Path, *, made: bool) -> None:
+        super().__init__(root)
+        self.made = made
+
+    @property
+    def live(self) -> bool:
+        return True
+
+    def run(self, argv: Sequence[str], **kwargs: object) -> tuple[int, str]:
+        if list(argv[:4]) == [hostsec.DSCL, ".", "-read", f"/Users/{ownuser.ROLE_USER}"]:
+            self.asked.append(tuple(argv))
+            return (0, "UniqueID: 497\n") if self.made else (56, "<dscl_cmd> DS Error: -14136 (eDSRecordNotFound)\n")
+        return super().run(argv, **kwargs)
+
+
+@pytest.mark.parametrize("made", [True, False])
+def test_her_account_is_checked_after_sysadminctl_made_it(
+    tmp_path: Path, no_user: None, monkeypatch: pytest.MonkeyPatch, made: bool
+) -> None:
+    """Review host-role-account (could not be checked: only macOS 27 was there): sysadminctl may end without an error
+    and no account made (an older macOS and its role-account numbers). Her account is looked up right after it; none
+    stops the move there, with a clear line, before her settings or her home."""
+    monkeypatch.setattr(ownuser, "free_id", lambda users, groups: 497)
+    (tmp_path / "root/var").mkdir(parents=True)
+    host = LiveDirectoryHost(tmp_path / "root", made=made)
+    host.path = lambda system: tmp_path / "root" / Path(system).relative_to("/")  # type: ignore[method-assign]
+    monkeypatch.setattr(ownuser, "run_checked", lambda host_, argv: host_.run(list(argv)))
+    if made:
+        ownuser.make_account(host, lambda text: None)
+        assert any("-addUser" in argv for argv in host.asked) and any(
+            argv[-2:] == ("Password", "*") for argv in host.asked
+        )
+        return
+    with pytest.raises(RuntimeError) as stopped:
+        ownuser.make_account(host, lambda text: None)
+    assert str(stopped.value) == (
+        "macOS made no account _estia: sysadminctl -addUser ended without an error, but the account is not there "
+        "(number 497; macOS not read; tested on macOS 27 only). sysadminctl said: nothing"
+    )
+    assert not any("IsHidden" in argv for argv in host.asked)  # no settings, no home, for an account not there
+
+
+class SaidHost(LiveDirectoryHost):
+    """sysadminctl ends with exit 0 and its own reason on its output, and makes no account (an older macOS)."""
+
+    def run(self, argv: Sequence[str], **kwargs: object) -> tuple[int, str]:
+        if argv[0] == hostsec.SYSADMINCTL:
+            self.asked.append(tuple(argv))
+            return 0, "2026-10-29 sysadminctl[812:4471] ### Error:-14136 UID 497 is outside the role-account range\n"
+        if argv[0] == "/usr/bin/sw_vers":
+            self.asked.append(tuple(argv))
+            return 0, "26.1\n"
+        return super().run(argv, **kwargs)
+
+
+def test_macos_making_no_account_names_what_sysadminctl_said_and_the_macos_version(
+    tmp_path: Path, no_user: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Second deep scan, macos-account-not-made-no-reason: sysadminctl's own reason (on its output, exit 0) was
+    dropped, so neither the friend nor a helping AI could tell why. The line names it, and the macOS version."""
+    monkeypatch.setattr(ownuser, "free_id", lambda users, groups: 497)
+    (tmp_path / "root/var").mkdir(parents=True)
+    host = SaidHost(tmp_path / "root", made=False)
+    host.path = lambda system: tmp_path / "root" / Path(system).relative_to("/")  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError) as stopped:
+        ownuser.make_account(host, lambda text: None)
+    said = str(stopped.value)
+    assert said.startswith("macOS made no account _estia: sysadminctl -addUser ended without an error"), said
+    assert "UID 497 is outside the role-account range" in said and "macOS 26.1" in said, said
+
+
+class RangeHost(LiveDirectoryHost):
+    """sysadminctl refuses a role account's UID outside its own range and names the range (as its usage line does on
+    macOS 27: "UID in 450-499 range"); another macOS may name another range. A UID in it makes the account."""
+
+    def __init__(self, root: Path, *, low: int, high: int, code: int = 1) -> None:
+        super().__init__(root, made=False)
+        self.low, self.high, self.code = low, high, code
+
+    def run(self, argv: Sequence[str], **kwargs: object) -> tuple[int, str]:
+        if argv[0] == hostsec.SYSADMINCTL:
+            self.asked.append(tuple(argv))
+            if self.low <= int(argv[argv.index("-UID") + 1]) <= self.high:
+                self.made = True
+                return 0, ""
+            return self.code, f"*Role accounts require name starting with _ and UID in {self.low}-{self.high} range.\n"
+        if list(argv[:3]) == [hostsec.DSCL, ".", "-list"] and argv[3] == "/Users":
+            self.asked.append(tuple(argv))
+            return 0, "_www 70\nalex 501\n_taken 400\n"
+        return super().run(argv, **kwargs)
+
+
+@pytest.mark.parametrize("code", [1, 0], ids=["refused", "exit 0, no account"])
+def test_a_refused_uid_is_tried_again_in_the_range_sysadminctl_names(
+    tmp_path: Path, no_user: None, monkeypatch: pytest.MonkeyPatch, code: int
+) -> None:
+    """plat-02 (owner's call, 29 Oct: macOS 27's range is kept, the tested one): when sysadminctl refuses the number
+    and names its own role-account range, her account is made once more with the highest free number in that range;
+    her group keeps its number."""
+    (tmp_path / "root/var").mkdir(parents=True)
+    host = RangeHost(tmp_path / "root", low=200, high=400, code=code)
+    host.path = lambda system: tmp_path / "root" / Path(system).relative_to("/")  # type: ignore[method-assign]
+    monkeypatch.setattr(ownuser, "run_checked", lambda host_, argv: host_.run(list(argv)))
+    ownuser.make_account(host, lambda text: None)
+    adds = [argv for argv in host.asked if "-addUser" in argv]
+    assert [argv[argv.index("-UID") + 1] for argv in adds] == ["497", "399"]  # 400 is a user's
+    assert all(argv[argv.index("-GID") + 1] == "497" for argv in adds)
+
+
+def test_a_range_is_read_from_sysadminctls_own_words() -> None:
+    assert ownuser.role_range("*Role accounts require name starting with _ and UID in 450-499 range.") == range(
+        499, 449, -1
+    )
+    assert ownuser.role_range("Error: UID 497 is outside the role-account range (200 - 400)") == range(400, 199, -1)
+    assert ownuser.role_range("UID 497 is outside the role-account range") is None
+    assert ownuser.role_range("nothing") is None
+
+
+class GroupHost(LiveDirectoryHost):
+    """The account made, its primary group as dscl shows it (`primary`), and whether dscl may change it."""
+
+    def __init__(self, root: Path, *, primary: int, settable: bool = True) -> None:
+        super().__init__(root, made=True)
+        self.primary = primary
+        self.settable = settable
+
+    def run(self, argv: Sequence[str], **kwargs: object) -> tuple[int, str]:
+        if list(argv[:5]) == [hostsec.DSCL, ".", "-read", f"/Users/{ownuser.ROLE_USER}", "PrimaryGroupID"]:
+            self.asked.append(tuple(argv))
+            return 0, f"PrimaryGroupID: {self.primary}\n"
+        if list(argv[:5]) == [hostsec.DSCL, ".", "-create", f"/Users/{ownuser.ROLE_USER}", "PrimaryGroupID"]:
+            self.asked.append(tuple(argv))
+            if not self.settable:
+                return 40, "<main> attribute status: eDSPermissionError\n"
+            self.primary = int(argv[5])
+            return 0, ""
+        return super().run(argv, **kwargs)
+
+
+@pytest.mark.parametrize("exists", [False, True], ids=["made now", "made before"])
+def test_her_primary_group_is_her_own_never_staff(
+    tmp_path: Path, no_user: None, monkeypatch: pytest.MonkeyPatch, exists: bool
+) -> None:
+    """Second deep scan, macos-primary-group-unchecked: sysadminctl ignores -UID on macOS 27 and may ignore -GID
+    elsewhere; then her primary group is staff (20) and her account reads every file your group may read in your
+    home. After sysadminctl, and on every run, her primary group is set to her own group's number; one macOS refuses
+    stops with a clear line."""
+    monkeypatch.setattr(ownuser, "free_id", lambda users, groups: 497)
+    if exists:
+        monkeypatch.setattr(ownuser, "lookup_uid", lambda name: 497)
+    (tmp_path / "root/var").mkdir(parents=True)
+    host = GroupHost(tmp_path / "root", primary=20)
+    host.path = lambda system: tmp_path / "root" / Path(system).relative_to("/")  # type: ignore[method-assign]
+    ownuser.make_account(host, lambda text: None)
+    assert host.primary == 497
+    refused = GroupHost(tmp_path / "root", primary=20, settable=False)
+    refused.path = host.path  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError) as stopped:
+        ownuser.make_account(refused, lambda text: None)
+    assert str(stopped.value).startswith("macOS kept staff (20) as _estia's primary group, not _estia (497)"), stopped
+
+
+def test_doctor_names_a_primary_group_other_than_her_own(tmp_path: Path, as_her: None) -> None:
+    """macos-primary-group-unchecked: doctor showed ✓ for her account in your staff group. Her record's primary group
+    is read with the rest; staff, or another than her own group, is a ✗ with `estia account` as the fix."""
+    installed(tmp_path)
+    record = LIVE_RECORD + "PrimaryGroupID: 20\n"
+    check = by_key(ownuser.install_checks(tmp_path, account=lambda: record))["own_user"]
+    assert check.status == "fail" and "primary group" in check.text and "staff" in check.text, check
+    assert "estia account" in (check.fix or "")
+    ok = by_key(
+        ownuser.install_checks(tmp_path, account=lambda: LIVE_RECORD + "PrimaryGroupID: 497\n", group=lambda: 497)
+    )
+    assert ok["own_user"].status == "ok", ok["own_user"]
+    other = ownuser.install_checks(tmp_path, account=lambda: LIVE_RECORD + "PrimaryGroupID: 80\n", group=lambda: 497)
+    assert by_key(other)["own_user"].status == "fail"
+
+
 def test_the_account_settings_are_set_again_when_the_user_exists(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1050,6 +1584,10 @@ GOOD: dict[str, Any] = {
         "PYTHONUNBUFFERED": "1",
     },
     "WorkingDirectory": "/usr/local/estia/current",
+    "Umask": 63,
+    "RunAtLoad": True,
+    "KeepAlive": True,
+    "ThrottleInterval": 30,
     "StandardOutPath": "/var/log/estia/launchd.log",
 }
 
@@ -1070,6 +1608,15 @@ GOOD: dict[str, Any] = {
         ({"StandardErrorPath": "/var/log/estia/../../etc/x"}, "/var/log/estia"),
         ({"StandardOutPath": "/var/estia/Library/Logs/local-assistant/launchd.log"}, "her own folder"),
         ({"Label": "com.example.other"}, "Label"),
+        # second deep scan, macos-plist-values-unchecked: the allowed keys' values too
+        ({"Umask": 0}, "Umask"),
+        ({"Umask": 18}, "Umask"),
+        ({"RunAtLoad": False}, "RunAtLoad"),
+        ({"KeepAlive": {"SuccessfulExit": False}}, "KeepAlive"),
+        ({"ThrottleInterval": 1}, "ThrottleInterval"),
+        ({"ThrottleInterval": "30"}, "ThrottleInterval"),
+        ({"ThrottleInterval": True}, "ThrottleInterval"),
+        ({"WorkingDirectory": "/usr/local/estia/current/../../../tmp"}, "WorkingDirectory"),
     ],
 )
 def test_a_service_file_that_is_not_only_hers_is_named(change: dict[str, object], word: str) -> None:
@@ -1078,10 +1625,17 @@ def test_a_service_file_that_is_not_only_hers_is_named(change: dict[str, object]
     assert problem is not None and word in problem
 
 
+@pytest.mark.parametrize("key", ["Umask", "RunAtLoad", "KeepAlive", "ThrottleInterval"])
+def test_a_service_file_without_one_of_her_settings_is_named(key: str) -> None:
+    """macos-plist-values-unchecked: her templates always set them; one left out is not hers."""
+    problem = ownuser.plist_problem({k: v for k, v in GOOD.items() if k != key}, "com.local-assistant.bridge")
+    assert problem is not None and key in problem
+
+
 def test_service_logs_left_in_her_folder_name_the_tools_update(tmp_path: Path, as_her: None) -> None:
-    """An install from before /var/log/estia: launchd still opens her logs as root in her folder, so a program of her
-    account could make root write into a file it names (a link there). A ✗, in plain words: the tools' update and one
-    more deploy render the new service files."""
+    """An install from before /var/log/estia: her logs are in her folder, where her account can put a link in its
+    place (launchd follows that link as her account, never as root: M01, 30 Oct). A ✗, in plain words: the tools'
+    update and one more deploy render the new service files."""
     installed(tmp_path)
     plist = tmp_path / "Library/LaunchDaemons/com.local-assistant.bridge.plist"
     data = plistlib.loads(plist.read_bytes())
@@ -1089,7 +1643,8 @@ def test_service_logs_left_in_her_folder_name_the_tools_update(tmp_path: Path, a
     plist.write_bytes(plistlib.dumps(data))
     check = by_key(ownuser.install_checks(tmp_path))["plists"]
     assert check.status == "fail" and "her own folder" in check.text
-    assert "a program of her account could make root write into a file it names" in check.text
+    assert "bridge: its output is in her own folder, where her account can put a link in its place" in check.text
+    assert "root" not in check.text
     assert check.fix == (
         "/usr/bin/sudo /usr/local/estia/bin/estia-deploy --update-tools (read the diff), then "
         "/usr/bin/sudo /usr/local/estia/bin/estia-deploy: it moves them to /var/log/estia"
@@ -1097,8 +1652,9 @@ def test_service_logs_left_in_her_folder_name_the_tools_update(tmp_path: Path, a
 
 
 def test_her_service_logs_are_made_in_a_root_owned_folder(tmp_path: Path) -> None:
-    """/var/log/estia (0755) and one file per service (0600, hers on the Mac): launchd opens them as root, in a folder
-    only root can change, so it never follows a link of hers; she empties them through the open file it gives her."""
+    """/var/log/estia (0755) and one file per service (0600, hers on the Mac), made before launchd opens them as her
+    (M01, 30 Oct: a missing one stops the start), in a folder only root can change, so no link of hers can be planted
+    at those names; she empties them through the open file launchd gives her."""
     host = RecordingHost(tmp_path)
     ownuser.make_stream_logs(host)
     folder = tmp_path / "var/log/estia"
@@ -1450,6 +2006,33 @@ def test_her_programs_name_what_she_runs(tmp_path: Path) -> None:
     )
     names = dict(ownuser.her_programs(calls, tmp_path))
     assert names["Java"] == jdk / "bin" / "java" and "the call helper" in names and "signal-cli (calls)" in names
+
+
+def test_her_java_is_the_one_she_runs_also_when_macos_picks_it(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """No java_home in her config and no JDK in her release: the JVM signal-cli runs the Java macOS picks, perhaps a
+    Homebrew keg linked into /Library/Java that your account can change. Doctor checks that one, links followed, as
+    it checks every program of hers (review I32)."""
+    from types import SimpleNamespace
+
+    installed(tmp_path)
+    keg = tmp_path / "opt/homebrew/Cellar/openjdk@25/25.0.1/libexec/openjdk.jdk/Contents/Home"
+    (keg / "bin").mkdir(parents=True)
+    (keg / "bin/java").write_text("java")
+    linked = tmp_path / "Library/Java/JavaVirtualMachines/openjdk-25.jdk"
+    linked.parent.mkdir(parents=True)
+    linked.symlink_to(keg.parent.parent)
+    calls = SimpleNamespace(
+        calls_enabled=True,
+        call_signal_cli=Path("/usr/local/estia/current/vendor/signal-cli-0.14.9-jvm/signal-cli-0.14.9/bin/signal-cli"),
+        call_tunnel=Path("/usr/local/estia/current/vendor/signal-call-tunnel/x"),
+        java_home=None,
+    )
+    names = dict(ownuser.her_programs(calls, tmp_path, java=lambda: linked / "Contents/Home"))
+    assert names["Java"] == linked / "Contents/Home/bin/java"
+    monkeypatch.setattr(ownuser, "lookup_uid", lambda name: os.getuid())
+    monkeypatch.setattr(ownuser, "CODE_UID", 0)  # the keg belongs to the test user, as Homebrew's to you
+    check = ownuser.program_check([("Java", names["Java"])], tmp_path)
+    assert check.status == "fail" and "Java" in check.text
 
 
 # once moved, the fixes never send you back to the move (it would run your checkout's Python as root)
@@ -1826,7 +2409,36 @@ def test_a_ctrl_c_during_the_voice_wait_ends_only_the_wait() -> None:
         raise KeyboardInterrupt
 
     line = ownuser.voice_end(voice.health, calls=True, clock=voice, sleep=sleep, say=said.append)
-    assert line == ownuser.VOICE_STOPPED and "http://127.0.0.1:8150/health" in line and "texts" not in line
+    assert line == ownuser.VOICE_STOPPED and "texts" not in line
+    # her voice service answers only her own account: your curl would be refused, her wrapper's check reads it as her
+    assert line.endswith("/usr/bin/sudo /usr/local/estia/bin/estia check shows it") and "curl" not in line
+    # review R2-F7: before her own macOS account that command refuses; the checkout's own check shows it
+    before = ownuser.voice_end(voice.health, calls=True, clock=voice, sleep=sleep, say=said.append, moved=False)
+    assert before == ownuser.VOICE_STOPPED_YOURS == "voice: not checked to the end (stopped); scripts/check.sh shows it"
+
+
+def test_a_voice_not_read_as_her_says_so_at_once_and_never_says_loading() -> None:
+    """Review R2-F1 and R2-F4: a read as her that sudo or her voice service refused said "loading", the same line as a
+    real load, and with [calls] waited 150 s and promised a text. It says it was not read, at once."""
+    said: list[str] = []
+    voice = VoiceClock(ready_at=None)
+    for why in (ownuser.VOICE_NOT_SIGNED_IN, ownuser.VOICE_REFUSED_HER):
+
+        def not_read(why: str = why) -> ownuser.VoiceHealth:
+            return ownuser.VoiceNotRead(why)
+
+        for calls in (True, False):
+            line = ownuser.voice_end(not_read, calls=calls, clock=voice, sleep=voice.sleep, say=said.append)
+            assert line == f"voice: not read as her ({why}); /usr/bin/sudo /usr/local/estia/bin/estia check shows it"
+    assert said == [] and voice.now == 0.0  # no wait, no "checking again"
+    assert ownuser.VOICE_NOT_SIGNED_IN == "no admin sign-in running"
+    assert ownuser.VOICE_REFUSED_HER == "her voice service refused it"
+    # one that turns not read during the wait ends it there
+    reads: Iterator[ownuser.VoiceHealth] = iter(
+        [{"stt": "loading", "tts": "loading"}, ownuser.VoiceNotRead(ownuser.VOICE_NOT_SIGNED_IN)]
+    )
+    line = ownuser.voice_end(lambda: next(reads), calls=True, clock=voice, sleep=voice.sleep, say=said.append)
+    assert line.startswith("voice: not read as her") and said == [ownuser.VOICE_WAITING]
 
 
 def test_without_calls_the_voice_end_promises_no_text_and_does_not_wait() -> None:
@@ -1899,6 +2511,62 @@ def test_the_voice_health_of_a_test_root_is_never_the_live_service(tmp_path: Pat
     assert move.voice_health() is None  # a fake root never asks 127.0.0.1:8150
 
 
+def test_her_voice_is_read_as_her_since_it_answers_only_her_own_account() -> None:
+    """Owner, 25 Oct: her voice service answers only programs running as her own macOS account, so root (the move, an
+    update) and you (setup) read its state with curl run as her: one fixed command, her home, no PATH of yours, no
+    curlrc of hers (-q), 5 s and 10 kB at most, never a password asked (-n)."""
+    seen: list[list[str]] = []
+
+    def run(argv: Sequence[str]) -> tuple[int, str]:
+        seen.append(list(argv))
+        return 0, '{"stt":"ready","tts":"ready","turn":"ready"}'
+
+    assert ownuser.her_voice_health(run) == {"stt": "ready", "tts": "ready", "turn": "ready"}
+    assert seen == [
+        [
+            "/usr/bin/sudo", "-n", "-u", "_estia", "-H", "--", "/usr/bin/env", "-i", "HOME=/var/estia",
+            "PATH=/usr/bin:/bin", "/usr/bin/curl", "-q", "-s", "-f", "--max-time", "5", "--max-filesize", "10000",
+            "http://127.0.0.1:8150/health",
+        ]
+    ]  # fmt: skip
+    # review R2-F1: curl -f exits 22 on her voice service's 403 (without it, 0 and the refusal read as an answer);
+    # sudo -n exits 1 when it needs a password (no admin sign-in running): both are "not read", never "loading"
+    expected: list[tuple[tuple[int, str], object]] = [
+        ((1, ""), ownuser.VoiceNotRead(ownuser.VOICE_NOT_SIGNED_IN)),
+        ((22, ""), ownuser.VoiceNotRead(ownuser.VOICE_REFUSED_HER)),
+        ((7, ""), None),  # no answer: not up yet, or restarting
+        ((28, ""), None),  # too slow
+        ((-1, ""), None),  # sudo and curl did not finish in time
+        ((0, "not json"), None),
+        ((0, "[1, 2]"), None),
+        ((0, ""), None),
+    ]
+    for answer, health in expected:
+
+        def refused(_argv: Sequence[str], answer: tuple[int, str] = answer) -> tuple[int, str]:
+            return answer
+
+        assert ownuser.her_voice_health(refused) == health, answer
+
+
+def test_a_read_as_her_that_does_not_finish_is_no_answer(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Sudo with -n never waits for a password: a read that times out is a slow service, never a refused sign-in."""
+
+    def slow(*_args: object, **_kwargs: object) -> object:
+        raise subprocess.TimeoutExpired(cmd="curl", timeout=ownuser.VOICE_READ_SECONDS)
+
+    monkeypatch.setattr(subprocess, "run", slow)
+    assert ownuser.her_voice_health() is None
+
+
+def test_the_move_reads_her_voice_as_her(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    asked: list[tuple[bool, bool]] = []
+    monkeypatch.setattr(ownuser, "voice_health", lambda live, *, as_her=False: asked.append((live, as_her)))
+    move, _host, _home, _root = migration(tmp_path)
+    move.voice_health()
+    assert asked == [(False, True)]  # a test root: not live, and as her once it is
+
+
 # ------------------------------------------------------------------ the copies kept aside in her home (remove-old)
 
 
@@ -1959,6 +2627,32 @@ def test_after_a_fresh_install_remove_old_deletes_the_copies_kept_aside(tmp_path
     copy = kept_aside(root / "var/estia", "20261013-204501")
     assert migration(tmp_path)[0].remove_old() == 0
     assert not copy.exists()
+
+
+@needs_plutil
+@pytest.mark.parametrize("fresh", [True, False])
+def test_a_dry_run_says_a_first_install_keeps_no_copy_of_your_folders(
+    tmp_path: Path, no_user: None, fresh: bool
+) -> None:
+    """The dry run said your folders "would move into /usr/local/estia/rollback (root only)", but a first install
+    deletes them right after the move (release review D9)."""
+    home, root = tmp_path / "home", tmp_path / "root"
+    her_old_setup(home, root, services=not fresh)
+    said: list[str] = []
+    move = ownuser.Migration(
+        ownuser.Host(root, dry_run=True, say=said.append),
+        ownuser.Owner("alex", home, os.getuid()),
+        checkout=a_checkout(tmp_path),
+        mode="dry",
+        deploy=lambda: 0,
+        say=said.append,
+    )
+    assert move.run() == 0, said
+    lines = [line for line in said if line.startswith("would move") and str(ownuser.HELD) in line]
+    assert lines, said
+    for line in lines:
+        assert ("deleted after the move; no copy is kept (back them up first)" in line) is fresh, line
+        assert ("held for 7 days" in line) is not fresh, line
 
 
 def test_a_dry_run_of_remove_old_names_the_copies_and_keeps_them(tmp_path: Path, no_user: None) -> None:
@@ -2216,3 +2910,85 @@ def test_a_watched_log_list_over_several_lines_is_handled_too() -> None:
     data = tomllib.loads(out)
     assert data["health"] == {"watch_logs": ["/var/log/estia"], "interval_hours": 4}
     assert any(note.startswith("health.watch_logs: 1 folder ") for note in notes)
+
+
+# ------------------------------------------------------------------ `estia signal-login`: root's half, the reading
+
+NUMBERLESS = "99999999-8888-4777-8666-555555555555"  # made up
+SHOWN_KEY = "ABCDEFGHIJKLMN#PQRSTUVWXYZ=12345" * 2  # made up, as Signal shows it
+
+
+def ask_login(hidden: list[str], typed: list[str]) -> tuple[dict[str, str] | None, list[str]]:
+    """Root's reading with a fake terminal: `hidden` at the hidden prompts, `typed` at the visible one."""
+    said: list[str] = []
+    secrets, answers = iter(hidden), iter(typed)
+
+    def read_hidden(prompt: str, needed: int, counted: Any) -> str:
+        said.append(prompt)
+        return next(secrets)
+
+    def ask(question: str) -> str:
+        said.append(question)
+        try:
+            return next(answers)
+        except StopIteration:  # the end of input, as hostsec.ask_tty raises it
+            raise EOFError from None
+
+    return ownuser.signal_login_ask(say=said.append, hidden=read_hidden, ask=ask), said
+
+
+def test_root_reads_the_account_id_the_key_and_her_username_and_hands_over_only_their_checked_forms() -> None:
+    """Her user cannot open your terminal, so root's code from the tools reads it (the hidden read across lines,
+    never a shell's read); what goes to her on stdin is the checked form only. A wrong one is asked again, with the
+    reason and never the key."""
+    login, said = ask_login(
+        [NUMBERLESS[:-1], NUMBERLESS.upper(), SHOWN_KEY[:62], "\n".join([SHOWN_KEY[:32], "", SHOWN_KEY[32:]])],
+        ["tiffany", "tiffany.42", ""],
+    )
+    assert login == {
+        "account": NUMBERLESS,
+        "recovery_key": SHOWN_KEY.lower().replace("#", "o").replace("=", "0"),
+        "username": "tiffany.42",
+    }
+    text = "\n".join(said)
+    assert hostsec.SIGNAL_LOGIN_INTRO in text and hostsec.NUMBERLESS_STEPS in text
+    assert "never unregistered, never deleted" in text
+    assert text.count(hostsec.ID_ASK) == 2 and text.count(hostsec.KEY_ASK) == 2 and "62 characters" in text
+    assert "two or more digits" in text and SHOWN_KEY[:12] not in text and NUMBERLESS not in text
+
+
+def test_root_reads_the_six_digit_code_only_when_one_is_typed() -> None:
+    """Signal may ask for a six-digit code (TOTP) before it moves the account (signal-cli's manual, register --totp;
+    review S7): a question last (Enter is no), then the code hidden; one of another form is asked again; it goes to her
+    on stdin."""
+    login, said = ask_login([NUMBERLESS, SHOWN_KEY, "12345", "123 456"], ["tiffany.42", "y"])
+    assert login is not None and login["totp"] == "123456"
+    text = "\n".join(said)
+    assert text.count(hostsec.TOTP_ASK) == 2 and hostsec.TOTP_BAD in text and "123456" not in text
+    assert hostsec.TOTP_QUESTION in text
+    none, _said = ask_login([NUMBERLESS, SHOWN_KEY], ["tiffany.42", ""])  # Enter: no code, none handed over
+    assert none is not None and "totp" not in none
+
+
+@pytest.mark.parametrize(
+    ("hidden", "typed"),
+    [(["q"], []), ([NUMBERLESS, "q"], []), ([NUMBERLESS, SHOWN_KEY], ["q"]), ([NUMBERLESS, SHOWN_KEY], [])],
+)
+def test_q_or_the_end_of_input_stops_root_reading_with_nothing_handed_over(hidden: list[str], typed: list[str]) -> None:
+    login, _said = ask_login(hidden, typed)
+    assert login is None
+
+
+def test_an_enter_alone_at_the_username_question_asks_it_again() -> None:
+    """Review, 23 Oct: the Enter after the key (as a blank line) answered the username question with nothing, and
+    that stopped the move. An empty answer is no answer: the question comes again, with no line that it is wrong."""
+    login, said = ask_login([NUMBERLESS, SHOWN_KEY], ["", "", "tiffany.42", ""])
+    assert login is not None and login["username"] == "tiffany.42"
+    assert said.count(hostsec.USERNAME_ASK) == 3 and hostsec.USERNAME_BAD not in "\n".join(said)
+
+
+def test_signal_login_reading_needs_root(capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(ownuser, "estia_root", lambda: Path("/"))
+    monkeypatch.setattr(os, "geteuid", lambda: 501)
+    assert ownuser.main(["signal-login"]) == 2
+    assert "/usr/bin/sudo /usr/local/estia/bin/estia signal-login" in capsys.readouterr().err

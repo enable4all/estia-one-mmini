@@ -29,6 +29,7 @@ from local_assistant.calendar_tools import (
     resolve_start,
 )
 from local_assistant.config import CalendarSource, MailAccount
+from local_assistant.store import Store
 from tests.no_links import (
     CAP_WORDS,
     CASES,
@@ -54,7 +55,7 @@ class Clock:
 class Home:
     """The real feed reader and tools on the fake helper's calendar, the clock where the test puts it."""
 
-    def __init__(self, tmp_path: Path, now: datetime = FRIDAY_0915) -> None:
+    def __init__(self, tmp_path: Path, now: datetime = FRIDAY_0915, store: Store | None = None) -> None:
         self.calendar = Calendar(tmp_path)
         self.clock = Clock(now)
         self.notes: list[str] = []
@@ -63,7 +64,7 @@ class Home:
             self.notes.append(text)
 
         self.tools = CalendarTools(
-            CalendarFeed(self.calendar.config), self.calendar.config, notify=notify, clock=self.clock
+            CalendarFeed(self.calendar.config), self.calendar.config, notify=notify, clock=self.clock, state=store
         )
 
     def add(self, title: str, start: str, end: str, **fields: Any) -> None:
@@ -321,6 +322,24 @@ async def test_google_down_or_a_dead_address_never_stops_the_digest(tmp_path: Pa
     assert home.notes == [prompts.CALENDAR_GONE] * 2  # gone again later: noted again
     home.fail("not_set")
     assert await home.tools.digest_block() == NOT_SET == "Calendar: not set up (scripts/set-calendar-url.sh on the Mac)"
+
+
+async def test_the_dead_address_note_is_not_sent_again_after_a_restart(tmp_path: Path, store: Store) -> None:
+    """Review O7 (0.9.7): which calendars were told their address stopped working (and why) is kept in the database,
+    so a restart (a deploy, a reboot) sends no second note; once it reads fine again, a later failure is noted."""
+    first = Home(tmp_path, store=store)
+    first.fail("gone")
+    await first.tools.digest_block()
+    assert first.notes == [prompts.CALENDAR_GONE]
+    restarted = Home(tmp_path, store=store)
+    await restarted.tools.digest_block()
+    assert restarted.notes == []
+    restarted.fail(None)  # a new address saved: read fine
+    await restarted.tools.digest_block()
+    again = Home(tmp_path, store=store)
+    again.fail("gone")
+    await again.tools.digest_block()
+    assert again.notes == [prompts.CALENDAR_GONE]
 
 
 async def test_a_search_cut_short_does_not_claim_nothing_is_there(
@@ -607,7 +626,7 @@ async def test_one_caldav_calendar_says_why_in_its_own_words(tmp_path: Path) -> 
             "the server refused the user name or app-specific password "
             "(scripts/set-calendar-password.sh calendar on the Mac)"
         ),
-        "no_calendar": "no calendar by that name on the server (check caldav and calendar in config.toml)",
+        "no_calendar": f"no calendar by that name on the server (check caldav and calendar in {prompts.CONFIG_WHERE})",
     }
     for error, why in reasons.items():
         calendar.data["error"] = error

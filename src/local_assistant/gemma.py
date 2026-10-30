@@ -14,8 +14,8 @@ import logging
 import socket
 import threading
 import time
-from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from collections.abc import Awaitable, Callable, Sequence
+from dataclasses import dataclass, replace
 from typing import Any, Protocol
 from urllib.parse import urlsplit
 
@@ -25,14 +25,27 @@ _TRANSIENT = frozenset({500, 502, 503, 504})
 # request names none (openai/openai.go, 0.40.4), over the model's own 0.95, so every request names it. It has no top_k
 # field: the model's 64 applies.
 TOP_P = 0.95
+# How long the model stays loaded after a request: every request names it (Ollama's OpenAI layer takes keep_alive since
+# 0.40.0, openai/openai.go; an older one ignores it), so it holds on the Ollama app too, which has no service file of
+# setup's to set OLLAMA_KEEP_ALIVE (ollama_build.KEEP_ALIVE is this value)
+KEEP_ALIVE = "120m"
 
 
 class GemmaError(Exception):
     """Gemma answered with an error, garbage, or not in time."""
 
+    # what the answer had already done when it failed, in code's words (Brain.answer: her profile changes and the
+    # reminders set; review I25), and the ones of them that quote outside text
+    notes: tuple[str, ...] = ()
+    outside: tuple[str, ...] = ()
+
 
 class GemmaUnavailableError(GemmaError):
     """Ollama could not be reached within the retry window."""
+
+
+class LockedError(GemmaError):
+    """/lock came while an answer was worked out: no request and no tool call more in it (Brain's `stopped`)."""
 
 
 class ModelPausedError(GemmaError):
@@ -68,6 +81,64 @@ class Completion:
     finish_reason: str = ""
     completion_tokens: int = 0  # what the model generated, hidden thought included
     reasoning_chars: int = 0  # the size of a reasoning field Ollama sent (thinking on); its text is never kept
+    cached_tokens: int | None = None  # the prompt's tokens Ollama took from its prompt cache; None: not reported
+    prompt_ms: float | None = None  # Ollama's time reading the prompt (a stream's timings); None: not reported
+    generation_ms: float | None = None  # Ollama's time generating; None: not reported
+    total_ms: float = 0.0  # the request as the bridge saw it: a wait for Ollama's one slot and a model load included
+
+
+@dataclass(frozen=True)
+class Timing:
+    """An answer's requests to Ollama in numbers, for its log line (metadata only, never a word): Ollama's own counts
+    and times, and the bridge's wall time, so a slow answer names its cause (a prompt read anew after another
+    program's requests took the prompt cache, a long generation, or a wait for Ollama's one slot or a model load)."""
+
+    requests: int = 0
+    prompt_tokens: int = 0  # the largest request's prompt
+    uncached: int | None = None  # prompt tokens read anew, all requests together; None: Ollama reported no cache count
+    prompt_ms: float | None = None  # None unless Ollama timed every request
+    generated: int = 0
+    generation_ms: float | None = None
+    total_ms: float = 0.0
+    # the last request's finish reason: "length" when the answer was cut at its token limit (review of 26 Oct,
+    # rtcall-10: a call says a cut answer up to its last whole sentence, and only a cut one)
+    finish_reason: str = ""
+
+    @classmethod
+    def of(cls, completions: Sequence[Completion]) -> Timing:
+        def summed(values: list[float | None]) -> float | None:
+            return None if any(value is None for value in values) else sum(value or 0.0 for value in values)
+
+        uncached = summed([None if c.cached_tokens is None else c.prompt_tokens - c.cached_tokens for c in completions])
+        return cls(
+            requests=len(completions),
+            prompt_tokens=max((c.prompt_tokens for c in completions), default=0),
+            uncached=None if uncached is None else int(uncached),
+            prompt_ms=summed([c.prompt_ms for c in completions]),
+            generated=sum(c.completion_tokens for c in completions),
+            generation_ms=summed([c.generation_ms for c in completions]),
+            total_ms=sum(c.total_ms for c in completions),
+            finish_reason=completions[-1].finish_reason if completions else "",
+        )
+
+    def line(self) -> str:
+        """As logged: "1 request, 17,213 prompt tokens, 17,209 not cached, prompt eval 13,512 ms, 171 tokens generated
+        in 7,004 ms, total 20,642 ms (126 ms waiting or loading)", each part only when Ollama reported it."""
+        if not self.requests:
+            return "no request"
+        parts = [f"{self.requests} request{'s' if self.requests > 1 else ''}", f"{self.prompt_tokens:,} prompt tokens"]
+        if self.uncached is not None:
+            parts.append(f"{self.uncached:,} not cached")
+        if self.prompt_ms is not None:
+            parts.append(f"prompt eval {self.prompt_ms:,.0f} ms")
+        made = f"{self.generated:,} tokens generated"
+        parts.append(made if self.generation_ms is None else f"{made} in {self.generation_ms:,.0f} ms")
+        total = f"total {self.total_ms:,.0f} ms"
+        if self.prompt_ms is not None and self.generation_ms is not None:
+            rest = max(0.0, self.total_ms - self.prompt_ms - self.generation_ms)
+            total += f" ({rest:,.0f} ms waiting or loading)"
+        cut = ["cut at the token limit"] if self.finish_reason == "length" else []
+        return ", ".join([*parts, total, *cut])
 
 
 class GemmaClient(Protocol):
@@ -110,6 +181,96 @@ def parse_completion(body: dict[str, Any]) -> Completion:
         finish_reason=str(choice.get("finish_reason") or ""),
         completion_tokens=int(usage.get("completion_tokens") or 0),
         reasoning_chars=len(str(message.get("reasoning") or "")),
+        **_counted(usage, body.get("timings")),
+    )
+
+
+def _counted(usage: Any, timings: Any) -> dict[str, Any]:
+    """Ollama's cache count (usage's prompt_tokens_details) and its times (a stream's timings), where it sent them."""
+    details = usage.get("prompt_tokens_details") if isinstance(usage, dict) else None
+    cached = details.get("cached_tokens") if isinstance(details, dict) else None
+    times = timings if isinstance(timings, dict) else {}
+
+    def ms(key: str) -> float | None:
+        value = times.get(key)
+        return float(value) if isinstance(value, int | float) else None
+
+    return {
+        "cached_tokens": int(cached) if isinstance(cached, int | float) else None,
+        "prompt_ms": ms("prompt_ms"),
+        "generation_ms": ms("predicted_ms"),
+    }
+
+
+def _events(body: bytes) -> list[str]:
+    """A streamed answer's events ("data: ..." lines), in order; [] for an answer that is not a stream. Split on the
+    newline bytes only: Ollama leaves U+0085 and U+2028 unescaped inside a chunk's JSON, which str.splitlines would
+    split."""
+    lines = (raw.rstrip(b"\r").decode("utf-8", errors="replace") for raw in body.split(b"\n"))
+    return [line[5:].strip() for line in lines if line.startswith("data:")]
+
+
+def stream_cut_off(body: bytes) -> bool:
+    """A stream that stopped before its end ([DONE]) without an error of its own: Ollama's 200 was sent before a
+    failure during generation, which unstreamed is an HTTP 500 (tried again). A stream with an error is an error."""
+    events = _events(body)
+    return bool(events) and "[DONE]" not in events and not any(_is_error(data) for data in events)
+
+
+def _is_error(data: str) -> bool:
+    try:
+        chunk = json.loads(data)
+    except json.JSONDecodeError:
+        return False
+    return isinstance(chunk, dict) and bool(chunk.get("error"))
+
+
+def parse_stream(body: bytes, *, tools: bool) -> Completion:
+    """A streamed answer (Ollama's OpenAI layer, `stream_options.include_usage`) joined into one Completion: its
+    content, the size of its reasoning, its tool calls (a call in pieces joined; none when no tools were offered, as
+    Ollama answers unstreamed), the finish reason, and the last chunk's usage and timings."""
+    content: list[str] = []
+    reasoning = 0
+    calls: list[list[str]] = []  # id, name, arguments
+    finish = ""
+    usage: Any = {}
+    timings: Any = None
+    for data in _events(body):
+        if data == "[DONE]":
+            break
+        try:
+            chunk = json.loads(data)
+        except json.JSONDecodeError as exc:
+            raise GemmaError("Ollama sent invalid JSON") from exc
+        if not isinstance(chunk, dict):
+            raise GemmaError("unexpected response from Ollama")
+        if chunk.get("error"):
+            raise GemmaError("Ollama sent an error in its answer")
+        usage = chunk.get("usage") or usage
+        timings = chunk.get("timings") or timings
+        for choice in chunk.get("choices") or []:
+            delta = choice.get("delta") or {}
+            content.append(str(delta.get("content") or ""))
+            reasoning += len(str(delta.get("reasoning") or ""))
+            for raw in delta.get("tool_calls") or []:
+                function = raw.get("function") or {}
+                arguments = function.get("arguments", "")
+                arguments = arguments if isinstance(arguments, str) else json.dumps(arguments)
+                if calls and not raw.get("id") and not function.get("name"):
+                    calls[-1][2] += arguments  # the rest of the call before
+                else:
+                    calls.append([str(raw.get("id") or f"call_{len(calls)}"), str(function.get("name", "")), arguments])
+            finish = str(choice.get("finish_reason") or finish)
+    if not tools and finish == "tool_calls":  # unstreamed, that answer's tool calls are dropped and it says "stop"
+        finish = "stop"
+    return Completion(
+        content="".join(content),
+        tool_calls=tuple(ToolCall(call_id, name, args or "{}") for call_id, name, args in calls) if tools else (),
+        prompt_tokens=int(usage.get("prompt_tokens") or 0) if isinstance(usage, dict) else 0,
+        finish_reason=finish,
+        completion_tokens=int(usage.get("completion_tokens") or 0) if isinstance(usage, dict) else 0,
+        reasoning_chars=reasoning,
+        **_counted(usage, timings),
     )
 
 
@@ -170,13 +331,17 @@ class OllamaGemma:
         temperature: float | None = None,
         json_schema: dict[str, Any] | None = None,
     ) -> Completion:
+        # streamed, with its usage: Ollama (0.40.4) sends its prompt and generation times only in a stream's last
+        # chunk (middleware/openai.go); the answer is read whole all the same
         payload: dict[str, Any] = {
             "model": self._model,
             "messages": messages,
             "max_tokens": max_tokens,
             "reasoning_effort": reasoning_effort,
             "top_p": TOP_P,
-            "stream": False,
+            "keep_alive": KEEP_ALIVE,
+            "stream": True,
+            "stream_options": {"include_usage": True},
         }
         if tools:
             payload["tools"] = tools
@@ -187,14 +352,19 @@ class OllamaGemma:
                 "type": "json_schema",
                 "json_schema": {"name": "result", "schema": json_schema, "strict": True},
             }
+        started = self._clock()
         status, body = await self._with_retries("POST", f"{self._prefix}/chat/completions", payload)
         if status != 200:
             raise GemmaError(f"Ollama HTTP {status}: {body[:200].decode(errors='replace')}")
-        try:
-            data = json.loads(body)
-        except json.JSONDecodeError as exc:
-            raise GemmaError("Ollama sent invalid JSON") from exc
-        return parse_completion(data)
+        if _events(body):
+            completion = parse_stream(body, tools=bool(tools))
+        else:  # an answer that is not a stream (an older Ollama): read as before
+            try:
+                data = json.loads(body)
+            except json.JSONDecodeError as exc:
+                raise GemmaError("Ollama sent invalid JSON") from exc
+            completion = parse_completion(data)
+        return replace(completion, total_ms=(self._clock() - started) * 1000)
 
     async def status(self) -> str:
         root = self._prefix.removesuffix("/v1")
@@ -248,9 +418,9 @@ class OllamaGemma:
             except (OSError, http.client.HTTPException) as exc:
                 problem = str(exc) or type(exc).__name__
             else:
-                if status not in _TRANSIENT:
+                if status not in _TRANSIENT and not (status == 200 and stream_cut_off(body)):
                     return status, body
-                problem = f"HTTP {status}"
+                problem = f"HTTP {status}" if status != 200 else "the answer stopped before its end"
             if self._clock() + delay > deadline:
                 raise GemmaUnavailableError(f"Ollama unreachable for {self._unreachable:.0f} s ({problem})")
             log.warning("Ollama not available (%s); retrying in %.0f s", problem, delay)

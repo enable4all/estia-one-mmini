@@ -204,7 +204,7 @@ async def test_the_first_look_reads_every_pdf_and_announces_nothing(
 ) -> None:
     pdf(folder / "lease.pdf", "Pets are allowed.")
     pdf(folder / "2026" / "letter.pdf", "School starts at 8.")
-    (folder / "notes.txt").write_text("not a PDF\n")
+    (folder / "notes.rtf").write_text("neither a PDF nor a text file\n")  # .txt and .md: tests/test_documents_text.py
     (folder / ".hidden.pdf").write_bytes(b"%PDF-1.7\nhidden\n")
     (folder / "linked.pdf").symlink_to(folder / "lease.pdf")
     outside = pdf(folder.parent / "not-shared" / "elsewhere.pdf", "not shared")
@@ -708,6 +708,23 @@ async def test_read_gives_up_to_three_pages_in_one_call(documents: Documents, fo
         documents.read_text("Practice Exam", 9, 8)
 
 
+async def test_under_a_32k_context_a_read_gives_one_page(store: Store, folder: Path, state: Path) -> None:
+    """Review of 0.9.8, guards-2: on a 16 GB Mac (16,384 tokens) three pages and a long answer passed the model's
+    context; there a read gives one page and names the next."""
+    from local_assistant.documents import SMALL_READ_PAGES
+
+    small = Documents(store, folder, Helper((sys.executable, str(FAKE), str(state)), 10.0), tz=TZ)
+    await exam_folder(small, folder)
+    one = small.read_text("Course Syllabus", 2, 9, pages=SMALL_READ_PAGES)
+    assert SMALL_READ_PAGES == 1
+    assert [int(n) for n in re.findall(r"Course syllabus page (\d+)\.", one)] == [2]
+    assert (
+        one.splitlines()[-1]
+        == prompts.DOCUMENT_READ_ON_ONE.format(next=3)
+        == "(one page in one read: page 3 comes next)"
+    )
+
+
 async def test_more_than_five_new_documents_are_counted(documents: Documents, folder: Path) -> None:
     await documents.look()
     for number in range(7):
@@ -818,6 +835,27 @@ async def test_a_look_stops_between_documents_when_asked(documents: Documents, f
     pdf(folder / "b.pdf", "y")
     look = await documents.look(stop=lambda: True)  # a call began
     assert look.read == 0 and look.left == 2 and store.get_state(LOOKED_KEY) is None
+
+
+async def test_a_call_that_begins_during_a_read_stops_the_helper_and_that_file_is_read_next_time(
+    documents: Documents, folder: Path, store: Store, state: Path
+) -> None:
+    """Review C21 (0.9.7): a PDF being read (up to 75 s, a scan with Vision) never runs on into a call or the lock: the
+    helper is stopped, nothing of that file is kept, and the next look reads it whole."""
+    pdf(folder / "a.pdf", "Pets are allowed.")
+    state.write_text(json.dumps({"sleep": 5}))
+    began = [False]
+    running = asyncio.create_task(documents.look(stop=lambda: began[0]))
+    await asyncio.sleep(0.5)  # the helper is reading
+    began[0] = True  # a call began
+    started = time.monotonic()
+    look = await asyncio.wait_for(running, 3)
+    assert time.monotonic() - started < 2  # not the helper's 5 s
+    assert (look.read, look.left, look.cut) == (0, 1, True) and store.doc_files() == []
+    assert store.get_state(LOOKED_KEY) is None  # the next tick goes on
+    state.write_text(json.dumps({}))
+    again = await documents.look()
+    assert again.read == 1 and [file.path for file in store.doc_files()] == ["a.pdf"]
 
 
 async def test_a_folder_that_stays_closed_is_noted_once_and_not_looked_at_every_minute(

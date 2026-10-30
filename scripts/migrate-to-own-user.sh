@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash
 # Move her into her own hidden user _estia: her data to /var/estia (0700), her code to a root-owned release in
 # /usr/local/estia, both services run as _estia from there. Run it as yourself; the real move asks for sudo once.
 #   scripts/migrate-to-own-user.sh --dry-run      every step and command, nothing changed (no sudo)
@@ -19,6 +19,7 @@
 # The first move only: once she runs in her own user it stops before any sudo (it would run this checkout as root).
 # Updates from then on: /usr/bin/sudo /usr/local/estia/bin/estia-deploy
 set -euo pipefail
+PATH="/usr/bin:/bin:/usr/sbin:/sbin:$PATH"  # the Mac's own tools first, then your PATH's (uv, Homebrew's)
 repo="$(cd "$(dirname "$0")/.." && pwd)"
 python="$repo/.venv/bin/python"
 usage="usage: scripts/migrate-to-own-user.sh [--dry-run | --rehearse | --rollback | --remove-old]"
@@ -26,7 +27,7 @@ usage="usage: scripts/migrate-to-own-user.sh [--dry-run | --rehearse | --rollbac
 [[ $# -le 1 ]] || { echo "$usage" >&2; exit 2; }
 source "$(dirname "$0")/own-user.sh"  # $estia: her commands' fixed path
 if [[ -z "${1:-}" ]] && moved; then  # never this checkout's Python as root once she is moved
-  echo "✓ already in her own user: use /usr/bin/sudo /usr/local/estia/bin/estia-deploy (it shows the commits first)"
+  echo "✓ already in her own macOS account: use /usr/bin/sudo /usr/local/estia/bin/estia-deploy (it shows the commits first)"
   exit 0
 fi
 case "${1:-}" in --rollback|--remove-old) ;; *) [[ -x "$python" ]] || { echo "no .venv in $repo: run uv sync --frozen first" >&2; exit 1; } ;; esac
@@ -38,9 +39,9 @@ case "${1:-}" in
     share --after-move --dry-run ;;  # its heading only over a folder to share
   "")
     "$sudo" "$python" -I -m local_assistant.ownuser migrate --checkout "$repo" || exit 1
-    share --after-move || { echo "! She runs in her own user; her projects folder is not shared yet: scripts/share-projects.sh" >&2; exit 3; } ;;
+    share --after-move || { echo "! She runs in her own macOS account; her projects folder is not shared yet: scripts/share-projects.sh" >&2; exit 3; } ;;
   --rollback|--remove-old)  # after the move: the root-owned tools do it, never this checkout's Python as root
-    [[ -x "$estia" ]] || { echo "no move into her own user is on record: nothing to go back from" >&2; exit 1; }
+    [[ -x "$estia" ]] || { echo "no move into her own macOS account is on record: nothing to go back from" >&2; exit 1; }
     exec "$sudo" "$estia" "${1#--}" ;;
   *) echo "$usage" >&2; exit 2 ;;
 esac

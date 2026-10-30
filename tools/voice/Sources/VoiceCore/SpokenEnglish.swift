@@ -7,14 +7,25 @@ import Foundation
 public enum SpokenEnglish {
     struct Pass {
         let name: String
-        let run: (String) -> String
+        /// The text, and what she said before it (`spoken(_:before:)`): only the times read it.
+        let run: (String, String) -> String
+
+        init(name: String, run: @escaping (String) -> String) {
+            self.name = name
+            self.run = { text, _ in run(text) }
+        }
+
+        init(name: String, withBefore run: @escaping (String, String) -> String) {
+            self.name = name
+            self.run = run
+        }
     }
 
     static let passes: [Pass] = [
         Pass(name: "chords", run: ChordSpeller.spell),
         Pass(name: "abbreviations", run: Abbreviations.spoken),
         Pass(name: "emails and domains", run: Electronic.spoken),
-        Pass(name: "times", run: NumberNormalizer.timesOfDay),
+        Pass(name: "times", withBefore: { NumberNormalizer.timesOfDay($0, before: $1) }),
         Pass(name: "dates", run: Dates.spoken),
         Pass(name: "phones and leading zeros", run: Phones.spoken),
         Pass(name: "measures", run: Measures.spoken),
@@ -31,14 +42,15 @@ public enum SpokenEnglish {
     /// The passes' names in their run order.
     public static var order: [String] { passes.map(\.name) }
 
-    /// `text` as Kokoro is to read it.
-    public static func spoken(_ text: String) -> String {
-        passes.reduce(text) { text, pass in pass.run(text) }
+    /// `text` as Kokoro is to read it; `before`: what she said just before it (on a call, her answer's sentences
+    /// before this one), read only for the times' part of the day.
+    public static func spoken(_ text: String, before: String = "") -> String {
+        passes.reduce(text) { text, pass in pass.run(text, before) }
     }
 
     /// Every pass but the chords (`NumberNormalizer.normalize`).
     static func withoutChords(_ text: String) -> String {
-        passes.dropFirst().reduce(text) { text, pass in pass.run(text) }
+        passes.dropFirst().reduce(text) { text, pass in pass.run(text, "") }
     }
 }
 

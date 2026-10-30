@@ -103,9 +103,9 @@ private func pcm16(_ samples: [Int16]) -> Data {
         #expect(Route("POST", "/turn?x=1") == .turn)  // no query is read
         #expect(Route("GET", "/turn") == .methodNotAllowed)
         #expect(Route("POST", "/turns") == .notFound)
-        let body = healthBody(stt: "ready", tts: "ready", vad: "ready", turn: "loading")
+        let body = healthBody(stt: "ready", tts: "ready", vad: "ready", turn: "loading", pocket: ["pocket": "ready"])
         let text = String(decoding: HTTP.json(200, body), as: UTF8.self)
         #expect(text.hasSuffix(
-            #"{"languages":["en","es","it","ko","pt","nl","pl","de","ja","ru","fr"],"stt":"ready","tts":"ready","turn":"loading","vad":"ready"}"#))
+            #"{"hints":true,"languages":["en","es","it","ko","pt","nl","pl","de","ja","ru","fr"],"pocket":"ready","stt":"ready","tts":"ready","turn":"loading","vad":"ready"}"#))
     }
 }

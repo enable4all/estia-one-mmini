@@ -89,12 +89,15 @@ private func sine(_ hertz: Double, rate: Int, count: Int, amplitude: Float = 1) 
     }
 
     @Test func healthListsTheLanguages() throws {
-        let body = healthBody(stt: "ready", tts: "loading", vad: "unavailable", turn: "ready")
+        let body = healthBody(stt: "ready", tts: "loading", vad: "unavailable", turn: "ready",
+                              pocket: ["pocket": "loading", "pocket_de": "idle"])
         #expect(body["stt"] as? String == "ready" && body["tts"] as? String == "loading")
         #expect(body["languages"] as? [String] == Languages.all)
-        // the speech and turn detectors' states are two more fields; the others stay byte for byte as they were
+        // the speech and turn detectors' states are two more fields, Pocket TTS's one a model (English's and a
+        // language's: 24-26 Oct); the others stay byte for byte as they were
         let text = String(decoding: HTTP.json(200, body), as: UTF8.self)
-        #expect(text.hasSuffix(#"{"languages":["en","es","it","ko","pt","nl","pl","de","ja","ru","fr"],"stt":"ready","tts":"loading","turn":"ready","vad":"unavailable"}"#))
+        // "hints": a transcription takes her name as a hint (the wake harness reads it)
+        #expect(text.hasSuffix(#"{"hints":true,"languages":["en","es","it","ko","pt","nl","pl","de","ja","ru","fr"],"pocket":"loading","pocket_de":"idle","stt":"ready","tts":"loading","turn":"ready","vad":"unavailable"}"#))
     }
 }
 
@@ -123,6 +126,27 @@ private func sine(_ hertz: Double, rate: Int, count: Int, amplitude: Float = 1) 
         #expect(request.voice == "bm_george" && request.speed == 1.5)
         let odd = try SpeechRequest(json: raw(#"{"input": "Hi.", "voice": "../../x", "speed": 0.1}"#))
         #expect(odd.voice == "af_heart" && odd.speed == 0.7)
+    }
+
+    /// The review of 28 Oct (calls-03): a call's line says so, and a Pocket TTS voice resting after failed runs is
+    /// tried again for it (`PocketSpeaker.speak(call:)`); any other request is as before.
+    @Test func aCallsLineSaysSo() throws {
+        #expect(try SpeechRequest(json: raw(#"{"input": "Hi.", "call": true}"#)).call)
+        #expect(try !SpeechRequest(json: raw(#"{"input": "Hi."}"#)).call)
+        #expect(try !SpeechRequest(json: raw(#"{"input": "Hi.", "call": "yes"}"#)).call)
+    }
+
+    /// Owner, 28 Oct (calls-03): on a call Kokoro says at most one line of a turn; each later line of it asks for no
+    /// Kokoro (`"kokoro": false`), so Kokoro never stands in for it in English. Supertonic-3, the stand-in in the other
+    /// ten languages, is no Kokoro: asked so, it stands in as ever. Only a JSON false asks it; any other request is as
+    /// before.
+    @Test func aCallsLineMayAskForNoKokoro() throws {
+        let english = try SpeechRequest(json: raw(#"{"input": "Hi.", "voice": "jane", "call": true, "kokoro": false}"#))
+        #expect(!english.kokoro && !english.standInAllowed)
+        let german = try SpeechRequest(json: raw(#"{"input": "Hallo.", "voice": "jane", "language": "de", "kokoro": false}"#))
+        #expect(!german.kokoro && german.standInAllowed)
+        #expect(try SpeechRequest(json: raw(#"{"input": "Hi.", "voice": "jane"}"#)).standInAllowed)
+        #expect(try SpeechRequest(json: raw(#"{"input": "Hi.", "kokoro": "no"}"#)).kokoro)
     }
 
     @Test func emptyTooLongOrBroken() {
@@ -183,6 +207,52 @@ private func sine(_ hertz: Double, rate: Int, count: Int, amplitude: Float = 1) 
         #expect(NumberNormalizer.normalize("At 7:30 a.m. tomorrow, 10:00 pm. Then")
             == "At seven thirty in the morning tomorrow, ten at night. Then")
         #expect(NumberNormalizer.normalize("12:15 am, 12:00 PM, 22:30") == "twelve fifteen at night, noon, ten thirty at night")
+    }
+
+    /// The Pocket TTS spike, 24 Oct: "Shall I remind you at 7:30?" after "closes at 8 tonight" was said "seven thirty in
+    /// the morning". A time before noon without am/pm says "in the morning" only when nothing in its sentence or before
+    /// it in her answer says evening or night: before it in the request, and on a call (one sentence a request) the
+    /// sentences of her answer said before it (`context`). Else it is the time alone.
+    @Test func aMorningIsSaidOnlyWithoutEveningOrNightBeforeIt() throws {
+        let everyday = "The pharmacy on Main Street closes at 8 tonight, so you still have about two hours. It's a "
+            + "ten-minute walk, or four minutes by car. Shall I remind you at 7:30?"
+        #expect(try SpeechRequest(json: raw(#"{"input": "\#(everyday)"}"#)).spokenInput.hasSuffix(
+            "Shall I remind you at seven thirty?"))
+        let call = try SpeechRequest(json: raw(
+            #"{"input": "Shall I remind you at 7:30?", "context": "The pharmacy closes at 8 tonight. It's a short walk."}"#))
+        #expect(call.spokenInput == "Shall I remind you at seven thirty?")
+        #expect(SpokenEnglish.spoken("Remind me at 7:30 tonight.") == "Remind me at seven thirty tonight.")
+        #expect(SpokenEnglish.spoken("See you at 9:15 this evening.") == "See you at nine fifteen this evening.")
+        #expect(SpokenEnglish.spoken("It was a long night. Wake me at 6:45.") == "It was a long night. Wake me at six forty five.")
+        #expect(SpokenEnglish.spoken("Dinner is at 8 p.m. Shall I call at 7:30?")
+            == "Dinner is at eight in the evening. Shall I call at seven thirty?")
+        #expect(SpokenEnglish.spoken("Shall I call at 7:30?", before: "The concert starts at 8pm.")
+            == "Shall I call at seven thirty?")
+        // nothing says evening or night: the morning, as before; am/pm said wins; a later answer's night is not before it
+        #expect(SpokenEnglish.spoken("Your dentist appointment is tomorrow at 9:15.")
+            == "Your dentist appointment is tomorrow at nine fifteen in the morning.")
+        #expect(SpokenEnglish.spoken("At 7:30 a.m., not tonight.") == "At seven thirty in the morning, not tonight.")
+        #expect(SpokenEnglish.spoken("Breakfast at 7:30. Then nothing tonight.")
+            == "Breakfast at seven thirty in the morning. Then nothing tonight.")
+        #expect(SpokenEnglish.spoken("Midnight snacks? Up at 6:30.") == "Midnight snacks? Up at six thirty in the morning.")
+        // the afternoon and the night keep their names; a range, too, drops only the morning
+        #expect(SpokenEnglish.spoken("Tonight at 21:30, or tomorrow at 14:00.")
+            == "Tonight at nine thirty in the evening, or tomorrow at two in the afternoon.")
+        #expect(SpokenEnglish.spoken("Free tonight from 7:30-9:00?") == "Free tonight from seven thirty to nine?")
+    }
+
+    /// The review of 24 Oct: code's reminder line writes its time on the 24-hour clock ("07:00"), and its "in the
+    /// morning" is the one spoken cue that the half of the day may be wrong. An hour written with a leading zero is the
+    /// 24-hour clock: it keeps its part of the day whatever was said around it; Gemma writes "7:30".
+    @Test func anHourWithItsLeadingZeroKeepsItsMorning() throws {
+        let line = try SpeechRequest(json: raw(
+            #"{"input": "Reminder set for Saturday 25 October, 07:00.", "context": "Enjoy cooking tonight!"}"#))
+        #expect(line.spokenInput.hasSuffix(", seven in the morning."))
+        #expect(SpokenEnglish.spoken("Good night. Wake-up call set for 06:45.")
+            == "Good night. Wake-up call set for six forty five in the morning.")
+        #expect(SpokenEnglish.spoken("Shall I call at 7:30?", before: "Good night.") == "Shall I call at seven thirty?")
+        #expect(SpokenEnglish.spoken("Free tonight from 07:30-09:00?")
+            == "Free tonight from seven thirty to nine in the morning?")
     }
 
     /// Owner, 16 Oct: "the 'am', 'pm'": an hour with am/pm and no minutes ("7pm" was "sevenpm") is a time too; a
@@ -250,6 +320,21 @@ private func sine(_ hertz: Double, rate: Int, count: Int, amplitude: Float = 1) 
         }
         #expect(cleanTranscript([TranscriptSegment(text: "[Music] Hello Gemma", noSpeechProb: 0.2, avgLogprob: -0.5)]) == "Hello Gemma")
     }
+
+    @Test func aCallKeepsTheCallersBareThanksAndBye() {
+        // review I23: a caller's bare "Bye." or "Thank you." was erased here, so it never ended the call; on a call
+        // (`call: true`) they are kept (the bridge's own noise gate judges them), Whisper's other habits still go
+        let heard = { (text: String) in [TranscriptSegment(text: text, noSpeechProb: 0.05, avgLogprob: -0.3)] }
+        for said in ["Bye.", "Thank you.", "Thanks.", "thank you"] {
+            #expect(cleanTranscript(heard(" " + said), call: true) == said)
+        }
+        for junk in [" you", "[BLANK_AUDIO]", "Thanks for watching!", "  ", "."] {
+            #expect(cleanTranscript(heard(junk), call: true) == "")
+        }
+        let silence = [TranscriptSegment(text: " Thank you.", noSpeechProb: 0.9, avgLogprob: -1.4)]
+        #expect(cleanTranscript(silence, call: true) == "")  // confident silence goes on a call too
+        #expect(cleanTranscript(heard(" Bye.")) == "")  // a voice note: as before
+    }
 }
 
 @Suite struct Audio {
@@ -264,6 +349,57 @@ private func sine(_ hertz: Double, rate: Int, count: Int, amplitude: Float = 1) 
         #expect(sniffAudio(raw("%PDF-1.7")) == nil)
         #expect(sniffAudio(Data()) == nil)
     }
+
+    /// A WAV with these header fields (RIFF, a 16-byte fmt chunk, then `extra` chunks, then data), for the reader's
+    /// refusals.
+    private func wav(format: Int = 1, channels: Int = 1, rate: Int = 16_000, bits: Int = 16, extra: Data = Data(),
+                     pcm: Data = Data([0x00, 0x40, 0x00, 0xC0])) -> Data {
+        func le32(_ value: Int) -> Data { Data((0..<4).map { UInt8((value >> (8 * $0)) & 0xFF) }) }
+        func le16(_ value: Int) -> Data { Data((0..<2).map { UInt8((value >> (8 * $0)) & 0xFF) }) }
+        let fmt = raw("fmt ") + le32(16) + le16(format) + le16(channels) + le32(rate)
+            + le32(rate * channels * bits / 8) + le16(channels * bits / 8) + le16(bits)
+        let body = raw("WAVE") + fmt + extra + raw("data") + le32(pcm.count) + pcm
+        return raw("RIFF") + le32(body.count) + body
+    }
+
+    @Test func aCallClipIsReadInMemoryAsAVAudioFileReadsIt() throws {
+        // what the bridge sends for every call turn (call_audio.pcm48_to_wav16k): 16 kHz mono 16-bit PCM
+        let clip = pcm16WAV([0, 0.5, -0.5, 1, -1], sampleRate: 16_000)
+        let samples = try #require(pcm16kMonoSamples(clip))
+        // AVAudioFile (and so WhisperKit's file path) reads a 16-bit sample as its value / 32768
+        #expect(samples == [0, 16_384, -16_384, 32_767, -32_767].map { Float($0) / 32_768 })
+        #expect(pcm16kMonoSamples(silentWAV(seconds: 1))?.count == 16_000)
+        #expect(pcm16kMonoSamples(wav())! == [0.5, -0.5])
+        #expect(pcm16kMonoSamples(wav(pcm: Data()))! == [])
+    }
+
+    @Test func aChunkBeforeTheDataIsSkipped() {
+        let list = raw("LIST") + Data([3, 0, 0, 0]) + raw("abc") + Data([0])  // an odd size is padded to even
+        #expect(pcm16kMonoSamples(wav(extra: list)) == [0.5, -0.5])
+    }
+
+    @Test func anyOtherAudioIsNotReadInMemory() {
+        #expect(pcm16kMonoSamples(wav(rate: 24_000)) == nil)
+        #expect(pcm16kMonoSamples(wav(rate: 48_000)) == nil)
+        #expect(pcm16kMonoSamples(wav(channels: 2)) == nil)
+        #expect(pcm16kMonoSamples(wav(bits: 8)) == nil)
+        #expect(pcm16kMonoSamples(wav(format: 3, bits: 32)) == nil)  // float samples
+        #expect(pcm16kMonoSamples(pcm16WAV([0.1], sampleRate: 24_000)) == nil)
+        #expect(pcm16kMonoSamples(Data([0, 0, 0, 0x1C]) + raw("ftypM4A ") + Data(count: 8)) == nil)
+        #expect(pcm16kMonoSamples(Data()) == nil)
+    }
+
+    @Test func aBrokenWAVIsNotReadInMemory() {
+        let whole = wav()
+        #expect(pcm16kMonoSamples(whole.prefix(whole.count - 1)) == nil)  // the data chunk is cut short
+        #expect(pcm16kMonoSamples(whole.prefix(36)) == nil)  // no data chunk
+        #expect(pcm16kMonoSamples(wav(pcm: Data([0, 0x40, 0]))) == nil)  // half a sample
+        let noFormat = raw("RIFF") + Data([12, 0, 0, 0]) + raw("WAVE") + raw("data") + Data(count: 4)
+        #expect(pcm16kMonoSamples(noFormat) == nil)
+        // a slice of a larger buffer (an HTTP body) is read from its own start
+        let sliced = (Data([9, 9, 9]) + whole).dropFirst(3)
+        #expect(pcm16kMonoSamples(sliced) == [0.5, -0.5])
+    }
 }
 
 @Suite struct Errors {
@@ -272,6 +408,7 @@ private func sine(_ hertz: Double, rate: Int, count: Int, amplitude: Float = 1) 
             (.notAudio, 415, "not_audio"), (.tooLong, 413, "too_long"), (.unreadable, 422, "unreadable"),
             (.notReady, 503, "not_ready"), (.failed, 500, "failed"), (.unsupportedLanguage, 400, "unsupported_language"),
             (.badStream, 400, "bad_stream"), (.badChunk, 400, "bad_chunk"), (.unavailable, 503, "unavailable"),
+            (.noStandIn, 409, "no_stand_in"),
         ]
         for (error, status, code) in cases {
             let text = String(decoding: error.response, as: UTF8.self)
@@ -420,6 +557,44 @@ private struct LoadFailed: Error {}
         }
     }
 
+    @Test func aHintIsHerNameAsSent() throws {
+        // her name, which the bridge sends on a call in standby so Whisper hears it (owner, 22 Oct)
+        let target = "/v1/audio/transcriptions"
+        #expect(try TranscriptionRequest(target: "\(target)?language=nl", body: wav).hint == "")
+        #expect(try TranscriptionRequest(target: "\(target)?hint=Estia", body: wav).hint == "Estia")
+        #expect(try TranscriptionRequest(target: "\(target)?language=nl&hint=Mary%20Jane", body: wav).hint == "Mary Jane")
+        #expect(try TranscriptionRequest(target: "\(target)?hint=Mary-Jane&language=de", body: wav).language == "de")
+        let katakana = "%E3%82%A8%E3%82%B9%E3%83%86%E3%82%A3%E3%82%A2"
+        #expect(try TranscriptionRequest(target: "\(target)?hint=\(katakana)", body: wav).hint == "エスティア")
+        #expect(try TranscriptionRequest(target: "\(target)?hint=", body: wav).hint == "")
+    }
+
+    @Test func aCallIsNamedByItsFlag() throws {
+        // the bridge's ?call=1 on a call's turns: the bare thanks and bye are the caller's (review I23)
+        let target = "/v1/audio/transcriptions"
+        #expect(try TranscriptionRequest(target: "\(target)?call=1", body: wav).call)
+        #expect(try TranscriptionRequest(target: "\(target)?language=nl&call=1&hint=Estia", body: wav).call)
+        #expect(try !TranscriptionRequest(target: target, body: wav).call)
+        #expect(try !TranscriptionRequest(target: "\(target)?call=0", body: wav).call)
+        #expect(try !TranscriptionRequest(target: "\(target)?hint=Estia", body: wav).call)
+    }
+
+    @Test func aHintThatIsNoNameIsRefused() {
+        // a name as the bridge's config allows it: letters of any script, spaces and hyphens, a letter at each end;
+        // never a token, a line break or a sentence (Whisper's prompt is text it may write back)
+        let bad = ["R2D2", "%3C%7Cendoftext%7C%3E", String(repeating: "a", count: 41), "Estia%0A", "%ZZ", "-Estia", "Estia.",
+                   "Say%20Estia%20now%2C%20please"]
+        for hint in bad {
+            #expect(throws: VoiceError.badHint) {
+                try TranscriptionRequest(target: "/v1/audio/transcriptions?hint=\(hint)", body: wav)
+            }
+        }
+        #expect(throws: VoiceError.unsupportedLanguage) {  // the language first, as ever
+            try TranscriptionRequest(target: "/v1/audio/transcriptions?language=xx&hint=R2D2", body: wav)
+        }
+        #expect(VoiceError.badHint.status == 400 && VoiceError.badHint.code == "bad_hint")
+    }
+
     @Test func notAudioOrTooBig() {
         #expect(throws: VoiceError.notAudio) {
             try TranscriptionRequest(target: "/v1/audio/transcriptions?language=nl", body: raw("%PDF-1.7"))
@@ -430,19 +605,22 @@ private struct LoadFailed: Error {}
     }
 }
 
-/// FluidAudio 0.15.8's own advisory (KokoroAneManager.isBnnsCrashProneOS): an Apple BNNS bug in macOS 26.4 and 26.5
-/// can crash Kokoro's speech (EXC_BAD_ACCESS in libBNNS) whatever the compute units; 26.6 fixes it. The service
-/// says so in its log at start.
+/// The Apple BNNS crash in Kokoro's speech (SIGSEGV in libBNNS) was seen on macOS 27.0.1 (calls.md, Gotchas): 27.0.x
+/// is warned until measured otherwise (the review of 28 Oct, calls-03). The service says so in its log at start.
+/// Estia needs macOS 27 or later (owner, 29 Oct): FluidAudio's own 26.4 and 26.5 advisory is no line of hers.
 @Suite struct KokoroOnThisMac {
-    @Test(arguments: [
-        (26, 3, false), (26, 4, true), (26, 5, true), (26, 6, false), (27, 0, false), (15, 6, false), (25, 4, false),
-    ])
-    func onlyMacOS264And265AreCrashProne(major: Int, minor: Int, prone: Bool) {
+    @Test(arguments: [(26, 4, false), (26, 5, false), (27, 0, true), (27, 1, false), (28, 0, false)])
+    func macOS270IsCrashProne(major: Int, minor: Int, prone: Bool) {
         #expect(KokoroAdvisory.crashProne(OperatingSystemVersion(majorVersion: major, minorVersion: minor, patchVersion: 1)) == prone)
     }
 
-    @Test func theWarningNamesTheFix() {
-        #expect(KokoroAdvisory.warning.contains("26.6 or later") && KokoroAdvisory.warning.contains("English"))
+    @Test func theWarningSaysThereIsNoFixYet() {
+        func warning(_ major: Int, _ minor: Int) -> String? {
+            KokoroAdvisory.warning(OperatingSystemVersion(majorVersion: major, minorVersion: minor, patchVersion: 1))
+        }
+        let seen = warning(27, 0) ?? ""
+        #expect(seen.contains("macOS 27.0.1") && seen.contains("no fix yet") && seen.contains("Kokoro"))
+        #expect(warning(26, 5) == nil && warning(27, 1) == nil)
     }
 }
 
@@ -468,5 +646,56 @@ private struct LoadFailed: Error {}
         await SpeakingRetry.run(sleep: { await record.sleep($0) }, load: { await record.attempt(succeedOn: 4) })
         #expect(await record.slept == [60, 300, 1800, 1800])
         #expect(await record.tries == 4)
+    }
+}
+
+/// The service's own arguments: launchd starts it with none (port 8150, the models folder in its home); a check built
+/// here runs on another port and, to fetch nothing into a home, with a models folder of its own (25 Oct: the six
+/// languages' check, in a scratch folder).
+@Suite struct ServiceArgumentsParsing {
+    @Test func noArgumentsAreTheLiveServicesOwn() {
+        #expect(ServiceArguments(["voice-service"]) == ServiceArguments(port: 8150, models: nil))
+    }
+
+    /// Owner, 26 Oct: the Pocket model follows the Mac's Gemma (`PocketTTS.english(memory:)`); a check built here
+    /// names one, to check the other model on this Mac.
+    @Test func aCheckNamesThePocketModel() {
+        #expect(ServiceArguments(["voice-service"])?.pocket == nil)  // launchd's: the Mac's own
+        let small = ServiceArguments(["voice-service", "--port", "8151", "--models", "/tmp/m", "--pocket", "18M"])
+        #expect(small == ServiceArguments(port: 8151, models: URL(fileURLWithPath: "/tmp/m"), pocket: .english18M))
+        #expect(ServiceArguments(["voice-service", "--pocket", "100M", "--port", "8151"])?.pocket == PocketModel.english)
+    }
+
+    @Test func aPortAndAModelsFolderInEitherOrder() {
+        #expect(ServiceArguments(["voice-service", "--port", "8151"]) == ServiceArguments(port: 8151, models: nil))
+        let both = ServiceArguments(["voice-service", "--port", "8151", "--models", "/tmp/scratch models"])
+        #expect(both == ServiceArguments(port: 8151, models: URL(fileURLWithPath: "/tmp/scratch models")))
+        #expect(ServiceArguments(["voice-service", "--models", "/tmp/m", "--port", "8152"])
+            == ServiceArguments(port: 8152, models: URL(fileURLWithPath: "/tmp/m")))
+    }
+
+    /// Anything it does not take is refused, never read as the defaults (the review of 25 Oct: a typo in a check run,
+    /// `--port 81510` or `--models scratch`, took the live address or fetched into the home the flag keeps clear).
+    @Test func anythingOddIsRefused() {
+        for odd in [["--port", "x"], ["--port"], ["--port", "81510"], ["--port", "0"], ["--port", "-1"], ["--models"],
+                    ["--models", "relative"], ["--models", ""], ["--other", "1"], ["--port", "8151", "extra"],
+                    ["--port", "8151", "--port", "8152"], ["--models", "/tmp/a", "--models", "/tmp/b"],
+                    ["--pocket"], ["--pocket", "18m"], ["--pocket", "small"], ["--pocket", "eve"],
+                    ["--pocket", "18M", "--pocket", "100M"]] {
+            #expect(ServiceArguments(["voice-service"] + odd) == nil, "\(odd)")
+        }
+    }
+
+    /// The review of 26 Oct (R2-F8): a check's models folder or Pocket model comes with a port of its own, never the
+    /// live one's (with only `--pocket 18M` or `--models /x` it took 8150: with her service stopped the bridge would
+    /// talk to the check, with it running her restart would fail while the check holds the port).
+    @Test func aChecksFlagsComeWithAPortOfItsOwn() {
+        for odd in [["--pocket", "18M"], ["--models", "/x"], ["--models", "/x", "--port", "8150"],
+                    ["--port", "8150", "--pocket", "100M"], ["--pocket", "18M", "--models", "/x"]] {
+            #expect(ServiceArguments(["vs"] + odd) == nil, "\(odd)")
+        }
+        #expect(ServiceArguments(["vs", "--pocket", "18M", "--port", "8151"])
+            == ServiceArguments(port: 8151, models: nil, pocket: .english18M))
+        #expect(ServiceArguments(["vs", "--port", "8150"]) == ServiceArguments(port: 8150, models: nil))  // the live one's
     }
 }

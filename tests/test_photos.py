@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from local_assistant.photos import PhotoError, data_uri, prepare, sniff
+from local_assistant.photos import PhotoError, ShownPhoto, data_uri, prepare, sniff
 
 HEIC = Path("/System/Library/Desktop Pictures/iMac Blue.heic")
 
@@ -92,3 +92,26 @@ async def test_prepare_refuses_too_many_pixels(tmp_path: Path) -> None:
     with pytest.raises(PhotoError, match="too large"):
         await prepare(png(100, 100), tmp_path, max_pixels=5_000)
     assert list(tmp_path.iterdir()) == []
+
+
+def test_the_last_photo_is_shown_for_its_seconds_from_the_start_of_its_answer() -> None:
+    """The last photo stays in her view for follow-ups in its conversation, `seconds` from the start of its answer
+    (in memory only)."""
+    shown = ShownPhoto(300)
+    assert shown.recent(1, 1000.0) is None
+    shown.keep(1, 7, ["data:image/jpeg;base64,AAAA"], 1000.0)
+    assert shown.recent(1, 1299.0) == {7: ["data:image/jpeg;base64,AAAA"]}
+    assert shown.recent(2, 1100.0) is None  # another conversation: gone
+    shown.keep(1, 8, ["x"], 2000.0)
+    assert shown.recent(1, 2301.0) is None  # past its 5 minutes
+
+
+def test_the_seconds_a_photo_is_still_shown() -> None:
+    """Second review of 0.9.8, guards-4: a hold for a photo says when it ends."""
+    shown = ShownPhoto(300)
+    assert shown.left(1, 1000.0) == 0.0
+    shown.keep(1, 7, ["x"], 1000.0)
+    assert shown.left(1, 1120.0) == 180.0
+    assert shown.left(2, 1120.0) == 0.0  # another conversation
+    assert shown.left(1, 1400.0) == 0.0
+    assert shown.left(3, 1400.0, new=True) == 300.0  # a photo of this message: the whole time

@@ -13,6 +13,7 @@ from local_assistant.mail_http import HttpResult
 from local_assistant.part_status import PartStatus, Record
 from local_assistant.store import Store
 from local_assistant.web_search import (
+    BRAVE_MONTHLY_MAX,
     BRAVE_URL,
     OLLAMA_URL,
     Limits,
@@ -74,7 +75,7 @@ def web(
     http: FakeHttp,
     store: Store,
     *,
-    cap: int = 2000,
+    cap: int = 900,
     month: str = "2026-10",
     text: str = "",
     clock: Clock | None = None,
@@ -157,8 +158,43 @@ async def test_brave_searches_are_counted_per_month(tmp_path: Path, store: Store
     search = web(tmp_path, http, store)
     await search.search("one")
     await search.search("two")
-    assert search.usage() == "Ollama 2 today, Brave backup 2/2000 this month"
-    assert web(tmp_path, http, store, month="2026-11").usage() == "Ollama 2 today, Brave backup 0/2000 this month"
+    assert search.usage() == "Ollama 2 today, Brave backup 2/900 this month"
+    assert web(tmp_path, http, store, month="2026-11").usage() == "Ollama 2 today, Brave backup 0/900 this month"
+
+
+async def test_brave_stops_at_900_a_month_whatever_the_config_says(tmp_path: Path, store: Store) -> None:
+    """Brave's free plan is a $5 monthly credit (about 1,000 searches) and bills beyond it with no cap of its own: code
+    stops at 900, so the card is never charged, even with a higher number in the config (owner, 25 Oct)."""
+    assert BRAVE_MONTHLY_MAX == 900
+    http = FakeHttp()
+    ollama_down(http)
+    http.add(BRAVE_URL, 200, BRAVE_ANSWER)
+    store.set_state("web_brave_2026-10", "899")
+    search = web(tmp_path, http, store, cap=2000)
+    assert (await search.search("the 900th")).provider == "Brave"
+    with pytest.raises(WebSearchError, match="not available right now"):
+        await search.search("the 901st")
+    assert asked(http) == [OLLAMA_URL, BRAVE_URL, OLLAMA_URL]  # the 901st never reached Brave
+    assert search.usage() == "Ollama 2 today, Brave backup 900/900 this month"
+
+
+async def test_past_brave_s_900_ollama_still_answers(tmp_path: Path, store: Store) -> None:
+    http = FakeHttp()
+    http.add(OLLAMA_URL, 200, OLLAMA_ANSWER)
+    store.set_state("web_brave_2026-10", "900")
+    found = await web(tmp_path, http, store, cap=100_000).search("ajax")
+    assert found.provider == "Ollama" and asked(http) == [OLLAMA_URL]
+
+
+async def test_a_lower_cap_in_the_config_still_counts(tmp_path: Path, store: Store) -> None:
+    http = FakeHttp()
+    ollama_down(http)
+    http.add(BRAVE_URL, 500, {"error": "down"})
+    search = web(tmp_path, http, store, cap=10)
+    with pytest.raises(WebSearchError):
+        await search.search("ajax")
+    assert store.get_state("web_brave_2026-10") == "1"  # a failed request may still count at Brave: it counts here
+    assert search.usage().endswith("Brave backup 1/10 this month")
 
 
 async def test_at_the_cap_brave_is_not_asked(tmp_path: Path, store: Store) -> None:
@@ -203,7 +239,7 @@ async def test_without_an_ollama_key_only_brave_is_asked(tmp_path: Path, store: 
     http.add(BRAVE_URL, 200, BRAVE_ANSWER)
     search = web(tmp_path, http, store, text="BRAVE_API_KEY=b-key\n")
     assert (await search.search("ajax")).provider == "Brave" and asked(http) == [BRAVE_URL]
-    assert search.usage() == "Brave 1/2000 this month (no Ollama key)"
+    assert search.usage() == "Brave 1/900 this month (no Ollama key)"
 
 
 async def test_without_a_brave_key_only_ollama_is_asked(tmp_path: Path, store: Store) -> None:
@@ -482,6 +518,21 @@ async def test_brave_once_a_second_waits_and_retries_once(tmp_path: Path, store:
     assert clock.slept[-1] == 0.8
 
 
+async def test_brave_is_never_tried_again_past_the_cap(tmp_path: Path, store: Store) -> None:
+    """Review SEC-4: the try again after Brave's one-a-second limit counts as a search too: at the cap it never goes."""
+    clock = Clock()
+    http = FakeHttp()
+    ollama_down(http)
+    per_second = {"x-ratelimit-remaining": "0, 1990", "x-ratelimit-reset": "1, 1800000"}
+    http.add(BRAVE_URL, 429, {"error": {"code": "RATE_LIMITED"}}, per_second)
+    http.add(BRAVE_URL, 200, BRAVE_ANSWER)
+    store.set_state("web_brave_2026-10", "899")
+    search = web(tmp_path, http, store, clock=clock)
+    with pytest.raises(WebSearchError):
+        await search.search("the 900th")
+    assert asked(http) == [OLLAMA_URL, BRAVE_URL] and store.get_state("web_brave_2026-10") == "900"
+
+
 async def test_brave_out_of_searches_for_the_month_is_paused(tmp_path: Path, store: Store) -> None:
     clock = Clock()
     http = FakeHttp()
@@ -532,6 +583,10 @@ async def test_on_a_call_brave_is_not_retried_after_its_one_a_second_limit(tmp_p
         "who is anna.smith@example.com",
         "bank NL91ABNA0417164300 owner",
         "bank NL91 ABNA 0417 1643 00 owner",
+        "bank nl91 abna 0417 1643 00 owner",
+        "iban GB48 WEST 12AB 34CD 56EF",  # no long digit run: only its check digits tell
+        "iban: GB48WEST12AB34CD56EF.",
+        "BE68 5390 0754 7034 2026 rent",  # a 16-character IBAN and a year after it
         "who called me from +31 6 1234 5678",
         "account 123456789",
     ],
@@ -543,7 +598,17 @@ async def test_private_details_never_go_into_a_search(tmp_path: Path, store: Sto
     assert http.requests == []
 
 
-@pytest.mark.parametrize("query", ["Ajax PSV 1-3 2026", "news 2026-10-10", "population of the Netherlands 17900000"])
+@pytest.mark.parametrize(
+    "query",
+    [
+        "Ajax PSV 1-3 2026",
+        "news 2026-10-10",
+        "population of the Netherlands 17900000",
+        "UK 2026 bank holidays",  # review places-5: refused as an IBAN once the spaces were taken out
+        "UK2026 bank holidays list",
+        "GB48 WEST 12AB 34CD 56EE",  # an IBAN's shape whose check digits do not add up
+    ],
+)
 async def test_dates_scores_and_ordinary_numbers_are_fine(tmp_path: Path, store: Store, query: str) -> None:
     http = FakeHttp()
     http.add(OLLAMA_URL, 200, OLLAMA_ANSWER)

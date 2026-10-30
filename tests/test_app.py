@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import re
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -21,22 +22,32 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from local_assistant import app as app_module
+from local_assistant import lifecycle as lifecycle_module
 from local_assistant import prompts
+from local_assistant import voice as voice_module
 from local_assistant.app import ALIVE_KEY, CALL_MAX_TOKENS, WELCOME_KEY, App, model_pin, signal_client
 from local_assistant.calendar_graph import OutlookReader
 from local_assistant.commands import TRUST_DAYS
-from local_assistant.config import DEFAULT_NAME, CalendarSource, Config, DeviceSpec, MailAccount
+from local_assistant.config import DEFAULT_NAME, CalendarSource, Config, DeviceSpec, MailAccount, parse_config
 from local_assistant.fetcher import Fetcher, FetchError, Page
-from local_assistant.gemma import Completion, GemmaUnavailableError, ModelEntry, ModelPausedError, ModelPin, OllamaGemma
+from local_assistant.gemma import (
+    Completion,
+    GemmaUnavailableError,
+    ModelEntry,
+    ModelPausedError,
+    ModelPin,
+    OllamaGemma,
+    ToolCall,
+)
 from local_assistant.health import HealthCheck
 from local_assistant.language import CODES
 from local_assistant.mail_auth import CALENDAR_SCOPES, MailAuthError, TokenStore
 from local_assistant.morning_digest import MorningDigest
-from local_assistant.part_status import PartStatus, Record, mail_part
+from local_assistant.part_status import PartStatus, Record, mail_part, read_security
 from local_assistant.part_status import lines as part_lines
 from local_assistant.part_status import read as read_part_status
-from local_assistant.profiler import UNANNOUNCED_KEY
-from local_assistant.signal_io import ReceiveProblem, SignalClient
+from local_assistant.profile import Op, Profile
+from local_assistant.signal_io import ReceiveProblem, SignalClient, SignalError
 from local_assistant.signal_text import plain as on_phone
 from local_assistant.spotify import Spotify
 from local_assistant.store import Store
@@ -46,6 +57,7 @@ from local_assistant.web_search import WebResult
 from tests.conftest import ME, STRANGER
 from tests.conftest import TZ as TZ_APP
 from tests.fakes.fake_gemma import FakeGemma, text, tool
+from tests.fakes.fake_signal_cli import LEAKS
 from tests.fakes.fake_voice import FakeVoiceService
 from tests.fakes.fake_web import FakeWeb
 from tests.no_links import assert_left_out
@@ -129,6 +141,12 @@ async def start(
     task = asyncio.create_task(app.run())
     await until(lambda: signal.ready)
     return Harness(app, gemma, folder, task)
+
+
+async def until_started(harness: Harness) -> None:
+    """The start is done (recovery, then the first sign of life): a test's own note after it is never sent by
+    recovery as well, which on a busy Mac reached it while the test's own send was on its way."""
+    await until(lambda: harness.app.store.get_state(ALIVE_KEY) is not None)
 
 
 async def stop(harness: Harness) -> None:
@@ -337,6 +355,44 @@ async def test_busy_note_when_gemma_takes_long(tmp_path: Path, monkeypatch: pyte
         await stop(harness)
 
 
+async def test_a_busy_note_that_could_not_be_sent_never_follows_the_answer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review S19 (0.9.7): the busy note is for the wait only. When it fails to go out it is set aside, so the resend
+    pass never sends it after her answer has gone out."""
+    pending: asyncio.Future[Completion] = asyncio.get_running_loop().create_future()
+    harness = await start(tmp_path, monkeypatch, FakeGemma(pending), busy_note_seconds=0.2)
+    real = harness.app._deliver
+    busy = prompts.BUSY.format(name=NAME)
+
+    async def deliver_but_the_busy_note(aci: str, text: str, what: str) -> int | None:
+        return None if text == busy else await real(aci, text, what)
+
+    monkeypatch.setattr(harness.app, "_deliver", deliver_but_the_busy_note)
+    try:
+        deliver(harness.folder, "hello", T0)
+        store = harness.app.store
+
+        def busy_status() -> list[str]:
+            rows = store._conn.execute("SELECT status FROM messages WHERE text = ?", (busy,)).fetchall()
+            return [row["status"] for row in rows]
+
+        await until(lambda: busy_status() == ["ignored"])
+        pending.set_result(text("Here you go."))
+        await until(lambda: sent(harness.folder) == ["Here you go."])
+        await harness.app.lifecycle.resend_failed()
+        assert sent(harness.folder) == ["Here you go."] and store.unsent_outgoing() == []
+    finally:
+        await stop(harness)
+
+
+def test_the_busy_note_says_what_is_known() -> None:
+    """Review S19 (0.9.7): it comes after a minute of one answer, whatever holds it up (a long answer, or another
+    program on the model): never "busy with another job"."""
+    busy = prompts.BUSY.format(name=NAME)
+    assert busy == "Estia is still working on your answer; this one takes a while."
+
+
 async def test_two_quick_messages_are_answered_in_order(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     harness = await start(tmp_path, monkeypatch, FakeGemma(text("first answer"), text("second answer")))
     try:
@@ -366,6 +422,238 @@ async def test_untrusted_identity_marks_the_reply_failed(
         await stop(harness)
 
 
+async def sends_work_again(harness: Harness, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The network is back: signal-cli (the fake) starts again with its sends working, the bridge runs on."""
+    monkeypatch.delenv("FAKE_SIGNAL_SEND_ERROR")
+    proc = harness.app.signal._proc
+    assert proc is not None
+    old = proc.pid
+    proc.terminate()
+    await until(lambda: harness.app.signal._proc is not None and harness.app.signal._proc.pid != old, 10)
+    await until(lambda: harness.app.signal.ready, 10)
+
+
+async def test_a_failed_send_is_logged_by_its_type_and_code_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """signal-cli's message for a failed send can name the recipient's number or account and a captcha's challenge
+    token (review S1; the fake's errors name made-up ones): each try logs the error's type and code, never its words,
+    and the resend pass a minute later the same."""
+    monkeypatch.setenv("FAKE_SIGNAL_SEND_ERROR", "-1")
+    harness = await start(tmp_path, monkeypatch, FakeGemma(text("hi")))
+    try:
+        deliver(harness.folder, "hello", T0)
+        await until(lambda: harness.app.store.count_messages() == 2 and harness.app.store.message(2).status == "failed")
+        await harness.app.lifecycle.resend_failed()
+        harness.app.store.delete_state("signal_profile_name")
+        monkeypatch.setattr(harness.app.signal, "update_profile", failing_update)
+        await harness.app.lifecycle.name_profile()
+    finally:
+        await stop(harness)
+    logged = " ".join(record.getMessage() for record in caplog.records)
+    assert "send attempt 1 failed: SignalError (code -1)" in logged
+    assert "Signal profile name not set: SignalError (code -1)" in logged
+    assert [value for value in (*LEAKS, ME) if value in logged] == []
+
+
+async def failing_update(name: str) -> None:
+    raise SignalError(f'User "{LEAKS[0]}" with challenge token "{LEAKS[2]}"', -1)
+
+
+async def test_a_reply_that_failed_is_sent_again_while_the_bridge_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Sends failed for a moment (the network): the reply is sent again within the recovery window while the bridge
+    runs, as recovery does at a start (review I4: it stayed failed, the user saw nothing)."""
+    monkeypatch.setenv("FAKE_SIGNAL_SEND_ERROR", "-1")
+    harness = await start(tmp_path, monkeypatch, FakeGemma(text("Your answer")))
+    try:
+        deliver(harness.folder, "hello", T0)
+        await until(lambda: harness.app.store.count_messages() == 2 and harness.app.store.message(2).status == "failed")
+        await sends_work_again(harness, monkeypatch)
+        await harness.app.lifecycle.resend_failed()
+        assert harness.app.store.message(2).status == "sent" and sent(harness.folder).count("Your answer") == 4
+        await harness.app.lifecycle.resend_failed()
+        assert sent(harness.folder).count("Your answer") == 4  # once sent, never again
+    finally:
+        await stop(harness)
+
+
+async def test_only_recent_failed_messages_to_trusted_accounts_are_sent_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The recovery window (10 minutes) bounds it, and an account whose safety number changed gets nothing until it
+    is trusted again (its replies stop)."""
+    harness = await start(tmp_path, monkeypatch, FakeGemma())
+    try:
+        await until_started(harness)
+        store = harness.app.store
+        conversation = store.current_conversation().id
+        old = store.add_outgoing(conversation, ME, "note", "an old note", None)
+        store.set_status(old, "failed")
+        eleven_minutes_ago = datetime.fromtimestamp(time.time() - 11 * 60, UTC).isoformat(timespec="seconds")
+        store._conn.execute("UPDATE messages SET created_at = ? WHERE id = ?", (eleven_minutes_ago, old))
+        recent = store.add_outgoing(conversation, ME, "note", "a recent note", None)
+        store.set_status(recent, "failed")
+        harness.app.signal_host.identity_changed.add(ME)
+        await harness.app.lifecycle.resend_failed()
+        assert sent(harness.folder) == []
+        harness.app.signal_host.identity_changed.discard(ME)
+        await harness.app.lifecycle.resend_failed()
+        assert sent(harness.folder) == ["a recent note"] and store.message(old).status == "failed"
+    finally:
+        await stop(harness)
+
+
+async def test_a_message_sent_is_never_sent_again(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A note sent by the resend pass and then asked for again (a reminder's own retry, 5 minutes later): it goes out
+    once, and the second ask says it went out."""
+    harness = await start(tmp_path, monkeypatch, FakeGemma())
+    try:
+        await until_started(harness)
+        store = harness.app.store
+        note = store.add_outgoing(store.current_conversation().id, ME, "note", "a note", None)
+        assert await harness.app._send(note)
+        assert await harness.app._send(note)
+        assert sent(harness.folder) == ["a note"]
+    finally:
+        await stop(harness)
+
+
+async def test_the_resend_pass_leaves_a_reminders_note_to_its_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A reminder's note that did not go out is tried again by the reminders themselves (every 5 minutes for an
+    hour): the resend pass leaves it to them, so the two never send it at the same moment."""
+    harness = await start(tmp_path, monkeypatch, FakeGemma())
+    try:
+        await until_started(harness)
+        store = harness.app.store
+        due = time.time() - 60
+        local = datetime.fromtimestamp(due, TZ_APP).strftime("%Y-%m-%d %H:%M")
+        rid = store.add_reminder(ME, "call mum", local, TZ_APP.key, due)
+        note = store.add_outgoing(store.current_conversation().id, ME, "note", "Reminder: call mum", None)
+        store.fire_reminder(rid, note)
+        store.set_status(note, "failed")
+        await harness.app.lifecycle.resend_failed()
+        assert sent(harness.folder) == [] and store.message(note).status == "failed"
+    finally:
+        await stop(harness)
+
+
+async def test_the_resend_pass_waits_for_a_calls_end(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Texts wait during a call, like every text (review I5): a failed note is sent again after the call."""
+    harness = await start(tmp_path, monkeypatch, FakeGemma())
+    try:
+        await until_started(harness)
+        store = harness.app.store
+        note = store.add_outgoing(store.current_conversation().id, ME, "note", "a note", None)
+        store.set_status(note, "failed")
+        harness.app._no_call.clear()  # a call is on
+        await harness.app.lifecycle.resend_failed()
+        assert sent(harness.folder) == []
+        harness.app._no_call.set()
+        await harness.app.lifecycle.resend_failed()
+        assert sent(harness.folder) == ["a note"]
+    finally:
+        await stop(harness)
+
+
+async def test_an_alert_says_sent_only_when_it_was(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The log said "alert sent" whatever happened (review I4); a failed one is sent again like any message."""
+    monkeypatch.setenv("FAKE_SIGNAL_SEND_ERROR", "-1")
+    harness = await start(tmp_path, monkeypatch, FakeGemma())
+    try:
+        await until_started(harness)
+        await harness.app._alert("⚠ Problem on the Mac")
+        assert not any("alert sent" in record.getMessage() for record in caplog.records)
+        assert any("alert not sent yet" in record.getMessage() for record in caplog.records)
+        await sends_work_again(harness, monkeypatch)
+        await harness.app.lifecycle.resend_failed()
+        assert sent(harness.folder)[-1] == "⚠ Problem on the Mac"
+    finally:
+        await stop(harness)
+
+
+async def test_no_pause_after_the_last_try(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("FAKE_SIGNAL_SEND_ERROR", "-1")
+    harness = await start(tmp_path, monkeypatch, FakeGemma())
+    try:
+        harness.app._retry_delay = 0.3
+        started = time.monotonic()
+        assert await harness.app._deliver(ME, "hi", "a test") is None
+        assert time.monotonic() - started < 1.5  # 0.3 s and 0.6 s between the three tries, nothing after (was 1.8 s)
+    finally:
+        await stop(harness)
+
+
+async def test_the_digest_is_held_by_the_lock_and_a_call(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    harness = await start(tmp_path, monkeypatch, FakeGemma(), **calendar_settings(tmp_path))
+    try:
+        digest = harness.app.morning_digest
+        assert digest is not None and not digest._held()
+        harness.app._no_call.clear()
+        assert digest._held()
+        harness.app._no_call.set()
+        harness.app.store.set_state("lock:on", "on")
+        assert digest._held()
+    finally:
+        await stop(harness)
+
+
+async def test_a_captcha_signal_asks_for_is_tried_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Signal wants a captcha before she sends more (-5 with a challenge): one try, never three in a row."""
+    monkeypatch.setenv("FAKE_SIGNAL_SEND_ERROR", "-5")
+    monkeypatch.setenv(
+        "FAKE_SIGNAL_SEND_ERROR_DATA",
+        json.dumps({"response": {"results": [{"type": "RATE_LIMIT_FAILURE", "token": "t", "retryAfterSeconds": 9}]}}),
+    )
+    harness = await start(tmp_path, monkeypatch, FakeGemma(text("hi")))
+    try:
+        deliver(harness.folder, "hello", T0)
+        await until(lambda: harness.app.store.count_messages() == 2 and harness.app.store.message(2).status == "failed")
+        assert sent(harness.folder) == ["hi"]
+    finally:
+        await stop(harness)
+
+
+@pytest.mark.parametrize(
+    ("result", "captcha"), [({"token": "t", "retryAfterSeconds": 86400}, True), ({"retryAfterSeconds": 900}, False)]
+)
+async def test_signals_wait_is_kept_and_nothing_is_sent_until_it_is_over(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, result: dict[str, Any], captcha: bool
+) -> None:
+    """A captcha asked for, or a rate limit longer than 10 s: Signal names its wait. The resend pass sent every failed
+    message again every minute for 10 minutes all the same (review S4). Now the wait is kept (status.json too, for
+    doctor), and no send or resend is tried until it is over."""
+    monkeypatch.setenv("FAKE_SIGNAL_SEND_ERROR", "-5")
+    monkeypatch.setenv(
+        "FAKE_SIGNAL_SEND_ERROR_DATA", json.dumps({"response": {"results": [{"type": "RATE_LIMIT_FAILURE", **result}]}})
+    )
+    clock = Clock()
+    harness = await start(tmp_path, monkeypatch, FakeGemma(text("hi")), clock=clock)
+    try:
+        deliver(harness.folder, "hello", T0)
+        await until(lambda: harness.app.store.count_messages() == 2 and harness.app.store.message(2).status == "failed")
+        tries = len(sent(harness.folder))
+        assert tries == 1
+        facts = read_security(tmp_path / "data" / "status.json")
+        assert facts.limited_until == pytest.approx(clock.now + result["retryAfterSeconds"], abs=5)
+        assert facts.limited_captcha is captcha
+        await harness.app.lifecycle.resend_failed()
+        assert await harness.app._deliver(ME, "a note", "a test") is None
+        assert len(sent(harness.folder)) == tries  # nothing tried while Signal's wait lasts
+        await sends_work_again(harness, monkeypatch)
+        assert await harness.app._deliver(ME, "a note", "a test") is None  # Signal's time, not signal-cli's restart
+        clock.now += result["retryAfterSeconds"] + 1
+        assert await harness.app._deliver(ME, "a note", "a test") is not None  # over: sent, and the wait cleared
+        assert read_security(tmp_path / "data" / "status.json").limited_until is None
+    finally:
+        await stop(harness)
+
+
 async def test_recovery_after_a_restart(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     now = time.time()
     ids: dict[str, int] = {}
@@ -385,6 +673,47 @@ async def test_recovery_after_a_restart(tmp_path: Path, monkeypatch: pytest.Monk
         assert note.startswith("I was offline ") and note.endswith("ask again if you still need something.")
         assert answer == "answer to the recent one"
         assert harness.app.store.message(ids["stale"]).status == "failed"
+    finally:
+        await stop(harness)
+
+
+async def test_a_stored_message_from_an_account_no_longer_allowed_never_reaches_gemma(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An account taken out of allowed_acis in a hurry (a stolen phone), then a restart: its unanswered messages of the
+    last 10 minutes are set aside with their files, never queued for Gemma (review S3: she acted on them and only the
+    reply was refused). Hard rule 1."""
+    removed = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"  # allowed before the restart (a patterned fake)
+    now = time.time()
+    ids: dict[str, int] = {}
+
+    def prepare(store: Store) -> None:
+        conv = store.current_conversation()
+        theirs = store.add_incoming(
+            conv.id, removed, int((now - 60) * 1000), "text", "[photo] remember my code is 1234"
+        )
+        mine = store.add_incoming(conv.id, ME, int((now - 50) * 1000), "text", "recent question")
+        assert theirs is not None and mine is not None
+        store.add_attachment(theirs, "theirs.png", "image/png", 10)
+        ids.update(theirs=theirs, mine=mine)
+
+    (tmp_path / "signal" / "attachments").mkdir(parents=True)
+    put(tmp_path / "signal", "theirs.png", png(8, 8))
+    harness = await start(tmp_path, monkeypatch, FakeGemma(text("answer to mine")), prepare=prepare)
+    try:
+        await until(lambda: sent(harness.folder) == ["answer to mine"])
+        assert harness.app.store.message(ids["theirs"]).status == "ignored"
+        assert len(harness.gemma.calls) == 1 and "remember my code" not in json.dumps(harness.gemma.calls)
+        assert not (harness.folder / "attachments" / "theirs.png").exists()
+        conv = harness.app.store.current_conversation()
+        late = harness.app.store.add_incoming(conv.id, removed, T0 + 5, "text", "turn on the lights")
+        assert late is not None
+        await harness.app.process(late)  # one that reached the queue anyway: never answered either
+        assert harness.app.store.message(late).status == "ignored" and len(harness.gemma.calls) == 1
+        store = harness.app.store  # set aside: idle learning, the check-ins and her history search never read them
+        assert {ids["theirs"], late} & {m.id for m in store.user_messages_after(0, 50)} == set()
+        found = [m.text for hit in store.search("remember code recent question lights") for m in hit.context]
+        assert found and not any("remember my code" in t or "turn on the lights" in t for t in found)
     finally:
         await stop(harness)
 
@@ -464,16 +793,53 @@ async def test_profile_changes_come_as_a_separate_note(tmp_path: Path, monkeypat
         await stop(harness)
 
 
-async def test_background_learning_is_mentioned_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_background_learning_is_named_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The quiet-time note (0.9.8) comes once, after the next reply, naming the notes the learning pass added."""
+
     def prepare(store: Store) -> None:
-        store.set_state(UNANNOUNCED_KEY, "2")
+        profile = Profile(store)
+        added = [Op("add", text="Work: The user is a nurse."), Op("add", text="Home: The user has a cat.")]
+        profile.record_quiet(profile.apply(added, source_kind="chat"))
 
     harness = await start(tmp_path, monkeypatch, FakeGemma(text("hi"), text("again")), prepare=prepare)
     try:
         deliver(harness.folder, "hello", T0)
         deliver(harness.folder, "hello again", T0 + 1)
         await until(lambda: len(sent(harness.folder)) == 3)
-        assert sent(harness.folder) == ["hi", prompts.DIGEST.format(count=2, things="things"), "again"]
+        note = "\n".join(
+            [
+                "Noted while we were quiet",  # bold in Signal
+                "Added #1: Work: The user is a nurse.",
+                "Added #2: Home: The user has a cat.",
+                prompts.QUIET_CLOSING,
+            ]
+        )
+        assert sent(harness.folder) == ["hi", note, "again"]
+    finally:
+        await stop(harness)
+
+
+async def test_the_quiet_time_note_waits_while_she_practises(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A /babble reply is practice in another language: the quiet-time note waits for the next chat reply, and comes
+    once (review: dialogue-5)."""
+
+    def prepare(store: Store) -> None:
+        profile = Profile(store)
+        profile.record_quiet(profile.apply([Op("add", text="Work: The user is a nurse.")], source_kind="chat"))
+
+    note = "\n".join(["Noted while we were quiet", "Added #1: Work: The user is a nurse.", prompts.QUIET_CLOSING])
+    gemma = FakeGemma(text("Hallo! Hoe gaat het?"), recap_answer(), text("Hi."))
+    harness = await start(tmp_path, monkeypatch, gemma, prepare=prepare)
+    try:
+        folder = harness.folder
+        deliver(folder, "/babble nl", T0)
+        deliver(folder, "Hallo", T0 + 1)
+        await until(lambda: "Hallo! Hoe gaat het?" in sent(folder))
+        deliver(folder, "/babble off", T0 + 2)
+        await until(lambda: prompts.BABBLE_ENDED.format(english="Dutch", level="A2") in sent(folder))
+        deliver(folder, "hi", T0 + 3)
+        await until(lambda: "Hi." in sent(folder) and note in sent(folder))
+        assert sent(folder).count(note) == 1 and sent(folder)[-2:] == ["Hi.", note]
     finally:
         await stop(harness)
 
@@ -601,6 +967,23 @@ async def test_one_unreadable_photo_of_two(tmp_path: Path, monkeypatch: pytest.M
         assert sent(harness.folder) == ["One blue square.", prompts.PHOTO_SOME_FAILED.format(failed=1)]
     finally:
         await stop(harness)
+
+
+async def test_a_photo_signal_cli_cannot_give_is_logged_without_its_words(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """getAttachment refused (the fake's error names a number, an account and a token): the log keeps the type."""
+    harness = await start(tmp_path, monkeypatch, FakeGemma(text("One blue square.")))
+    try:
+        image = png(8, 8)
+        put(harness.folder, "good.png", image)
+        attachments = [photo("good.png", image), photo("gone.png", image)]  # gone.png: never in signal-cli's folder
+        deliver(harness.folder, "what are these?", T0, attachments=attachments)
+        await until(lambda: len(sent(harness.folder)) == 2)
+    finally:
+        await stop(harness)
+    assert "not usable: SignalError (code -1)" in caplog.text
+    assert [value for value in LEAKS if value in caplog.text] == []
 
 
 async def test_a_strangers_photo_is_deleted_at_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -803,6 +1186,71 @@ async def test_a_follow_up_within_5_minutes_sees_the_photo_again(
 
         assert first_user(1)[1]["image_url"]["url"].startswith("data:image/jpeg;base64,")
         assert first_user(2).endswith("[photo, no longer visible] what is this?")
+    finally:
+        await stop(harness)
+
+
+async def test_an_answer_is_told_how_long_its_photo_is_still_shown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Second review of 0.9.8, guards-4: a hold for a photo says when it ends; its own message for the whole time."""
+    clock = Clock()
+    gemma = FakeGemma(text("A blue square."), text("It was blue."), text("Gone now."))
+    harness = await start(tmp_path, monkeypatch, gemma, clock=clock)
+    seen: list[float] = []
+    answer = harness.app.brain.answer
+
+    async def spy(*args: Any, **kwargs: Any) -> Any:
+        seen.append(kwargs.get("photo_left", -1.0))
+        return await answer(*args, **kwargs)
+
+    harness.app.brain.answer = spy  # type: ignore[method-assign]
+    try:
+        image = png(8, 8)
+        put(harness.folder, "p1.png", image)
+        deliver(harness.folder, "what is this?", T0, attachments=[photo("p1.png", image)])
+        await until(lambda: len(sent(harness.folder)) == 1)
+        clock.now += 2 * 60
+        deliver(harness.folder, "what colour was it?", T0 + 1)
+        await until(lambda: len(sent(harness.folder)) == 2)
+        clock.now += 4 * 60
+        deliver(harness.folder, "and now?", T0 + 2)
+        await until(lambda: len(sent(harness.folder)) == 3)
+        assert seen == [300.0, 180.0, 0.0]
+    finally:
+        await stop(harness)
+
+
+async def test_a_reminder_after_a_photo_is_set_in_the_users_own_words_never_in_its_own_message(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Owner, 28 Oct (review of 0.9.8, memory-2): the parking sign. The photo's own message never sets a reminder, and
+    code's line says what works; a new message a minute later, the photo still shown, sets it in the user's words."""
+    clock = Clock()
+    when = datetime.fromtimestamp(time.time() + 3 * 3600, TZ_APP).strftime("%Y-%m-%d %H:%M")
+    gemma = FakeGemma(
+        tool("set_reminder", at=when, text="move the car"),
+        text("Until 18:00, the sign says."),
+        tool("set_reminder", at=when, text="move the car", call_id="c2"),
+        text("I'll remind you."),
+    )
+    harness = await start(tmp_path, monkeypatch, gemma, clock=clock)
+    try:
+        image = png(8, 8)
+        put(harness.folder, "p1.png", image)
+        asked = "until when can I park here? remind me to move the car"
+        deliver(harness.folder, asked, T0, attachments=[photo("p1.png", image)])
+        await until(lambda: len(sent(harness.folder)) == 1)
+        assert sent(harness.folder)[0].endswith(
+            "No reminder was set: a message with a photo never sets one; ask again in a new message, in your own "
+            "words, or use /remind."
+        )
+        clock.now += 60
+        deliver(harness.folder, "remind me to move the car before then", T0 + 1)
+        await until(lambda: any(text.startswith("Reminder set (#1):") for text in sent(harness.folder)))
+        assert [reminder.text for reminder in harness.app.store.open_reminders(ME)] == ["move the car"]
+        shown = next(m for m in gemma.calls[2]["messages"] if m["role"] == "user")["content"]
+        assert shown[1]["image_url"]["url"].startswith("data:image/jpeg;base64,")  # the photo still in her view
     finally:
         await stop(harness)
 
@@ -1014,6 +1462,7 @@ async def test_the_calendar_gets_its_tools_rules_and_status_line(tmp_path: Path)
                 reminders=True,
                 practice_last=prompts.PRACTICE_NEVER,
                 capabilities=app.capability_lines(),
+                inventory=app.status_host.inventory(),
             )
         )
         assert await app._status_lines() == ["Calendar: ok (0 events in the next 7 days)"]
@@ -1343,7 +1792,7 @@ async def test_an_ask_first_device_changes_only_after_the_users_yes(
         deliver(folder, "switch the heater off", T0)
         await until(lambda: len(sent(folder)) == 2)
         assert sent(folder) == [
-            "The heater needs your OK first: reply yes.",
+            "The heater needs your OK first: reply yes.\nShall I switch heater off?",  # code's question last
             "Devices: reply yes within 2 minutes to switch heater off",  # the bridge's own words
         ]
         assert home.sets() == []
@@ -1356,6 +1805,28 @@ async def test_an_ask_first_device_changes_only_after_the_users_yes(
         deliver(folder, "what's the weather?", T0 + 3)  # anything but yes cancels, and is answered as usual
         await until(lambda: len(sent(folder)) == 6)
         assert sent(folder)[5] == "Sunny, 24 degrees." and len(home.sets()) == 1
+    finally:
+        await stop(harness)
+
+
+async def test_while_a_device_waits_her_text_ends_with_codes_question_never_hers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Second review of 0.9.8, redteam-05: a yes to her own closing question ("Shall I read you the next mail?") would
+    switch the waiting device. While a change waits, her closing question goes and code's question ends her text."""
+    gemma = FakeGemma(
+        tool("device_set", device="heater", power="off"),
+        text("The heater waits for your OK. You have two new mails. Shall I read you the next one? Or the first?"),
+    )
+    harness, home = await devices_app(tmp_path, monkeypatch, gemma)
+    try:
+        deliver(harness.folder, "switch the heater off", T0)
+        await until(lambda: len(sent(harness.folder)) == 2)
+        assert sent(harness.folder)[0] == (
+            "The heater waits for your OK. You have two new mails.\nShall I switch heater off?"
+        )
+        assert harness.app.store.message(2).text == sent(harness.folder)[0]  # the history: what was sent
+        assert home.sets() == []
     finally:
         await stop(harness)
 
@@ -1403,6 +1874,51 @@ async def test_a_switch_is_reported_even_when_gemma_fails_afterwards(
         deliver(harness.folder, "turn off the living room lamp", T0)
         await until(lambda: len(sent(harness.folder)) == 2)
         assert sent(harness.folder) == [prompts.UNAVAILABLE.format(name=NAME), "Devices: living room lamp off"]
+    finally:
+        await stop(harness)
+
+
+async def test_a_reminder_set_before_gemma_failed_gets_its_note(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Gemma set the reminder, then her next request failed: code's note still says it is set (only that note means
+    a reminder is set), so a retry is no duplicate in the dark (review I25)."""
+    when = datetime.fromtimestamp(time.time() + 3 * 3600, TZ_APP).strftime("%Y-%m-%d %H:%M")
+    gemma = FakeGemma(tool("set_reminder", at=when, text="call mum"), GemmaUnavailableError("down"))
+    harness = await start(tmp_path, monkeypatch, gemma)
+    try:
+        deliver(harness.folder, "remind me to call mum tonight", T0)
+        await until(lambda: len(sent(harness.folder)) == 2)
+        assert sent(harness.folder)[0] == prompts.UNAVAILABLE.format(name=NAME)
+        assert sent(harness.folder)[1].startswith("Reminder set (#1):")
+    finally:
+        await stop(harness)
+
+
+async def test_a_fact_saved_before_gemma_failed_gets_its_note(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    gemma = FakeGemma(tool("remember", fact="The user likes tea."), GemmaUnavailableError("down"))
+    harness = await start(tmp_path, monkeypatch, gemma)
+    try:
+        deliver(harness.folder, "remember that I like tea", T0)
+        await until(lambda: len(sent(harness.folder)) == 2)
+        assert sent(harness.folder) == [
+            prompts.UNAVAILABLE.format(name=NAME),
+            "Profile changes\nSaved #1: The user likes tea. (/forget 1 undoes it)",
+        ]
+    finally:
+        await stop(harness)
+
+
+async def test_a_reminder_set_on_a_call_before_gemma_failed_gets_its_note(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    when = datetime.fromtimestamp(time.time() + 3 * 3600, TZ_APP).strftime("%Y-%m-%d %H:%M")
+    gemma = FakeGemma(tool("set_reminder", at=when, text="cook"), GemmaUnavailableError("gone"))
+    harness = await start(tmp_path, monkeypatch, gemma, **call_settings(tmp_path))
+    try:
+        turn = await harness.app.call_turn(ME, "remind me to cook", lambda: None)
+        assert turn.text == prompts.CALL_LOST
+        await until(lambda: any(text.startswith("Reminder set (#1):") for text in sent(harness.folder)))
     finally:
         await stop(harness)
 
@@ -1610,6 +2126,31 @@ async def test_with_calls_texts_wait_during_a_call(tmp_path: Path, monkeypatch: 
         await stop(harness)
 
 
+@pytest.mark.parametrize(
+    ("memory", "set_by_hand", "tokens", "waits"),
+    [(32.0, None, 500, 45.0), (16.0, None, 300, 60.0), (16.0, 90.0, 300, 90.0), (32.0, 20.0, 500, 20.0)],
+    ids=["26b", "12b", "12b-set-by-hand", "26b-set-by-hand"],
+)
+async def test_a_call_answers_by_the_macs_tier(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, memory: float, set_by_hand: float | None, tokens: int, waits: float
+) -> None:
+    """Owner, 28 Oct ("yes, lets have a different limit on the 12B"): a call's answer is capped at 500 tokens beside
+    Gemma 4 26B ("lets do 500") and 300 beside 12B, a Mac under 30 GB, where setup puts the smaller model and an answer
+    takes longer; an answer may take 45 s beside 26B and 60 s beside 12B before the call gives up on it, unless
+    `[calls] turn_timeout_seconds` says otherwise. Not measured on a 16 GB M3 yet."""
+    monkeypatch.setattr(voice_module, "memory_gb", lambda: memory)
+    gemma = FakeGemma(text("Two meetings tomorrow."))
+    settings = call_settings(tmp_path) | {"calls_turn_timeout_seconds": set_by_hand}
+    harness = await start(tmp_path, monkeypatch, gemma, **settings)
+    try:
+        app = harness.app
+        assert app.calls is not None and app.calls.settings.turn_timeout_s == waits
+        await app.call_turn(ME, "what's on tomorrow", lambda: None)
+        assert gemma.calls[0]["max_tokens"] == tokens
+    finally:
+        await stop(harness)
+
+
 async def test_a_call_turn_is_stored_and_answered_with_the_same_brain(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1630,6 +2171,91 @@ async def test_a_call_turn_is_stored_and_answered_with_the_same_brain(
         assert app.store.message(turn.reply_id).text == "Two …"  # history holds what the user heard
         assert app.store.unanswered_incoming() == [] and app.store.unsent_outgoing() == []
         assert sent(harness.folder) == []  # nothing goes out as a text
+    finally:
+        await stop(harness)
+
+
+async def test_a_call_turn_cancelled_after_it_set_a_reminder_still_sends_its_note(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review of 0.9.7 (C5a): a call turn cut off by its time limit or the call's end after it set a reminder or
+    changed the profile sent no note of it, while "I stopped working on it" said the work was stopped. Its done
+    notes go out when the call drops the turn (CallManager._abandon: call_drop_waiting)."""
+    when = datetime.fromtimestamp(time.time() + 3 * 3600, TZ_APP).strftime("%Y-%m-%d %H:%M")
+    blocked: asyncio.Future[Completion] = asyncio.get_running_loop().create_future()
+    gemma = FakeGemma(tool("set_reminder", at=when, text="cook"), blocked)
+    harness = await start(tmp_path, monkeypatch, gemma, **call_settings(tmp_path))
+    try:
+        app = harness.app
+        app.call_started(ME)
+        task = asyncio.create_task(app.call_turn(ME, "remind me to cook", lambda: None))
+        await until(lambda: len(gemma.calls) == 2)  # the reminder is set; the model is asked again and hangs
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        await app.call_drop_waiting(ME)  # what the call does once the turn is dropped
+        await until(lambda: any(text.startswith("Reminder set (#1):") for text in sent(harness.folder)))
+        await app.call_drop_waiting(ME)  # told once
+        await asyncio.sleep(0.1)
+        assert len([text for text in sent(harness.folder) if text.startswith("Reminder set")]) == 1
+    finally:
+        await stop(harness)
+
+
+async def test_a_call_turns_notes_are_sent_after_it_returns_never_before_her_answer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review of 0.9.7 (C4): each texted note of a call turn (sources, devices, reminders, the lookup line) was sent
+    through Signal, retries and rate-limit waits too, before the turn returned: her first word waited for them. The
+    notes are stored in order at once and sent in order in the background."""
+    when = datetime.fromtimestamp(time.time() + 3 * 3600, TZ_APP).strftime("%Y-%m-%d %H:%M")
+    gemma = FakeGemma(tool("set_reminder", at=when, text="cook"), text("Done."))
+    harness = await start(tmp_path, monkeypatch, gemma, **call_settings(tmp_path))
+    try:
+        app = harness.app
+        gate = asyncio.Event()
+        send = app._send
+
+        async def slow_send(out_id: int) -> bool:  # Signal taking its time (retries, a rate limit)
+            await gate.wait()
+            return await send(out_id)
+
+        monkeypatch.setattr(app, "_send", slow_send)
+        app.call_started(ME)
+        turn = await asyncio.wait_for(app.call_turn(ME, "remind me to cook", lambda: None), 2.0)
+        assert turn.text == "Done." and turn.code_text.startswith("Reminder set")
+        notes = [m for m in app.store.unsent_outgoing() if m.kind == "note"]
+        assert [m.text.split(":")[0] for m in notes] == ["**Reminder set** (#1)"]  # stored at once
+        gate.set()
+        await until(lambda: any(text.startswith("Reminder set (#1):") for text in sent(harness.folder)))
+    finally:
+        await stop(harness)
+
+
+async def test_every_text_answer_and_call_turn_logs_its_models_counts_and_times_and_no_words(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A slow turn names its cause (owner's call, 22 Oct: two turns of 20 s, the log said only "0 tool calls"):
+    Ollama's prompt tokens, those not in its cache, its prompt and generation times, and the whole wait."""
+    from dataclasses import replace
+
+    def timed(content: str) -> Completion:
+        answer = text(content, prompt_tokens=17213)
+        return replace(answer, cached_tokens=4, completion_tokens=171, prompt_ms=13512.0, generation_ms=7004.0)
+
+    caplog.set_level(logging.INFO, logger="local_assistant")
+    gemma = FakeGemma(timed("Sunny all day."), timed("Two meetings tomorrow."))
+    harness = await start(tmp_path, monkeypatch, gemma, **call_settings(tmp_path))
+    try:
+        deliver(harness.folder, "weather in Athens tomorrow?", T0)
+        await until(lambda: sent(harness.folder) == ["Sunny all day."])
+        await harness.app.call_turn(ME, "what's on tomorrow", lambda: None)
+        logged = [r.getMessage() for r in caplog.records if "answered:" in r.getMessage()]
+        timing = "1 request, 17,213 prompt tokens, 17,209 not cached, prompt eval 13,512 ms, 171 tokens generated in "
+        assert [line.split("; model: ")[1].startswith(timing) for line in logged] == [True, True], logged
+        assert logged[0].startswith("message ") and logged[1].startswith("call turn ")
+        words = ("weather", "Athens", "Sunny", "meetings", "tomorrow")
+        assert not [line for line in logged if any(word in line for word in words)]
     finally:
         await stop(harness)
 
@@ -1664,6 +2290,55 @@ async def test_a_spoken_yes_switches_the_waiting_device_in_code(
         await stop(harness)
 
 
+async def test_on_a_call_the_device_question_is_her_last_sentence_after_a_reminder_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review of 0.9.7 (C13): a reminder line after the device question made the question no longer her last sentence,
+    the only one that cannot be talked over; a yes right after the question then landed on the reminder line and
+    dropped it."""
+    when = datetime.fromtimestamp(time.time() + 3 * 3600, TZ_APP).strftime("%Y-%m-%d %H:%M")
+    gemma = FakeGemma(
+        tool("set_reminder", at=when, text="cook"), tool("device_set", device="heater", power="off"), text("Okay.")
+    )
+    home = Home(tmp_path, monkeypatch)
+    harness = await start(
+        tmp_path, monkeypatch, gemma, tapo_devices=DEVICE_SPECS, tapo_helper=home.helper, **call_settings(tmp_path)
+    )
+    try:
+        app = harness.app
+        app.call_started(ME)
+        asked = await app.call_turn(ME, "remind me to cook, and the heater can go off", lambda: None)
+        assert asked.asks_yes and "Reminder set" in asked.code_text
+        assert asked.code_text.endswith("Shall I switch heater off?"), asked.code_text
+        assert asked.reply_id is not None
+        assert app.store.message(asked.reply_id).text.endswith("Shall I switch heater off?")  # stored as said
+        assert asked.kept_code == ("Shall I switch heater off?",)  # kept once reached; the reminder line never
+    finally:
+        await stop(harness)
+
+
+async def test_on_a_call_the_texted_device_note_asks_for_a_spoken_yes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review of 0.9.7 (C14): the note said "reply yes within 2 minutes"; a typed yes waits for the call's end, and by
+    then the question is gone."""
+    gemma = FakeGemma(tool("device_set", device="heater", power="off"), text("Okay."))
+    home = Home(tmp_path, monkeypatch)
+    harness = await start(
+        tmp_path, monkeypatch, gemma, tapo_devices=DEVICE_SPECS, tapo_helper=home.helper, **call_settings(tmp_path)
+    )
+    try:
+        app = harness.app
+        app.call_started(ME)
+        asked = await app.call_turn(ME, "switch the heater off", lambda: None)
+        assert asked.asks_yes
+        note = "Devices: say yes on the call within 2 minutes to switch heater off"
+        await until(lambda: note in sent(harness.folder))
+        assert not [line for line in sent(harness.folder) if "reply yes" in line]
+    finally:
+        await stop(harness)
+
+
 async def test_on_a_call_the_device_question_is_spoken_by_code(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """The caller hears what their yes will do in code's words; Gemma's last question may be about something else."""
     gemma = FakeGemma(
@@ -1681,6 +2356,46 @@ async def test_on_a_call_the_device_question_is_spoken_by_code(tmp_path: Path, m
         assert asked.text == "Sunny, 18 degrees. Want the weekend too?"
         assert asked.reply_id is not None
         assert app.store.message(asked.reply_id).text == f"{asked.text} {asked.code_text}"  # stored as heard
+        assert home.sets() == []
+    finally:
+        await stop(harness)
+
+
+async def test_a_blank_answer_after_an_ask_first_device_sends_codes_question_then_the_note(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """25 Oct, device_ask_first: her answer was "---" (asked once more, the same): the user gets code's question, as in
+    another language, and the bridge's note asking for the yes after it."""
+    gemma = FakeGemma(tool("device_set", device="heater", power="off"), text("---"), text("---"))
+    harness, home = await devices_app(tmp_path, monkeypatch, gemma)
+    try:
+        deliver(harness.folder, "switch the heater off", T0)
+        await until(lambda: len(sent(harness.folder)) == 2)
+        assert sent(harness.folder) == [
+            "Shall I switch heater off?",
+            "Devices: reply yes within 2 minutes to switch heater off",
+        ]
+        assert home.sets() == []
+    finally:
+        await stop(harness)
+
+
+async def test_on_a_call_a_blank_answer_after_an_ask_first_device_says_codes_question_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Code's question in place of her words is the question the call says last anyway: said and kept once."""
+    gemma = FakeGemma(tool("device_set", device="heater", power="off"), text("---"), text("---"))
+    home = Home(tmp_path, monkeypatch)
+    harness = await start(
+        tmp_path, monkeypatch, gemma, tapo_devices=DEVICE_SPECS, tapo_helper=home.helper, **call_settings(tmp_path)
+    )
+    try:
+        app = harness.app
+        app.call_started(ME)
+        asked = await app.call_turn(ME, "switch the heater off", lambda: None)
+        assert asked.asks_yes and (asked.text, asked.code_text) == ("", "Shall I switch heater off?")
+        assert asked.reply_id is not None
+        assert app.store.message(asked.reply_id).text == "Shall I switch heater off?"
         assert home.sets() == []
     finally:
         await stop(harness)
@@ -1881,6 +2596,41 @@ async def test_without_her_offer_and_a_clear_yes_code_reads_nothing(
         await stop(harness)
 
 
+@pytest.mark.parametrize("said", ["Yeah.", "Yes."])
+async def test_call_rundown_rhetorical_yes_en(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, said: str) -> None:
+    """Review of 26 Oct (DLG-05): a full answer may ask a question on its way ("But is that really freedom?"); her
+    offer is the answer whose last sentence asks, so a listener's "Yeah." or "Yes." after it reads neither the
+    calendar nor the mail digest (that would turn the turn into outside text)."""
+    first = "Some say no. But is that really freedom? Compatibilists say it is. I lean their way."
+    gemma = FakeGemma(text(first), text("Sure."))
+    harness = await start(
+        tmp_path, monkeypatch, gemma, prepare=glance_mail, clock=glance_clock(), **glance_settings(tmp_path)
+    )
+    try:
+        app = harness.app
+        app.call_started(ME)
+        await app.call_turn(ME, "is free will compatible with determinism?", lambda: None)
+        await app.call_turn(ME, said, lambda: None)
+        assert app.store.tool_calls() == [] and "tool_calls" not in gemma.calls[1]["messages"][-1]
+    finally:
+        await stop(harness)
+
+
+def test_her_offer_is_an_answer_whose_last_sentence_asks() -> None:
+    from local_assistant.call_host import CallGlance, rundown_reads
+
+    for answer, offers in (
+        (OFFER, True),
+        ("Some say no. But is that really freedom? Compatibilists say it is.", False),
+        ("Two meetings today. 明日にしますか。", True),  # Japanese's か asks without a question mark
+        ("Three things today. Shall I go through them？", True),
+    ):
+        glance = CallGlance("13:10", "", None)
+        glance.note(answer)
+        assert glance.offered is offers, answer
+        assert bool(rundown_reads(answer, "yes", "en", calendar=True, mail=True)) is offers, answer
+
+
 async def test_the_rundown_is_read_once_a_call_and_only_right_after_her_offer(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1900,6 +2650,45 @@ async def test_the_rundown_is_read_once_a_call_and_only_right_after_her_offer(
         await app.call_turn(ME, "hi again", lambda: None)
         await app.call_turn(ME, "yes", lambda: None)
         assert [call.name for call in app.store.tool_calls()] == ["calendar_agenda", "mail_digest"]
+    finally:
+        await stop(harness)
+
+
+async def test_a_yes_said_over_the_end_of_her_offer_reads_the_day_too(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review of 0.9.7 (C19): a "yes" said over her offer's last sentence reached the code as "(cutting in) yes", so
+    code read nothing for her."""
+    gemma = FakeGemma(text(OFFER), text("At two the dentist."))
+    harness = await start(
+        tmp_path, monkeypatch, gemma, prepare=glance_mail, clock=glance_clock(), **glance_settings(tmp_path)
+    )
+    try:
+        app = harness.app
+        app.call_started(ME)
+        await app.call_turn(ME, "hi", lambda: None)
+        await app.call_turn(ME, f"{prompts.CUTTING_IN} yes", lambda: None)
+        assert [call.name for call in app.store.tool_calls()] == ["calendar_agenda", "mail_digest"]
+    finally:
+        await stop(harness)
+
+
+async def test_standby_drops_her_offer_so_a_yes_after_her_wake_line_reads_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review, 22 Oct: her name alone ends standby with her wake line ("Yes?") and never reaches call_turn, which is
+    where her offer is used up; a "yes" to the wake line then read the day aloud. Standby drops the offer."""
+    gemma = FakeGemma(text(OFFER), text("Sure, what is it?"))
+    harness = await start(
+        tmp_path, monkeypatch, gemma, prepare=glance_mail, clock=glance_clock(), **glance_settings(tmp_path)
+    )
+    try:
+        app = harness.app
+        app.call_started(ME)
+        await app.call_turn(ME, "hi", lambda: None)
+        await app.call_standby(ME)  # 90 s of quiet: the check-in, then standby
+        await app.call_turn(ME, "yes", lambda: None)
+        assert app.store.tool_calls() == []
     finally:
         await stop(harness)
 
@@ -2377,6 +3166,50 @@ async def test_after_a_call_the_summary_is_a_note(tmp_path: Path, monkeypatch: p
         await stop(harness)
 
 
+async def test_a_long_calls_summary_reads_its_start_too(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Review of 26 Oct (rtcall-7): the summary read only the call's last 12,000 characters, so after seven or more
+    full answers its first topics were gone. Its start and its end are given, with a line between them that says the
+    middle is left out, and a short call goes whole as before."""
+    gemma = FakeGemma(text("- ten topics"))
+    harness = await start(tmp_path, monkeypatch, gemma, **call_settings(tmp_path))
+    try:
+        lines: list[str] = []
+        for n in range(1, 11):
+            lines += [f"User: tell me about topic {n}", f"{NAME}: Topic {n}. " + "A full answer about it. " * 62]
+        assert len("\n".join(lines)) > 12_000
+        await harness.app.call_summary(ME, lines, 30)
+        given = gemma.calls[0]["messages"][1]["content"]
+        assert given.startswith("User: tell me about topic 1\n") and lines[-1] in given
+        assert "\n(… the middle of the call is left out …)\n" in given and len(given) <= 12_100
+        assert all(line in given for line in lines[:2] + lines[-6:])
+    finally:
+        await stop(harness)
+
+
+async def test_the_call_summary_defangs_every_link_the_caller_did_not_say(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review I33: the summary skipped the link rule, so a mail's link read on the call (defanged when she said it)
+    could come back tappable once the summary dropped the [.]. Every link the caller did not say is defanged."""
+    summary = (
+        "- the newest mail asks you to sign in at https://evil.example/login or evil.com\n- the club: club.example.org"
+    )
+    gemma = FakeGemma(text(summary))
+    harness = await start(tmp_path, monkeypatch, gemma, **call_settings(tmp_path))
+    try:
+        lines = [
+            "User: what's in my mail, and is club.example.org still up?",
+            "Estia: The newest mail asks you to sign in at evil[.]example/login.",
+        ]
+        await harness.app.call_summary(ME, lines, 2)
+        assert set(sent(harness.folder)) == {
+            "📞 Call summary (2 min)\n• the newest mail asks you to sign in at evil[.]example/login or evil[.]com\n"
+            "• the club: club.example.org"
+        }
+    finally:
+        await stop(harness)
+
+
 def test_with_calls_signal_cli_is_the_jvm_build_with_the_call_env(tmp_path: Path) -> None:
     folder = Path(tempfile.mkdtemp(prefix="c", dir="/tmp"))
     cfg = Config(
@@ -2460,6 +3293,50 @@ async def test_dropping_a_waiting_question_on_a_call(tmp_path: Path, monkeypatch
         assert app.devices is not None and not app.devices.pending
         assert (await app.call_turn(ME, "yes", lambda: None)).text  # no longer a yes to anything
         assert home.sets() == []
+    finally:
+        await stop(harness)
+
+
+async def test_standby_drops_a_waiting_device_question(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Review, 22 Oct: a device question is open 120 s, standby starts after 90 s of quiet, and her wake line ("Yes?")
+    invites a yes: standby drops the question, so that yes switches nothing."""
+    gemma = FakeGemma(
+        tool("device_set", device="heater", power="off"), text("Say yes to switch it off."), text("Yes to what?")
+    )
+    home = Home(tmp_path, monkeypatch)
+    harness = await start(
+        tmp_path, monkeypatch, gemma, tapo_devices=DEVICE_SPECS, tapo_helper=home.helper, **call_settings(tmp_path)
+    )
+    try:
+        app = harness.app
+        assert (await app.call_turn(ME, "switch the heater off", lambda: None)).asks_yes
+        await app.call_standby(ME)
+        assert app.devices is not None and not app.devices.pending
+        await app.call_turn(ME, "yes", lambda: None)
+        assert home.sets() == []
+    finally:
+        await stop(harness)
+
+
+async def test_call_standby_drops_device_question_said(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The second deep scan (dialogue-standby-drops-yes-silently): "Shall I switch heater off?", then 90 s of quiet and
+    standby; back at the phone, "Estia, yes." switched nothing, and nothing said the question had lapsed. Code's note
+    says so when standby drops it; a standby with nothing waiting sends none."""
+    gemma = FakeGemma(tool("device_set", device="heater", power="off"), text("Say yes to switch it off."))
+    home = Home(tmp_path, monkeypatch)
+    harness = await start(
+        tmp_path, monkeypatch, gemma, tapo_devices=DEVICE_SPECS, tapo_helper=home.helper, **call_settings(tmp_path)
+    )
+    try:
+        app = harness.app
+        app.call_started(ME)
+        assert (await app.call_turn(ME, "switch the heater off", lambda: None)).asks_yes
+        await app.call_standby(ME)
+        note = "Devices: heater not switched off: no yes came before the call went quiet"
+        await until(lambda: note in sent(harness.folder))
+        await app.call_standby(ME)  # standby again later: nothing waits, so no note
+        await asyncio.sleep(0.1)
+        assert sent(harness.folder).count(note) == 1 and home.sets() == []
     finally:
         await stop(harness)
 
@@ -2587,6 +3464,61 @@ async def test_on_a_call_the_web_links_are_texted(tmp_path: Path, monkeypatch: p
         await stop(harness)
 
 
+async def test_on_a_call_the_rest_of_an_answer_her_voice_did_not_say_is_codes_note_to_the_caller(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Owner, 28 Oct (calls-03): Kokoro says at most one line of a call's turn; when a second would need it, the rest
+    of her answer goes to the caller as a text (`CallManager._speak`). Here the app's side: code's note in the turn's
+    conversation, after her reply, sent in the background to the caller only, in her history as a code_notes result in
+    the words the user saw (rule 6), marked as quoting outside text when her answer read some (`Turn.outside`), while
+    her stored reply keeps what was heard. Code's lines that go as texts of their own are named (`Turn.also_texted`)."""
+    gemma = FakeGemma(
+        tool("web_search", query="Ajax score"),
+        text("Ajax won 2-1. The second goal came late."),
+        text("Okay."),
+    )
+    harness = await start(
+        tmp_path, monkeypatch, gemma, web_enabled=True, web_keys_path=tmp_path / "web.env", **call_settings(tmp_path)
+    )
+    try:
+        app = harness.app
+        app.tools._web = FakeWeb({"ajax": [NOS]})
+        app.call_started(ME)
+        turn = await app.call_turn(ME, "did Ajax win", lambda: None)
+        assert turn.reply_id is not None and turn.outside and turn.also_texted == ()
+        app.call_interrupted(turn.reply_id, "Ajax won 2-1.")
+        note = f"{prompts.CALL_VOICE_STOPPED}\nThe second goal came late."
+        assert note == "My voice stopped working on this call. The rest of my answer:\nThe second goal came late."
+        await app.call_host.call_text(ME, note, reply_id=turn.reply_id, outside=turn.outside)
+        await until(lambda: note in sent(harness.folder))
+        assert [to for to, said in sent_to(harness.folder) if said == note] == [ME]
+        await app.call_turn(ME, "thanks", lambda: None)
+        request = gemma.calls[-1]
+        assert code_notes_in(request)[-1].endswith(note)  # code's note, after her reply
+        assert "OUTSIDE TEXT" in code_notes_in(request)[-1].split("\n")[0]  # her answer read the web
+        assert "Ajax won 2-1." in her_words(request) and "The second goal came late." not in her_words(request)
+    finally:
+        await stop(harness)
+
+
+async def test_a_call_turns_lines_texted_on_their_own_are_named_so_no_text_doubles_them(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A reminder set on a call: its spoken line goes as its own note too, so a turn whose voice stopped leaves it out
+    of the rest it texts (`Turn.also_texted`); an answer that read nothing outside is no outside text."""
+    when = datetime.fromtimestamp(time.time() + 3 * 3600, TZ_APP).strftime("%Y-%m-%d %H:%M")
+    gemma = FakeGemma(tool("set_reminder", at=when, text="cook"), text("Done."))
+    harness = await start(tmp_path, monkeypatch, gemma, **call_settings(tmp_path))
+    try:
+        app = harness.app
+        app.call_started(ME)
+        turn = await app.call_turn(ME, "remind me to cook", lambda: None)
+        assert turn.code_text.startswith("Reminder set") and turn.also_texted == (turn.code_text,)
+        assert not turn.outside
+    finally:
+        await stop(harness)
+
+
 async def test_an_audio_file_is_heard_as_outside_text(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     # D4: audio not recorded in Signal (no voice-note flag) is someone else's voice: "[audio file] …", a text answer
     with FakeVoiceService() as service:
@@ -2707,6 +3639,28 @@ async def test_a_changed_picture_is_sent_again(tmp_path: Path, monkeypatch: pyte
         await stop(harness)
 
 
+@pytest.mark.parametrize("configured", [{}, {"avatar": "/usr/local/estia/current/docs/brand/letters/t.png"}])
+async def test_an_install_that_showed_her_letter_gets_estias_mark_at_its_next_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, configured: dict[str, str]
+) -> None:
+    """Owner, 25 Oct: one picture for everyone. Tiffany's Signal picture was her letter, t. (its digest stored), and
+    her config left `avatar` out or named the letter file, gone now: the next start sends Estia's mark, once."""
+    raw: dict[str, object] = {"bot_number": "+306900000000", "allowed_acis": [ME], "name": "Tiffany", **configured}
+    avatar = parse_config(raw).avatar
+    mark = Path(__file__).resolve().parents[1] / "docs" / "brand" / "estia-avatar.png"
+    assert avatar == mark
+
+    def letter_before(store: Store) -> None:
+        store.set_state("signal_profile_avatar", "the sha256 of her letter t.")
+
+    harness = await start(tmp_path, monkeypatch, FakeGemma(), prepare=letter_before, avatar=avatar, name="Tiffany")
+    try:
+        await until(lambda: harness.app.store.get_state("signal_profile_avatar") == sha256(mark))
+        assert avatar_updates(harness.folder) == [{"avatar": str(mark)}]
+    finally:
+        await stop(harness)
+
+
 async def test_no_picture_sends_none(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """avatar = "" in the config (or no repo picture): nothing is sent, and a picture set before stays."""
     harness = await start(tmp_path, monkeypatch, FakeGemma(), avatar=None)
@@ -2731,6 +3685,7 @@ async def test_a_picture_signal_refused_is_tried_at_the_next_start(
         await until(lambda: "Signal profile picture not set" in caplog.text)
         assert harness.app.store.get_state("signal_profile_avatar") is None
         assert "private-folder" not in caplog.text  # metadata only
+        assert [value for value in LEAKS if value in caplog.text] == []  # never signal-cli's words
     finally:
         await stop(harness)
     monkeypatch.delenv("FAKE_SIGNAL_AVATAR_ERROR")
@@ -2783,8 +3738,11 @@ async def test_a_location_pin_is_where_the_user_is_and_maps_are_offered(
         app = harness.app
         assert app.maps is not None
         assert {"places_search", "route"} <= {schema["function"]["name"] for schema in app.tools.schemas}
-        assert "Places and routes:" in app.context.system_prompt(app.store.current_conversation())
-        assert await app._status_lines() == ["Maps: key missing (scripts/set-web-keys.sh)"]
+        rules = app.context.system_prompt(app.store.current_conversation())
+        assert "Places and routes:" in rules and "• Places and routes: OpenStreetMap places," in rules  # no Google key
+        assert "• places_search: places near you or near a place you name, from OpenStreetMap" in rules
+        assert "Google" not in json.dumps([s for s in app.tools.schemas if s["function"]["name"] == "places_search"])
+        assert await app._status_lines() == ["Maps: OpenStreetMap lookups 0/100, routes 0/100 today"]
         deliver(harness.folder, "Dam Square\nhttps://maps.google.com/maps?q=52.37312%2C4.89201", T0)
         await until(lambda: len(sent(harness.folder)) == 1)
         assert app.maps.here() == (52.37312, 4.89201)
@@ -2804,6 +3762,112 @@ async def test_a_chosen_voice_is_used_after_a_restart(tmp_path: Path, monkeypatc
             await stop(harness)
 
 
+async def test_choosing_a_pocket_voice_asks_the_voice_service_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Owner, 26 Oct: every English Pocket voice speaks the one model the voice service fetches at its start, so
+    /voice asks it for no line; eve-full is eve (the voice service knows no eve-full), kept as eve, and after a restart
+    eve-full chosen before 26 Oct is eve too."""
+
+    def old_choice(store: Store) -> None:
+        store.set_state("voice_name", "eve-full")
+
+    with FakeVoiceService() as service:
+        harness = await start(tmp_path, monkeypatch, FakeGemma(), prepare=old_choice, voice_url=service.url)
+        try:
+
+            def spoken() -> list[str]:
+                return [
+                    json.loads(body)["voice"] for _, path, _, body in service.requests if path == "/v1/audio/speech"
+                ]
+
+            async def answered(count: int) -> None:
+                await until(lambda: len(sent(harness.folder)) == count)
+
+            assert harness.app.voice is not None and harness.app.voice.voice == "eve"
+            for step, name in enumerate(("vera", "alba", "michael", "eve-full", "af_heart")):
+                deliver(harness.folder, f"/voice {name}", T0 + step)
+                await answered(step + 1)
+            await asyncio.sleep(0.2)
+            assert spoken() == []
+            assert sent(harness.folder)[3] == (
+                "Eve is on: calls and voice notes use her voice now. eve-full is another name for eve."
+            )
+            assert harness.app.voice.voice == "af_heart" and harness.app.store.get_state("voice_name") == "af_heart"
+        finally:
+            await stop(harness)
+
+
+async def test_vera_chosen_on_a_mac_with_the_small_model_is_not_used(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Owner, 26 Oct: vera is offered only beside Pocket TTS's 100M model; a vera kept from before (a database moved to
+    a 16 GB Mac) leaves the config's voice in use, heart's by default (owner, 29 Oct: on 16 GB Macs too)."""
+
+    def vera(store: Store) -> None:
+        store.set_state("voice_name", "vera")
+
+    monkeypatch.setattr(voice_module, "memory_gb", lambda: 16.0)
+    with FakeVoiceService() as service:
+        harness = await start(tmp_path, monkeypatch, FakeGemma(), prepare=vera, voice_url=service.url)
+        try:
+            assert harness.app.voice is not None and harness.app.voice.voice == "heart"
+            assert harness.app.commands.pocket_standard is False
+        finally:
+            await stop(harness)
+
+
+async def test_a_configs_vera_on_a_mac_with_the_small_model_speaks_in_heart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The review of 26 Oct (R1-F4): Pocket TTS's 18M model has no vera, so a config's `voice = "vera"` on a 16 GB Mac
+    was used as written: every line Kokoro's af_heart, as a stand-in, and no canned call line kept, so each was made
+    again on every call. The voice that speaks is heart, the default (owner, 29 Oct: on 16 GB Macs too), with one log
+    line; a call's canned line is asked in heart and kept. The config itself still says vera (it may move between
+    Macs)."""
+    monkeypatch.setattr(voice_module, "memory_gb", lambda: 16.0)
+    with FakeVoiceService() as service:
+        harness = await start(
+            tmp_path, monkeypatch, FakeGemma(), voice_url=service.url, voice_name="vera", calls_enabled=True
+        )
+        try:
+            app = harness.app
+            assert app.cfg.voice_name == "vera" and app.voice is not None and app.voice.voice == "heart"
+            assert app.calls is not None and app._call_voice is not None and app._call_voice.voice == "heart"
+            told = [r.getMessage() for r in caplog.records if "vera" in r.getMessage()]
+            assert told == ["voice: the config's vera speaks only beside Pocket TTS's 100M model; heart speaks here"]
+            for _ in range(2):
+                await app.calls._clip("Got it.", "en")
+            asked = [json.loads(body)["voice"] for _, path, _, body in service.requests if path == "/v1/audio/speech"]
+            assert asked == ["heart"]  # kept after the first
+        finally:
+            await stop(harness)
+
+
+@pytest.mark.parametrize(("memory", "speaks"), [(32.0, "heart"), (16.0, "heart")], ids=["26b", "12b"])
+async def test_heart_is_the_default_on_either_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, memory: float, speaks: str
+) -> None:
+    """Owner, 27 Oct: heart ("make it default") speaks beside Pocket TTS's 100M model (Gemma 4 26B); 29 Oct, beside the
+    18M too ("on 16gb make Heart the default as well", its own clone; this replaces 27 Oct's "for small, do Jane"). The
+    config's default, heart, speaks as heart on either, with no log line; a call's canned line is asked in heart."""
+    caplog.set_level(logging.INFO)
+    monkeypatch.setattr(voice_module, "memory_gb", lambda: memory)
+    with FakeVoiceService() as service:
+        harness = await start(tmp_path, monkeypatch, FakeGemma(), voice_url=service.url, calls_enabled=True)
+        try:
+            app = harness.app
+            assert app.cfg.voice_name == "heart" and app.voice is not None and app.voice.voice == speaks
+            assert app.calls is not None and app._call_voice is not None and app._call_voice.voice == speaks
+            told = [(r.levelno, r.getMessage()) for r in caplog.records if "speaks only beside" in r.getMessage()]
+            assert told == []
+            await app.calls._clip("Got it.", "en")
+            asked = [json.loads(body)["voice"] for _, path, _, body in service.requests if path == "/v1/audio/speech"]
+            assert asked == [speaks]
+        finally:
+            await stop(harness)
+
+
 async def test_commands_are_answered_during_a_call_but_new_waits(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2815,7 +3879,7 @@ async def test_commands_are_answered_during_a_call_but_new_waits(
             app.call_started(ME)
             deliver(harness.folder, "/voice name am_puck", T0)
             await until(lambda: len(sent(harness.folder)) == 1)
-            assert sent(harness.folder)[0].startswith("Voice: am_puck")
+            assert sent(harness.folder)[0] == "am_puck is on: calls and voice notes use his voice now."
             assert app.voice is not None and app.voice.voice == "am_puck"
             deliver(harness.folder, "/new", T0 + 1)
             await asyncio.sleep(0.3)
@@ -2826,17 +3890,210 @@ async def test_commands_are_answered_during_a_call_but_new_waits(
             await stop(harness)
 
 
+# A text that waits for the call's end (owner, 23 Oct: he typed the same text three times during a call, as nothing
+# said it waits): code's line in the chat at once, once a call; the text still waits and is answered after the call
+
+
+def on_a_call(app: App, aci: str = ME) -> None:
+    """A call from `aci` is on, as the call manager has it (its caller, a practice call when practice runs for `aci`)
+    and as the app hears of it (call_started)."""
+    assert app.calls is not None
+    call = app.calls._new_call(aci, 5, practice_ok=True)
+    app.calls._call = call
+    app.call_started(aci, practice=call.practice)
+
+
+def call_over(app: App) -> None:
+    assert app.calls is not None
+    app.calls._call = None
+    app.call_ended()
+
+
+def sent_to(folder: Path) -> list[tuple[str, str]]:
+    """Each text sent, with its recipient."""
+    return [
+        (r["params"]["recipient"][0], r["params"]["message"])
+        for r in requests(folder)
+        if r["method"] == "send" and "message" in r["params"]
+    ]
+
+
+async def test_a_text_during_a_call_gets_codes_line_at_once_and_is_answered_after_the_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The first text of the call gets code's line at once, a second none; never stored, so never in her history and
+    never sent again by recovery; both texts are still answered after the call; a new call starts over."""
+    gemma = FakeGemma(text("Hi."), text("Sure."), text("Again."))
+    harness = await start(tmp_path, monkeypatch, gemma, **call_settings(tmp_path))
+    try:
+        folder, app = harness.folder, harness.app
+        on_a_call(app)
+        deliver(folder, "hello", T0)
+        await until(lambda: sent(folder) == [prompts.CALL_TEXT_WAITS])
+        deliver(folder, "and one more thing", T0 + 1)
+        await until(lambda: len(app.store.unanswered_incoming()) == 2)
+        await asyncio.sleep(0.3)
+        assert sent(folder) == [prompts.CALL_TEXT_WAITS] and gemma.calls == []  # both wait; one line
+        assert app.calls is not None and app.calls._call is not None and app.calls._call.text_owed  # said on the call
+        call_over(app)
+        await until(lambda: len(sent(folder)) == 3)
+        assert sent(folder)[1:] == ["Hi.", "Sure."]
+        stored = app.store._conn.execute("SELECT COUNT(*) FROM messages WHERE text = ?", (prompts.CALL_TEXT_WAITS,))
+        assert stored.fetchone()[0] == 0
+        for request in gemma.calls:  # never in her history, as a note or as her words
+            assert prompts.CALL_TEXT_WAITS not in json.dumps(request["messages"], ensure_ascii=False)
+            assert not any(prompts.CALL_TEXT_WAITS in note for note in code_notes_in(request))
+        on_a_call(app)  # a new call starts over
+        deliver(folder, "and now?", T0 + 2)
+        await until(lambda: sent(folder)[3:] == [prompts.CALL_TEXT_WAITS])
+        call_over(app)
+        await until(lambda: sent(folder)[4:] == ["Again."])
+    finally:
+        await stop(harness)
+
+
+async def test_a_voice_note_and_a_photo_during_a_call_get_the_line_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    harness = await start(tmp_path, monkeypatch, FakeGemma(), **call_settings(tmp_path))
+    try:
+        folder, app = harness.folder, harness.app
+        on_a_call(app)
+        put(folder, "p1", b"\x89PNG fake")
+        deliver(folder, None, T0, attachments=[photo("p1", b"\x89PNG fake")])
+        await until(lambda: sent(folder) == [prompts.CALL_TEXT_WAITS])
+        put(folder, "v1", b"\0" * 2048)
+        deliver(folder, None, T0 + 1, attachments=[voice("v1", b"\0" * 2048) | {"voiceNote": True}])
+        await until(lambda: len(app.store.unanswered_incoming()) == 2)
+        await asyncio.sleep(0.3)
+        assert sent(folder) == [prompts.CALL_TEXT_WAITS]  # once a call, whatever kind waits
+    finally:
+        call_over(harness.app)
+        await stop(harness)
+
+
+async def test_a_command_answered_during_a_call_gets_no_line_and_one_that_waits_gets_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    harness = await start(tmp_path, monkeypatch, FakeGemma(), **call_settings(tmp_path))
+    try:
+        folder, app = harness.folder, harness.app
+        on_a_call(app)
+        deliver(folder, "/help", T0)  # answered at once (no Gemma)
+        await until(lambda: len(sent(folder)) == 1)
+        await asyncio.sleep(0.3)
+        assert sent(folder) == [on_phone(prompts.help_text(app.capability_lines()))]
+        deliver(folder, "/new", T0 + 1)  # waits for the call's end, as a text does
+        await until(lambda: len(sent(folder)) == 2)
+        assert sent(folder)[1] == prompts.CALL_TEXT_WAITS
+        call_over(app)
+        await until(lambda: len(sent(folder)) == 3)
+    finally:
+        await stop(harness)
+
+
+async def test_a_text_the_gate_holds_or_one_while_locked_gets_no_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    harness = await start(tmp_path, monkeypatch, FakeGemma(), **call_settings(tmp_path))
+    try:
+        folder, app = harness.folder, harness.app
+        on_a_call(app)
+        deliver(folder, "hello from a stranger", T0, source=STRANGER)  # ignored
+        deliver(folder, "hello from a new laptop", T0 + 1, device=2)  # held: not stored, not read, its own note
+        await until(lambda: len(sent(folder)) == 1)
+        deliver(folder, "/lock", T0 + 2)
+        await until(lambda: len(sent(folder)) == 2 and app.guard.locked)
+        deliver(folder, "hello", T0 + 3)  # not stored, not read
+        await asyncio.sleep(0.5)
+        assert len(sent(folder)) == 2 and prompts.CALL_TEXT_WAITS not in sent(folder)
+    finally:
+        await stop(harness)
+
+
+async def test_another_accounts_text_during_a_call_gets_the_line_in_its_own_chat_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Households: another account's text gets the line in that account's chat, once a call, and is never said on the
+    caller's call; the caller's own text gets its line too."""
+    gemma = FakeGemma(text("She is on a call."), text("Hi."))
+    settings = call_settings(tmp_path) | {"allowed_acis": frozenset({ME, PARTNER})}
+    harness = await start(tmp_path, monkeypatch, gemma, **settings)
+    try:
+        folder, app = harness.folder, harness.app
+        assert app.calls is not None
+        on_a_call(app)
+        deliver(folder, "is she free?", T0, source=PARTNER)
+        await until(lambda: sent_to(folder) == [(PARTNER, prompts.CALL_TEXT_WAITS)])
+        assert app.calls._call is not None and not app.calls._call.text_owed  # never said on the caller's call
+        deliver(folder, "hello", T0 + 1)
+        await until(lambda: len(sent_to(folder)) == 2)
+        assert sent_to(folder)[1] == (ME, prompts.CALL_TEXT_WAITS) and app.calls._call.text_owed
+        call_over(app)
+        await until(lambda: len(sent(folder)) == 4)
+    finally:
+        await stop(harness)
+
+
+async def test_a_text_typed_during_a_practice_call_gets_no_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A text typed during a practice call is a practice turn, answered first after it: no line."""
+    gemma = FakeGemma(text("Leuk! Hoe laat sta je meestal op?"), recap_answer())
+    harness = await start(tmp_path, monkeypatch, gemma, **call_settings(tmp_path))
+    try:
+        folder, app = harness.folder, harness.app
+        deliver(folder, "/babble nl", T0)
+        await until(lambda: len(sent(folder)) == 1)
+        on_a_call(app)
+        assert app.calls is not None and app.calls._call is not None and app.calls._call.practice
+        deliver(folder, "Ik ben moe", T0 + 1)
+        await until(lambda: bool(app.store.unanswered_incoming()))
+        await asyncio.sleep(0.3)
+        assert len(sent(folder)) == 1 and not app.calls._call.text_owed
+        call_over(app)
+        await app.practice_call_ended(ME)
+        await until(lambda: len(sent(folder)) == 3)
+        assert prompts.CALL_TEXT_WAITS not in sent(folder)
+    finally:
+        await stop(harness)
+
+
 async def test_a_cut_off_call_answer_ends_at_its_last_whole_sentence(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # live test 2026-10-10: a long answer hit the token limit and she stopped mid-sentence ("after they found their")
-    gemma = FakeGemma(text("They formed in 1983. Their sound mixed funk and punk. After they found their"))
+    cut = Completion(
+        "They formed in 1983. Their sound mixed funk and punk. After they found their", finish_reason="length"
+    )
+    gemma = FakeGemma(cut)
     harness = await start(tmp_path, monkeypatch, gemma, **call_settings(tmp_path))
     try:
         turn = await harness.app.call_turn(ME, "tell me about the band", lambda: None)
         assert turn.text == "They formed in 1983. Their sound mixed funk and punk."
         assert harness.app.store.message(turn.reply_id or 0).text == turn.text  # stored as said
-        assert app_module.CALL_MAX_TOKENS == 300
+        assert app_module.CALL_MAX_TOKENS == 500  # owner, 26 Oct: "calls will have to get longer, lets do 500"
+    finally:
+        await stop(harness)
+
+
+@pytest.mark.parametrize("practice", [False, True])
+async def test_a_call_answer_the_model_ended_itself_is_said_whole(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, practice: bool
+) -> None:
+    """Review of 26 Oct (rtcall-10): only a cut-off answer (finish reason "length") ends at its last whole sentence;
+    one the model ended itself keeps its last sentence, also without a mark at its end (a name, an emoji)."""
+    answer = "They formed in 1983. Ask Alex Example about them"
+    gemma = FakeGemma(text(answer), recap_answer())
+    harness = await start(tmp_path, monkeypatch, gemma, **call_settings(tmp_path))
+    try:
+        app = harness.app
+        if practice:
+            deliver(harness.folder, "/babble nl", T0)
+            await until(lambda: len(sent(harness.folder)) == 1)
+        app.call_started(ME)
+        turn = await app.call_turn(ME, "tell me about the band", lambda: None, practice=practice)
+        assert turn.text == answer and app.store.message(turn.reply_id or 0).text == answer
     finally:
         await stop(harness)
 
@@ -2866,6 +4123,73 @@ async def test_a_fresh_install_says_welcome_once(tmp_path: Path, monkeypatch: py
         assert sent(restarted.folder).count(WELCOME) == 1
     finally:
         await stop(restarted)
+
+
+def learned_before(count: str) -> Callable[[Store], None]:
+    """A store from 0.9.6 with its count of notes learned and not told yet (that release's state key)."""
+
+    def prepare(store: Store) -> None:
+        store.set_state("unannounced_learned", count)
+
+    return prepare
+
+
+@pytest.mark.parametrize(
+    ("count", "line"),
+    [
+        ("3", "3 notes from before the update: /profile notes shows them."),
+        ("1", "1 note from before the update: /profile notes shows it."),
+    ],
+)
+async def test_notes_learned_before_the_update_are_named_once_at_the_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, count: str, line: str
+) -> None:
+    """Review of 0.9.8, memory-7: 0.9.6 counted the notes she learned in quiet times under `unannounced_learned`, told
+    with her next reply; 0.9.8 tells the last quiet time's notes instead and never read that key, so the count was
+    dropped without a word. The first start after the update sends one line, then the key goes."""
+    harness = await start(tmp_path, monkeypatch, FakeGemma(), prepare=learned_before(count))
+    try:
+        await until(lambda: sent(harness.folder) == [line])
+        assert harness.app.store.get_state("unannounced_learned") is None
+        await until(lambda: harness.app.store.message(1).status == "sent")
+        assert harness.app.store.message(1).kind == "note"  # code's note: in her history as code's
+    finally:
+        await stop(harness)
+    restarted = await start(tmp_path, monkeypatch, FakeGemma())
+    try:
+        await until(lambda: restarted.app.store.get_state(ALIVE_KEY) is not None)
+        assert sent(restarted.folder).count(line) == 1  # never again
+    finally:
+        await stop(restarted)
+
+
+async def test_no_notes_waiting_from_before_the_update_is_no_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """0.9.6 left "0" once its line had gone out: the key goes, nothing is said."""
+    harness = await start(tmp_path, monkeypatch, FakeGemma(), prepare=learned_before("0"))
+    try:
+        await until(lambda: harness.app.store.get_state(ALIVE_KEY) is not None)
+        assert sent(harness.folder) == [] and harness.app.store.get_state("unannounced_learned") is None
+    finally:
+        await stop(harness)
+
+
+async def test_while_locked_the_notes_from_before_the_update_wait_for_the_next_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from local_assistant.commands import LOCK_KEY
+
+    def locked(store: Store) -> None:
+        learned_before("2")(store)
+        store.set_state(LOCK_KEY, "on")
+
+    harness = await start(tmp_path, monkeypatch, FakeGemma(), prepare=locked)
+    try:
+        await until(lambda: harness.app.store.get_state(ALIVE_KEY) is not None)
+        assert sent(harness.folder) == [] and harness.app.store.get_state("unannounced_learned") == "2"
+    finally:
+        await stop(harness)
 
 
 async def test_the_welcome_flag_alone_means_no_second_welcome(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -3050,26 +4374,39 @@ async def test_an_account_no_longer_allowed_is_not_owed_the_welcome(
 def test_the_welcome_names_only_the_parts_that_are_set_up() -> None:
     plain = prompts.welcome(name=NAME)
     assert plain.startswith("Hi, I'm Estia") and plain.endswith("/help lists what I can do here and the commands.")
-    assert "Everything stays on this Mac." in plain and "Only you get answers from me." in plain
+    assert "Everything stays on this Mac, except what goes out for links you send (pages, YouTube videos)." in plain
+    assert "Only you get answers from me." in plain
     for part in ("Mail", "Calendar", "Voice notes", "Calls", "Lights and plugs", "Web search", "Places", "Music"):
         assert part not in plain
     some = prompts.welcome(name=NAME, mail=True, device="desk lamp", web=True)
     assert "Mail:" in some and '"turn on desk lamp"' in some and "Web search:" in some
     assert "Calendar" not in some and "Voice notes" not in some and "Music" not in some
-    assert "except what web search needs to send" in some
+    assert "except what goes out for links you send (pages, YouTube videos), web search and mail search." in some
     assert "I only read your mail, never change it, and only you get answers from me." in some
     every = prompts.welcome(
         name=NAME, mail=True, calendar=True, voice=True, calls=True, device="desk lamp", web=True, maps=True, music=True
     )
     tries = [line for line in every.splitlines() if line.startswith("• ")]
-    assert len(tries) == 8 and all(":" in line for line in tries)
-    assert "\n\n**Set up and ready to try**\n• Mail: " in every  # a bold heading, one part per line
-    assert "except what web search, places and music need to send" in every
+    assert len(tries) == 9 and all(":" in line for line in tries)  # memory first, always on (0.9.8)
+    assert "\n\n**Set up and ready to try**\n• Memory: " in every and "\n• Mail: " in every  # one part per line
+    assert "links you send (pages, YouTube videos), web search, places, music and mail search." in every
     assert "I only read your mail and calendar, never change them" in every
     assert "Reminder set" not in every  # the contract comes with reminders only
     with_reminders = prompts.welcome(name=NAME, reminders=True, wake_calls=True)
     [line] = [line for line in with_reminders.splitlines() if line.startswith("• Reminders:")]
     assert line.endswith('(a reminder is set only when my "Reminder set" note says so)')
+
+
+def test_the_welcome_names_everything_that_goes_out() -> None:
+    """Review of 0.9.7, X14: links she reads for you (a page, a YouTube video: always on) and, with mail, mail search
+    send words out too, so the welcome's "stays on this Mac" line names them beside web search, places and music."""
+    plain = prompts.welcome(name=NAME)
+    assert "Everything stays on this Mac, except what goes out for links you send (pages, YouTube videos)." in plain
+    every = prompts.welcome(name=NAME, mail=True, web=True, maps=True, music=True)
+    assert (
+        "except what goes out for links you send (pages, YouTube videos), web search, places, music and mail search."
+    ) in every
+    assert "mail search" not in prompts.welcome(name=NAME, web=True)
 
 
 @pytest.mark.parametrize(
@@ -3129,7 +4466,8 @@ async def test_a_voice_note_is_heard_and_answered_in_the_language(
             deliver(harness.folder, None, T0, attachments=[voice("v1.m4a", M4A)])
             await until(lambda: len(voice_notes(harness.folder)) == 1)
             assert "/v1/audio/transcriptions?language=nl" in service.paths()
-            assert ("nl", {"input": "De lamp is uit.", "voice": "af_heart", "speed": 1.05, "language": "nl"}) in (
+            # owner, 25 Oct: Dutch is spoken in jane (Pocket TTS's Dutch model): the language voice goes with it
+            assert ("nl", {"input": "De lamp is uit.", "voice": "jane", "speed": 1.05, "language": "nl"}) in (
                 speech_requests(service)
             )
         finally:
@@ -3144,7 +4482,8 @@ async def test_the_voice_warms_up_at_the_start_and_after_a_switch(
         harness = await start(tmp_path, monkeypatch, FakeGemma(), voice_url=service.url, language="nl")
         try:
             line = prompts.spoken("nl", name=NAME).now_speaking
-            warm_up = ("nl", {"input": line, "voice": "af_heart", "speed": 1.05, "language": "nl"})
+            # in jane (owner, 25 Oct): the voice service checks and fetches her Dutch model now, only the language in use
+            warm_up = ("nl", {"input": line, "voice": "jane", "speed": 1.05, "language": "nl"})
             await until(lambda: speech_requests(service) == [warm_up])
             deliver(harness.folder, "/language de", T0)
             await until(lambda: len(speech_requests(service)) == 2)
@@ -3154,6 +4493,41 @@ async def test_the_voice_warms_up_at_the_start_and_after_a_switch(
             await until(lambda: len(sent(harness.folder)) == 2)
             await asyncio.sleep(0.2)
             assert len(speech_requests(service)) == 2  # English (Kokoro) needs no warm-up
+        finally:
+            await stop(harness)
+
+
+async def test_the_warm_up_waits_for_a_voice_service_that_is_not_up_yet(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The review of 25 Oct: after a boot where the bridge starts before the voice service listens, the warm-up found no
+    answer and gave up, so jane's German model was checked only at the first call's first line (F1 said the opening
+    lines). It asks again every 15 s for about 5 minutes (here at once): its one line in the language once the voice
+    service answers, none in English."""
+    monkeypatch.setattr(voice_module, "LANGUAGES_WAIT_S", 0.05)
+    with FakeVoiceService() as service:
+        service.languages = list(CODES)
+        service.status["/health"] = 503  # not up yet
+        harness = await start(tmp_path, monkeypatch, FakeGemma(), voice_url=service.url, language="de")
+        try:
+            await until(lambda: service.paths().count("/health") >= 3)
+            assert speech_requests(service) == []
+            del service.status["/health"]
+            line = prompts.spoken("de", name=NAME).now_speaking
+            warm_up = ("de", {"input": line, "voice": "jane", "speed": 1.05, "language": "de"})
+            await until(lambda: speech_requests(service) == [warm_up])
+            await asyncio.sleep(0.3)
+            assert len(speech_requests(service)) == 1  # one line, not one a try
+        finally:
+            await stop(harness)
+    with FakeVoiceService() as service:  # English: no warm-up, however long the voice service is down
+        service.status["/health"] = 503
+        harness = await start(tmp_path / "en", monkeypatch, FakeGemma(), voice_url=service.url)
+        try:
+            await asyncio.sleep(0.3)
+            del service.status["/health"]
+            await asyncio.sleep(0.3)
+            assert speech_requests(service) == []
         finally:
             await stop(harness)
 
@@ -3261,7 +4635,7 @@ async def test_a_call_follows_the_language(tmp_path: Path, monkeypatch: pytest.M
         app = harness.app
         assert app.calls is not None and app.calls.language == "nl"
         turn = await app.call_turn(ME, "hoe laat is het?", lambda: None)
-        assert turn.text == prompts.spoken("nl", name=NAME).again  # said in Dutch, like the call's other lines
+        assert turn.text == prompts.spoken("nl", name=NAME).lost  # said in Dutch, like the call's other lines
         deliver(harness.folder, "/language pl", T0)
         await until(lambda: len(sent(harness.folder)) == 1)
         assert app.calls.language == "pl" and app._call_voice is not None and app._call_voice.language == "pl"
@@ -3299,6 +4673,45 @@ async def test_a_reminder_from_the_command_fires_as_a_note(tmp_path: Path, monke
         await stop(harness)
 
 
+async def test_the_same_remind_command_twice_gets_a_second_reply(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review O1 (0.9.7): the repeat set nothing new, and its reply still goes out, at once and once (an empty one
+    failed to send and the resend pass tried it every minute for 10 minutes)."""
+    harness = await start(tmp_path, monkeypatch, FakeGemma())
+    try:
+        deliver(harness.folder, "/remind 20m take the pizza out", T0)
+        await until(lambda: len(sent(harness.folder)) == 1)
+        deliver(harness.folder, "/remind 20m take the pizza out", T0 + 1)
+        await until(lambda: len(sent(harness.folder)) == 2)
+        assert sent(harness.folder)[1].startswith("Already set as #1 for ")
+        assert sent(harness.folder)[1].endswith("; nothing new was set.")
+        assert len(harness.app.store.open_reminders(ME)) == 1
+        assert harness.app.store.unsent_outgoing() == []  # nothing left for the resend pass
+    finally:
+        await stop(harness)
+
+
+async def test_an_empty_reply_is_never_sent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A safety net under every caller: an empty text is set aside and goes nowhere (the resend pass would try it every
+    minute); the message it answers keeps its status."""
+    harness = await start(tmp_path, monkeypatch, FakeGemma())
+    try:
+        await until_started(harness)
+        store = harness.app.store
+        conversation = store.current_conversation()
+        message_id = store.add_incoming(conversation.id, ME, T0, "command", "/x")
+        assert message_id is not None
+        await harness.app._reply(store.message(message_id), "  \n", "command", "answered")
+        assert store.message(message_id).status == "answered"
+        out_id = store.add_outgoing(conversation.id, ME, "note", "", message_id)
+        assert await harness.app._send(out_id) is False
+        assert store.message(out_id).status == "ignored" and store.unsent_outgoing() == []
+        assert sent(harness.folder) == []
+    finally:
+        await stop(harness)
+
+
 async def test_gemma_sets_a_reminder_and_code_confirms_it(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     when = datetime.fromtimestamp(time.time() + 3 * 3600, TZ_APP).strftime("%Y-%m-%d %H:%M")
     gemma = FakeGemma(tool("set_reminder", at=when, text="call mum"), text("Sure, I'll remind you."))
@@ -3309,6 +4722,23 @@ async def test_gemma_sets_a_reminder_and_code_confirms_it(tmp_path: Path, monkey
         await until(lambda: len(sent(harness.folder)) == 2)
         answer, note = sent(harness.folder)
         assert answer == "Sure, I'll remind you." and note.startswith("Reminder set (#1):") and '"call mum"' in note
+    finally:
+        await stop(harness)
+
+
+async def test_two_identical_reminder_calls_set_one_reminder(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    when = datetime.fromtimestamp(time.time() + 3 * 3600, TZ_APP).strftime("%Y-%m-%d %H:%M")
+    arguments = json.dumps({"at": when, "text": "call mum"})
+    twice = (ToolCall("call_1", "set_reminder", arguments), ToolCall("call_2", "set_reminder", arguments))
+    gemma = FakeGemma(Completion(content="", tool_calls=twice, finish_reason="tool_calls"), text("Sure."))
+    harness = await start(tmp_path, monkeypatch, gemma)
+    try:
+        deliver(harness.folder, "remind me in three hours to call mum", T0)
+        await until(lambda: len(sent(harness.folder)) == 2)
+        await asyncio.sleep(0.2)
+        answer, note = sent(harness.folder)
+        assert answer == "Sure." and note.startswith("Reminder set (#1):") and note.count("Reminder set") == 1
+        assert len(harness.app.store.open_reminders(ME)) == 1
     finally:
         await stop(harness)
 
@@ -3516,8 +4946,11 @@ async def test_with_reminders_off_nothing_changes(tmp_path: Path, monkeypatch: p
     try:
         app = harness.app
         assert app.reminders is None and app.reminder_scheduler is None
-        rules = prompts.rules(  # every rules text names practice; the list has no reminders
-            name=NAME, practice_last=prompts.PRACTICE_NEVER, capabilities=app.capability_lines()
+        rules = prompts.rules(  # every rules text names practice; the lists have no reminders
+            name=NAME,
+            practice_last=prompts.PRACTICE_NEVER,
+            capabilities=app.capability_lines(),
+            inventory=app.status_host.inventory(),
         )
         assert app.context.system_prompt(app.store.current_conversation()).startswith(rules)
         assert not any("Reminders" in line for line in app.capability_lines())
@@ -3703,6 +5136,33 @@ async def test_an_install_from_before_hears_nothing_new_while_they_are_off(
 def test_the_alive_mark_keeps_its_name_and_its_minute(tmp_path: Path) -> None:
     """estia-deploy's health check reads state.last_alive (read-only) after a deploy: the key and its timing stay."""
     assert ALIVE_KEY == "last_alive" and app_module.ALIVE_SECONDS == 60
+
+
+async def test_a_database_error_in_the_heartbeat_never_ends_the_bridge(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review D13 (0.9.7): one failed write of the alive mark is logged and the heartbeat goes on (a task of the
+    bridge's task group that raises takes the whole bridge down, and launchd starts it again)."""
+    monkeypatch.setattr(lifecycle_module, "ALIVE_SECONDS", 0.01)
+    harness = await start(tmp_path, monkeypatch, FakeGemma())
+    try:
+        await until_started(harness)
+        store = harness.app.store
+        real = store.set_state
+        failures = [2]
+
+        def set_state(key: str, value: str) -> None:
+            if key == ALIVE_KEY and failures[0]:
+                failures[0] -= 1
+                raise sqlite3.OperationalError("database is locked")
+            real(key, value)
+
+        monkeypatch.setattr(store, "set_state", set_state)
+        store.delete_state(ALIVE_KEY)
+        await until(lambda: store.get_state(ALIVE_KEY) is not None)
+        assert failures == [0] and not harness.task.done()
+    finally:
+        await stop(harness)
 
 
 LOGGING_SCRIPT = """
@@ -3896,6 +5356,72 @@ async def test_lock_holds_back_an_answer_already_on_its_way(tmp_path: Path, monk
         await stop(harness)
 
 
+async def test_lock_stops_an_answers_tool_calls_still_to_come(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """/lock while Gemma works on an answer (a linked device, maybe someone else's hands): the tool calls she makes
+    after it never run, and Gemma is not asked again (review I1: the fact was saved and the lamp switched)."""
+    pending: asyncio.Future[Completion] = asyncio.get_running_loop().create_future()
+    gemma = FakeGemma(pending, text("Noted, and the lamp is off."))
+    harness, home = await devices_app(tmp_path, monkeypatch, gemma)
+    try:
+        deliver(harness.folder, "turn off every light and remember my new address", T0)
+        await until(lambda: len(gemma.calls) == 1)
+        deliver(harness.folder, "/lock", T0 + 1, device=1)
+        await until(lambda: len(sent(harness.folder)) == 1)
+        address = ToolCall("call_remember", "remember", json.dumps({"fact": "The user lives at 1 Example Street."}))
+        lamp = ToolCall("call_device_set", "device_set", json.dumps({"device": "living room lamp", "power": "off"}))
+        pending.set_result(Completion(content="", tool_calls=(address, lamp), finish_reason="tool_calls"))
+        await asyncio.sleep(0.5)
+        assert sent(harness.folder) == [prompts.LOCKED.format(device=1, minutes=10)]
+        assert harness.app.profile.facts() == [] and home.sets() == [] and len(gemma.calls) == 1
+        statuses = [harness.app.store.message(i).status for i in range(1, harness.app.store.newest_message_id() + 1)]
+        assert "pending" not in statuses and "failed" not in statuses  # never sent later
+    finally:
+        await stop(harness)
+
+
+async def test_a_lock_while_her_voice_answer_is_made_sends_no_voice_note(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The text went out before /lock; the voice note made from it while the lock came never does."""
+    with FakeVoiceService() as service:
+        service.speech_delay = 1.0
+        harness = await start(tmp_path, monkeypatch, FakeGemma(text("Done, the lamp is off.")), voice_url=service.url)
+        try:
+            put(harness.folder, "v1.m4a", M4A)
+            deliver(harness.folder, None, T0, attachments=[voice("v1.m4a", M4A)])
+            await until(lambda: any(request[1] == "/v1/audio/speech" for request in service.requests))
+            deliver(harness.folder, "/lock", T0 + 1, device=1)
+            await until(lambda: prompts.LOCKED.format(device=1, minutes=10) in sent(harness.folder))
+            await asyncio.sleep(1.5)
+            assert voice_notes(harness.folder) == []
+        finally:
+            await stop(harness)
+
+
+async def test_a_lock_while_her_call_for_a_reminder_rings_hangs_it_up(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """/lock while a call she placed still rings (a wake-up call at 07:00, the phone in someone else's hands): hung up
+    at once, so nobody can pick it up and talk to her while she is locked (review C1)."""
+    with FakeVoiceService() as service:
+        harness = await start(
+            tmp_path, monkeypatch, FakeGemma(), **(call_settings(tmp_path) | {"voice_url": service.url})
+        )
+        calls = harness.app.calls
+        assert calls is not None
+        placing = asyncio.create_task(calls.place(ME, wake=True, time="7:00", text="wake up"))
+        try:
+            await until(lambda: calls._dial is not None and calls._dial.call_id == 42)  # ringing
+            assert not calls.in_call
+            deliver(harness.folder, "/lock", T0, device=1)
+            await until(lambda: any(r["method"] == "hangupCall" for r in requests(harness.folder)))
+            hangup = next(r for r in requests(harness.folder) if r["method"] == "hangupCall")
+            assert hangup["params"]["callId"] == 42
+        finally:
+            placing.cancel()
+            await stop(harness)
+
+
 async def test_the_lock_survives_a_restart(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     harness = await start(tmp_path, monkeypatch, FakeGemma())
     try:
@@ -3933,7 +5459,9 @@ async def test_a_reminder_due_while_locked_comes_after_the_unlock(
         assert len(sent(harness.folder)) == 1
         clock.now += 600
         deliver(harness.folder, "/unlock", T0 + 1, device=1)
-        await until(lambda: "Reminder: stretch" in sent(harness.folder))
+        # it waited 13 minutes: the late form, with the time it was due (review O4)
+        await until(lambda: any(t.startswith("Late reminder (due ") for t in sent(harness.folder)))
+        assert sent(harness.folder)[-1].endswith("): stretch")
     finally:
         await stop(harness)
 
@@ -3960,6 +5488,34 @@ async def test_a_changed_safety_number_is_recorded_and_shown_until_a_message_ope
         deliver(harness.folder, "it's me again", T0)
         await until(lambda: sent(harness.folder) == ["hi"])
         assert "identity_changed" not in status_file.read_text()
+    finally:
+        await stop(harness)
+
+
+async def test_signal_clis_connection_reaches_status_json_and_the_heartbeat_waits_for_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Signal logged this Mac out: signal-cli ends at every start. The heartbeat kept "Always on" green and only
+    /status, over Signal, counted the restarts (review S2). Now status.json keeps since when, the restarts and the
+    kind, and no sign of life is written while signal-cli is not ready."""
+    harness = await start(tmp_path, monkeypatch, FakeGemma())
+    try:
+        await until_started(harness)
+        assert harness.app.part_status.security().signal_ready is not None
+        monkeypatch.setenv("FAKE_SIGNAL_SUBSCRIBE_ERROR", "1")
+        harness.app.store.delete_state(ALIVE_KEY)
+        assert harness.app.signal._proc is not None
+        harness.app.signal._proc.terminate()
+        await until(lambda: harness.app.part_status.security().signal_failure == "not registered", 10)
+        facts = read_security(tmp_path / "data" / "status.json")
+        assert facts.signal_down is not None and (facts.signal_restarts or 0) >= 2
+        harness.app.lifecycle.beat()
+        assert harness.app.store.get_state(ALIVE_KEY) is None  # not connected: no sign of life
+        monkeypatch.delenv("FAKE_SIGNAL_SUBSCRIBE_ERROR")
+        await until(lambda: harness.app.signal.ready, 10)
+        harness.app.lifecycle.beat()
+        assert harness.app.store.get_state(ALIVE_KEY) is not None
+        assert harness.app.part_status.security().signal_down is None
     finally:
         await stop(harness)
 
@@ -4117,6 +5673,78 @@ async def test_another_users_message_does_not_clear_a_changed_safety_number(
         deliver(harness.folder, "from the other account", T0, source=STRANGER)
         await until(lambda: sent(harness.folder) == ["hi"])
         assert harness.app.part_status.security().identity_changed is not None
+    finally:
+        await stop(harness)
+
+
+async def test_after_a_restart_only_the_changed_accounts_message_clears_its_safety_number(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """status.json keeps the ✗ across a restart, and so does her state table the accounts it is for (review S5: after
+    a restart the first message from any allowed account cleared it)."""
+    both = frozenset({ME, STRANGER})
+    harness = await start(tmp_path, monkeypatch, FakeGemma(text("hi"), text("hello")), allowed_acis=both)
+    try:
+        harness.app.on_problem(ReceiveProblem("UntrustedIdentityException", ME, 1))
+    finally:
+        await stop(harness)
+    harness = await start(tmp_path, monkeypatch, FakeGemma(text("hi"), text("hello")), allowed_acis=both)
+    try:
+        assert harness.app.signal_host.identity_changed == {ME}  # read back at the start
+        deliver(harness.folder, "from the other account", T0, source=STRANGER)
+        await until(lambda: sent(harness.folder) == ["hi"])
+        assert harness.app.part_status.security().identity_changed is not None
+        deliver(harness.folder, "it's me again", T0 + 1)
+        await until(lambda: sent(harness.folder) == ["hi", "hello"])
+        assert (
+            harness.app.part_status.security().identity_changed is None and not harness.app.signal_host.identity_changed
+        )
+    finally:
+        await stop(harness)
+    harness = await start(tmp_path, monkeypatch, FakeGemma(), allowed_acis=both)
+    try:
+        assert harness.app.signal_host.identity_changed == set()
+    finally:
+        await stop(harness)
+
+
+async def test_a_changed_safety_number_from_before_names_no_account_so_every_allowed_one_must_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Recorded by a release that kept no accounts (status.json only): each allowed account counts until its message
+    opens; with one allowed account that is its first message, as before."""
+    status = tmp_path / "data" / "status.json"
+    status.parent.mkdir(parents=True)
+    status.write_text(json.dumps({"parts": {}, "security": {"identity_changed": time.time() - 60}}))
+    harness = await start(
+        tmp_path, monkeypatch, FakeGemma(text("hi"), text("hello")), allowed_acis=frozenset({ME, STRANGER})
+    )
+    try:
+        assert harness.app.signal_host.identity_changed == {ME, STRANGER}
+        deliver(harness.folder, "from the other account", T0, source=STRANGER)
+        await until(lambda: sent(harness.folder) == ["hi"])
+        assert harness.app.part_status.security().identity_changed is not None
+        deliver(harness.folder, "it's me", T0 + 1)
+        await until(lambda: sent(harness.folder) == ["hi", "hello"])
+        assert harness.app.part_status.security().identity_changed is None
+    finally:
+        await stop(harness)
+
+
+async def test_a_changed_safety_number_of_an_account_no_longer_allowed_is_shown_no_more(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def kept(store: Store) -> None:
+        store.set_state("identity_changed", STRANGER)  # taken out of allowed_acis since
+
+    status = tmp_path / "data" / "status.json"
+    status.parent.mkdir(parents=True)
+    status.write_text(json.dumps({"parts": {}, "security": {"identity_changed": time.time() - 60}}))
+    harness = await start(tmp_path, monkeypatch, FakeGemma(), prepare=kept)
+    try:
+        assert harness.app.signal_host.identity_changed == set()
+        assert harness.app.part_status.security().identity_changed is None
+        assert harness.app.store.get_state("identity_changed") is None
     finally:
         await stop(harness)
 
@@ -4312,7 +5940,9 @@ async def test_a_practice_call_turn_joins_practice_and_the_calls_end_sends_the_r
         app.call_started(ME)
         turn = await app.call_turn(ME, "Ik woon in Utrecht.", lambda: None, practice=True)
         assert turn.text == "Leuk! Waar werk je?"
-        assert gemma.calls[0]["tools"] is None and gemma.calls[0]["max_tokens"] == CALL_MAX_TOKENS
+        # a practice call keeps a call's old room (review of 26 Oct, DLG-02 and eval-methods-14): its rules ask for a
+        # few sentences ending in one question, and 500 tokens invited a monologue
+        assert gemma.calls[0]["tools"] is None and gemma.calls[0]["max_tokens"] == 300 < CALL_MAX_TOKENS
         assert [m.text for m in app.store.window_messages(session.conversation_id, 0)] == [
             "[call] Ik woon in Utrecht.",
             "Leuk! Waar werk je?",
@@ -4647,6 +6277,36 @@ def her_rules(app: App) -> str:
     return app.context.system_prompt(app.store.current_conversation())
 
 
+async def test_her_rules_and_tools_carry_her_tools_list(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Owner, 23 Oct: her tools' list, built from the tools this install offers her: her rules carry it after what she
+    can do, /tools shows it word for word, a tool that is off is not on it (mail here), and the programs behind them are
+    the ones on."""
+    harness = await start(tmp_path, monkeypatch, FakeGemma(), calls_enabled=True)
+    try:
+        app = harness.app
+        listed = app.status_host.inventory()
+        assert listed is not None
+        tools = [line.removeprefix("• ").split(":", 1)[0] for line in listed.tools]
+        assert tools == [name for name, _ in app.tools.inventory_tools()]
+        assert "set_reminder" in tools and "end_call" in tools and not any(name.startswith("mail_") for name in tools)
+        assert [line.split(":", 1)[0] for line in listed.helpers] == [
+            "• Voice service",
+            "• Call helper",
+            "• YouTube helper",
+        ]
+        assert "placed by me at a time you set (wake-up calls and reminders)" in listed.helpers[1]
+        rules = her_rules(app)
+        assert prompts.inventory_section(listed) in rules
+        assert rules.index("\n".join(app.capability_lines())) < rules.index(prompts.INVENTORY_RULE)
+        deliver(harness.folder, "/tools", T0)
+        await until(lambda: sent(harness.folder) == [on_phone(prompts.inventory_text(listed))])
+        deliver(harness.folder, "/help", T0 + 1)
+        await until(lambda: len(sent(harness.folder)) == 2)
+        assert "/tools - my tools here" in sent(harness.folder)[1]
+    finally:
+        await stop(harness)
+
+
 async def test_her_rules_and_help_carry_what_she_can_do_here(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     harness = await start(tmp_path, monkeypatch, FakeGemma(), security_level=lambda: "hardened")
     try:
@@ -4699,9 +6359,10 @@ async def test_the_list_follows_the_config(tmp_path: Path, monkeypatch: pytest.M
     harness = await start(tmp_path, monkeypatch, FakeGemma(), security_level=lambda: "nuclear", **settings)
     try:
         lines = harness.app.capability_lines()
-        assert "• Calls: a spoken conversation on Signal. Interrupt: only speech or any sound (now: any sound)" in (
-            line.split(". Example", 1)[0] for line in lines
-        )
+        assert (
+            "• Calls: a spoken conversation on Signal: you call me, or I call you at a time you set (wake-up calls and "
+            "reminders). Interrupt: only speech or any sound (now: any sound)"
+        ) in (line.split(". Example", 1)[0] for line in lines)
         assert any(line.startswith("• Reminders and wake-up calls: ") for line in lines)
         assert any("Levels: off, summary, docs or code (now: summary)" in line for line in lines)
         assert any(line.startswith("• Voice notes: ") for line in lines)  # calls need [voice]: on too
@@ -4777,5 +6438,34 @@ async def test_the_learn_reply_names_the_page_without_its_links(
         reply = sent(harness.folder)[0]
         assert reply.startswith(f"Learned from {named}:\nSaved #1: The user lives in Amsterdam, NL.")
         assert not any(piece in reply for piece in ("evil.com", "evil.example", "ab.cd"))
+    finally:
+        await stop(harness)
+
+
+# the model's context window (review I24): the whole request fits it, the oldest messages leaving her input first
+
+
+async def test_her_request_fits_the_models_context(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A small context (the 16 GB tier's is 16,384 tokens; 8,192 here, with this setup's few tools): the request, its
+    tools and her reply's tokens fit it, as the code counts them; Ollama would cut it without a word."""
+
+    def long_chat(store: Store) -> None:
+        conversation = store.current_conversation()
+        for turn in range(20):
+            ask = store.add_incoming(conversation.id, ME, T0 - 900_000 + turn * 2_000, "text", f"{turn} " + "q" * 200)
+            assert ask is not None
+            store.set_status(ask, "answered")
+            out = store.add_outgoing(conversation.id, ME, "text", f"{turn} " + "a" * 1_400, ask)
+            store.mark_sent(out, T0 - 899_000 + turn * 2_000)
+
+    harness = await start(tmp_path, monkeypatch, FakeGemma(text("Sure.")), prepare=long_chat, context_tokens=8_192)
+    try:
+        deliver(harness.folder, "and the last one?", T0)
+        await until(lambda: len(sent(harness.folder)) == 1)
+        request = harness.gemma.calls[0]
+        chars = len(json.dumps(request["messages"], ensure_ascii=False)) + len(json.dumps(request["tools"]))
+        assert chars / 3.5 + harness.app.cfg.reply_max_tokens <= 8_192
+        assert request["messages"][-1]["content"].endswith("and the last one?")
+        assert "19 " + "a" * 1_400 in [message.get("content") for message in request["messages"]]
     finally:
         await stop(harness)

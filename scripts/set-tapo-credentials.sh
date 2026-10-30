@@ -1,8 +1,9 @@
-#!/usr/bin/env bash
+#!/bin/bash
 # Store the TP-Link account login used for local Kasa/Tapo control (read only by the device helper, never by
 # the bridge). Hidden prompt: the password is never echoed, logged or passed on a command line. Once she runs as her
 # own user _estia, both go through pipes into /usr/bin/sudo /usr/local/estia/bin/estia secret set tapo.env <KEY>.
 set -euo pipefail
+PATH=/usr/bin:/bin:/usr/sbin:/sbin  # the Mac's own tools only: a key passes through them
 dir="$HOME/.config/local-assistant"
 file="$dir/tapo.env"
 source "$(dirname "$0")/own-user.sh"  # moved, and her commands' fixed paths ($estia, $estia_deploy)

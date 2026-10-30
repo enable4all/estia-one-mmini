@@ -1,9 +1,27 @@
 import CryptoKit
 import Foundation
 
+/// A folder of pinned files under a models base: exactly these files with these bytes, checked before anything loads
+/// them (`prepareModel`).
+public protocol PinnedFolder: Sendable {
+    /// The folder under the base, as the base's own path (for the log: the folder to delete).
+    var path: String { get }
+    /// Every file, by its path inside the folder.
+    var sha256: [String: String] { get }
+    /// The folder against the pins.
+    func check(in base: URL) -> ModelFiles
+}
+
+extension PinnedFolder {
+    public func location(in base: URL) -> URL { base.appendingPathComponent(path) }
+
+    public func check(in base: URL) -> ModelFiles { checkModelFiles(at: location(in: base), against: sha256) }
+}
+
 /// Files from one Hugging Face repository at one commit, each checked against its sha256 before anything loads them.
-/// They sit where a Hub download puts them (WhisperKit's layout): `<base>/models/<repo>/<folder>`.
-public struct HubPin: Equatable, Sendable {
+/// They sit where a Hub download puts them (WhisperKit's layout): `<base>/models/<repo>/<folder>`, or in a folder of
+/// their own (`local`: one repository folder's files from several commits, Pocket TTS's).
+public struct HubPin: PinnedFolder, Equatable {
     public let repo: String
     /// The commit (40 hex digits), never a branch: a branch can change.
     public let revision: String
@@ -11,18 +29,19 @@ public struct HubPin: Equatable, Sendable {
     public let folder: String
     /// Every file, by its path inside `folder`.
     public let sha256: [String: String]
+    /// The local folder under the base, when not the Hub's layout.
+    public let local: String?
 
-    public init(repo: String, revision: String, folder: String, sha256: [String: String]) {
+    public init(repo: String, revision: String, folder: String, sha256: [String: String], local: String? = nil) {
         self.repo = repo
         self.revision = revision
         self.folder = folder
         self.sha256 = sha256
+        self.local = local
     }
 
     /// The files' folder under a download base, as the base's own path (for the log: the folder to delete).
-    public var path: String { folder.isEmpty ? "models/\(repo)" : "models/\(repo)/\(folder)" }
-
-    public func location(in base: URL) -> URL { base.appendingPathComponent(path) }
+    public var path: String { local ?? (folder.isEmpty ? "models/\(repo)" : "models/\(repo)/\(folder)") }
 
     /// What a download asks for: the whole folder, or the pinned files at the top.
     public var globs: [String] { folder.isEmpty ? sha256.keys.sorted() : ["\(folder)/*"] }
@@ -39,10 +58,10 @@ public struct HubPin: Equatable, Sendable {
         return URL(string: "https://huggingface.co/" + encoded.joined(separator: "/"))!
     }
 
-    /// The folder against the pins. At a repository's top, a download keeps its records (`.cache`) beside the files:
-    /// never loaded, so left out.
+    /// The folder against the pins. At a repository's top, a Hub download keeps its records (`.cache`) beside the
+    /// files: never loaded, so left out.
     public func check(in base: URL) -> ModelFiles {
-        checkModelFiles(at: location(in: base), against: sha256, skipping: folder.isEmpty ? [".cache"] : [])
+        checkModelFiles(at: location(in: base), against: sha256, skipping: folder.isEmpty && local == nil ? [".cache"] : [])
     }
 }
 
@@ -53,9 +72,9 @@ public struct HubPin: Equatable, Sendable {
 /// a pin is kept, so the disk never fills), and the pinned commit is downloaded into a fresh folder and checked: so no
 /// recovery needs her user or admin rights. A fresh download that is changed too, or a folder that cannot be moved,
 /// stays `.changed` (never loaded). A download that fails throws; one that brought nothing (offline) leaves `.missing`.
-public func prepareModel(
-    _ pin: HubPin, in base: URL, now: Date = Date(), setAside: (URL) -> Void = { _ in },
-    download: (HubPin) async throws -> Void
+public func prepareModel<Pin: PinnedFolder>(
+    _ pin: Pin, in base: URL, now: Date = Date(), setAside: (URL) -> Void = { _ in },
+    download: (Pin) async throws -> Void
 ) async throws -> ModelFiles {
     let files = pin.check(in: base)
     if files == .changed {
@@ -71,7 +90,7 @@ public func prepareModel(
 
 /// Moves a pin's folder aside (`<folder>.refused-<UTC time>`, beside it), after removing an older copy set aside for
 /// the same pin. Links are moved or removed as links, never followed.
-func setAsideFolder(of pin: HubPin, in base: URL, now: Date) throws -> URL {
+func setAsideFolder(of pin: some PinnedFolder, in base: URL, now: Date) throws -> URL {
     let files = FileManager.default
     let folder = pin.location(in: base)
     let parent = folder.deletingLastPathComponent()
@@ -175,6 +194,11 @@ public func sha256Hex(_ data: Data) -> String {
 public func sha256Hex(file: URL) throws -> String {
     let handle = try FileHandle(forReadingFrom: file)
     defer { try? handle.close() }
+    return try sha256Hex(reading: handle)
+}
+
+/// The sha256 of what `handle` reads from where it stands to its end, in 1 MiB pieces.
+public func sha256Hex(reading handle: FileHandle) throws -> String {
     var hasher = SHA256()
     while true {
         let more = try autoreleasepool { () throws -> Bool in

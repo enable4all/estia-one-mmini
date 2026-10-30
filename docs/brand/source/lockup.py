@@ -1,4 +1,4 @@
-"""Logo lockups: the e. mark beside the name "estia" in lower case (outlined text), on paper and at night."""
+"""Logo lockups: the Hearth mark beside the name "estia" in lower case (outlined text), on paper and at night."""
 
 from __future__ import annotations
 

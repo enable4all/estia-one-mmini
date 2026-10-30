@@ -1,7 +1,10 @@
 # Copy to ~/.config/local-assistant/config.toml and chmod 600 (the bridge refuses a readable file).
 # Placeholders such as +300000000000 and the all-zero UUID must be replaced with your own values.
-bot_number = "+300000000000"   # the Signal number the bot is registered with: full number, + and country code
+bot_number = "+300000000000"   # her Signal account: its number (+ and country code), or the Account ID of one without a number
 # Signal account IDs (ACI, a UUID) allowed to talk to the bot: your own account. Finding it: setup_assistant.md, 2.4.
+# Several allowed accounts share one chat history, the profile and its notes, mail, calendars, documents,
+# the morning digest and the last location sent, and each one can change or remove the others' facts. Allow only
+# people who may see all of it.
 # Send the bot a message, then, with the bridge stopped:
 #   signal-cli -Djava.net.preferIPv4Stack=true -a <bot-number> receive
 #   signal-cli -Djava.net.preferIPv4Stack=true -a <bot-number> listContacts --all-recipients
@@ -10,14 +13,17 @@ allowed_acis = ["00000000-0000-0000-0000-000000000000"]
 # Her name: she answers to it, greets you with it on calls, and your Signal shows it ("Estia (AI)"). Every home names
 # its own: 1-20 letters, spaces or hyphens (ours is called Tiffany).
 name = "Estia"
-# Her Signal profile picture: a PNG or JPEG of at most 5 MB (a full path, ~ allowed), sent when the bridge starts and
-# again only after the file changes. Left out: Estia's e. (docs/brand/estia-avatar.png), or with another name its
-# first letter, a to z, with the orange full stop (docs/brand/letters/); "" for none. Keep your own picture
-# outside the repo folder: a missing or unusable file is skipped (she runs on, Signal keeps the picture it has).
+# Her Signal picture is Estia's mark, whatever her name: a silver ring around an orange rounded square. A picture of
+# your own can replace it: avatar, a PNG or JPEG of at most 5 MB (a full path, ~ allowed), sent when the bridge
+# starts and again only after the file changes. avatar = "" sends none, and Signal keeps the picture it has; left
+# out: the mark (docs/brand/estia-avatar.png). Keep your own picture outside the repo folder: a missing or unusable
+# file is skipped (she runs on, Signal keeps the picture it has).
 #avatar = "~/Pictures/her-picture.png"
 # The one language she listens and speaks in: en, es, it, ko, pt, nl, pl, de, ja, ru or fr (GUIDE.md, Languages).
 # Only the starting value: a typed /language in Signal changes it later (and wins over this line).
 language = "en"
+# Ollama on this Mac only: setup writes port 8151 for her own Ollama; 11434 is the Ollama app's, and an install's from
+# before 0.9.8.
 ollama_base_url = "http://127.0.0.1:11434/v1"
 #model = "local-worker"          # default: the alias made in setup_assistant.md, 2.2 (or another tag you made the same way)
 # The model always runs on this Mac: a cloud model (a tag ending in -cloud or :cloud, which Ollama runs on its own
@@ -26,6 +32,14 @@ ollama_base_url = "http://127.0.0.1:11434/v1"
 # gets no message. Left out: no pin. Doctor shows the digest Ollama has now; after you change the model yourself, put
 # the new one here and restart her.
 #model_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+# The model's context window in tokens, as local-worker was made (setup writes it: 16384 on a 16 GB Mac). Each request
+# (rules, history, tools, reply) is kept within it; a longer chat loses its oldest messages first. Left out: the
+# history keeps its own limits only (about 12,000 tokens, 20,000 at most), which count on 32768 or more.
+#context_tokens = 32768
+# Which Ollama she uses: "build", Ollama's official build as a background service (setup installs it), or "app", the
+# Ollama app, when you chose it at setup. With the app, she answers only while someone is logged in and the Ollama app
+# runs.
+#ollama = "build"
 signal_cli = "signal-cli"       # on PATH (Homebrew's default), or a full path
 digest_time = "09:15"           # the morning digest (calendar, then mail), every day; before 12:00
 #host_label = "the Mac"          # top level, not under [health]: how status messages name this machine, e.g. "the study Mac"
@@ -67,24 +81,27 @@ disk_free_min_percent = 10
 # Projects (extra, off by default): the git projects in one folder of this Mac, read-only. Off without [projects];
 # setup asks (Recommendation: no). Levels: summary (the README, open to-do items and recent commits), docs (also the
 # project's documents) and code (also its source code). Only files git tracks, never secret-like names such as .env,
-# never outside the folder you named. In her own user (_estia) root is your folder's absolute path (the move writes
-# it), and her user reads that folder read-only, nothing else in your home but ~/Estia-KB with [documents] (below):
-# scripts/share-projects.sh (as you, no sudo; the move runs it). scripts/setup.sh --extras switches it on later.
-# After a change: restart her.
+# never outside the folder you named. In her own macOS account (_estia) root is your folder's absolute path (the move
+# writes it), and her account reads that folder read-only, nothing else in your home but ~/Estia-KB with [documents]
+# (below): scripts/share-projects.sh (as you, no sudo; the move runs it). scripts/setup.sh --extras switches it on
+# later. After a change: restart her.
 #[projects]
 #root = "~/dev"                 # the folder that holds the projects (git repositories directly in it)
 #default = "summary"            # every project: summary, docs or code
 #docs = []                      # single projects at level docs, e.g. ["my-project"]
 #code = []                      # single projects at level code
 
-# Documents (extra, off without [documents]; setup does not ask yet): the PDFs in your ~/Estia-KB and the PDFs you send
-# her on Signal (saved there), read on this Mac only (Apple's PDFKit, and Vision for scanned pages); Gemma is not used
-# in the look, the reading or the note. She looks at the folder every look_minutes outside quiet hours, and whenever you
-# ask about documents or type /docs; a new PDF found there gets a short note. Limits: 25 MB and 300 pages a document; 60
-# seconds to read it; one document at a time. Her user may list and read the folder and add files to it, never delete or
-# change yours: scripts/share-documents.sh (as you, no admin rights; --revoke takes it back). Write the folder out in
-# full: in her own user (_estia) a ~ is her home, not yours. The folder is directly in your home: macOS guards
-# Documents, Desktop and Downloads; a folder in your home needs no extra permission. After a change: restart her.
+# Documents (extra, off without [documents]; setup writes it when Documents is picked): the PDFs and text files (.txt, .md) in your
+# ~/Estia-KB and the ones you send her on Signal (saved there), read on this Mac only (a PDF by Apple's PDFKit, and
+# Vision for scanned pages; a text file by her own code); Gemma is not used in the look, the reading or the note. She
+# looks at the folder every look_minutes outside quiet hours, and whenever you ask about documents or type /docs; a new
+# document found there gets a short note. Limits: 25 MB and 300 pages a PDF; 60 seconds to read it; one document at a
+# time. 1 MB a text file, in pages of about 3,000 characters (about one printed page); at most 667 pages, the most
+# 1 MB gives without page breaks. Her own macOS account may list and read the folder and add files to it,
+# never delete or change yours: scripts/share-documents.sh (as you, no admin rights; --revoke takes it back). Write the
+# folder out in full: in her own macOS account (_estia) a ~ is her home, not yours. The folder is directly in your home:
+# macOS guards Documents, Desktop and Downloads; a folder in your home needs no extra permission. After a change:
+# restart her.
 #[documents]
 #folder = "/Users/<you>/Estia-KB"  # always your ~/Estia-KB, written in full (the share prints it)
 #look_minutes = 60                 # how often she looks at the folder: 5 to 1440 minutes
@@ -96,10 +113,12 @@ disk_free_min_percent = 10
 #[chords]
 
 # Mail, read-only (Microsoft Graph, delegated Mail.Read). Off without [mail]. Work or school (Microsoft 365) mailboxes only.
+# Outlook.com: not supported.
 # IDs come from the app registration (Microsoft Entra admin center, "Accounts in this organizational directory only"):
 # Directory (tenant) ID is tenant_id, Application (client) ID is client_id. They are identifiers, not secrets.
 # Sign in each mailbox once on the Mac: scripts/mail-login.sh <address> (with its calendar in [[calendar.sources]], the
-# sign-in asks for Calendars.Read too; add --mail-only to sign in mail alone). Gmail is not built in: setup_assistant.md.
+# sign-in asks for Calendars.Read too; add --mail-only to sign in mail alone). Gmail is not built in. Forwarding Gmail to
+# a mailbox she reads works today. See setup_assistant.md, "Gmail (not built in)".
 #[mail]
 #tenant_id = "00000000-0000-0000-0000-000000000000"
 #client_id = "00000000-0000-0000-0000-000000000000"
@@ -117,13 +136,25 @@ disk_free_min_percent = 10
 #address = "you@example.com"
 
 # Voice notes through the local voice service (tools/voice; install: scripts/install-voice-daemon.sh).
-# Off without [voice]: take the # off [voice] and the lines below. An empty [voice] uses these defaults (voice af_heart).
-# voice: the Kokoro voice for English spoken answers and calls; setup writes the one that goes with her name
-# (female: af_heart, af_bella, bf_emma; male: am_michael; /voices lists all).
+# Off without [voice]: take the # off [voice] and the lines below. An empty [voice] uses these defaults (voice heart,
+# on every Mac).
+# voice: the English voice for spoken answers and calls; setup writes the one that goes with her name (heart for a
+# female name, alba for a male name). heart, jane, eve, vera, alba and michael are Pocket TTS voices (on the CPU; its
+# program comes with an update); vera speaks only on a Mac with 32 GB of memory or more, and heart speaks for her on a
+# smaller one. heart is Kokoro's af_heart made a Pocket TTS voice, one file for each model; its files come with an
+# update, never downloaded. A Mac with Gemma 4 26B speaks them on Pocket TTS's larger model (about 250 MB), a smaller
+# one on its small model (about 130 MB): the voice service fetches it at its first start, and until then Kokoro says
+# her lines. eve-full is another name for eve. The others are Kokoro's (female: af_heart, af_bella, bf_emma; male:
+# am_michael; /voices lists all).
+# language_voice: the voice of Spanish, Italian, Portuguese, Dutch, German and French: jane, on Pocket TTS's own model
+# of each language (about 227 MB, downloaded only for a language in use, with /language or /babble; until then
+# Supertonic-3's F1 says her lines). Only jane is taken, or "" for Supertonic-3's F1 in them, as before jane.
+# Korean, Polish, Japanese and Russian use Supertonic-3's F1.
 #[voice]
 #url = "http://127.0.0.1:8150"
-#voice = "af_heart"
-#speed = 1.05
+#voice = "heart"
+#language_voice = "jane"
+#speed = 1.05               # Kokoro's and Supertonic-3's speed, not Pocket TTS's voices (none has a speed setting)
 #max_spoken_chars = 1500     # longer answers are cut at a sentence: "The rest is in the text."
 #max_audio_bytes = 10000000  # voice notes up to 10 MB / 3 minutes
 
@@ -178,15 +209,16 @@ disk_free_min_percent = 10
 
 # Voice calls with her over Signal (needs [voice]; setup: setup_assistant.md "Calls (once)", tools/call-tunnel).
 # Off without [calls]; an empty [calls] uses the defaults below. With it the bridge runs the JVM build of signal-cli.
-# The four paths default to the build folder tools/call-tunnel/build.sh and install-signal-cli-jvm.sh use:
-# <data_dir>/vendor, where <data_dir> is ~/Library/Application Support/local-assistant
-# (LOCAL_ASSISTANT_VENDOR changes that folder when you build).
+# signal_cli and tunnel default to the builds in the code's vendor folder, <repo>/vendor, where
+# tools/call-tunnel/build.sh and install-signal-cli-jvm.sh put them (in her own macOS account, her release's own), else
+# in <data_dir>/vendor, where <data_dir> is ~/Library/Application Support/local-assistant. Builds made in another
+# folder (LOCAL_ASSISTANT_VENDOR): write their paths here.
 #[calls]
-#signal_cli = "~/Library/Application Support/local-assistant/vendor/signal-cli-0.14.9-jvm/signal-cli-0.14.9/bin/signal-cli"   # default: the 0.14.9 build; else the path install-signal-cli-jvm.sh printed
+#signal_cli = "<repo>/vendor/signal-cli-0.14.9-jvm/signal-cli-0.14.9/bin/signal-cli"   # default: the newest JVM build in the vendor folder (none there: the 0.14.9 build's path)
 #java_home = "/opt/homebrew/opt/openjdk/libexec/openjdk.jdk/Contents/Home"   # Homebrew openjdk (keg-only): write its path out in full (default: /usr/libexec/java_home, which does not find it)
-#tunnel = "~/Library/Application Support/local-assistant/vendor/signal-call-tunnel/signal-call-tunnel/target/release/signal-call-tunnel"
+#tunnel = "<repo>/vendor/signal-call-tunnel/signal-call-tunnel/target/release/signal-call-tunnel"
 #socket_dir = "~/Library/Application Support/local-assistant/calls"   # default; ~/.la-calls if a long home folder makes this too long. Set by hand: under 65 characters (Unix sockets)
-#speed = 1.05                 # Kokoro speed on calls (voice notes keep [voice] speed)
+#speed = 1.05                 # Kokoro's and Supertonic-3's speed on calls, not Pocket TTS's voices (voice notes keep [voice] speed)
 #end_of_turn_seconds = 2.3    # the full pause: this long ends your turn (laid back: room to think)
 #early_end = true             # a turn that sounds finished ends after a short pause: Smart Turn, a small model on the
 #                             # Mac, hears a turn's last 8 seconds; fairly sure, she waits 1.5 seconds; unsure, she waits
@@ -199,6 +231,9 @@ disk_free_min_percent = 10
 #                             # most every 10 minutes), then standby: only a turn with her name is answered, and every 10
 #                             # minutes "I'm still here." until max_call_minutes
 #max_call_minutes = 60
+#turn_timeout_seconds = 45    # how long a call waits for one answer, then "Sorry, I lost my train of thought. Could
+#                             # you say that again?"; left out: 45 on a Mac with 32 GB of memory or more (Gemma 4
+#                             # 26B), 60 on a smaller one (Gemma 4 12B, whose call answers are shorter); 15 to 180
 #summary = true               # a short summary text after a call with 2+ turns
 #fillers = false              # "hmm, let me think" lines while she thinks (off: she answers when ready)
 #acknowledge = true           # a short "Got it." or "On it." once a request of 5+ words is taken in, or when an empty answer is asked again (not before a device answer, never two in a row)
@@ -247,15 +282,19 @@ disk_free_min_percent = 10
 # scripts/set-web-keys.sh from the login keychain. Off without [web].
 #[web]
 #country = "NL"                # Brave's search country (two letters) or ALL
-#brave_monthly_cap = 2000      # Brave searches per month (its free plan's limit); 0 = Ollama only
+#brave_monthly_cap = 900       # Brave searches per month, at most 900 (below its $5 free credit); 0 = Ollama only
 
-# Places and routes: Google Places (New) + Routes; key GOOGLE_MAPS_API_KEY in web.env (scripts/set-web-keys.sh).
-# Off without [maps]. Setup: setup_assistant.md "Places and routes (once)".
+# Places and routes: OpenStreetMap (Nominatim, FOSSGIS's routing servers, Transitous), with nothing to install and no
+# account. Google Places (New) + Routes once its key GOOGLE_MAPS_API_KEY is in web.env (scripts/setup-google-maps.sh):
+# asked first, OpenStreetMap when Google fails or its daily cap is reached. Off without [maps]. Setup:
+# setup_assistant.md "Places and routes (once)".
 #[maps]
-#home = "Street 1, 1000 AA Town"   # private file; sent to Google to find it and for routes from/to home; "near me" searches get only a ~1 km area
-                                   # the database keeps that area and a keyed tag of the address, never the address
-#daily_cap = 30                    # requests per API and day (Google's free monthly allowance with room to spare)
-#region = "NL"                     # two-letter region bias sent to Google; leave it out to send none
+#home = "Example Street, Town"     # the home area: a street and a city, no house number needed (a "Home area:" fact
+                                   # wins); OpenStreetMap gets it without a house number, Google as written, also for
+                                   # routes from/to home; "near me" searches get only a ~1 km area. The database keeps
+                                   # that area and a keyed tag of the address, never the address
+#daily_cap = 30                    # Google's requests per API and day (its free monthly allowance with room to spare)
+#region = "NL"                     # two-letter region bias sent with each request; leave it out to send none
 
 # Spotify by text message (Premium; your own app's Client ID; setup: setup_assistant.md "Spotify (once)").
 # Off without [spotify]. Voice control is not allowed by Spotify, so calls and voice notes never control music.

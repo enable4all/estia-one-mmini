@@ -5,7 +5,9 @@ import socket
 import threading
 import time
 from collections.abc import Iterator
+from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any, ClassVar
 
 import pytest
@@ -19,6 +21,7 @@ from local_assistant.gemma import (
     ModelPin,
     OllamaGemma,
     PinnedGemma,
+    Timing,
     parse_completion,
 )
 
@@ -121,7 +124,8 @@ async def test_payload_has_effort_tools_and_schema(base_url: str) -> None:
     )
     assert body["tools"] == tools
     assert body["response_format"]["json_schema"]["schema"] == schema
-    assert body["stream"] is False
+    # streamed with usage: Ollama (0.40.4) sends its own prompt and generation times only in a stream's usage chunk
+    assert body["stream"] is True and body["stream_options"] == {"include_usage": True}
 
 
 async def test_every_request_sends_googles_top_p(base_url: str) -> None:
@@ -135,6 +139,18 @@ async def test_every_request_sends_googles_top_p(base_url: str) -> None:
     assert TOP_P == 0.95
     assert [request["body"]["top_p"] for request in FakeOllama.requests] == [0.95, 0.95]
     assert "top_k" not in FakeOllama.requests[0]["body"]  # the OpenAI layer has no top_k: the model's 64 applies
+
+
+async def test_every_request_keeps_the_model_loaded_as_the_service_did(base_url: str) -> None:
+    """The Ollama app runs without setup's service file, so its OLLAMA_KEEP_ALIVE (120m) is not there: every request
+    names it (Ollama's OpenAI layer takes keep_alive since 0.40.0, openai/openai.go; an older one ignores it)."""
+    from local_assistant import ollama_build
+    from local_assistant.gemma import KEEP_ALIVE
+
+    gemma = OllamaGemma(base_url, "local-worker")
+    await gemma.chat([{"role": "user", "content": "hi"}], max_tokens=50)
+    assert KEEP_ALIVE == ollama_build.KEEP_ALIVE == "120m"
+    assert FakeOllama.requests[0]["body"]["keep_alive"] == "120m"
 
 
 def test_completion_tokens_and_the_reasoning_fields_size_are_parsed() -> None:
@@ -213,6 +229,176 @@ def test_parse_completion_rejects_unexpected_shapes() -> None:
         parse_completion({"choices": []})
     dict_args = completion_json("", [{"id": "c", "function": {"name": "forget", "arguments": {"fact": "3"}}}])
     assert json.loads(parse_completion(dict_args).tool_calls[0].arguments) == {"fact": "3"}
+
+
+# a streamed answer (Ollama's OpenAI layer, 0.40.4: middleware/openai.go): chunks of content, reasoning and tool
+# calls, a finish chunk, then with include_usage a chunk with the usage and Ollama's own timings
+
+
+def event(payload: dict[str, Any] | str) -> bytes:
+    return b"data: " + (payload if isinstance(payload, str) else json.dumps(payload)).encode() + b"\n\n"
+
+
+def delta(finish: str | None = None, **fields: Any) -> dict[str, Any]:
+    return {"object": "chat.completion.chunk", "choices": [{"index": 0, "delta": fields, "finish_reason": finish}]}
+
+
+def usage(prompt: int = 17213, cached: int | None = 4, completion: int = 171, timed: bool = True) -> dict[str, Any]:
+    counts: dict[str, Any] = {"prompt_tokens": prompt, "completion_tokens": completion}
+    if cached is not None:
+        counts["prompt_tokens_details"] = {"cached_tokens": cached}
+    chunk: dict[str, Any] = {"object": "chat.completion.chunk", "choices": [], "usage": counts}
+    if timed:
+        chunk["timings"] = {"prompt_n": prompt, "prompt_ms": 13512.0, "predicted_n": completion, "predicted_ms": 7004.0}
+    return chunk
+
+
+def stream(*chunks: dict[str, Any], done: bool = True) -> bytes:
+    return b"".join(event(chunk) for chunk in chunks) + (event("[DONE]") if done else b"")
+
+
+async def test_a_streamed_answer_is_joined_with_ollamas_counts_and_times(base_url: str) -> None:
+    FakeOllama.replies = [
+        (
+            200,
+            stream(
+                delta(role="assistant", content="", reasoning="a hidden thought"),
+                delta(content="It is "),
+                delta(content="sunny."),
+                delta("stop"),
+                usage(),
+            ),
+        )
+    ]
+    result = await OllamaGemma(base_url, "local-worker").chat([{"role": "user", "content": "hi"}], max_tokens=300)
+    assert (result.content, result.finish_reason, result.tool_calls) == ("It is sunny.", "stop", ())
+    assert (result.prompt_tokens, result.cached_tokens, result.completion_tokens) == (17213, 4, 171)
+    assert (result.prompt_ms, result.generation_ms, result.reasoning_chars) == (13512.0, 7004.0, 16)
+    assert result.total_ms >= 0 and "hidden" not in repr(result)
+
+
+async def test_a_streamed_answer_keeps_line_breaks_unicode_has_inside_its_json(base_url: str) -> None:
+    """Ollama's encoder (Go) leaves U+0085, U+2028 and U+2029 unescaped inside a chunk's JSON (a web page's garbled
+    ellipsis she quotes is enough): only a newline ends an event, so the chunk stays whole and the answer is read."""
+    words = "Open today\x85 until 18:00\u2028and\u2029Sunday\x1c\x1d\x1e too\x0b\x0c."
+    raw = b"data: " + json.dumps(delta(content=words), ensure_ascii=False).encode() + b"\n\n"
+    FakeOllama.replies = [(200, raw + stream(delta("stop"), usage()))]
+    result = await OllamaGemma(base_url, "local-worker").chat([], max_tokens=50)
+    assert (result.content, result.finish_reason) == (words, "stop")
+
+
+async def test_a_stream_with_windows_line_ends_is_read_too(base_url: str) -> None:
+    body = stream(delta(content="Sunny."), delta("stop"), usage()).replace(b"\n", b"\r\n")
+    FakeOllama.replies = [(200, body)]
+    result = await OllamaGemma(base_url, "local-worker").chat([], max_tokens=50)
+    assert (result.content, result.finish_reason, result.prompt_tokens) == ("Sunny.", "stop", 17213)
+
+
+async def test_a_streamed_tool_call_is_read_whole_and_in_pieces(base_url: str) -> None:
+    whole = {"id": "call_1", "type": "function", "function": {"name": "web_search", "arguments": '{"query": "x"}'}}
+    first = {"index": 0, "id": "call_2", "type": "function", "function": {"name": "remember", "arguments": '{"fa'}}
+    rest = {"index": 0, "function": {"arguments": 'ct": "y"}'}}
+    FakeOllama.replies = [
+        (
+            200,
+            stream(delta(tool_calls=[whole]), delta(tool_calls=[first]), delta(tool_calls=[rest]), delta("tool_calls")),
+        )
+    ]
+    tools = [{"type": "function", "function": {"name": "web_search", "parameters": {"type": "object"}}}]
+    result = await OllamaGemma(base_url, "local-worker").chat([], max_tokens=50, tools=tools)
+    assert [(call.id, call.name, json.loads(call.arguments)) for call in result.tool_calls] == [
+        ("call_1", "web_search", {"query": "x"}),
+        ("call_2", "remember", {"fact": "y"}),
+    ]
+    assert (result.finish_reason, result.cached_tokens, result.prompt_ms) == ("tool_calls", None, None)  # no usage
+
+
+async def test_a_streamed_tool_call_without_tools_offered_is_dropped_as_ollama_drops_it_unstreamed(
+    base_url: str,
+) -> None:
+    """Unstreamed, Ollama keeps tool calls only when the request offered tools (server/routes.go, writeChatResponse);
+    a stream passes them on: read the same either way."""
+    call = {"id": "call_1", "type": "function", "function": {"name": "remember", "arguments": "{}"}}
+    FakeOllama.replies = [(200, stream(delta(content="Fine."), delta(tool_calls=[call]), delta("tool_calls")))]
+    result = await OllamaGemma(base_url, "local-worker").chat([], max_tokens=50)
+    assert (result.content, result.tool_calls, result.finish_reason) == ("Fine.", (), "stop")
+
+
+DATA = Path(__file__).parent / "data"
+
+
+async def test_ollamas_own_streams_are_read_with_their_tool_call_counts_and_times(base_url: str) -> None:
+    """Two answers captured from the real Ollama (0.40.4, local-worker, 22 Oct; the suite's web_lookup case): her
+    web_search call, whole in one chunk with its id and index, and the answer after its result, in 17 pieces."""
+    FakeOllama.replies = [
+        (200, (DATA / "ollama_stream_tool_call.txt").read_bytes()),
+        (200, (DATA / "ollama_stream_answer.txt").read_bytes()),
+    ]
+    tools = [{"type": "function", "function": {"name": "web_search", "parameters": {"type": "object"}}}]
+    gemma = OllamaGemma(base_url, "local-worker")
+    asked = await gemma.chat([], max_tokens=600, tools=tools)
+    [call] = asked.tool_calls
+    assert (call.id, call.name, json.loads(call.arguments)) == (
+        "call_h40f2cxk",
+        "web_search",
+        {"query": "Ajax vs PSV score 4 October 2026"},
+    )
+    assert (asked.content, asked.finish_reason, asked.prompt_tokens, asked.cached_tokens) == ("", "tool_calls", 6720, 5)
+    assert (asked.prompt_ms, asked.generation_ms, asked.completion_tokens) == (4487.0, 677.0, 26)
+    answer = await gemma.chat([], max_tokens=600, tools=tools)
+    assert answer.tool_calls == () and answer.finish_reason == "stop" and answer.content.startswith("Yes,")
+    assert (answer.prompt_tokens, answer.cached_tokens, answer.prompt_ms) == (6889, 6716, 197.0)
+
+
+async def test_a_stream_cut_off_before_its_end_is_tried_again_like_ollama_down(base_url: str) -> None:
+    """Unstreamed, an error during generation is an HTTP 500, tried again; a stream has sent its 200 by then and just
+    stops (no finish chunk, no [DONE]): the same retry."""
+    FakeOllama.replies = [
+        (200, stream(delta(content="It is "), done=False)),
+        (200, stream(delta(content="Sunny."), delta("stop"), usage())),
+    ]
+    fake = FakeTime()
+    result = await OllamaGemma(base_url, "local-worker", sleep=fake.sleep, clock=fake.clock).chat([], max_tokens=50)
+    assert result.content == "Sunny." and fake.sleeps == [2.0] and len(FakeOllama.requests) == 2
+
+
+async def test_an_error_in_a_stream_is_an_error(base_url: str) -> None:
+    FakeOllama.replies = [(200, event({"error": {"message": "model runner stopped", "type": "api_error"}}))]
+    with pytest.raises(GemmaError, match="error in its answer"):
+        await OllamaGemma(base_url, "local-worker").chat([], max_tokens=50)
+
+
+async def test_an_unstreamed_answer_is_still_read_with_its_cache_count(base_url: str) -> None:
+    """A server that answers unstreamed (an older Ollama, the tests' fakes): its JSON as before; the cache count is in
+    its usage, the times are not."""
+    body = completion_json("hi")
+    body["usage"]["prompt_tokens_details"] = {"cached_tokens": 60}
+    FakeOllama.replies = [(200, body)]
+    FakeOllama.delay = 0.05
+    result = await OllamaGemma(base_url, "local-worker").chat([], max_tokens=50)
+    assert (result.content, result.prompt_tokens, result.cached_tokens) == ("hi", 71, 60)
+    assert (result.prompt_ms, result.generation_ms) == (None, None)
+    assert result.total_ms >= 50  # the request in the bridge, the wait for Ollama included
+
+
+def test_an_answers_timing_sums_its_requests_and_names_the_rest_as_waiting() -> None:
+    """Turn 998 of the owner's call (22 Oct, Ollama's log): 17,213 prompt tokens, 4 of them cached (the prompt cache
+    had been taken by another program's requests), 13.5 s to read the prompt, 7 s to generate, 20.6 s in all."""
+    first = Completion("", prompt_tokens=17213, cached_tokens=4, completion_tokens=171, prompt_ms=13512.0)
+    first = replace(first, generation_ms=7004.0, total_ms=20642.0)
+    assert Timing.of([first]).line() == (
+        "1 request, 17,213 prompt tokens, 17,209 not cached, prompt eval 13,512 ms, 171 tokens generated in "
+        "7,004 ms, total 20,642 ms (126 ms waiting or loading)"
+    )
+    second = Completion("ok", prompt_tokens=17400, cached_tokens=17300, completion_tokens=20, total_ms=900.0)
+    two = Timing.of([first, second])
+    assert two.line() == (
+        "2 requests, 17,400 prompt tokens, 17,309 not cached, 191 tokens generated, total 21,542 ms"
+    )  # the second had no times: no prompt eval or generation time is claimed for the answer
+    assert Timing.of([Completion("ok", prompt_tokens=5, total_ms=10.0)]).line() == (
+        "1 request, 5 prompt tokens, 0 tokens generated, total 10 ms"
+    )
+    assert Timing.of([]).line() == "no request"
 
 
 # hardening: the model alias must keep the digest pinned in the config, else answers pause

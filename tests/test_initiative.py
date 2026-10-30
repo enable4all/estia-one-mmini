@@ -287,6 +287,9 @@ def test_an_improvised_note_is_written_unless_nothing_at_all_fits() -> None:
         "Look at evil。ch/x",
         "Look at evil．ch",
         "Look at evil｡ch",
+        "Visit -evil.com today",  # review G10: a host right after a hyphen, which Signal may still link
+        "Visit my-evil.com today",
+        "Try --evil.ch/x",
     ],
 )
 def test_a_bare_domain_on_any_ending_is_a_link(words: str) -> None:

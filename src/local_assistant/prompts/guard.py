@@ -59,8 +59,8 @@ LOCK_NOT_FROM_KNOWN = "Not allowed: /lock and /unlock work only from a device I 
 
 # her own Signal account's devices (only this Mac is expected) and the model's pin: code's notes to the user
 LINKED_ALERT = (
-    "My Signal account has {count} devices; only this Mac should be there. A device linked to my number can read our "
-    'chats: doctor on the Mac shows it, and SECURITY.md, "If the Mac is compromised", says what to do.'
+    "My Signal account has {count} devices; only this Mac should be there. A device linked to my account can read "
+    'our chats: doctor on the Mac shows it, and SECURITY.md, "If the Mac is compromised", says what to do.'
 )
 MODEL_PAUSED = (
     "Answers are paused: the model {model} on {host} no longer has the digest pinned in my config, so no message goes "

@@ -93,7 +93,13 @@ def test_doctor_names_the_nuclear_option_for_a_firewall_that_is_off_never_a_warn
     """The firewall is part of scripts/harden.sh --nuclear: off, doctor says so in one neutral line, never ! or ✗."""
     line = hostsec.doctor_firewall(FakeHost(tmp_path, answers))
     assert line.status == "info" and line.fix == "" and line.apply == ()
-    assert "scripts/harden.sh --nuclear" in line.text and "other services on this Mac" in line.text
+    words = " ".join(line.text.split())
+    assert NUCLEAR_WORDS in words and hostsec.NUCLEAR_HOW in words
+    assert all(len(shown) <= 135 for shown in f"○ Firewall: {line.text}".splitlines())  # the terminal (owner)
+    assert "scripts/harden.sh --nuclear" in line.text  # a command stays on one line, with its flag
+    named = hostsec.doctor_firewall(FakeHost(tmp_path, answers), name="Maria-Christina Ann")  # 19 letters: still fits
+    assert hostsec.nuclear_line("Maria-Christina Ann") in " ".join(named.text.split())
+    assert all(len(shown) <= 135 for shown in f"○ Firewall: {named.text}".splitlines())
 
 
 @pytest.mark.parametrize(("stealth", "said"), [(STEALTH_ON, "with stealth mode"), (STEALTH_OFF, "answers ping")])
@@ -270,6 +276,10 @@ def test_a_rule_without_your_password_is_named_wherever_it_is(added: str, named:
     ("default", "named"),
     [
         ("timestamp_type=global", "one sudo sign-in counts for every program of yours (timestamp_type=global)"),
+        (  # Apple and NIST's mSCP (os_sudoers_timestamp_type_configure, CIS 5.5): neither global nor ppid, only tty
+            "timestamp_type=ppid",
+            "one sudo sign-in counts for every program started by the same program (timestamp_type=ppid)",
+        ),
         ("!tty_tickets", "one sudo sign-in counts for every program of yours (!tty_tickets)"),
         ("!authenticate", "sudo asks no password at all (!authenticate)"),
     ],
@@ -604,6 +614,12 @@ def test_the_real_host_reads_under_its_root_and_runs_without_a_shell(tmp_path: P
     assert host.read(Path("/etc/x.conf")) == "hello\n" and host.read(Path("/etc/none")) is None
     assert host.path("/var/estia") == tmp_path / "var" / "estia"
     assert host.run(["/bin/echo", "a;b", "$HOME"]) == (0, "a;b $HOME\n")  # no shell: nothing expanded
+
+
+def test_the_real_host_reads_a_byte_that_is_not_utf8_as_a_replacement(tmp_path: Path) -> None:
+    """Second deep scan, macos-move-logs-skip-restore: a byte in her log that is not UTF-8 raised in Host.run and
+    ended the move before the restore; it is read as U+FFFD."""
+    assert Host(tmp_path).run(["/usr/bin/printf", "a\\377b"]) == (0, "a\ufffdb")
 
 
 def test_a_dry_run_host_prints_changes_and_still_reads(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -1107,8 +1123,19 @@ def test_doctor_names_the_security_level_last(
         assert "stealth mode and the keychain lock do not count" in line.text
 
 
+# owner, 20 Oct: the nuclear level in these words, in setup, harden, doctor, GUIDE.md, SECURITY.md and the AI's
+# briefing (checked: no --setblockall, the signed-software settings untouched, the app firewall filters only incoming)
+NUCLEAR_WORDS = (
+    "The nuclear level, only for deeply technical users and best on a Mac used for Estia alone: the Mac's firewall on, "
+    "with each program that other machines reach asked about one by one; python3 and ruby off its list; stealth mode "
+    "and the keychain lock, each asked first. Outgoing connections and remote login (SSH) are never blocked, nor are "
+    "signed programs while macOS's own setting lets signed software through (as on a new Mac)."
+)
+
+
 def test_the_neutral_line_names_the_nuclear_level() -> None:
-    assert hostsec.NUCLEAR_LINE.startswith("the nuclear level: the firewall,")
-    # the same words as setup's line about it, on the same screen (owner, 19 Oct; review, 19 Oct)
-    assert "only for deeply technical users" in hostsec.NUCLEAR_LINE
+    assert hostsec.NUCLEAR_LINE == NUCLEAR_WORDS == hostsec.nuclear_line("Estia")
+    # her name is the config's: a home that calls her Tiffany reads "a Mac used for Tiffany alone" (setup, doctor)
+    assert hostsec.nuclear_line("Tiffany") == NUCLEAR_WORDS.replace("for Estia alone", "for Tiffany alone")
     assert "default" not in hostsec.NUCLEAR_LINE
+    assert hostsec.NUCLEAR_HOW == "Only with scripts/harden.sh --nuclear; it may stop other services on this Mac."

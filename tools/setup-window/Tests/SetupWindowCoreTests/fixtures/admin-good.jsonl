@@ -1,0 +1,8 @@
+{"t": "admin_line", "id": "a1", "line": "✓ Restarted."}
+{"t": "admin_line", "id": "a3", "line": "\u001f? Deploy it? Read the list above first."}
+{"t": "admin_line", "id": "a1", "line": ""}
+{"t": "admin_done", "id": "a1", "code": 0, "refused": false}
+{"t": "admin_done", "id": "a2", "code": 3, "refused": false}
+{"t": "admin_done", "id": "a3", "code": 0, "refused": true}
+{"t": "admin_done", "id": "a4", "code": 120, "refused": false}
+{"t": "admin_done", "id": "a5", "code": 127, "refused": false, "unrun": true}

@@ -313,10 +313,11 @@ CLOSE_WHAT = (
     "  on this Mac keep what they can open today (every login is in your group, staff).\n"
     "  Nothing in them changes; her share and Ollama keep working."
 )
-CLOSE_ASK = "Close them now with chmod -h o-rwx (no Mac password)? Recommendation: yes."
+# the recommendation on a line of its own, said right before the question, never inside it (owner, 27 Oct)
+CLOSE_RECOMMENDED = "Yes (recommended)."
+CLOSE_ASK = "Close them now with chmod -h o-rwx (no Mac password)?"
 CLOSE_ASK_OPT = (
-    "Close them now with chmod -h o-rwx, and opt with chmod -h o-r (her way to Ollama stays; no Mac password)? "
-    "Recommendation: yes."
+    "Close them now with chmod -h o-rwx, and opt with chmod -h o-r (her way to Ollama stays; no Mac password)?"
 )
 # without a terminal (an installing AI's command tool) nothing is asked; a dry run says what a terminal is asked
 CLOSE_NO_TERMINAL = (
@@ -326,10 +327,9 @@ CLOSE_NO_TERMINAL = (
 CLOSE_DRY_RUN = '  (in a terminal it then asks "{ask} [Y/n]")'
 # the move's end (scripts/migrate-to-own-user.sh, --after-move): a heading only over a folder to share
 AFTER_MOVE = "Her projects folder, read-only for her (no admin rights needed):"
+NO_ROLE_USER = f"✗ {ROLE_USER} does not exist yet: the move into her own macOS account makes it. Nothing changed."
 AFTER_MOVE_DRY_RUN = "Her projects folder, read-only for her, at the end of the move (no admin rights needed):"
-CLOSE_ASK_OPT_ONLY = (
-    "Close opt's listing now with chmod -h o-r (her way to Ollama stays; no Mac password)? Recommendation: yes."
-)
+CLOSE_ASK_OPT_ONLY = "Close opt's listing now with chmod -h o-r (her way to Ollama stays; no Mac password)?"
 CLOSED = "✓ Closed to her account: {names}."
 NOT_CLOSED = "! Not closed: {names} ({why}). {fix}"
 
@@ -434,6 +434,7 @@ def _say_open(
         say(CLOSE_NO_TERMINAL.format(script=script))
     else:
         say(CLOSE_WHAT)
+        say(CLOSE_RECOMMENDED)
         if ask(question):
             _close(every, run, say, acl)
 
@@ -982,10 +983,22 @@ def projects_off(home: Path, marker: Path | None) -> bool:
     return loaded and projects is None
 
 
-def main(argv: list[str] | None = None) -> int:
+_TERMINAL: Callable[[str], bool] | None = None  # main's default ask: the terminal's (`terminal_ask`)
+
+
+def main(
+    argv: list[str] | None = None,
+    *,
+    ask: Callable[[str], bool] | None = _TERMINAL,
+    say: Callable[[str], None] = print,
+) -> int:
+    """The share scripts, or setup's window in-process (the move's end, the extras): `ask` the close question there
+    (a window screen; by default the terminal's, `terminal_ask`), `say` each line."""
+    if ask is _TERMINAL:
+        ask = terminal_ask()
     parser = argparse.ArgumentParser(
         prog=SCRIPT,
-        description="Give her user read-only access to your projects folder, or list, read and add access to your "
+        description="Give her own macOS account read-only access to your projects folder, or list, read and add access to your "
         "~/Estia-KB (--documents); no sudo. --revoke takes it back.",
     )
     parser.add_argument("folder", nargs="?", type=Path, help="the projects folder (default: the one on record)")
@@ -1004,34 +1017,42 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     home = Path(os.environ.get("HOME") or pwd.getpwuid(os.getuid()).pw_dir)
     if args.documents:
-        return _documents_main(home, args.marker, revoke=args.revoke, dry=args.dry_run)
+        return _documents_main(home, args.marker, revoke=args.revoke, dry=args.dry_run, ask=ask, say=say)
     root = Path(os.path.abspath(args.folder.expanduser())) if args.folder else default_root(home, args.marker)
     if root is None:
         if projects_off(home, args.marker):  # no tool would read a shared folder: none is suggested
-            print("Projects are off (no [projects] in the config): nothing to share.")
+            say("Projects are off (no [projects] in the config): nothing to share.")
         else:
-            print(
+            say(
                 f"No projects folder on record for her: with [projects] in her config, name its folder: {SCRIPT} <folder>."
             )
         return 0
     if args.after_move:  # the heading only over a folder to share
-        print(AFTER_MOVE_DRY_RUN if args.dry_run else AFTER_MOVE)
+        say(AFTER_MOVE_DRY_RUN if args.dry_run else AFTER_MOVE)
     if not args.dry_run and lookup_uid(ROLE_USER) is None:
-        print(f"✗ her user {ROLE_USER} does not exist yet: the move into her own user makes it. Nothing changed.")
+        say(NO_ROLE_USER)
         return 1
     if args.revoke:  # your documents folder may still need your home open
-        return revoke_projects(root, home, dry=args.dry_run, keep=home / DOCUMENTS)
-    return share_projects(root, home, dry=args.dry_run, ask=terminal_ask())
+        return revoke_projects(root, home, dry=args.dry_run, keep=home / DOCUMENTS, say=say)
+    return share_projects(root, home, dry=args.dry_run, ask=ask, say=say)
 
 
-def _documents_main(home: Path, marker: Path | None, *, revoke: bool, dry: bool) -> int:
+def _documents_main(
+    home: Path,
+    marker: Path | None,
+    *,
+    revoke: bool,
+    dry: bool,
+    ask: Callable[[str], bool] | None,
+    say: Callable[[str], None],
+) -> int:
     folder = home / DOCUMENTS
     if not dry and lookup_uid(ROLE_USER) is None:
-        print(f"✗ her user {ROLE_USER} does not exist yet: the move into her own user makes it. Nothing changed.")
+        say(NO_ROLE_USER)
         return 1
     if revoke:  # your projects folder may still need your home open
-        return revoke_documents(folder, home, dry=dry, keep=default_root(home, marker))
-    return share_documents(folder, home, dry=dry, ask=terminal_ask())
+        return revoke_documents(folder, home, dry=dry, keep=default_root(home, marker), say=say)
+    return share_documents(folder, home, dry=dry, ask=ask, say=say)
 
 
 if __name__ == "__main__":

@@ -76,9 +76,15 @@ LISTEN_FLOOR_FRAMES = 20
 LISTEN_START_FRAMES = 10
 LISTEN_PREROLL_FRAMES = 20
 LISTEN_MIN_RMS = 450.0
+DROPPED_LOG_S = 0.1  # the caller's sound dropped as her answer starts is logged from this much on (CallAudio.say)
 LISTEN_FLOOR_FACTOR = 4.0
 TAIL_FRAMES = 20
 ECHO_TAIL_FRAMES = 15  # after she stops, the caller's next 150 ms may still carry her voice
+# A line of hers that waits for a quiet moment (calls.py: the caller's text waits for the call's end; owner, 23 Oct):
+# the listen gives way to it once no utterance has started, this many frames in a row were quiet (1 s) and no frame
+# waits to be heard (a quiet second in a backlog is old; review, 23 Oct), so it never comes over the caller's speech;
+# a loud frame (a word, a click) counts the second again
+LINE_QUIET_FRAMES = 100
 # The floor is the line's quiet level: the quietest frames (10th percentile), capped, so a caller who is already
 # talking when the measuring starts does not raise it above their own voice. Phones suppress noise: on live calls
 # the floor was 1-3 RMS.
@@ -112,7 +118,9 @@ EARLY_KINDS = ("sure", "probably", "speech")  # the ends before the full pause
 PAUSE_NOISE_P = 0.1
 PAUSE_FAILURES = 3
 EARLY_BARGE_S = 1.5  # a takeover this soon into her answer counts against the end before it (calls.py)
-HOLDS = ("goes on", "ends the call")  # why calls.py held an early end to the full pause (`TurnEnd.held`)
+# why calls.py held an early end to the full pause (`TurnEnd.held`), always in the end line; in standby also "her
+# name" (her name alone: what follows a pause after it is the request), in the line only when it happened
+HOLDS = ("goes on", "ends the call")
 
 
 def floor_of(levels: list[float]) -> float:
@@ -151,6 +159,7 @@ class Said:
     floor: float = 0.0
     level: float = 0.0
     shadows: tuple[str, ...] = ()  # the other rules that fired in the clip before she was stopped (Barge.false_stop)
+    closed: bool = False  # the line closed before the clip went out whole (the call ended): played_s of it went out
 
 
 def rms(pcm: bytes) -> float:
@@ -305,6 +314,7 @@ class Barge:
         self.chunks = 0  # chunks the detector was asked about
         self.slowest = 0.0  # seconds from a chunk's end to its answer, the longest in the call
         self.least = 0.0  # her own voice was heard: a stop needs more than this (both rules)
+        self.raised = False  # `least` raised for her own voice, until the caller's next takeover
         self.stopped = dict.fromkeys(RULES, 0)  # stops by each rule while it was in charge
         self.would = dict.fromkeys(RULES, 0)  # stops each rule would have made as the shadow
         self.own_voice = 0
@@ -367,12 +377,20 @@ class Barge:
             self.would[rule] += 1
 
     def her_own_voice(self, level: float) -> None:
-        """Her own voice stopped her at `level` (calls.py heard her sentence in the transcript): the first time in a
-        call, a stop needs OWN_VOICE_FACTOR times that from now on; later times are only counted (raised once, never
-        compounding, so a caller can always still stop her)."""
-        if not self.own_voice:
+        """Her own voice stopped her at `level` (calls.py heard her sentence in the transcript): the first time, a stop
+        needs OWN_VOICE_FACTOR times that from now on; later times are only counted (raised once, never compounding,
+        so a caller can always still stop her), until a takeover lowers it again (`caller_took_over`)."""
+        if not self.raised:
             self.least = max(self.least, OWN_VOICE_FACTOR * level)
+            self.raised = True
         self.own_voice += 1
+
+    def caller_took_over(self) -> None:
+        """A stop was the caller's own words: a raise for her own voice is lowered again, and her voice may raise it
+        once more (review 0.9.7, C9: a caller's repeat-back taken for her voice raised it to 1.5 times the caller's
+        own level for the rest of the call, so a "wait" at that level never stopped her again)."""
+        if self.raised:
+            self.least, self.raised = 0.0, False
 
     def acknowledgement(self) -> None:
         """A stop was a listener's acknowledgement alone ("okay", "mm-hm"; calls.py): she carried on. Only counted."""
@@ -424,7 +442,8 @@ class _End:
     saved_s: float  # the full pause less the quiet run: how much sooner than loudness at least (0 for "max")
     noise_frames: int = 0  # loud frames counted as pause (the pause by speech)
     noise: bool = False  # no words in it (calls.py): not a turn
-    held: str | None = None  # waited out the full pause after the words were read: "goes on" or "ends the call"
+    # waited out the full pause after the words were read: "goes on", "ends the call" or, in standby, "her name"
+    held: str | None = None
     caught: bool = False  # the caller went on in that hold: joined into the next listen's turn
     cut_off: bool = False  # the caller went on after an early end, before her answer, and no hold caught it
     barged_early: bool = False  # the caller took over in her first EARLY_BARGE_S of the answer
@@ -599,8 +618,8 @@ class TurnEnd:
             self.ends[-1].noise = True
 
     def held(self, reason: str) -> None:
-        """The latest end's words go on ("goes on") or end the call ("ends the call"): calls.py waits out the rest of
-        the full pause after all, so it saved nothing."""
+        """The latest end's words go on ("goes on"), end the call ("ends the call") or in standby are her name alone
+        ("her name"): calls.py waits out the rest of the full pause after all, so it saved nothing."""
         if self.ends and self.ends[-1].held is None:
             self.ends[-1].held = reason
             self.ends[-1].saved_s = 0.0
@@ -717,13 +736,14 @@ class _Listening:
     settled (`_chunk_state`), and noise then. The full pause ends the turn, or sooner Smart Turn's answer, asked once a
     pause at the short pause, acting while the pause it was asked about goes on."""
 
-    def __init__(self, turn: TurnEnd, end_silence_s: float) -> None:
+    def __init__(self, turn: TurnEnd, end_silence_s: float, *, early: bool = True) -> None:
         self.turn = turn
         self.full_s = end_silence_s
         turn.full_s = end_silence_s
         self.ask_frames = max(1, round(turn.early_pause_s / FRAME_S))
         self.probably_frames = round(min(PROBABLY_END_S, end_silence_s) / FRAME_S)
-        self.judging = turn.judging  # the clip's 16 kHz frames are kept for the window
+        self.early = early  # Smart Turn may end it at the short pause (standby: never, `CallAudio.listen`)
+        self.judging = turn.judging and early  # the clip's 16 kHz frames are kept for the window
         self.converting = turn.judging or turn.detecting
         self.onset: collections.deque[bytes] = collections.deque(maxlen=LISTEN_PREROLL_FRAMES + LISTEN_START_FRAMES)
         self.lows = bytearray()  # the clip's frames at 16 kHz, one conversion a frame
@@ -850,7 +870,7 @@ class _Listening:
             # again, so that ask is about no pause; drop it and ask about this one (its window ends as on time)
             turn._dropped(self.ask)
             self.ask = None
-        if turn.judging and self.ask is None and pause >= self.ask_frames:
+        if self.early and turn.judging and self.ask is None and pause >= self.ask_frames:
             end = start + 1 + TAIL_FRAMES - self.first
             frames = self.lows[max(0, end - TURN_WINDOW_FRAMES) * LOW_FRAME_BYTES : end * LOW_FRAME_BYTES]
             self.ask = _Ask(start, index, turn._ask(bytes(frames)))
@@ -1038,9 +1058,13 @@ class CallAudio:
         except Exception:  # what calls.py does with it never stops the call's audio
             log.exception("calls: the watch after an early end failed")
 
-    def drain_incoming(self) -> None:
+    def drain_incoming(self) -> float:
+        """Drop what came in and was not listened to; returns the seconds of sound among it (frames as loud as a listen
+        needs at least, LISTEN_MIN_RMS): words said into a wait go with it."""
+        sound = 0
         while not self.incoming.empty():
-            self.incoming.get_nowait()
+            sound += rms(self.incoming.get_nowait()) > LISTEN_MIN_RMS
+        return sound * FRAME_S
 
     def stop_speaking(self) -> None:
         self._outgoing.clear()
@@ -1053,8 +1077,9 @@ class CallAudio:
         line while her answer is worked out ("Got it.", a thinking line): the watch after an early end goes on."""
         if not watch:
             self._end_watch()  # she answers: whatever the caller says now is barge-in's
-        if fresh:
-            self.drain_incoming()
+        if fresh and (dropped := self.drain_incoming()) >= DROPPED_LOG_S:
+            # metadata (review of 26 Oct, rtcall-2): words said while she was thinking never reach her
+            log.info("calls: %.1f s of the caller's sound dropped as her answer started", dropped)
         total = len(pcm) / (2 * RATE)
         self._outgoing = bytearray(pcm)
         self._sent = 0
@@ -1108,7 +1133,8 @@ class CallAudio:
             rules.would[rule] += 1
         _log_gated(gated, floor)
         await self._skip(ECHO_TAIL_FRAMES)
-        return Said(round(total, 2), round(self._sent / (2 * RATE), 2), False)
+        closed = self.closed.is_set() and self._sent < len(pcm)  # review 0.9.7, C8: a hang-up is no "said whole"
+        return Said(round(total, 2), round(self._sent / (2 * RATE), 2), False, closed=closed)
 
     def _speech(
         self, asked: list[_Asked], frames: int, floor: float, gated: list[tuple[float, float]]
@@ -1161,15 +1187,21 @@ class CallAudio:
         no_speech_s: float | None = None,
         max_s: float = 120.0,
         turn: TurnEnd | None = None,
+        early: bool = True,
+        line: Callable[[], bool] | None = None,
     ) -> tuple[bytes, dict[str, Any]]:
         """The caller's next utterance, or b"" when nobody spoke within no_speech_s (frames of call time).
         After a barge-in, start inside the caller's speech with the pre-roll (`turn` is then left out: what the caller
         says over her ends by end_silence_s alone). With `turn`, the call's rules for the end of a turn (`TurnEnd`):
-        the end is kept there, and the info says how the turn ended when the call has a judge. ConnectionError when
-        the call's audio ends."""
-        rules = _Listening(turn, end_silence_s) if turn is not None and not preroll else None
+        the end is kept there, and the info says how the turn ended when the call has a judge; `early` false asks its
+        judge nothing, so the full pause or the pause by speech ends it (standby's listens: the review of 28 Oct,
+        calls-02). With `line` (asked on
+        every frame heard while no utterance has started: a line of hers waits and is ready while it holds), b"" as
+        soon as it holds at a quiet moment: no utterance started, the last LINE_QUIET_FRAMES frames quiet and none
+        waiting to be heard; the info says `line`. ConnectionError when the call's audio ends."""
+        rules = _Listening(turn, end_silence_s, early=early) if turn is not None and not preroll else None
         try:
-            return await self._listen(preroll, floor, end_silence_s, no_speech_s, max_s, rules)
+            return await self._listen(preroll, floor, end_silence_s, no_speech_s, max_s, rules, line)
         finally:
             if rules is not None:
                 rules.close()
@@ -1182,13 +1214,14 @@ class CallAudio:
         no_speech_s: float | None,
         max_s: float,
         rules: _Listening | None,
+        line: Callable[[], bool] | None = None,
     ) -> tuple[bytes, dict[str, Any]]:
         got = bytearray()
         floor_levels: list[float] = []
         measuring: list[tuple[bytes, float, int]] = []  # the floor's frames, judged once the floor is known
         onset: collections.deque[bytes] = collections.deque(maxlen=LISTEN_PREROLL_FRAMES + LISTEN_START_FRAMES)
         started = bool(preroll)
-        quiet_run = waited = 0
+        quiet_run = waited = hush = 0  # hush: quiet frames in a row before an utterance started (a line may wait)
         voice = _Voice()
         if preroll:
             got += b"".join(preroll)
@@ -1220,6 +1253,7 @@ class CallAudio:
                 if rules is not None:
                     rules.heard(index, frame_now, loud)
                 if not started:
+                    hush = 0 if loud else hush + 1
                     onset.append(frame_now)
                     if not loud:
                         voice = _Voice()  # only the run that starts the utterance counts
@@ -1260,5 +1294,7 @@ class CallAudio:
                     if rules is not None:
                         info |= rules.ended(kind, pause, quiet_run)
                     return clip, info
+            if not started and line is not None and line() and hush >= LINE_QUIET_FRAMES and self.incoming.empty():
+                return b"", {"speech": False, "line": True, "floor": round(floor_now), "peak": round(peak)}
             if not started and no_speech_s is not None and waited * FRAME_S >= no_speech_s:
                 return b"", {"speech": False, "floor": round(floor_now), "peak": round(peak)}

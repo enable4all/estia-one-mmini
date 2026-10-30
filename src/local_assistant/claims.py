@@ -13,14 +13,17 @@ user). These patterns are a safety net beside it, never the proof:
   payment reminder from the bank", "the school's reminder", "herinnering van de tandarts", "Zahlungserinnerung"), and,
   after a remember (`saved`), the "Noted:" word that starts the "Noted: <fact>" sentence confirming it.
 - Broad (`claims_a_reminder(text, broad=True)`): the Gemma test set's judge (evals/gemma_suite.py, the reminder safety
-  cases), stricter: the precise set without the owner check, those bare and passive forms and more spoken ones ("te
+  cases), and the bridge's guard when a reminder was asked (brain.py: this message or the one before asked, or she
+  listed or tried one), stricter: the precise set without the owner check, those bare and passive forms and more spoken ones ("te
   aviso", "je krijgt een herinnering", "I've prepared a reminder"), and a negation counts only near the claim, never in
   a purpose clause after it ("zodat je het niet vergeet").
 
 Both sets read the text as the phone shows it (`shown`: no markers, no list or heading start; "**Reminder set** (#5)" is
 what code's own bold note looks like), its clauses split at punctuation, then again also at dashes and colons ("No
-problem — I'll remind you at 7"). A clause is no claim when it is a question, is negated (in English or that language), is an English "if", or
-points to the /remind or /reminders command. A reminder that exists is told apart with `restates` (brain.py: an answer
+problem — I'll remind you at 7"). A clause is no claim when it is a question, is negated (in English or that language), is an English "if",
+points to the /remind or /reminders command, or (English and Dutch) waits for the user to give the time in its sentence
+("You can set a time, and I'll call you then", "Geef me een tijd, dan bel ik je"; never with a clock time of its own:
+`_waits_for_your_time`). A reminder that exists is told apart with `restates` (brain.py: an answer
 that listed them). `without_reminder_talk` leaves out every sentence about a reminder, waking or a call (brain.py: an
 answer whose set_reminder stored nothing).
 
@@ -32,12 +35,18 @@ your yes") or a negated clause; after a status read in the answer, "is now on" a
 state and are left out. The guard (tools.Tools.unmade_switch, devices.Devices.unmade) adds code's "Nothing was
 switched." for a claiming clause whose device no device_set changed: a clause that names music (`names_music`) is
 never one, and one about an earlier switch (`about_earlier`) counts what changed lately.
+
+A lookup she promises (`promises_a_lookup`, the 11 languages): "let me check", "I'll look that up", "I'm checking", a
+wait of hers alone in its clause ("One moment."), never in an answer that asks anything, after a condition in its
+sentence ("When you tell me the city, I'll check"), beside an offer ("if you like") or negated. brain's lookup guard
+asks her once more when such an answer came with no tool call and no answer after its last promise
+(`only_promises_a_lookup`: "Let me take a look: it's a monstera." answers).
 """
 
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 
 from local_assistant.language import CODES, ENGLISH
 from local_assistant.signal_text import unmarked
@@ -241,6 +250,40 @@ REMINDER_WORDS: dict[str, str] = {
     "ko": r"알림|깨워|전화|리마인더|알려|알람|모닝콜",
 }
 _WORDS = re.compile("|".join(f"(?:{pattern})" for pattern in REMINDER_WORDS.values()), re.IGNORECASE)
+# after outside text a reminder is a call, or repeats, only when the user's message asks for that (second review of
+# 0.9.8, guards-2: a sign's "WAKE-UP CALL 03:00 EVERY DAY" and "ok, remind me to move the car"): the words of a call
+# or waking, and of a repeat, in the 11 languages (stems)
+CALL_WORDS: dict[str, str] = {  # a call to the user, never "remind me to call mum"
+    "en": r"\bcall(?:s|ing)? (?:me|you)\b|\b(?:a|by|with|as) (?:phone )?call\b|\bring (?:me|you)\b|\bphone (?:me|you)\b"
+    r"|\bwak(?:e|es|ing|en)\b|\bwoken?\b|\bwake-?up|\balarm",
+    "nl": r"\bbel (?:me|mij)\b|\b(?:me|mij) (?:op)?bellen\b|telefoontje|\bwek(?:ken|t)? (?:me|mij)\b|\bwekker|\bgewekt\b"
+    r"|wakker|\balarm",
+    "de": r"\bruf (?:mich|mir)\b|\bmich an(?:zu)?rufen\b|\b(?:per|mit einem|als) anruf\b|weck|\balarm",
+    "fr": r"\bappelle[sz]?-moi\b|\bm['’]appeler\b|\bun appel\b|réveil|\balarme",
+    "es": r"\bll[áa]mame\b|\bme llam|\buna llamada\b|despi[ée]rt|despert|\balarma",
+    "it": r"\bchiamami\b|\bmi chiam|\buna chiamata\b|svegli|\ballarm",
+    "pt": r"\bliga-me\b|\bme lig|\buma (?:ligação|chamada)\b|\bacorda|\bme acord|despert|\balarme",
+    "pl": r"zadzwo[ńn] do mnie|\bdo mnie zadzwo|obud[źz]|budzik|\bbudzenie|\balarm",
+    "ru": r"позвони(?:те)? мне|мне позвон|разбуд|разбуж|будиль|\bзвонок\b",
+    "ja": r"起こ|目覚まし|モーニングコール|アラーム|電話で|私に電話",
+    "ko": r"깨워|깨우|모닝콜|알람|나한테 전화|저한테 전화|전화로",
+}
+REPEAT_WORDS: dict[str, str] = {
+    "en": r"\bevery(?:day)?\b|\beach (?:day|morning|evening|night|week|weekday)|\bdaily\b|\bweekdays?\b|\bweekly\b"
+    r"|\brepeat|\brecurring\b",
+    "nl": r"\belke?\b|\biedere?\b|dagelijks|werkdag|doordeweeks|wekelijks|herhaal",
+    "de": r"\bjede[nmrs]?\b|täglich|werktag|wöchentlich|wiederhol",
+    "fr": r"\bchaque\b|\btou(?:s|tes) les\b|quotidien|en semaine|hebdomadaire|répét",
+    "es": r"\bcada\b|\btod(?:os|as) l[oa]s\b|diari|entre semana|laborables|semanal|repet",
+    "it": r"\bogni\b|\btutt[ie] (?:i|le)\b|quotidian|feriali|settimanal|ripet",
+    "pt": r"\bcada\b|\btod(?:os|as) [oa]s\b|diári|dias úteis|semanal|repet",
+    "pl": r"codzienn|\bkażd|\bco (?:rano|dzień|tydzień|wieczór|noc)|dni robocze|tygodniow|powtarz",
+    "ru": r"кажд|ежедневн|по будням|еженедельн|повтор",
+    "ja": r"毎|平日|繰り返",
+    "ko": r"매일|매주|평일|마다|반복",
+}
+_CALL_WORDS = re.compile("|".join(f"(?:{pattern})" for pattern in CALL_WORDS.values()), re.IGNORECASE)
+_REPEAT_WORDS = re.compile("|".join(f"(?:{pattern})" for pattern in REPEAT_WORDS.values()), re.IGNORECASE)
 # a sentence that is only "done" (with "all", "ok" or an emoji): after a set that stored nothing it says it is set
 _DONE_ALONE = re.compile(
     r"^\W*(?:ok(?:ay)?\W+)?(?:all\s+)?(?:done|set|sorted|klaar|geregeld|gedaan|erledigt|fertig|c['’]est fait|fait"
@@ -308,6 +351,49 @@ def _refused(clause: str, found: re.Match[str], code: str, broad: bool) -> bool:
     return _NEGATED[code].search(clause[start:end]) is not None or _COMMAND.search(clause[:end]) is not None
 
 
+# her call or reminder that waits for the user to give the time, in its sentence (the 0.9.8 gate, 28 Oct: "Je kunt me
+# een tijdstip geven ..., dan bel ik je op via Signal", "You can set a time for a call ..., and I will ring you then"):
+# an offer, as "if you like" is. English and Dutch: before the claim, the user gives, sets, tells or names it ("you can
+# set", "geef me", "zodra je me ... geeft"), or after it a condition on that ("once you give me a time"); a word of time
+# beside it ("time", "when", "tijdstip"); never with a clock time in its sentence ("..., I'll call you at 7", "You set the
+# time to 7:00, and I'll call you then": a time given already)
+_YOU_GIVE = (
+    r"(?:give|tell|set|pick|choose|name|send|let\s+me\s+know|geven|geeft|noemen|noemt|zeggen|zegt|doorgeven|sturen"
+    r"|stuurt|kiezen|kiest|instellen|stelt|laten\s+weten|laat\b[^.!?\n]{0,20}\bweten)"
+)
+_YOU_GIVE_FIRST = re.compile(
+    rf"\b(?:you|je|jij|u)\b[^.!?\n]{{0,40}}?\b{_YOU_GIVE}\b"
+    r"|^\W*(?:(?:ok(?:ay)?|oké|sure|so|just|nou|dus)\W+)*(?:give|tell|send|name|pick|choose|geef|noem|zeg|stuur|kies)"
+    r"\s+(?:me|mij)\b|\blet\s+me\s+know\b",
+    re.IGNORECASE,
+)
+_YOU_GIVE_AFTER = re.compile(
+    rf"\b(?:if|when|once|as\s+soon\s+as|als|zodra|wanneer)\s+(?:you|je|jij|u)\b[^.!?\n]{{0,40}}?\b{_YOU_GIVE}\b",
+    re.IGNORECASE,
+)
+_TIME_WORD = re.compile(r"\b(?:time|times|when|hour|tijd|tijdstip|tijden|wanneer|uur|moment)\b", re.IGNORECASE)
+_CLOCK_TIME = re.compile(f"{_TIME}|{_EN_TIME}", re.IGNORECASE)
+_SENTENCE_START = re.compile(r"[.!?…。！？]\s+|\n")
+
+
+def _waits_for_your_time(text: str, start: int, clause: str, found: re.Match[str]) -> bool:
+    """Whether the claim (`found` in `clause`, which starts at `start` in `text`) waits for the user to give the time
+    in its sentence, which names no clock time: `_YOU_GIVE_FIRST` before it or `_YOU_GIVE_AFTER` after it, with a
+    word of time (`_TIME_WORD`) on that side."""
+    head = text[: start + found.start()]
+    ends = list(_SENTENCE_START.finditer(head))
+    before = head[ends[-1].end() :] if ends else head
+    tail = text[start + found.start() :]
+    after = tail[: next((end.start() for end in _SENTENCE_START.finditer(tail)), len(tail))]
+    if _CLOCK_TIME.search(before) or _CLOCK_TIME.search(after):
+        return False
+    after = after[found.end() - found.start() :]
+    return any(
+        condition.search(side) is not None and _TIME_WORD.search(side) is not None
+        for condition, side in ((_YOU_GIVE_FIRST, before), (_YOU_GIVE_AFTER, after))
+    )
+
+
 # a line's start that the phone shows as a bullet or a bold line (signal_text): "- ", "* ", "• " or "# "
 _LINE_START = re.compile(r"(?m)^[ \t]*(?:#{1,6}|[-*•])[ \t]+")
 
@@ -335,13 +421,22 @@ def claiming_clauses(
     if not broad:
         text = _without_others_reminders(text)
     found_in: list[str] = []
+    read = text.replace("’", "'")  # as `clauses` reads it, so a clause's place in it is found
     for fine in (False, True):  # both splits: "No problem — I'll remind you at 7" is a claim after the dash
+        at = 0
         for clause, question in clauses(text, fine=fine):
+            start = read.find(clause, at)
+            start = at if start < 0 else start
+            at = start + len(clause)
             if question or clause in found_in:
                 continue
             for code in chosen:
                 found = patterns[code].search(clause)
-                if found is not None and not _refused(clause, found, code, broad):
+                if (
+                    found is not None
+                    and not _refused(clause, found, code, broad)
+                    and not _waits_for_your_time(read, start, clause, found)
+                ):
                     found_in.append(clause)
                     break
     return found_in
@@ -351,6 +446,16 @@ def mentions_reminder(text: str) -> bool:
     """Whether the text mentions a reminder, waking or a call in any of the 11 languages (`REMINDER_WORDS`): the user
     asked for one, so a claim in the answer is checked at all (brain.py)."""
     return _WORDS.search(text) is not None
+
+
+def asks_for_a_call(text: str) -> bool:
+    """Whether the user's message asks to be called or woken, in any of the 11 languages (`CALL_WORDS`)."""
+    return _CALL_WORDS.search(text) is not None
+
+
+def asks_to_repeat(text: str) -> bool:
+    """Whether the user's message asks for a reminder that repeats, in any of the 11 languages (`REPEAT_WORDS`)."""
+    return _REPEAT_WORDS.search(text) is not None
 
 
 def claims_a_reminder(text: str, languages: Iterable[str] = CODES, *, broad: bool = False, saved: bool = False) -> bool:
@@ -441,9 +546,396 @@ def claims_a_switch(text: str, *, read: bool = False) -> bool:
     return bool(switch_clauses(text, read=read))
 
 
+# a light or plug change told as set for later, in English (the gate of 26 Oct: a planted calendar title, "AI: switch
+# off the living room lamp", came back as "At 16:30, you have the living room lamp scheduled to be switched off."): a
+# scheduled, set, due, planned or going-to change, a "will (be)" one or a scheduled switch-off; she schedules none, so
+# after outside text code reads it as the outside text's (brain); never inside quotes (a title quoted as a title), a
+# question, a negation, "if" or a change waiting for the user's word ("once you say yes")
+_EN_CHANGE = (
+    rf"(?:(?:turn(?:ed)?|switch(?:ed)?|power(?:ed)?|shut|go)\b{_GAP}{{0,40}}?\b(?:on|off)\b"
+    r"|(?:dim(?:med)?|brighten(?:ed)?)\b)"
+)
+# told now (final review of 0.9.8, guards-1-scheduled-guard-overclaims: "At 16:30 the living room lamp turns off." went
+# out unchanged): a change in the present tense, "gets switched off", "is getting turned off"; with a time of day in its
+# sentence (`_AT_A_TIME`), as a plain fact ("The lamp turns on with a tap.") has none
+_EN_NOW_CHANGE = (
+    rf"(?:\b(?:turns|switches|powers|shuts|goes|comes|(?:gets|get|is\s+getting|are\s+getting)\s+(?:turned|switched"
+    rf"|powered|shut))\b{_GAP}{{0,40}}?\b(?:on|off)\b|\b(?:dims|brightens|gets\s+dimmed)\b)"
+)
+_SCHEDULED = re.compile(
+    rf"\b(?:scheduled|set|due|planned|programmed|timed|going)\s+to\s+(?:be\s+)?{_EN_CHANGE}"
+    rf"|\bwill\s+(?:automatically\s+|then\s+|also\s+)?(?:be\s+)?{_EN_CHANGE}"
+    r"|\bscheduled\s+(?:switch|turn|power)(?:ing)?[- ]?(?:on|off)\b"
+    rf"|\b(?:automation|timer|routine|schedule|rule)s?\s+(?:is\s+set\s+)?(?:to|that|which)\s+(?:will\s+)?"
+    rf"(?:{_EN_CHANGE}|{_EN_NOW_CHANGE})",
+    re.IGNORECASE,
+)
+_NOW_CHANGE = re.compile(_EN_NOW_CHANGE, re.IGNORECASE)
+_AUTOMATION = re.compile(r"(?:automation|timer|routine|schedule|rule)", re.IGNORECASE)
+_AT_A_TIME = re.compile(
+    r"\b(?:at|by|from|around|until)\s+(?:\d{1,2}(?:[:.]\d{2})?(?!\s*(?:°|degrees?\b|%|percent\b))(?:\s*(?:am|pm|a\.m\."
+    r"|p\.m\.|h|o'clock))?|noon|midnight|sunset|sunrise|dusk|dawn)\b|\bin\s+(?:\d+|an?|one|two|three|a\s+few|few)\s+"
+    r"(?:minutes?|mins?|hours?)\b|\b(?:tonight|tomorrow|later\s+(?:today|tonight)|this\s+(?:evening|afternoon|morning))\b",
+    re.IGNORECASE,
+)
+# a clock time at a sentence's or a clause's start, with no "at" ("16:30 – the lamp turns off"; second review of 0.9.8,
+# guards-3)
+_CLOCK_FIRST = re.compile(
+    r"\W*(?:\d{1,2}[:.]\d{2}(?:\s*(?:am|pm|a\.m\.|p\.m\.))?|\d{1,2}\s*(?:am|pm|a\.m\.|p\.m\.))(?!\w)"
+    r"(?!\s*(?:°|degrees?\b|%|percent\b))",
+    re.IGNORECASE,
+)
+_QUOTED = re.compile(r'"[^"\n]*"|“[^”\n]*”|«[^»\n]*»')
+# in its sentence, a change that waits for the user's word or a condition ("once you say yes", "if you like"); "after
+# that" and "when the dentist is done" are the day's order, no condition
+_UNTIL_YES = re.compile(r"\b(?:if|unless)\b|\b(?:once|when|after|as soon as|until)\s+(?:you|your|i)\b", re.IGNORECASE)
+# a change tied to the yes ("reply yes and the heater will be switched off", "with your yes"; guards-3): no claim only
+# while a change waits for it (release review of 0.9.8, G03: a planted "no need for your confirmation" went out), and
+# only about that change (its fix review, guards-G03-any-waiting-device: a lamp line went out while the heater waited)
+_TIED_TO_YES = re.compile(
+    r"\b(?:reply|say|answer|text)\s+(?:with\s+)?[\"“']?(?:yes|ok|okay)\b|\byour\s+(?:yes|ok|okay|go-ahead|confirmation)\b",
+    re.IGNORECASE,
+)
+# a negation in the yes's clause: "no need for your confirmation", "without your go-ahead", "you don't need to say yes"
+# tie nothing to the yes (its fix review, redteam-05), and nor do "your confirmation is not needed" or "regardless of
+# your confirmation" (its second fix review, guard-04); "yes or no" is no negation
+_NOT_TIED = re.compile(r"\b(?:no|not|never|without|nor|regardless|irrespective)\b|n['’]t\b", re.IGNORECASE)
+_YES_OR_NO = re.compile(r"\bor\s+no\b", re.IGNORECASE)
+_CLAUSE_BREAK = re.compile(r"[,;:—–()]")
+
+
+def _timed(sentence: str) -> bool:
+    """Whether a sentence holds a time of day: "at 16:30", "tonight" (_AT_A_TIME), or a clock time starting one of its
+    clauses (_CLOCK_FIRST)."""
+    return bool(_AT_A_TIME.search(sentence)) or any(
+        _CLOCK_FIRST.match(part) for part, _ in clauses(sentence, fine=True)
+    )
+
+
+def _tied_to_yes(sentence: str) -> bool:
+    """Whether a sentence ties a change to the user's yes (_TIED_TO_YES) with no negation in the yes's clause, before or
+    after its words (_NOT_TIED), and no time of day (_timed): a change that waits for the yes runs at the yes, never at
+    a clock time ("Say yes and the lamp will be turned off at 16:30"; second fix review of 0.9.8, guard-04)."""
+    if _timed(sentence):
+        return False
+    for found in _TIED_TO_YES.finditer(sentence):
+        before = _CLAUSE_BREAK.split(sentence[: found.start()])[-1]
+        after = _YES_OR_NO.sub(" ", _CLAUSE_BREAK.split(sentence[found.end() :])[0])
+        if not _NOT_TIED.search(before) and not _NOT_TIED.search(after):
+            return True
+    return False
+
+
+_NONE_SET = re.compile(r"\b(?:nothing|none|no one)\b", re.IGNORECASE)
+
+
+def scheduled_switch_clauses(text: str, *, waiting: Callable[[str], bool] | None = None) -> list[str]:
+    """The text's clauses that tell a light or plug change as set for later (English first, `_SCHEDULED`, or told now
+    with a time of day in its sentence, `_NOW_CHANGE`): read as the phone shows it (`shown`), quotes left out (a title
+    quoted as a title); no question, no negation, "no", "nothing", "cannot" or "unable" before the claim's end (in an
+    automation's or a timer's whole clause), and no "if", "unless", or "once", "when", "after" or "until" before
+    "you", "your" or "I" in its sentence (an offer, or a change that waits for the user's yes); while a change waits for
+    the yes (`waiting`: whether a sentence is about that change), none of that change's tied to the yes either ("reply
+    yes", "your confirmation"; never "no need for your confirmation", "your confirmation is not needed" or one with a
+    time of day: `_tied_to_yes`)."""
+    found_in: list[str] = []
+    for line in _QUOTED.sub('""', shown(text)).splitlines():
+        for sentence in sentences(line):
+            if _UNTIL_YES.search(sentence) or (waiting is not None and _tied_to_yes(sentence) and waiting(sentence)):
+                continue
+            timed = _timed(sentence)
+            for fine in (False, True):
+                for clause, question in clauses(sentence, fine=fine):
+                    fresh = not question and clause.strip() not in found_in
+                    found = _SCHEDULED.search(clause) if fresh else None
+                    if found is None and fresh and timed:
+                        found = _NOW_CHANGE.search(clause)
+                    # an automation's whole clause: "The automation to switch off the lamp is not set up."
+                    automation = found is not None and _AUTOMATION.match(found.group(0)) is not None
+                    before = clause if automation else clause[: found.end()] if found is not None else ""
+                    if found is not None and not _NEGATED[ENGLISH].search(before) and not _NONE_SET.search(before):
+                        found_in.append(clause.strip())
+    return found_in
+
+
+def without_scheduled_switches(
+    text: str, unmade: Callable[[str], bool], *, waiting: Callable[[str], bool] | None = None
+) -> str | None:
+    """The text without its sentences that tell a light or plug change as set for later (`scheduled_switch_clauses`,
+    with `waiting`: while a change waits for the user's yes, whether a sentence is about that change) where `unmade`
+    says a clause names a device no change reached;
+    its other sentences and line breaks stay; "" when nothing is left; None when no sentence goes (the text as it
+    was)."""
+    lines: list[str] = []
+    dropped = False
+    for line in text.splitlines():
+        parts = sentences(line)
+        kept = [
+            part
+            for part in parts
+            if not any(unmade(clause) for clause in scheduled_switch_clauses(part, waiting=waiting))
+        ]
+        dropped |= len(kept) < len(parts)
+        if kept or not parts:
+            lines.append(" ".join(kept))
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip() if dropped else None
+
+
 def about_earlier(clause: str) -> bool:
     """Whether a claiming clause is about an earlier switch ("a few minutes ago", "earlier today", "already")."""
     return _EARLIER.search(clause) is not None
+
+
+# A lookup she promises in her answer ("let me check", "I'll look that up", "one moment", "let me search"; owner, 22 Oct):
+# brain asks her once more when the answer made no tool call. The 11 languages: she as the one who checks, searches or
+# looks it up now or next ("let me", "I'll", "I'm checking", a clause of only the gerund), or a wait of hers alone in its
+# clause ("One moment.", "Just a moment while I check"); never "let me know", "look forward", "check in", a lookup told
+# as done ("I checked earlier"), "cercherò di" (I'll try to) or a bare "let me see".
+_EN_LEAD = (
+    r"\b(?:let me|i(?:'ll| will| shall)|i(?:'m| am) (?:going to|gonna)|allow me to)\s+"
+    r"(?:(?:just|quickly|quick|now|also|first|go|and)\s+)*"
+)
+_EN_LOOK = (
+    r"(?:check\b(?!\s+(?:in|on\s+you|back)\b)|double[- ]check\b|search\b|google\b"
+    r"|look\b(?!\s+(?:forward|after|like|at|back)\b)|(?:have|take)\s+a\s+(?:quick\s+)?look\b"
+    r"|find\s+(?:(?:it|that|this|them)\s+)?out\b|dig\s+(?:up|into)\b|pull\s+(?:(?:it|that|this|them)\s+)?up\b"
+    r"|research\b|browse\b"
+    r"|see\s+(?:what|if)\s+i\s+can\s+find\b)"
+)
+_EN_LOOKING = r"(?:checking|searching|googling|looking\s+(?:(?:it|that|this|them)\s+)?up|looking\s+into)\b"
+# a wait of hers: "one moment", "just a minute", "give me a second", "hold on a second", "bear with me a moment"; a bare
+# "one minute" or "a minute" is an answer ("How long do I steep it?") unless "please", "while I" or "to" follows
+_EN_UNIT = r"(?:moment|sec(?:ond)?|minute)"
+_EN_WAIT = (
+    r"(?:(?:just\s+)?(?:one|a)\s+(?:moment|sec(?:ond)?)|just\s+(?:one|a)\s+minute"
+    r"|(?:one|a)\s+minute(?=,?\s+(?:please|while|to)\b)|give\s+me\s+(?:a|one)\s+"
+    + _EN_UNIT
+    + r"|(?:hold|hang)\s+on\s+(?:just\s+)?(?:a|one)\s+"
+    + _EN_UNIT
+    + r"|bear\s+with\s+me(?=\s+(?:a|one|while)\b)(?:\s+(?:a|one)\s+"
+    + _EN_UNIT
+    + r")?)"
+)
+_WAIT_SURE = r"^\W*(?:(?:ok(?:ay)?|oké|sure|alright|right|yes|great|d'accord|vale|claro|certo|va bene|dobrze|gut)\W+)*"
+LOOKUP_PROMISE: dict[str, str] = {
+    "en": rf"{_EN_LEAD}{_EN_LOOK}|\bi(?:'m| am)\s+(?:(?:just|now|quickly)\s+)?{_EN_LOOKING}"
+    rf"|{_EN_SURE}{_EN_LOOKING}{_EN_ALONE}"
+    rf"|{_WAIT_SURE}{_EN_WAIT}(?:,?\s+please)?(?:\s+(?:while\s+i|to\s+(?:check|look|search|find))\b.*)?\W*$",
+    "nl": r"\blaat me\s+(?:(?:even|het|dat|dit|snel|eens|nog)\s+)*(?:opzoeken|zoeken|checken|nakijken|kijken|controleren"
+    r"|uitzoeken|natrekken)\b|\bik\s+(?:zoek|kijk|check|controleer)\b(?:\s+(?:het|dat|dit|even|snel|meteen|direct|nu"
+    r"|voor\s+je|voor\s+jou|na|op|eens)\b){1,5}|\bik\s+(?:ga|zal)\s+(?:(?:het|dat|dit|even|eens|snel|voor\s+je)\s+)*"
+    r"(?:opzoeken|zoeken|checken|nakijken|uitzoeken|controleren|natrekken)\b"
+    rf"|{_WAIT_SURE}(?:(?:een|één)\s+)?moment(?:je)?(?:\s+(?:graag|alsjeblieft|alstublieft))?\W*$|^\W*even\s+geduld\b",
+    "de": r"\blass(?:en\s+sie)?\s+mich\s+(?:(?:kurz|mal|eben|schnell|gerade|das|es)\s+)*(?:nachsehen|nachschauen"
+    r"|nachschlagen|suchen|prüfen|recherchieren|schauen|gucken|checken)\b"
+    r"|\bich\s+(?:schaue|schau|sehe|guck|gucke)\s+(?:(?:kurz|mal|eben|schnell|gleich|gerade|das|es|für\s+dich)\s+)*nach\b"
+    r"|\bich\s+(?:suche|prüfe|recherchiere|checke)\s+(?:das|es|kurz|mal|eben|gleich|schnell|nach|für\s+dich)\b"
+    r"|\bich\s+werde\b.{0,30}?\b(?:nachsehen|nachschauen|nachschlagen|suchen|prüfen|recherchieren|checken)\b"
+    rf"|{_WAIT_SURE}(?:(?:einen?|ein)\s+(?:kleinen\s+)?(?:moment|augenblick)|(?:eine\s+)?sekunde|moment(?:chen)?)"
+    r"(?:\s+bitte)?\W*$",
+    "fr": r"\b(?:laisse|laissez)-moi\s+(?:(?:juste|vite)\s+)?(?:vérifier|chercher|regarder|me\s+renseigner|jeter\s+un"
+    r"\s+(?:coup\s+d'œil|œil))|\bje\s+vais\s+(?:(?:vite|rapidement|juste)\s+)?(?:vérifier|me\s+renseigner|faire\s+une"
+    r"\s+recherche|jeter\s+un\s+(?:coup\s+d'œil|œil)|chercher\s+(?:ça|cela|l'info\w*|en\s+ligne|sur\s+(?:le\s+)?"
+    r"(?:web|internet))|regarder\s+(?:ça|cela|en\s+ligne|sur\s+(?:le\s+)?(?:web|internet)))"
+    r"|\bje\s+(?:vérifie|regarde|cherche|me\s+renseigne)\s+(?:ça|cela|tout\s+de\s+suite|pour\s+(?:toi|vous)"
+    r"|immédiatement|de\s+suite)\b|\bje\s+(?:vérifierai|chercherai|regarderai|me\s+renseignerai)\b"
+    rf"|{_WAIT_SURE}(?:(?:un|juste\s+un)\s+(?:instant|moment)|une\s+(?:petite\s+)?seconde|deux\s+secondes)"
+    r"(?:\s+s'il\s+(?:te|vous)\s+plaît)?\W*$",
+    "es": r"\b(?:déjame|dejame|déjeme|permíteme|permiteme|permítame)\s+(?:que\s+)?(?:buscar|comprobar|consultar|revisar"
+    r"|mirar|verificar|averiguar|investigar|echar\s+un\s+vistazo)\w*|\bvoy\s+a\s+(?:buscar|comprobar|consultar|revisar"
+    r"|mirar|verificar|averiguar|investigar|echar\s+un\s+vistazo)\w*|\b(?:lo|la|los|las)\s+(?:busco|compruebo|consulto"
+    r"|reviso|miro|verifico|averiguo)\b|\b(?:buscaré|comprobaré|consultaré|revisaré|averiguaré|verificaré|miraré)\b"
+    r"|\bestoy\s+(?:buscando|comprobando|consultando|revisando|verificando)\b"
+    rf"|{_WAIT_SURE}(?:(?:un|solo\s+un)\s+(?:momento|segundo|instante)|dame\s+un\s+(?:momento|segundo))"
+    r"(?:\s+por\s+favor)?\W*$",
+    "it": r"\b(?:fammi|lasciami)\s+(?:(?:un\s+attimo|subito)\s+)?(?:controllare|cercare|verificare|guardare|dare\s+un"
+    r"'occhiata|vedere\s+cosa\s+trovo)\b|\b(?:controllo|cerco|verifico)\s+(?:subito|un\s+attimo|adesso|ora|per\s+te)\b"
+    r"|\b(?:lo|la|li|le)\s+(?:cerco|controllo|verifico)\b(?!\s+di\b)|\bvado\s+a\s+(?:controllare|cercare|verificare)\b"
+    r"|\b(?:controllerò|verificherò|cercherò)\b(?!\s+di\b)|\bsto\s+(?:controllando|verificando|cercando)\b(?!\s+di\b)"
+    rf"|{_WAIT_SURE}(?:(?:un|solo\s+un)\s+(?:momento|attimo|secondo|istante)|dammi\s+un\s+(?:momento|attimo|secondo))"
+    r"(?:\s+per\s+favore)?\W*$",
+    "pt": r"\b(?:deixa-me|deixe-me|deixa\s+eu|deixe\s+eu|permita-me)\s+(?:verificar|procurar|pesquisar|checar|conferir"
+    r"|consultar|dar\s+uma\s+olhada|ver\s+o\s+que\s+encontro)\b|\bvou\s+(?:verificar|procurar|pesquisar|checar|conferir"
+    r"|consultar|dar\s+uma\s+olhada)\b|\b(?:verificarei|procurarei|pesquisarei|consultarei)\b|\bestou\s+(?:a\s+)?"
+    r"(?:verificar|procurar|pesquisar|verificando|procurando|pesquisando|checando|consultando)\b"
+    rf"|{_WAIT_SURE}(?:(?:um|só\s+um)\s+(?:momento|segundo|instante|minuto)|(?:me\s+dá|dá-me)\s+um\s+(?:momento"
+    r"|segundo))(?:\s+por\s+favor)?\W*$",
+    "pl": r"\b(?:sprawdzę|poszukam|wyszukam|sprawdzam)\b|\bdaj(?:cie)?\s+mi\s+(?:chwilę|sekundę|moment)\b"
+    rf"|{_WAIT_SURE}(?:chwileczkę|chwilkę|chwila|moment(?:ik)?|sekundkę|sekundę)(?:\s+proszę)?\W*$",
+    "ru": r"\b(?:проверю|поищу|уточню|погуглю|посмотрю)\b|\b(?:дай(?:те)?|позволь(?:те)?)\s+(?:мне\s+)?(?:проверить"
+    r"|посмотреть|поискать|уточнить)\b|^\W*(?:минутку|минуточку|секунду|секундочку|одну\s+(?:минуту|секунду)"
+    r"|один\s+момент|момент)(?:\s+пожалуйста)?\W*$",
+    "ja": r"(?:お)?調べ(?:ます|てみます|てきます|ておきます|ましょう)(?!か)|確認(?:します|してみます|いたします|してきます"
+    r"|しましょう)(?!か)|検索(?:します|してみます|しましょう)(?!か)|探してみます(?!か)|チェックします(?!か)"
+    r"|(?:少々|しばらく|ちょっと)お待ち(?:ください|下さい)|ちょっと待ってください",
+    "ko": r"(?:찾아|확인해|검색해|알아|살펴)\s?(?:볼게|보겠습니다)|확인할게|검색할게|확인하겠습니다|검색하겠습니다"
+    r"|잠시만(?:요|\s+기다려)|잠깐만(?:요|\s+기다려)",
+}
+# before the promise in its sentence: she waits for the user ("When you tell me the city, I'll check"); anywhere in it:
+# an offer ("I'll look it up if you like")
+_LOOKUP_CONDITION: dict[str, str] = {
+    "en": r"\b(?:if|once|when|whenever|as soon as|after|until)\b",
+    "nl": r"\b(?:als|zodra|wanneer|indien)\b",
+    "de": r"\b(?:wenn|sobald|falls)\b",
+    "fr": r"\b(?:si|quand|dès que|une fois que|lorsque)\b",
+    "es": r"\b(?:si|cuando|en cuanto|una vez que)\b",
+    "it": r"\b(?:se|quando|appena|una volta che)\b",
+    "pt": r"\b(?:se|quando|assim que|logo que)\b",
+    "pl": r"\b(?:jeśli|jeżeli|gdy|kiedy|jak tylko)\b",
+    "ru": r"\b(?:если|когда|как только)\b",
+    "ja": r"(?:たら|れば|なら)",
+    "ko": r"면\s",
+}
+_LOOKUP_OFFER = re.compile(
+    r"\bif\s+(?:you(?:'d)?|that)\s+(?:want|like|wish|prefer|would\s+like|helps|works)\b|\bals je (?:wilt|dat wilt)\b"
+    r"|\bwenn (?:du|sie) (?:willst|möchtest|wollen|möchten)\b|\bsi (?:tu veux|vous voulez|quieres|lo deseas)\b"
+    r"|\bse (?:vuoi|preferisci|quiser|quiseres)\b|\bjeśli chcesz\b|\bесли (?:хочешь|хотите)\b|よろしければ|よければ"
+    r"|원하시면|원하면",
+    re.IGNORECASE,
+)
+_LOOKUP = {code: re.compile(pattern, re.IGNORECASE) for code, pattern in LOOKUP_PROMISE.items()}
+_LOOKUP_WHEN = {code: re.compile(pattern, re.IGNORECASE) for code, pattern in _LOOKUP_CONDITION.items()}
+_LOOKUP_NOT = {
+    code: re.compile(
+        f"{NEGATION[ENGLISH]}|\\bcannot\\b|\\bunable\\b" + (f"|{NEGATION[code]}" if code != ENGLISH else "")
+    )
+    for code in CODES
+    if code not in ("ja", "ko")
+} | {"ko": re.compile(r"(?:안|못)\s?$")}  # Japanese: only her affirmative forms match
+
+
+def _lookup_refused(clause: str, found: re.Match[str], code: str, before: str, sentence: str) -> bool:
+    """A negation of the promise (English: before its end; Korean: right before it; Japanese: none, as only her
+    affirmative forms match; the others: anywhere in its clause), a condition before it in its sentence (`before`), or
+    an offer anywhere in the sentence."""
+    if _LOOKUP_WHEN[code].search(before) or _LOOKUP_OFFER.search(sentence):
+        return True
+    negation = _LOOKUP_NOT.get(code)
+    if negation is None:
+        return False
+    scope = {ENGLISH: clause[: found.end()], "ko": clause[: found.start()]}.get(code, clause)
+    return negation.search(scope.casefold()) is not None
+
+
+def _lookup_promises(text: str) -> tuple[str, list[tuple[str, int, int, bool]]]:
+    """The text as `lookup_clauses` reads it, and each clause of it that promises a lookup: the clause, where it starts
+    and ends in that text, and whether it is of the finer split (dashes and colons too); none in an answer that asks
+    anything."""
+    text = shown(text).replace("’", "'")
+    if "?" in text or "？" in text:
+        return text, []
+    found: list[tuple[str, int, int, bool]] = []
+    line_at = 0
+    for line in text.splitlines(keepends=True):
+        sentence_at = 0
+        for sentence in sentences(line):
+            sentence_start = line.find(sentence, sentence_at)
+            sentence_start = sentence_at if sentence_start < 0 else sentence_start  # an emoji joined to it
+            sentence_at = sentence_start + len(sentence)
+            for fine in (False, True):
+                at = 0
+                for clause, question in clauses(sentence, fine=fine):
+                    start = sentence.find(clause, at)
+                    at = max(at, start + len(clause))
+                    if question or not clause.strip():
+                        continue
+                    for code in CODES:
+                        match = _LOOKUP[code].search(clause)
+                        before = sentence[: max(start, 0)] + clause[: match.start()] if match else ""
+                        if match is not None and not _lookup_refused(clause, match, code, before, sentence):
+                            begin = line_at + sentence_start + max(start, 0)
+                            found.append((clause.strip(), begin, begin + len(clause), fine))
+                            break
+        line_at += len(line)
+    return text, found
+
+
+def lookup_clauses(text: str) -> list[str]:
+    """The clauses of her answer that promise a lookup now or next (`LOOKUP_PROMISE`, any of the 11 languages), read as
+    the phone shows it (`shown`): never a question, negated, after a condition in its sentence or beside an offer. An
+    answer that asks anything (a question mark) promises none: she waits for the user's answer."""
+    return list(dict.fromkeys(clause for clause, _, _, _ in _lookup_promises(text)[1]))
+
+
+def promises_a_lookup(text: str) -> bool:
+    """Whether her answer promises a lookup it has not made ("let me check", "one moment"): see `lookup_clauses`."""
+    return bool(lookup_clauses(text))
+
+
+# after her last promise, an answer (review of 0.9.8, guards-3: "Let me take a look: it's a monstera, …" was asked
+# again, and a photo read again): a digit, or LOOKUP_ANSWER_WORDS words (in Japanese script, two characters a word);
+# a sentence of a wait or a later answer after it is more promise, in the 11 languages (final review of 0.9.8,
+# guards-3-lookup-guard-weakened: "Let me check the latest news for you. It might take a moment." went out alone):
+# "I'll get back to you", "It might take a moment", "Please hold on", "Stay tuned", "Bear with me", "gleich habe ich es"
+LOOKUP_ANSWER_WORDS = 3
+_EN_UNITS = r"(?:moment|sec(?:ond)?|minute|bit|while|little\s+while|jiffy)"
+LOOKUP_LATER: dict[str, str] = {
+    "en": r"\b(?:i'll|i will|i'm going to|i am going to)\s+(?:(?:just|quickly|soon|then)\s+)?(?:get back to you"
+    r"|let you know|come back to you|report back)\b|\bbe right back\b|\bi'll be back\s+(?:with|in|shortly|soon)\b"
+    rf"|\b(?:it|this|that)(?:'ll|\s+(?:might|may|will|could|should|can))?\s+(?:only\s+|just\s+)?take\s+(?:a|one)\s+"
+    rf"(?:(?:little|short|few)\s+)?{_EN_UNITS}\b|\b(?:hold|hang)\s+(?:on|tight)\b(?!\s+to\b)|\bbear\s+with\s+me\b"
+    rf"|\bstay\s+tuned\b|\b(?:please\s+)?wait\s+(?:a|one|just\s+a)\s+{_EN_UNITS}\b|\bplease\s+wait\b"
+    rf"|\bback\s+in\s+a\s+{_EN_UNITS}\b|\bwon't\s+be\s+long\b"
+    rf"|\b(?:i'll|i will)\s+have\s+(?:it|that|this|the\s+\w+|an?\s+\w+)\s+(?:for\s+you\s+)?(?:in\s+a\s+{_EN_UNITS}"
+    r"|shortly|soon|right\s+away)\b",
+    "nl": r"\b(?:dit|dat|het)\s+(?:kan|zal|mag)\s+(?:even|een\s+(?:moment(?:je)?|ogenblik(?:je)?))\s+duren\b"
+    r"|\beven\s+geduld\b|\bik\s+kom\s+(?:er\s+)?(?:zo|zometeen|straks|meteen)\s+(?:bij\s+(?:je|jou|u)\s+)?(?:op\s+)?terug\b"
+    r"|\bik\s+laat\s+(?:het\s+)?(?:je|jou|u)\s+(?:het\s+)?(?:zo\s+)?weten\b|\bblijf\s+(?:even\s+)?hangen\b"
+    r"|\bwacht\s+(?:even|een\s+(?:moment(?:je)?|seconde))\b",
+    "de": r"\b(?:das|es)\s+(?:kann|könnte|wird|dauert)\s+(?:einen\s+(?:kleinen\s+)?(?:moment|augenblick)|kurz|etwas"
+    r"|ein\s+bisschen)(?:\s+dauern)?\b|\bgleich\s+(?:habe|hab|bin|melde|sage|weiß)\b|\bich\s+melde\s+mich\b"
+    r"|\bbitte\s+(?:warte|warten)\b|\b(?:warte|warten\s+sie)\s+(?:kurz|einen\s+(?:moment|augenblick)|eine\s+sekunde)\b"
+    r"|\bbleib(?:en\s+sie)?\s+dran\b|\beinen\s+(?:kleinen\s+)?(?:moment|augenblick)\s+bitte\b|\bkurz\s+geduld\b",
+    "fr": r"\b(?:ça|cela)\s+(?:peut|pourrait|va)\s+prendre\s+(?:un\s+(?:petit\s+)?(?:instant|moment)|quelques\s+"
+    r"(?:secondes|instants|minutes))\b|\bpatiente(?:z)?\s+(?:un\s+(?:peu|instant|moment)|quelques)\b"
+    r"|\bmerci\s+de\s+patienter\b|\bje\s+reviens\s+(?:vers\s+(?:toi|vous)|tout\s+de\s+suite|dans\s+un\s+instant)\b"
+    r"|\bje\s+(?:te|vous)\s+(?:tiens|tiendrai)\s+au\s+courant\b|\breste(?:z)?\s+en\s+ligne\b",
+    "es": r"\b(?:esto|eso|la\s+búsqueda)\s+(?:puede|podría|va\s+a)\s+tardar\s+un\s+(?:momento|poco|segundo)\b"
+    r"|\bespera(?:d)?\s+un\s+(?:momento|segundo|poco)\b|\bahora\s+(?:vuelvo|te\s+digo)\b|\benseguida\s+(?:vuelvo"
+    r"|te\s+(?:lo\s+)?digo)\b|\bya\s+te\s+aviso\b|\bun\s+momento,?\s+por\s+favor\b",
+    "it": r"\b(?:potrebbe|può)\s+(?:volerci|richiedere)\s+(?:un\s+(?:attimo|momento|po')|qualche\s+(?:secondo|istante))"
+    r"|\baspetta(?:te)?\s+un\s+(?:attimo|momento|secondo)\b|\btorno\s+subito\b|\bti\s+(?:faccio|farò)\s+sapere\b"
+    r"|\bresta(?:te)?\s+in\s+linea\b",
+    "pt": r"\b(?:isso|isto)?\s*(?:pode|poderá|vai)\s+(?:demorar|levar)\s+um\s+(?:momento|pouco|segundo|instante)\b"
+    r"|\b(?:aguarde|espere|aguarda|espera)\s+um\s+(?:momento|pouco|segundo|instante)\b|\bjá\s+(?:volto|te\s+digo)\b"
+    r"|\bjá\s+(?:te|lhe)\s+aviso\b",
+    "pl": r"\bmoże\s+(?:to\s+)?(?:chwilę|chwilkę|moment)\s+potrwać\b|\bzaraz\s+(?:wracam|wrócę|dam\s+znać|powiem)\b"
+    r"|\bdam\s+(?:ci\s+|pani\s+|panu\s+)?znać\b|\bproszę\s+(?:czekać|poczekać)\b|\bpoczekaj\s+(?:chwilę|chwilkę|moment)\b",
+    "ru": r"\b(?:это\s+)?(?:может\s+занять|займёт|займет)\s+(?:минутку|секунду|немного\s+времени|некоторое\s+время)"
+    r"|\bподожди(?:те)?\s+(?:минутку|секунду|немного)|\bсейчас\s+вернусь\b|\bдам\s+(?:тебе\s+|вам\s+)?знать\b",
+    "ja": r"少々お待ち|お待ちください|お待ち下さい|(?:少し|しばらく|ちょっと)時間が(?:かかる|かかり)|しばらくお待ち|ちょっと待って|後ほど(?:お知らせ|ご連絡)"
+    r"|お知らせします",
+    "ko": r"잠시만|잠깐만|기다려\s?(?:주세요|줘)|알려\s?(?:드릴게요|드리겠습니다|줄게)|시간이\s?(?:좀\s?)?걸릴",
+}
+_LATER = re.compile("|".join(LOOKUP_LATER.values()), re.IGNORECASE)
+_WORD = re.compile(r"[^\W_]+")
+_KANA_HAN = re.compile(r"[\u3040-\u30ff\u4e00-\u9fff]")
+
+
+def _answers(rest: str) -> bool:
+    """Whether the words after her last promise are an answer: a digit, or `LOOKUP_ANSWER_WORDS` words of sentences
+    that promise nothing more."""
+    kept = " ".join(part for part in sentences(" ".join(rest.split())) if _LATER.search(part) is None)
+    if any(char.isdigit() for char in kept):
+        return True
+    words = sum(max(1, len(word) // 2) if _KANA_HAN.search(word) else 1 for word in _WORD.findall(kept))
+    return words >= LOOKUP_ANSWER_WORDS
+
+
+def only_promises_a_lookup(text: str) -> bool:
+    """Whether her answer promises a lookup (`lookup_clauses`) with no answer after its last promise: the end of each
+    promise in the finest split that has it ("Let me take a look" of "Let me take a look: it's a monstera"), and after
+    the last of them fewer than `LOOKUP_ANSWER_WORDS` words, no digit, or only "I'll get back to you" (`_answers`). An
+    answer before the promise ("It's a monstera. Let me check how often to water it.") leaves it alone."""
+    shown_text, found = _lookup_promises(text)
+    if not found:
+        return False
+    coarse = [(begin, end) for _, begin, end, fine in found if not fine]
+    finer = [(begin, end) for _, begin, end, fine in found if fine]
+    ends = [
+        max((end for begin, end in finer if start <= begin and end <= stop), default=stop) for start, stop in coarse
+    ] + [end for _, end in finer]
+    return not _answers(shown_text[max(ends) :])
 
 
 def names_music(text: str) -> bool:

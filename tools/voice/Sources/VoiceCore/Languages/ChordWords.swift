@@ -98,13 +98,15 @@ enum ChordWords {
             case .letters: roots = "[A-G]"
             }
             // root, sign, quality, alterations ("b5"), brackets ("(maj7)", "(b9)", "(no3)"), then a deferred tail;
-            // without the forms' words (ja, ko) the quality is one of the first four and the next two groups stay empty
+            // without the forms' words (ja, ko) the quality is one of the first four and the next two groups stay empty.
+            // The tail's numbers end where the digits do, and it holds at most 8 parts (review 0.9.7, C7: "C", 40
+            // digits, then a letter split the digits every way before the end check failed, in exponential time)
             func pattern(forms: Bool) -> Pattern {
                 let quality = !forms ? "(maj7|m7|m|7)?()()"
                     : #"(mMaj7|mmaj7|mM7|maj7|m7|-7|m|7)?((?:[#♯♭b](?:5|9|11|13)(?![0-9]))*)"#
                     + #"(\((?:maj7|Maj7|M7|no3|[#♯♭b](?:5|9|11|13))(?:,(?:[#♯♭b](?:5|9|11|13)))*\))?"#
                 return Pattern(#"(?<![\p{Latin}\p{Cyrillic}\p{N}#♯♭+/°º'’])("# + roots + #")([#♯♭b]?)"# + quality
-                    + #"((?:sus[24]?|dim7?|aug|add[0-9]{1,2}|[0-9]{1,2}|°|ø|/[A-H](?:is|es|[#♯♭b])?)*)"#
+                    + #"((?:sus[24]?|dim7?|aug|add[0-9]{1,2}(?![0-9])|[0-9]{1,2}(?![0-9])|°|ø|/[A-H](?:is|es|[#♯♭b])?){0,8})"#
                     + #"(?![\p{Latin}\p{Cyrillic}\p{N}#♯♭+])"#)
             }
             candidate = pattern(forms: style.forms != nil)

@@ -60,17 +60,18 @@ BUILT_IN_STYLES = {"hearth": HEARTH_STYLE, "playful": PLAYFUL_STYLE}
 # is the most prompt-sensitive one (docs/agents/prompts-evals.md, Gotchas: call_goodbye), so it stays short. Reviewed
 # 15 Oct, run in turn with a fresh tag and the strict judges: playful's call version call_goodbye 4 of 8 against 0 of 8
 # with its chat style, call_no_joke 6 of 8 against 2 of 8; hearth's 13 of 33 against 17 of 33 on call_goodbye in four
-# runs (no difference), no joke 24 of 25 against 25 of 25; a shorter call version 0 of 5 on call_goodbye
-HEARTH_CALL_STYLE = """Steady, warm from the first words: short spoken sentences, one idea per turn, no lists.
+# runs (no difference), no joke 24 of 25 against 25 of 25; a shorter call version 0 of 5 on call_goodbye. 26 Oct (owner:
+# "I ask a deep question and I get a question back"): the length rule and the question rule in place of "one idea per
+# turn", the calm line in fewer words; 353 and 344 characters (298 each before): within 300 only by dropping a rule
+HEARTH_CALL_STYLE = """Steady, warm from the first words: short spoken sentences, no lists.
+- Quick question: short answer; deep one: the full answer. A question back only when needed.
 - Goodbye: one line, no summary.
 - No jokes unless the caller jokes or asks for one.
-- When the caller is worried, sad or stressed, or on health, money trouble or safety: calm, kind and practical, never \
-a joke."""
-PLAYFUL_CALL_STYLE = """Curious, with a light touch, warm from the first words: short spoken sentences, one idea per \
-turn.
+- Worried, sad or stressed, or on health, money trouble or safety: calm, kind and practical, never a joke."""
+PLAYFUL_CALL_STYLE = """Curious, with a light touch, warm from the first words: short spoken sentences.
+- Quick question: short answer; deep one: the full answer. A question back only when needed.
 - No jokes unless the caller jokes or asks for one; one at most.
-- When the caller is worried, sad or stressed, or talks about health, money trouble or safety: calm, kind and \
-practical, never a joke."""
+- Worried, sad or stressed, or on health, money trouble or safety: calm, kind and practical, never a joke."""
 BUILT_IN_CALL_STYLES = {"hearth": HEARTH_CALL_STYLE, "playful": PLAYFUL_CALL_STYLE}
 # code's line right after a usable soul.md, after a blank line (owner, 15 Oct: a custom soul keeps the built-in styles'
 # calm on a worry), unless [personality] calm_on_worry = false; never without a soul.md (the built-in styles carry it

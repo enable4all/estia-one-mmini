@@ -3,7 +3,7 @@
 set -uo pipefail
 source "$(dirname "$0")/own-user.sh"  # moved, and her commands' fixed paths ($estia, $estia_deploy)
 if moved && [[ "$(id -un)" != _estia ]]; then
-  echo "She runs as her own user _estia: her data is readable only by that user. Run: /usr/bin/sudo /usr/local/estia/bin/estia check"
+  echo "She runs as her own macOS account _estia: her data is readable only by that account. Run: /usr/bin/sudo /usr/local/estia/bin/estia check"
   exit 1
 fi
 db="$HOME/Library/Application Support/local-assistant/assistant.db"
@@ -22,7 +22,12 @@ else
   echo "bridge:     NOT running"; status=1
 fi
 if pgrep -f 'signal-cli.*jsonRpc' >/dev/null; then echo "signal-cli: running"; else echo "signal-cli: NOT running"; status=1; fi
-if voice="$(curl -s --max-time 2 http://127.0.0.1:8150/health)"; then echo "voice:      $voice"; else echo "voice:      not running (optional)"; fi
+# printable characters only: while her voice service restarts, another program may answer at its address
+if voice="$(curl -s --max-time 2 http://127.0.0.1:8150/health)"; then
+  echo "voice:      $(printf '%s' "$voice" | /usr/bin/tr -cd '[:print:]')"
+else
+  echo "voice:      not running (optional)"
+fi
 if [[ -f "$db" ]]; then
   sqlite3 "$db" <<'SQL'  # not -readonly: that fails while the bridge is stopped (no -shm file)
 SELECT 'last in:    ' || COALESCE(MAX(created_at), '-') FROM messages WHERE direction = 'in';

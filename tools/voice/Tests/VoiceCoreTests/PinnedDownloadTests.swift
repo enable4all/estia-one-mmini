@@ -174,6 +174,19 @@ final class StubProtocol: URLProtocol {
         await #expect(throws: ModelDownloadError.status(404)) { try await fetched("https://example.test/missing") }
     }
 
+    /// A larger file has longer to come (the review of 25 Oct: a flat 600 s, sized for Smart Turn, meant a language's
+    /// 219 MB weights or the 100M's could never come below about 2.9 Mbit/s, and each failed try starts again from
+    /// zero): a file of its cap still comes at 64 KiB a second, Smart Turn's at 600 s as before; a stall still ends
+    /// after 60 s without data.
+    @Test func aLargerFileHasLongerToCome() {
+        let turn = fetchConfiguration(maxBytes: TurnModel.maxFileBytes)
+        #expect(turn.timeoutIntervalForResource == 600 && turn.timeoutIntervalForRequest == 60)
+        let language = fetchConfiguration(maxBytes: PocketModel.german.maxFileBytes)
+        #expect(language.timeoutIntervalForResource == 4096 && language.timeoutIntervalForRequest == 60)
+        #expect(219_029_196 / language.timeoutIntervalForResource < 54_000)  // a language's weights at 54 KB/s
+        #expect(fetchConfiguration(maxBytes: 1 << 20).timeoutIntervalForResource == 600)
+    }
+
     @Test func theRefusalsSayWhatWentWrong() {
         #expect(ModelDownloadError.notHTTPS.description == "not https")
         #expect(ModelDownloadError.status(404).description == "HTTP 404")

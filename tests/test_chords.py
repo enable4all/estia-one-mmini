@@ -44,19 +44,33 @@ def test_chords_is_an_extra_off_without_its_section() -> None:
 
 # The request's parts with [chords] off, at 2acb640 (before the extra): its rules, a call's rules, the tools, /help.
 # A text in every request once cost call_goodbye 30 points (docs/agents/prompts-evals.md, Gotchas), so without the
-# extra nothing changes.
+# extra nothing changes. 24 Oct, the owner's wording ("her own macOS account" in the projects-off rule; the Gemma test
+# set twice): rules 882740a1… and e4fdec36…, call_rules 2d8183f9… and fd5ea40a… before. 24 Oct, her tools' list in a
+# text's rules (owner, 23 Oct; tests/test_inventory.py): rules da0fa5f4… and 2e448cdd… before (plain: d2b6efd3… until
+# its reminders' lines named no call without calls; 03c7a37e… and 21a88ad0… before the review of 24 Oct changed her
+# list's lines and its rule: docs/agents/prompts-evals.md); a call's rules, the tools and /help's list unchanged.
+# 25 Oct, review G11 and G12 (her photo line: nothing is saved while a photo is shown; "through Ollama", no model
+# size): rules e0e39066… and 73f13ec5…, call_rules 0b4f70d9… and 5cf9110d… before. 26 Oct, how long she answers on a
+# call (owner: a deep question gets the full answer; docs/agents/prompts-evals.md): web_calls' rules 0f441720… and
+# call_rules fa0cb13b… before; plain has no call rules. 26 Oct, the review's DLG-13 (the views frame only for a question
+# people disagree on, no "practising"): web_calls' rules 186a8e80… and call_rules def52cc0… before. 26 Oct, the calls
+# line names her own calls with wake-up calls (web_calls, merged for 0.9.8; docs/agents/prompts-evals.md): rules
+# f605e5b2… and help 47fa63d5… before; call_rules unchanged. 28 Oct, review of 0.9.8 guards-6 (her list's voice line
+# names Pocket TTS, who speaks her voices): web_calls' rules 7e7103bd… before. 29 Oct, C4 (a call's deep question ends
+# with "the view you find strongest and why: "I think …"", owner: "put C4 back"; docs/agents/prompts-evals.md):
+# web_calls' rules da3520af… and call_rules 5e8f9b46… before.
 BEFORE_CHORDS = {
     "plain": {
-        "rules": "882740a167731b5133cb87dc24866a5e6151254b8092938e3eae0b762e7f8824",
-        "call_rules": "2d8183f9141a8922dfaf18a9b57fe1a2a058e9ae58bb168e5a7ef9f73f438bb9",
+        "rules": "29715938b5543548a70f07c55751680c80b02c0f5d8e80fd905f9093d77308a7",
+        "call_rules": "79d1a4864fd97133a71541b87af8e7921b16d15b3be074a467a7e83e5fb6e20c",
         "tools": "9fa8044d05b59d5d2c1b75b2d63ae36dc244e03ec7f996e8dbc3cb473d50ea39",
         "help": "2ff862f1c392f91a9a336338b2da1117a17086ef989bc46846de01ca0af1fd7d",
     },
     "web_calls": {
-        "rules": "e4fdec3656a51413c0f19900e5d6138def0faf6795257500f7564bbd7864a814",
-        "call_rules": "fd5ea40a6d7baa4f676bf5f7a75405add6ee142c41121c8b98e3be6eff76e3d3",
+        "rules": "2ce3a320d943ce2cfe990dcd4257a714ce8d1511cd480da35e7dc711b6e9001c",
+        "call_rules": "a80f224c6a87487516dd654cdb82ba8125c22ad714e33f23deec27efb83fb3f4",
         "tools": "cfeb41ac8a696bde3310c5c7cd93b1790e3a929b4402df0d9533898db05f393a",
-        "help": "47fa63d552a9a0fd1fe8c205a03cd2db1d1ae0f2f21e51c453bb1162bc455ef4",
+        "help": "2fa4d4e9c68770ba0c1884de5ea801898c89a4752f4ad2403c8efd36cf3f47a5",
     },
 }
 SETUPS: dict[str, dict[str, Any]] = {
@@ -169,6 +183,17 @@ def test_the_tool_is_offered_only_with_chords_and_its_description_is_short(store
 def test_the_tool_is_offered_on_calls_too(store: Store) -> None:
     tools = chord_tools(store, calls=True)
     assert "chords" in [schema["function"]["name"] for schema in tools.schemas]
+
+
+async def test_a_web_pages_chords_call_is_logged_with_arguments_ollama_accepts(store: Store) -> None:
+    """A page's chords are never stored (Brave's terms), so the log keeps a stub for the arguments too; a later request
+    replays the call with them, and Ollama answers HTTP 400 "invalid tool call arguments" to any that are not a JSON
+    object (24 Oct, local-worker): the stub is one."""
+    turn = said(store, "Transpose the chords of Spooky up 2")
+    turn.used_web = True
+    await chord_tools(store).call(turn, "chords", args(action="transpose", chords="Am F C G", semitones=2))
+    [logged] = store.tool_calls(turn.message.id)
+    assert isinstance(json.loads(logged.arguments), dict) and "Am F" not in logged.arguments
 
 
 async def test_a_transpose_gives_the_fixed_lines_and_keeps_the_result(store: Store) -> None:
@@ -604,6 +629,9 @@ async def test_after_a_web_search_the_tool_log_keeps_a_stub(store: Store) -> Non
     row = store.tool_calls()[-1]
     assert row.name == "chords"
     assert "Am7" not in row.arguments and "Gm7" not in row.result  # a page's chords are never stored
+    # replayed in a later request: Ollama refuses arguments that are not a JSON object ("invalid tool call
+    # arguments", HTTP 400, probed 24 Oct), which broke every later message of the conversation
+    assert isinstance(json.loads(row.arguments), dict)
     plain = said(store, "Am F C G up 2", T0 + 200_000)
     await tools.call(plain, "chords", args(action="transpose", chords="Am F C G", semitones=2))
     assert "Am F C G" in store.tool_calls()[-1].arguments  # the user's own chords: kept as any tool call
@@ -1346,6 +1374,34 @@ async def test_no_message_after_a_call_without_a_move(tmp_path: Path, monkeypatc
         await stop(harness)
 
 
+async def test_on_a_call_a_chords_line_the_message_after_it_leaves_out_stays_in_a_texted_rest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The review of 28 Oct (pipeline-02, words-02): the message after the call is sent only when a transpose ran, and
+    holds only the results that worked. So a turn's chords line counts as texted on its own (`Turn.also_texted`: left
+    out of the rest of an answer her voice stopped for) only when every result it tells moved; a left-out line, a
+    notes, capo or key result stays in that rest."""
+    gemma = FakeGemma(
+        text("Sure. Up 2 it is Bm G D A."),
+        tool("chords", action="notes", chords="Bm"),
+        text("B, D and F sharp."),
+        tool("chords", **TRANSPOSE),
+        text("Done."),
+    )
+    harness = await chord_call(tmp_path, monkeypatch, gemma)
+    try:
+        app = harness.app
+        app.call_started(ME)
+        left_out = await app.call_turn(ME, "transpose Am F C G up 2", lambda: None)
+        assert left_out.code_text == prompts.CHORDS_LEFT_OUT and left_out.also_texted == ()
+        notes = await app.call_turn(ME, "and the notes of B minor", lambda: None)
+        assert notes.code_text == "Bm: the notes B, D and F sharp." and notes.also_texted == ()
+        moved = await app.call_turn(ME, "transpose Am F C G up 2 then", lambda: None)
+        assert moved.code_text.endswith(prompts.CHORDS_LATER) and moved.also_texted == (moved.code_text,)
+    finally:
+        await stop(harness)
+
+
 async def test_without_the_page_the_turns_sources_are_the_source(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1413,8 +1469,8 @@ def test_the_guide_has_the_chords_part_and_its_rows() -> None:
         "A web search keeps at most 1,200 characters of each page",
         "Nothing to install.",
         # GUIDE, 19 Oct (206d3d6): in her own user setup prints the line, before it setup adds it (setup.chords_extra)
-        "`scripts/setup.sh --extras` lists it. In her own user her config is hers alone, so a yes prints the one line "
-        "to add to it, `[chords]`, and the restart; before her own user, a yes adds the line itself.",
+        "`scripts/setup.sh --extras` lists it. In her own macOS account her config is hers alone, so a yes prints the one line "
+        "to add to it, `[chords]`, and the restart; before her own macOS account, a yes adds the line itself.",
         # review, minor: the check's known gaps (design 3.7), in the part's own limits
         "after the code's work, its chords said again, in another order or with one left out, pass",
         "without it, her chords count by their root alone",
@@ -1429,7 +1485,7 @@ def test_the_guide_has_the_chords_part_and_its_rows() -> None:
         assert words in part, words
     assert (
         "| Transposing chords | `[chords]` | Nothing to install: `scripts/setup.sh --extras`, then add the line it prints, "
-        "`[chords]`, to her config |" in guide
+        "`[chords]`, to her config unless it is there already |" in guide
     )
     assert f'| Transposing chords | "Transpose Am F C G up 2" | {SAME} An extra, off by default. |' in guide
     for banned in ("exactly", "never in the model's head", "http://", "<"):  # the site's rules, and plain copy
@@ -1488,7 +1544,7 @@ def test_the_cost_in_every_request_is_measured_and_stated(tmp_path: Path) -> Non
     finally:
         off.store.close()
         on.store.close()
-    assert (rules, call_rules, tool) == (616, 439, 1_127)
+    assert (rules, call_rules, tool) == (732, 439, 1_127)  # 616 before her tools' list (its chords line, 24 Oct)
     agents = agent_docs()  # AGENTS.md and its rule files (the AGENTS.md diet)
     texts, calls = rules + tool, call_rules + tool
     assert f"{texts:,} characters on texts (about {round(texts / 4, -1):.0f} tokens)" in agents

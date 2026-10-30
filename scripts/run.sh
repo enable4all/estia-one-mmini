@@ -3,7 +3,7 @@
 set -euo pipefail
 source "$(dirname "$0")/own-user.sh"  # moved, and her commands' fixed paths ($estia, $estia_deploy)
 if moved; then  # a second bridge as you would start with your empty data and take her Signal account away
-  echo "She runs always on as her own user _estia; this would start a second one with your empty data, so it does not."
+  echo "She runs always on as her own macOS account _estia; this would start a second one with your empty data, so it does not."
   echo "Restart her instead: /usr/bin/sudo /usr/local/estia/bin/estia restart"
   exit 1
 fi

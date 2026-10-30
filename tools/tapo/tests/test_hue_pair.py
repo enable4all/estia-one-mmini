@@ -1,6 +1,8 @@
 """Pairing the Hue Bridge: found by mDNS (macOS's dns-sd, its output format as printed on macOS 27) or given, its certificate trusted on first
 use and shown, the key asked for once the button is pressed, everything saved in hue.env. Never Philips' cloud."""
 
+import io
+import sys
 import tomllib
 from pathlib import Path
 from typing import Any
@@ -126,6 +128,36 @@ def test_pairing_shows_the_fingerprint_waits_for_the_button_and_saves(tmp_path: 
         assert "hue-application-key" not in headers
     # the lights, as lines to add to the config
     assert f'light = "{LIGHT}"' in said.text and PLUG in said.text and 'brand = "hue"' in said.text
+
+
+class Flushed(io.StringIO):
+    """stdout as a pipe or a file sees it: only what was flushed has left the program."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.out = ""
+
+    def flush(self) -> None:
+        self.out = self.getvalue()
+
+
+def test_the_button_prompt_leaves_before_the_wait(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Off a terminal (the setup window reads its output from a file or a pipe) Python buffers print: the prompt to
+    press the button must leave the program before the 60 seconds' wait, never at its end (review FRIEND-1)."""
+    bridge = FakeBridge()
+    bridge.presses_needed = 2
+    stdout = Flushed()
+    monkeypatch.setattr(sys, "stdout", stdout)
+    clock = Clock()
+    seen: list[str] = []
+
+    def sleep(seconds: float) -> None:
+        seen.append(stdout.out)
+        clock.sleep(seconds)
+
+    path = tmp_path / "hue.env"
+    assert hue.pair("192.168.1.40", path=path, open=bridge.open, find=lambda: [], sleep=sleep, clock=clock) == 0
+    assert seen and "Press the round button" in seen[0]
 
 
 def test_the_button_not_pressed_in_time_saves_nothing(tmp_path: Path) -> None:

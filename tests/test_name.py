@@ -50,7 +50,7 @@ def test_the_owners_tiffany_is_tiffany_everywhere() -> None:
     assert prompts.call_greetings("Tiffany")[0] == "Hi, it's Tiffany. What's on your mind?"
     assert prompts.call_lines("nl", name="Tiffany").greetings == ("Hoi, met Tiffany. Wat kan ik voor je doen?",)
     assert prompts.spoken("nl", name="Tiffany").greeting == "Hoi, met Tiffany. Wat kan ik voor je doen?"
-    assert prompts.BUSY.format(name="Tiffany").startswith("Tiffany is busy")
+    assert prompts.BUSY.format(name="Tiffany").startswith("Tiffany is still working")
 
 
 @pytest.mark.parametrize("code", LATIN)

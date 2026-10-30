@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
 import time
-from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+import unicodedata
+from collections.abc import Awaitable, Callable, Mapping, Sequence
+from dataclasses import dataclass, field
 from typing import Any
 
 from local_assistant import chords as chord_checks
@@ -17,16 +19,21 @@ from local_assistant.claims import (
     claiming_clauses,
     clauses,
     mentions_reminder,
+    only_promises_a_lookup,
     restates,
     without_reminder_talk,
 )
-from local_assistant.context import ContextBuilder, without_fake_notices, without_notes
-from local_assistant.gemma import Completion, GemmaClient, ToolCall
+from local_assistant.context import PHOTO_PREFIX, ContextBuilder, with_line, without_fake_notices, without_notes
+from local_assistant.gemma import Completion, GemmaClient, GemmaError, LockedError, Timing, ToolCall
+from local_assistant.maps import home_area_text
+from local_assistant.osm import has_house_number
+from local_assistant.profile import shown_link_fact
 from local_assistant.signal_text import MARKERS, unmarked
-from local_assistant.store import Conversation, Message
+from local_assistant.store import Conversation, Message, own_text
 from local_assistant.tools import ReminderAttempt, Tools, Turn
 from local_assistant.video import without_copies
 from local_assistant.voice import without_stage_directions
+from local_assistant.web_endings import ENDINGS
 from local_assistant.web_search import sources
 
 log = logging.getLogger(__name__)
@@ -34,7 +41,18 @@ log = logging.getLogger(__name__)
 
 INSTANT_TOOLS = frozenset({"remember", "forget", "end_call", "chords"})  # no "let me check" on a call for these
 DOCUMENT_REPLY_TOKENS = 2_000  # an answer after read_document may run this long: a section in full (16 Oct)
+# on a call the lookup guard asks once more only this soon into the turn: a retry, a search and her answer after it
+# must fit the call's turn time limit (review M1: one first request took 16.6 s under load); later, her words and code's
+# true line come at once. A third of the call's own limit (the second deep scan of 0.9.8, calls-lookup-window-fixed: a
+# fixed 15 s overran `[calls] turn_timeout_seconds = 20` and skipped retries that fit the 12B tier's 60 s), 15 s of
+# the 26B tier's 45 s; LOOKUP_RETRY_WITHIN_S when no limit is given. A text has no time limit
+LOOKUP_RETRY_WITHIN_S = 15.0
 WARM_UP_TOKENS = 1  # a call's warm-up asks for one token: Ollama reads the prompt and stops
+
+
+def _lookup_window(turn_limit: float | None) -> float:
+    """How long into a call turn the lookup guard may still ask once more: a third of its time limit."""
+    return LOOKUP_RETRY_WITHIN_S if turn_limit is None else turn_limit / 3
 
 
 @dataclass(frozen=True)
@@ -63,6 +81,15 @@ class Reply:
     # this answer read outside text, or had a note of code's quoting it in her input: the notes after it that may quote
     # it are marked so (code_notes)
     read_outside: bool = False
+    # she promised a lookup and no tool ran, also when asked once more (the lookup guard): code's true line, a note
+    # after her words in a text (in her history only as code's) and said in English on a call
+    lookup: str = ""
+    timing: Timing = field(default_factory=Timing)  # Ollama's counts and times of its requests, for its log line
+
+    @property
+    def cut(self) -> bool:
+        """Whether the answer was cut off at its token limit (the last request's finish reason "length")."""
+        return self.timing.finish_reason == "length"
 
     @property
     def hers(self) -> str:
@@ -70,8 +97,13 @@ class Reply:
         return self.text.removesuffix(self.not_set).rstrip() if self.not_set else self.text
 
 
-# web addresses, also bare ones with a path; a link's trailing punctuation stays in the sentence
-_LINK = re.compile(r"(?:https?://|www\.)[^\s()<>]+|\b(?:[a-z0-9-]+\.)+[a-z]{2,}/[^\s()<>]*", re.IGNORECASE)
+# web addresses, also bare ones with a path; a link's trailing punctuation stays in the sentence. A link ends where
+# another starts inside it (review I10: "a.example/r?u=https://evil.example", "a.example/x,www.evil.example"), so each
+# is a match of its own
+_NO_INNER = r"(?:(?!https?://|(?<![\w.-])www\.)[^\s()<>])"
+_LINK = re.compile(
+    rf"(?:https?://(?:www\.)?|www\.){_NO_INNER}+|\b(?:[a-z0-9-]+\.)+[a-z]{{2,}}/{_NO_INNER}*", re.IGNORECASE
+)
 
 
 def _split_links(text: str, pattern: re.Pattern[str], change: Callable[[str], str], allowed: str = "") -> str:
@@ -91,6 +123,28 @@ def _split_links(text: str, pattern: re.Pattern[str], change: Callable[[str], st
     return text
 
 
+_STAMPED = re.compile(r"^\[[^\]\n]{1,40}\] ")  # the time stamp before a user's message in her input (context.to_chat)
+
+
+def users_own(messages: Sequence[Mapping[str, Any]]) -> list[str]:
+    """The user's own words in her input, oldest first: her notes before the newest message left out (`without_notes`),
+    and never an audio file (`[audio file] <transcript>`: someone else's voice, which Store.user_messages_after leaves
+    out too; review G1: its planted "wake-up call at 04:00 saying thanks" counted as the user's ask on their "thanks!").
+    A sent document's name is left out, after the stamp too, its caption kept (`own_text`; "" without one). A message
+    with a photo shown (its content in parts) is left out, as before."""
+    said: list[str] = []
+    for chat in messages:
+        content = chat.get("content")
+        if chat.get("role") != "user" or not isinstance(content, str):
+            continue
+        text = without_notes(content)
+        stamp = _STAMPED.match(text)
+        body = text[stamp.end() :] if stamp and not text.startswith(prompts.DOCUMENT_MARK) else text
+        if not (text.startswith(prompts.AUDIO_MARK) or body.startswith(prompts.AUDIO_MARK)):
+            said.append(text[: len(text) - len(body)] + own_text(body))
+    return said
+
+
 def without_links(text: str) -> str:
     """An answer that searched the web: its links come only in the code-written Sources note, so a link a web page
     planted (a fake login page) never reaches the user in her words, also one that markup splits."""
@@ -103,18 +157,22 @@ def without_links(text: str) -> str:
     return re.sub(r"[ \t]{2,}", " ", text).strip()
 
 
-# a bare domain Signal would make tappable (common top-level domains only, so file names stay as they are)
+# a bare name Signal would make tappable: one on a real ending (web_endings.ENDINGS, IANA's list, or an xn-- one), as
+# Signal Android and Desktop check it (signal_text.unlinked reads it so too), so "report.pdf" and "node.js" stay; a file
+# name on a real ending ("setup.sh", "notes.zip") is one, as the phone links it; inside a path ("docs/README.md") none
+_ENDING = "|".join(re.escape(ending) for ending in sorted(ENDINGS, key=len, reverse=True))
 _BARE_DOMAIN = re.compile(
-    r"(?<![\w@.\[\]/-])(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+"
-    r"(?:com|net|org|info|biz|io|co|cc|app|dev|xyz|me|link|click|top|site|online|shop|store|live|icu|buzz|ru|cn|tk|"
-    r"nl|de|uk|gr|eu|fr|it|es|be|pl|pt|ch|at|us|ai|ly)(?![\w@-]|\.\w)",
-    re.IGNORECASE,
+    rf"(?<![\w@.\[\]/-])(?:[^\W_](?:[\w-]*[^\W_])?\.)+(?:{_ENDING}|xn--[\w-]+)(?![\w@-]|\.\w)", re.IGNORECASE
 )
+# an address by its numbers ("192.0.2.7", "192.0.2.7:8080/login"), as phones link it (signal_text reads it so too)
+_BARE_ADDRESS = re.compile(r"(?<![\w.\[\]/-])(?:\d{1,3}\.){3}\d{1,3}(?!\d|\.\d)")
 
 
 def defang_links(text: str, allowed: str) -> str:
     """After outside text: links in her answer that the user did not send (`allowed`: their message) lose what makes
-    them tappable ("https://evil.example/login" -> "evil[.]example/login"), also one that markup splits
+    them tappable ("https://evil.example/login" -> "evil[.]example/login"), also one inside another's path, query or
+    fragment or right after it (review I10: "a.example/r?u=https://evil.example" -> "a[.]example/r?u=evil[.]example"),
+    a bare name on a real ending, an address by its numbers, and one that markup splits
     ("**evil**.com" -> "**evil[.]com"); the Sources note stays code's."""
     said = allowed.casefold()
 
@@ -126,10 +184,12 @@ def defang_links(text: str, allowed: str) -> str:
         host, slash, rest = re.sub(r"^https?://", "", core, flags=re.IGNORECASE).partition("/")
         return host.replace(".", "[.]") + slash + rest + link[len(core) :]
 
+    def defang_bare(match: re.Match[str]) -> str:
+        return match.group(0) if match.group(0).casefold() in said else match.group(0).replace(".", "[.]")
+
     text = _LINK.sub(defang, text)
-    text = _BARE_DOMAIN.sub(
-        lambda match: match.group(0) if match.group(0).casefold() in said else match.group(0).replace(".", "[.]"), text
-    )
+    text = _BARE_DOMAIN.sub(defang_bare, text)
+    text = _BARE_ADDRESS.sub(defang_bare, text)
     for pattern in (_LINK, _BARE_DOMAIN):  # then a link that only markup splits ("**evil**.com"), as the phone joins it
         text = _split_links(text, pattern, lambda core: defang_links(core, ""), allowed)
     return text
@@ -163,18 +223,46 @@ def without_written_end_call(text: str) -> tuple[str, bool]:
 
 
 def _links(turn: Turn) -> list[tuple[str, str]]:
-    """The web results' links, then the map links, without repeats, at most 5."""
+    """The web results' links, then the map links, without repeats, at most 5; then the map's credit lines
+    (OpenStreetMap's, FOSSGIS's and Transitous's), which the cap never cuts."""
     links = sources(turn.web)
     links += [link for link in turn.links if all(link[1] != url for _, url in links)]
-    return links[:5]
+    return links[:5] + [credit for at, credit in enumerate(turn.credits) if credit not in turn.credits[:at]]
 
 
 NOTHING_SAVED = 'Profile changes: none. Nothing was saved; say "remember that ..." to try again.'
+# a remember ran and saved nothing: trying again fails the same way (refused while a photo is shown, the profile full)
+NOTHING_SAVED_REFUSED = "Profile changes: none. Nothing was saved."
+
+
+_NOTED_START = re.compile(r"\s*noted\s*:", re.IGNORECASE)
+# a save told in other words, English first (review E1, 0.9.7: "I've noted that your dentist is at 11:30" with no
+# remember call went out as it was): she noted it or made a note of it, or a sentence starts "Noted that"; never a
+# question, a negation ("I haven't noted"), someone else's note ("As you noted") or a plain "Noted!"
+_NOTED_SAID = re.compile(
+    r"\bI(?:['’]ve| have)?\s+(?:also\s+|already\s+|duly\s+|just\s+)?noted\b"
+    r"|\bI(?:['’]ve| have|['’]ll| will)\s+(?:also\s+|already\s+|just\s+)?(?:made|make)\s+a\s+note\b"
+    r"|^(?:(?:okay|ok|sure|alright|got it)[,!.]?\s+)?noted\s+that\b",
+    re.IGNORECASE,
+)
+_SENTENCES = re.compile(r"(?<=[.!?])\s+|\n+")
+
+
+def _starts_noted(text: str) -> bool:
+    """The rules make Gemma confirm a save with "Noted: ..." (a plain "Noted!" acknowledgement does not count)."""
+    return _NOTED_START.match(text) is not None
 
 
 def _claims_a_save(text: str) -> bool:
-    """The rules make Gemma confirm a save with "Noted: ..." (a plain "Noted!" acknowledgement does not count)."""
-    return re.match(r"\s*noted\s*:", text, re.IGNORECASE) is not None
+    """Whether her answer says a save was made: a "Noted: ..." start, or a sentence of hers that says she noted it
+    (`_NOTED_SAID`, English first). A sentence about a reminder is the reminder guard's ("I've noted the reminder for
+    17:00": code's "No reminder was set"). Practice reads only the start (`_starts_noted`): a tutor's "I noted that you
+    wrote …" is about the user's words."""
+    return _starts_noted(text) or any(
+        _NOTED_SAID.search(sentence) and not mentions_reminder(sentence)
+        for sentence in (part.strip() for part in _SENTENCES.split(text))
+        if sentence and not sentence.endswith("?")
+    )
 
 
 def _practice_claims(words: str, users: Sequence[str]) -> list[str]:
@@ -231,6 +319,18 @@ def _not_set_lines(attempts: Sequence[ReminderAttempt], *, spoken: bool = False)
     whys = (attempt.said if spoken else attempt.reason for attempt in attempts if attempt.reason)
     return "\n".join(prompts.REMINDER_NOT_SET.format(reason=why) for why in dict.fromkeys(whys)) or (
         prompts.REMINDER_GUARD_SPOKEN
+    )
+
+
+def _heard_outside(turn: Turn) -> bool:
+    """Whether this answer, or her context for it, holds outside text: a tool call's words may come from it."""
+    return (
+        turn.untrusted
+        or turn.read_mail_or_calendar
+        or turn.used_web
+        or turn.after_outside
+        or bool(turn.outside_notes)
+        or turn.message.text.startswith((prompts.AUDIO_MARK, "[photo]"))
     )
 
 
@@ -314,9 +414,25 @@ def _once(callback: Callable[[], None] | None) -> Callable[[], None]:
     return call
 
 
+_MARKUP_SYMBOLS = frozenset("~`=>|+<^")  # markdown's symbols that are no punctuation (a rule's "-", "*", "_" are)
+
+
+def blank(text: str) -> bool:
+    """Whether an answer has no words for the user: nothing, spaces, invisible characters, or only punctuation and
+    markdown's symbols (a rule, "---", "***", "___"; "...", "…", "**"; live 22 and 25 Oct: "---" after device_set). A
+    letter, a digit or an emoji is an answer ("👍", "1.")."""
+    return all(
+        char.isspace()
+        or char in _MARKUP_SYMBOLS
+        or unicodedata.category(char)[0] == "P"
+        or unicodedata.category(char) == "Cf"
+        for char in text
+    )
+
+
 def _usable(completion: Completion, allow_tools: bool) -> bool:
-    """An answer with text, or with a tool call that may run."""
-    return bool(completion.content.strip() or (completion.tool_calls and allow_tools))
+    """An answer with words (not `blank`), or with a tool call that may run."""
+    return bool(not blank(completion.content) or (completion.tool_calls and allow_tools))
 
 
 def _has_images(messages: list[dict[str, Any]]) -> bool:
@@ -324,11 +440,45 @@ def _has_images(messages: list[dict[str, Any]]) -> bool:
 
 
 def profile_notice(turn: Turn) -> str:
-    lines = [f"Saved #{fid}: {text} (/forget {fid} undoes it)" for fid, text in turn.saved]
-    lines += [f"Updated #{fid}: {text}" for fid, text in turn.updated]
+    def shown(text: str) -> str:  # a fact from a page learned now: no link but the one the user sent (redteam-02)
+        return text if turn.learned_url is None else shown_link_fact(text, turn.learned_url)
+
+    lines = [f"Saved #{fid}: {shown(text)} (/forget {fid} undoes it)" for fid, text in turn.saved]
+    lines += [f"Updated #{fid}: {shown(text)}" for fid, text in turn.updated]
     lines += [f"Removed #{fid}: {text}" for fid, text in turn.removed]
     lines += [f"Moved to notes #{fid}: {text}" for fid, text in turn.moved]  # making room: kept, not always sent
+    lines += [f"Already kept #{fid}: {shown(text)}" for fid, text in turn.already if fid]  # a remember of a kept fact
+    if any(has_house_number(area) for _, text in turn.saved + turn.updated if (area := home_area_text(text))):
+        lines.append(prompts.HOME_AREA_ADVICE)  # kept and used all the same (owner: never refused)
     return "**Profile changes**\n" + "\n".join(lines) if lines else ""  # bold in Signal (markup)
+
+
+def _nothing_saved(text: str, turn: Turn) -> str:
+    """Code's note when her answer claims a save and none was made; no try-again advice after a remember that ran and
+    saved nothing (it would fail the same way). A fact kept already is no unmade save."""
+    if not _claims_a_save(text) or turn.already:
+        return ""
+    return NOTHING_SAVED_REFUSED if turn.remember_refused else NOTHING_SAVED
+
+
+def _done_notes(turn: Turn) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """What an answer that failed had already done: her profile changes and the reminders set, as the notes an answer
+    sends; the second: those that quote outside text (the profile notice after outside text, as `Reply.read_outside`)."""
+    notice, reminders = profile_notice(turn), "\n".join(turn.reminder_notes)
+    read_outside = turn.untrusted or turn.read_mail_or_calendar or turn.used_web or bool(turn.outside_notes)
+    return tuple(note for note in (notice, reminders) if note), (notice,) if notice and read_outside else ()
+
+
+async def _told(
+    step: Awaitable[str], turn: Turn, on_cancel: Callable[[tuple[str, ...], tuple[str, ...]], None] | None
+) -> str:
+    """A tool call of an answer; cancelled, `on_cancel` is told what the answer had already done (_done_notes)."""
+    try:
+        return await step
+    except asyncio.CancelledError:
+        if on_cancel is not None:
+            on_cancel(*_done_notes(turn))
+        raise
 
 
 def _assistant_tool_message(completion: Completion) -> dict[str, Any]:
@@ -354,8 +504,10 @@ class Brain:
         reply_max_tokens: int = 600,
         language: Callable[[], str] = lambda: "",
         clock: Callable[[], float] = time.monotonic,
+        stopped: Callable[[], bool] = lambda: False,
     ) -> None:
         self._gemma = gemma
+        self._stopped = stopped  # /lock: what an answer has still to do stops (LockedError; review I1)
         self._language = language  # her language's code now, for the empty answers' log
         self._clock = clock
         self._context = context
@@ -363,6 +515,11 @@ class Brain:
         self._max_tool_calls = max_tool_calls
         self._learn_tool_calls = learn_tool_calls  # one remember per fact after learn_link
         self._reply_max_tokens = reply_max_tokens
+        context.reserve(tools.schemas, reply_max_tokens)  # each request's tools and reply, in the model's context
+
+    def now(self) -> float:
+        """This brain's clock: a call turn's start, for `answer(started=…)`."""
+        return self._clock()
 
     async def answer(
         self,
@@ -371,6 +528,7 @@ class Brain:
         images: Sequence[str] = (),
         *,
         recent: Mapping[int, Sequence[str]] | None = None,
+        photo_left: float = 0.0,
         max_tokens: int | None = None,
         on_tools: Callable[[], None] | None = None,
         practice: PracticeTurn | None = None,
@@ -378,10 +536,15 @@ class Brain:
         reads: Sequence[tuple[str, str]] = (),
         on_retry: Callable[[], None] | None = None,
         chords_before: Sequence[chord_checks.Result] = (),
+        on_cancel: Callable[[tuple[str, ...], tuple[str, ...]], None] | None = None,
+        started: float | None = None,
+        turn_limit: float | None = None,
     ) -> Reply:
         """Gemma's reply to the newest message of the conversation (already stored), with its photos.
 
-        `recent`: photos of an earlier message that are still shown (a follow-up question about them).
+        `recent`: photos of an earlier message that are still shown (a follow-up question about them); `photo_left`:
+        the seconds a photo shown with this message stays shown (its own, or `recent`), so a hold for it says when it
+        ends (0: unknown).
         On a call: `max_tokens` keeps spoken answers short; `on_tools` is called once, when the first tool that
         takes a moment runs (the call says "let me check"); `glance`: code's counts at the call's start (numbers and
         times only: no outside text, so nothing in the answer is refused for it); `reads`: tool calls (name, JSON
@@ -390,35 +553,51 @@ class Brain:
         read is outside text for this answer exactly as when she calls them. `practice`: a /babble turn
         (`_practise`). `on_retry`: called once in an answer, when a try came back empty, before it is asked again (a
         call says an acknowledgement meanwhile). `chords_before`: on a call, its earlier chords results (sources for
-        her chords)."""
+        her chords). `on_cancel`: told, when the answer is cancelled (a call turn's time limit, the call's end), what it
+        had already done, as GemmaError.notes and .outside (review of 0.9.7, C5: a reminder set got no note). An answer
+        that promises a lookup with no answer after it (claims.only_promises_a_lookup) while no tool ran, web search
+        is offered is asked once more, code's line in her newest message (the lookup guard); a retry that still
+        promises with no tool call keeps her words and gets code's true line (`Reply.lookup`), as does a promise with a
+        photo in the request, or on a call past a third of the turn's time limit (`turn_limit`; none
+        given: LOOKUP_RETRY_WITHIN_S) from the turn's start (`started`, on this brain's clock, `now`: a call turn's
+        waits before its answer count; review of 0.9.7, C12), with no retry; a retry that answers without a search gets none. Her written end_call
+        never stands beside code's line: the caller may ask again."""
+        started = self._clock() if started is None else started
         limit_tokens = max_tokens or self._reply_max_tokens
         shown = {**(recent or {}), **({message.id: images} if images else {})}
         retrying = _once(on_retry)
+        spent: list[Completion] = []  # every request of this answer, for its timing
         if practice is not None:
-            return await self._practise(conversation, message, practice, limit_tokens, shown, retrying)
+            return await self._practise(conversation, message, practice, limit_tokens, shown, retrying, spent)
         quoted = self._context.quoted_notes(conversation, message.id)
         turn = Turn(
             message=message,
+            # an earlier photo shown again (a follow-up): in her input as a photo message is, outside text (review I6)
+            untrusted=bool(recent),
+            other_outside=bool(recent),
+            photo=bool(recent),
+            photo_left=photo_left,
             after_outside=self._context.after_outside(conversation, message.id),
             outside_notes=tuple(note.text for note in quoted),
             private_notes=tuple(note.text for note in quoted if note.private),
         )
         if quoted:  # this answer stays outside text once the notes have left her input
             self._context.mark_outside_notes(message.id)
+        self._tools.replayed_reminders(turn)  # set before a restart cut this answer off: told now
         # code's video lines, last in the prompt: a kept video's (reading it again), a YouTube link in this message's
         # (what read_link reads); none on a call, so never with a call's glance
         glance = "\n\n".join(part for part in (glance, self._tools.video_hint(message)) if part)
         # on a call her rules leave out the list of what she can do (spoken sentences, never a list)
         on_call = message.text.startswith(prompts.CALL_MARK)
         messages = self._input(conversation, shown, glance, call=on_call)
-        said = [  # the user's own words: her notes before the newest message are not theirs
-            without_notes(str(m["content"]))
-            for m in messages
-            if m.get("role") == "user" and isinstance(m.get("content"), str)
-        ]
+        # the message answered: the last of the user's (the lookup retry puts code's line in it)
+        newest = max((index for index, chat in enumerate(messages) if chat.get("role") == "user"), default=0)
+        said = users_own(messages)  # the user's own words: never her notes, never an audio file's (review G1)
         # the user asked for a reminder, a wake-up or a call now or in their message before ("and at 17:00?")
-        asked_before = any(mentions_reminder(text) for text in said[-2:]) or mentions_reminder(message.text)
+        asked_before = any(mentions_reminder(text) for text in said[-2:]) or mentions_reminder(message.own_text)
         turn.asked_reminder = asked_before  # after outside text, a reminder needs it (tools)
+        # the user's own words before the message answered: a project named in their last may be read
+        turn.said = tuple(users_own(messages[:newest])[-1:])
         calls = 0
         if reads:  # code's own reads, as if she had called them first
             if on_tools is not None:
@@ -428,10 +607,14 @@ class Brain:
             messages.append(_assistant_tool_message(Completion(content="", tool_calls=read)))
             for call in read:
                 calls += 1
-                result = await self._tools.call(turn, call.name, call.arguments)
+                self._halt()
+                result = await _told(self._tools.call(turn, call.name, call.arguments), turn, on_cancel)
                 messages.append({"role": "tool", "tool_call_id": call.id, "content": result})
+        # a photo of this message or one still shown (a follow-up): no lookup retry (guards-3), code's line instead
+        with_photo = bool(shown) or message.text.startswith(PHOTO_PREFIX)
         corrected = False
         chords_nudged = False
+        lookup_checked = lookup_retried = False  # the lookup guard: read once an answer; the retry it asked
         while True:
             limit = self._learn_tool_calls if turn.learned_document_id is not None else self._max_tool_calls
             allow_tools = calls < limit
@@ -440,9 +623,32 @@ class Brain:
             room = DOCUMENT_REPLY_TOKENS if turn.read_documents and max_tokens is None else limit_tokens
             with_document = turn.read_documents or message.text.startswith(prompts.DOCUMENT_MARK)
             path = "call" if on_call else "document" if with_document else "text"
-            completion = await self._complete(
-                messages, allow_tools, max(limit_tokens, room), retrying, path=path, message_id=message.id
-            )
+            # the request within the model's context, her answer's tokens with it: this answer's newest tool result is
+            # cut at its end when it would not fit (review of 0.9.8, guards-2)
+            messages, cut = self._context.fit_turn(messages, max(limit_tokens, room), newest + 1)
+            if cut:
+                log.warning(
+                    "message %d: over the model's context; %d characters of this answer's tool results cut",
+                    message.id,
+                    cut,
+                )
+            try:
+                completion = await self._complete(
+                    messages,
+                    allow_tools,
+                    max(limit_tokens, room),
+                    retrying,
+                    path=path,
+                    message_id=message.id,
+                    spent=spent,
+                )
+            except GemmaError as exc:  # what this answer already did is still told, in code's words (review I25)
+                exc.notes, exc.outside = _done_notes(turn)
+                raise
+            except asyncio.CancelledError:  # and when it is cut off (review of 0.9.7, C5)
+                if on_cancel is not None:
+                    on_cancel(*_done_notes(turn))
+                raise
             if completion.tool_calls and allow_tools:
                 if on_tools is not None and any(call.name not in INSTANT_TOOLS for call in completion.tool_calls):
                     on_tools()
@@ -457,21 +663,58 @@ class Brain:
                         why = prompts.REMINDER_WHY_LIMIT
                     else:
                         calls += 1
-                        result = await self._tools.call(turn, call.name, call.arguments)
+                        self._halt()  # /lock while Gemma worked: her tool calls after it never run
+                        result = await _told(self._tools.call(turn, call.name, call.arguments), turn, on_cancel)
                         why = prompts.REMINDER_WHY_UNREADABLE
                     if asked and len(turn.reminder_attempts) == tried:  # it never reached the reminder checks
-                        turn.reminder_attempts.append(ReminderAttempt(_reminder_text(call.arguments), why))
+                        unchecked = _reminder_text(call.arguments)  # its words may be planted after outside text
+                        turn.reminder_attempts.append(ReminderAttempt(unchecked, why, outside=_heard_outside(turn)))
                     messages.append({"role": "tool", "tool_call_id": call.id, "content": result})
                 continue
             text, wrote_end_call = _filtered(completion.content, message.id)
+            # an answer sent back (the save nudge, the chords nudge) is set aside with its written end_call; an
+            # end_call tool she called before it stands (review of 0.9.8, guards-4)
+            ended_before = turn.end_call
             if wrote_end_call and self._tools.calls_on and message.text.startswith(prompts.CALL_MARK):
-                turn.end_call = True
-            if not corrected and _claims_a_save(text) and not turn.saved and allow_tools:
-                # "Noted" without a remember call means nothing was saved: send it back once
+                # after outside text only on the caller's own leave-taking, as the tool (redteam-07)
+                turn.end_call = turn.end_call or self._tools.may_end_call(turn)
+            if not lookup_checked and not calls and allow_tools and self._tools.web_on and only_promises_a_lookup(text):
+                # "let me check" in a turn with no tool call and no answer after it: nothing would come back. Once
+                # more, the same request with code's line in her newest message (the prefix stays cached); a search
+                # then runs as any, on a call with its checking line (on_tools). Her first answer is set aside, its
+                # written end_call with it. Never a retry with a photo in the request: "let me take a look" is at the
+                # photo, and a retry reads it again (review of 0.9.8, guards-3); her words and code's line instead
+                # (final review of 0.9.8, guards-3-lookup-guard-weakened: the promise went out alone)
+                lookup_checked = True
+                if with_photo:
+                    log.warning(
+                        "message %d: a lookup promised without a tool call, a photo shown: no retry", message.id
+                    )
+                elif on_call and self._clock() - started >= _lookup_window(turn_limit):
+                    log.warning("message %d: a lookup promised without a tool call, too late for a retry", message.id)
+                else:
+                    lookup_retried, turn.end_call = True, False
+                    messages = [
+                        *messages[:newest],
+                        with_line(messages[newest], prompts.LOOKUP_RETRY),
+                        *messages[newest + 1 :],
+                    ]
+                    log.warning("message %d: a lookup promised without a tool call; asking Gemma once more", message.id)
+                    continue
+            if not corrected and _claims_a_save(text) and not (turn.saved or turn.already) and allow_tools:
+                # "Noted" (or "I've noted that …") without a remember call means nothing was saved: send it back once;
+                # a remember of a fact kept already is no unmade save (review of 0.9.8, memory-1). After a remember
+                # that saved nothing, the true reason and no "call remember now" (second deep scan, dialogue-refused-
+                # remember-false-nudge: "no remember call was made" sent her to a remember refused again)
                 corrected = True
+                if turn.remember_refused:
+                    nudge = prompts.NOTED_REFUSED_NUDGE
+                else:
+                    nudge = prompts.NOTED_NUDGE if _starts_noted(text) else prompts.NOTED_SAID_NUDGE
                 messages.append({"role": "assistant", "content": completion.content})
-                messages.append({"role": "user", "content": prompts.NOTED_NUDGE})
-                log.warning("message %d: 'Noted' without a save; asking Gemma to correct it", message.id)
+                messages.append({"role": "user", "content": nudge})
+                turn.end_call = ended_before
+                log.warning("message %d: a save claimed without one; asking Gemma to correct it", message.id)
                 continue
             if self._tools.chords_on and not chords_nudged and allow_tools and not on_call:
                 # chords she worked out in her head: once, on texts, back to her (a call answers at once instead)
@@ -480,32 +723,38 @@ class Brain:
                     chords_nudged = True
                     messages.append({"role": "assistant", "content": completion.content})
                     messages.append({"role": "user", "content": prompts.CHORDS_NUDGE})
+                    turn.end_call = ended_before
                     log.warning(
                         "message %d: her chords not worked out by a chords call; asking Gemma once more", message.id
                     )
                     continue
             if turn.forgot:
                 self._context.refresh_snapshot()
-            if turn.used_web:
-                text = without_links(text)
+            if turn.used_web:  # her links go, and a bare name left is defanged; the sites the results name stay
+                sites = [found.site for search in turn.web for found in search.results]
+                text = defang_links(without_links(text), "\n".join([message.own_text, *turn.allowed_links, *sites]))
             elif (
                 turn.untrusted
                 or turn.read_mail_or_calendar
                 or turn.after_outside
                 or message.text.startswith((prompts.AUDIO_MARK, "[photo]"))
-            ):  # a link planted in outside text never reaches the user tappable, unless they sent it themselves
-                text = defang_links(text, "\n".join([message.text, *turn.allowed_links]))
+            ):  # a link planted in outside text never reaches the user tappable, unless they sent it themselves (a
+                # sent document's name is the file's, never theirs: R1-F2)
+                text = defang_links(text, "\n".join([message.own_text, *turn.allowed_links]))
             text = _without_captions(text, turn)
             chords_note = chords_spoken = ""
             if self._tools.chords_on:
                 text, chords_note, chords_spoken = self._chords_note(text, turn, message, chords_before)
+            blank_chars = len(text) if text and blank(text) else 0  # only a rule or stray markup: no words of hers
+            if blank_chars:
+                text = ""
             reminder = list(turn.reminder_notes)
             spoken = list(turn.reminder_spoken)
             # per answer, never across turns: a set_reminder that stored nothing gets code's line whatever she wrote;
             # so does a claim when none was stored: asked for one (this message or the one before, or she listed or
             # tried one): the strict, broad reading in all 11 languages; not asked: the precise one, and none at all
             # when she summarised outside text (a mail's payment reminder is not hers); a restated listed one is fine
-            saved = bool(turn.saved or turn.updated)
+            saved = bool(turn.saved or turn.updated or turn.already)
             asked_for_one = asked_before or turn.reminders_listed or turn.reminder_tried
             if asked_for_one:  # asked: the strict reading
                 clauses = claiming_clauses(text, broad=True, saved=saved)
@@ -523,32 +772,81 @@ class Brain:
                 text = "\n".join(part for part in (without_reminder_talk(text, saved=saved), not_set) if part)
                 log.warning("message %d: no reminder was set (refused); her reminder talk left out", message.id)
             elif self._tools.reminders_on and not turn.reminder_set and claimed:
-                new = turn.reminders_listed  # beside a listing: one more that was never set
+                # beside a listing, or when her claim or the message names an open one (asked again: "already set",
+                # review I26): one more that was never set
+                open_ones = self._tools.open_reminders(turn)
+                new = turn.reminders_listed or any(restates(part, open_ones) for part in (*clauses, message.text))
                 reminder.append(prompts.REMINDER_GUARD_NEW if new else prompts.REMINDER_GUARD)
                 spoken.append(prompts.REMINDER_GUARD_NEW if new else prompts.REMINDER_GUARD_SPOKEN)
                 log.warning("message %d: no reminder was set (claimed)", message.id)
             elif self._tools.reminders_on and turn.reminder_set:  # one set, another refused: that one gets a note
+                yours = "\n".join([message.own_text, *turn.allowed_links])  # its links as her answer's (review I12)
                 for missed in unset(turn.reminder_attempts):
-                    reminder.append(
-                        prompts.REMINDER_NOT_SET_ONE.format(what=_quoted(missed.text), reason=missed.reason)
+                    # one refused for outside text: none of its words (review G3: the note is stored plain)
+                    what = (
+                        prompts.REMINDER_NOT_SET_WHAT if missed.outside else _quoted(defang_links(missed.text, yours))
                     )
+                    reminder.append(prompts.REMINDER_NOT_SET_ONE.format(what=what, reason=missed.reason))
                     spoken.append(prompts.REMINDER_NOT_SET_ONE_SPOKEN.format(reason=missed.said))
                     log.warning("message %d: one of its reminders was not set", message.id)
+            # after outside text (this answer's, her context's, a note's, an audio file's or a photo's), a light or plug
+            # change she tells as set for later (English first): she schedules none, so it is the outside text's (the
+            # gate of 26 Oct: a planted calendar title told as the lamp "scheduled to be switched off"); her sentence
+            # goes and code's line follows, alone when nothing of hers is left
+            device = ""
+            outside = (
+                turn.untrusted
+                or turn.read_mail_or_calendar
+                or turn.used_web
+                or turn.after_outside
+                or bool(turn.outside_notes)
+                or message.text.startswith((prompts.AUDIO_MARK, "[photo]"))
+            )
+            unscheduled = self._tools.unscheduled(turn, text) if outside else None
+            if unscheduled is not None:  # code's line after her other words, or alone as the answer
+                device = prompts.DEVICE_NOT_SCHEDULED if unscheduled else ""
+                text = unscheduled or prompts.DEVICE_NOT_SCHEDULED
+                log.warning(
+                    "message %d: a device change told as set for later after outside text; code's line", message.id
+                )
             # a device change she claims that no device_set made (English first): code's line after her words; "else"
             # when this answer did switch one (its Devices note says which)
-            device = ""
             if self._tools.unmade_switch(turn, text):
-                device = prompts.DEVICE_GUARD_ELSE if turn.switched else prompts.DEVICE_GUARD
+                unmade = prompts.DEVICE_GUARD_ELSE if turn.switched else prompts.DEVICE_GUARD
+                device = " ".join(line for line in (unmade, device) if line)
                 log.warning("message %d: a device change claimed, none made", message.id)
-            # nothing of hers left: code's note holds a chords result that worked (review I5), else she got confused
-            text = text or (prompts.CHORDS_DONE if any(result.ok for result in turn.chords) else prompts.CONFUSED)
+            # nothing of hers left: code's own line for a device of this answer (its question while it waits for the
+            # yes, else its result line: Tools.device_line), code's note holds a chords result that worked (review I5),
+            # else she got confused
+            device_line = "" if text else self._tools.device_line(turn)
+            if blank_chars or device_line:
+                instead = "code's device line" if device_line else "code's line"
+                log.warning(
+                    "message %d: no words in her answer (%d chars); %s instead", message.id, blank_chars, instead
+                )
+            text = (
+                text
+                or device_line
+                or (prompts.CHORDS_DONE if any(result.ok for result in turn.chords) else prompts.CONFUSED)
+            )
+            # append only, her words stay: after a promise with no retry (late on a call), or a retry that still
+            # promises; a retry that answered without a search left nothing undone (review G6)
+            undone = lookup_checked and not calls and (not lookup_retried or only_promises_a_lookup(text))
+            # with a photo, asking again reads the photo again: a line that promises no search (second deep scan,
+            # dialogue-photo-promise-line-says-search)
+            not_done = prompts.LOOKUP_PHOTO_NOT_DONE if with_photo else prompts.LOOKUP_NOT_DONE
+            lookup = not_done if undone else ""
+            if lookup and lookup_retried:
+                log.warning("message %d: no tool call after the lookup retry; code's line follows", message.id)
+            if lookup:  # "Ask me again and I'll search." never ends the call (review of 0.9.7, C12)
+                turn.end_call = False
             return Reply(
                 text=text,
                 tool_calls=calls,
                 prompt_tokens=completion.prompt_tokens,
-                notice=profile_notice(turn) or (NOTHING_SAVED if _claims_a_save(text) else ""),
+                notice=profile_notice(turn) or _nothing_saved(text, turn),
                 end_call=turn.end_call,
-                sources=prompts.sources_note(_links(turn)),
+                sources=prompts.sources_note(_links(turn), instead=turn.maps_instead),
                 reminder="\n".join(reminder),
                 reminder_spoken=" ".join(spoken),
                 not_set=not_set,
@@ -559,6 +857,8 @@ class Brain:
                 chords_spoken=chords_spoken,
                 chords_results=tuple(turn.chords),
                 read_outside=turn.untrusted or turn.read_mail_or_calendar or turn.used_web or bool(turn.outside_notes),
+                lookup=lookup,
+                timing=Timing.of(spent),
             )
 
     def _chords_checked(
@@ -595,6 +895,7 @@ class Brain:
         max_tokens: int,
         shown: Mapping[int, Sequence[str]],
         on_retry: Callable[[], None],
+        spent: list[Completion],
     ) -> Reply:
         """A practice turn: the practice rules, no tools offered (none can run), no tool loop. A reply that is empty,
         only "---" or only a "→" line is asked again once, then replaced by the language's fallback question (the
@@ -610,7 +911,7 @@ class Brain:
         on_call = message.text.startswith(prompts.CALL_MARK)
         messages = self._practice_input(conversation, shown, practice, call=on_call)
         shape = _Shape("practice", max_tokens, 0, practice.language or self._language(), after_tool=False)
-        completion, took = await self._timed(messages, max_tokens, None)
+        completion, took = await self._timed(messages, max_tokens, None, spent)
         if not _has_images(messages):  # image tokens are counted by Ollama but not in our characters
             self._context.calibrate(messages, completion.prompt_tokens)
         if broken(completion.content):
@@ -621,7 +922,7 @@ class Brain:
             )
             on_retry()
             nudged = [*messages, {"role": "user", "content": prompts.EMPTY_NUDGE}]
-            completion, took = await self._timed(nudged, max_tokens, None)
+            completion, took = await self._timed(nudged, max_tokens, None, spent)
             if broken(completion.content):
                 log.warning(
                     "message %d: the practice reply stayed broken; the fallback question instead (%s)",
@@ -660,7 +961,7 @@ class Brain:
         if self._tools.reminders_on and asked and claimed:
             reminder, spoken = prompts.PRACTICE_NO_REMINDER, prompts.PRACTICE_NO_REMINDER_SPOKEN
             log.warning("message %d: no reminder was set (claimed in practice)", message.id)
-        claimed_save = _claims_a_save(words)
+        claimed_save = _starts_noted(words)
         if claimed_save:
             log.warning("message %d: 'Noted' in practice, where nothing is saved", message.id)
         return Reply(
@@ -671,6 +972,7 @@ class Brain:
             end_call=end_call,
             reminder=reminder,
             reminder_spoken=spoken,
+            timing=Timing.of(spent),
         )
 
     async def warm_up(
@@ -719,12 +1021,23 @@ class Brain:
         """The tools a request offers: all of this setup's, or none once the tool limit is reached."""
         return self._tools.schemas if allow_tools else None
 
+    def _halt(self) -> None:
+        """No request to Gemma and no tool call once /lock came (`stopped`), also in an answer already running."""
+        if self._stopped():
+            raise LockedError("locked (/lock): the answer stops here")
+
     async def _timed(
-        self, messages: list[dict[str, Any]], max_tokens: int, tools: list[dict[str, Any]] | None
+        self,
+        messages: list[dict[str, Any]],
+        max_tokens: int,
+        tools: list[dict[str, Any]] | None,
+        spent: list[Completion],
     ) -> tuple[Completion, float]:
-        """One Gemma call and the seconds it took."""
+        """One Gemma call and the seconds it took; the completion is added to the answer's `spent`."""
+        self._halt()
         started = self._clock()
         completion = await self._gemma.chat(messages, max_tokens=max_tokens, tools=tools)
+        spent.append(completion)
         return completion, self._clock() - started
 
     async def _complete(
@@ -736,13 +1049,14 @@ class Brain:
         *,
         path: str,
         message_id: int,
+        spent: list[Completion],
     ) -> Completion:
         """One Gemma call; an answer with neither text nor a usable tool call is retried once (`on_retry` first), and
         the retry's result is checked: a second empty one is a warning of its own, and the caller gives the confused
         line. Each try of an empty answer is one log line, metadata only (`_Shape`; `path`: call, text or
         document)."""
         tools = self._offered(allow_tools)
-        completion, took = await self._timed(messages, max_tokens, tools)
+        completion, took = await self._timed(messages, max_tokens, tools, spent)
         if not _has_images(messages):  # image tokens are counted by Ollama but not in our characters
             self._context.calibrate(messages, completion.prompt_tokens)
         if _usable(completion, allow_tools):
@@ -757,7 +1071,7 @@ class Brain:
             *messages,
             {"role": "user", "content": prompts.EMPTY_NUDGE},
         ]  # an identical request may come back empty again
-        retried, took = await self._timed(nudged, max_tokens, tools)
+        retried, took = await self._timed(nudged, max_tokens, tools, spent)
         if _usable(retried, allow_tools):
             log.info(
                 "message %d: the retry after an empty answer answered (%s)", message_id, shape.of(retried, 2, took)

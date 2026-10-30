@@ -160,6 +160,19 @@ def test_the_first_confirmation_each_user_gets_says_only_this_note_means_one_is_
     assert prompts.REMINDER_CONTRACT not in first.spoken and prompts.REMINDER_CONTRACT not in first.result
 
 
+def test_the_same_reminder_asked_twice_is_kept_once(store: Store) -> None:
+    """Two identical set_reminder calls (one answer, or the next): one reminder, one note (review I26: both fired)."""
+    reminders = service(store, Clock())
+    first = reminders.set(ME, at="17:00", text="call mum")
+    again = reminders.set(ME, at="17:00", text="Call  Mum")  # the same words, in another case and spacing
+    assert again.reminder.id == first.reminder.id and again.note == "" and again.spoken == ""
+    assert again.result == "Already set as #1 for Mon 12 Oct 17:00; nothing new was set. Confirm it briefly."
+    assert [r.id for r in store.open_reminders(ME)] == [1]
+    assert reminders.set(ME, at="17:00", text="call mum", call=True).reminder.id == 2  # a call: another one
+    assert reminders.set(ME, at="18:00", text="call mum").reminder.id == 3  # another time
+    assert reminders.set(STRANGER, at="17:00", text="call mum").reminder.id == 4  # another user's
+
+
 def test_a_date_and_time_and_minutes_from_now(store: Store) -> None:
     reminders = service(store, Clock())
     dated = reminders.set(ME, at="2026-10-14 09:30", text="dentist")
@@ -306,6 +319,42 @@ async def test_a_wake_up_text_without_calls_comes_twice_unless_the_user_wrote(st
     ]
 
 
+async def test_a_wake_up_text_that_fails_is_tried_again_like_a_text_reminder(store: Store) -> None:
+    """Review O5 (0.9.7): without a call the text is all there is: a first text that did not go out is tried every 5
+    minutes for an hour (it got no further try), and the reminder records what reached the user."""
+    clock = Clock()
+    reminders, run, sent = scheduler(store, clock, calls=None, calls_on=False)
+    created = reminders.set(ME, at="2026-10-13 07:00", text="wake up", call=True)
+    sent.fail = True
+    clock.now = at("2026-10-13 07:00")
+    await run.tick()
+    await run.drain()
+    firing = store.reminder(created.reminder.id)
+    assert firing is not None and firing.status == "firing" and sent.texts == []
+    sent.fail = False
+    clock.now = at("2026-10-13 07:05")
+    await run.tick()
+    assert [text for _, text in sent.texts] == ["Wake-up: 07:00 · wake up. No call: calls are off."]
+    done = store.reminder(created.reminder.id)
+    assert done is not None and (done.status, done.outcome) == ("done", "sent")
+
+
+async def test_a_wake_up_text_that_never_goes_out_fails_after_an_hour(store: Store) -> None:
+    clock = Clock()
+    reminders, run, sent = scheduler(store, clock, calls=None, calls_on=False)
+    created = reminders.set(ME, at="2026-10-13 07:00", text="wake up", call=True)
+    sent.fail = True
+    clock.now = at("2026-10-13 07:00")
+    await run.tick()
+    await run.drain()
+    for _ in range(12):
+        clock.now += 300
+        await run.tick()
+    failed = store.reminder(created.reminder.id)
+    assert failed is not None and (failed.status, failed.outcome) == ("failed", "send_failed")
+    assert store.message(failed.message_id or 0).status == "ignored"
+
+
 def test_weekdays_start_on_a_weekday_and_the_note_says_the_rhythm(store: Store) -> None:
     clock = Clock(at("2026-10-17 10:00"))  # a Saturday
     created = service(store, clock).set(ME, at="08:00", text="take the pills", repeat="weekdays")
@@ -365,9 +414,12 @@ class Sent:
         self.store = store
         self.texts: list[tuple[str, str]] = []
         self.fail = False
+        self.meanwhile: Callable[[], object] | None = None  # what happens while the note is on its way
 
     async def __call__(self, out_id: int) -> None:
         message = self.store.message(out_id)
+        if self.meanwhile is not None:
+            self.meanwhile()
         if self.fail:
             self.store.set_status(out_id, "failed")
             return
@@ -469,6 +521,34 @@ async def test_a_repeat_says_how_to_stop_and_goes_on(store: Store) -> None:
     assert again is not None and (again.status, again.local_time, again.fired) == ("open", "2026-10-14 08:00", 1)
 
 
+async def test_a_repeat_cancelled_while_its_note_is_sent_stays_cancelled(store: Store) -> None:
+    """Review O3 (0.9.7): /reminders cancel N while the note is on its way: the repeat is never opened again for its
+    next time (the reminder read before the send was put back as it was)."""
+    clock = Clock()
+    reminders, run, sent = scheduler(store, clock)
+    created = reminders.set(ME, at="08:00", text="take the pills", repeat="daily")
+    sent.meanwhile = lambda: reminders.cancel(ME, created.reminder.id)
+    clock.now = at("2026-10-13 08:00")
+    await run.tick()
+    assert sent.texts == [(ME, "Reminder: take the pills (daily at 08:00 · /reminders to stop)")]
+    after = store.reminder(created.reminder.id)
+    assert after is not None and after.status == "cancelled"
+    clock.now = at("2026-10-14 08:00")
+    await run.tick()
+    assert len(sent.texts) == 1
+
+
+async def test_a_reminder_cancelled_while_its_note_is_sent_is_not_marked_done(store: Store) -> None:
+    clock = Clock()
+    reminders, run, sent = scheduler(store, clock)
+    created = reminders.set(ME, at="17:00", text="call mum")
+    sent.meanwhile = lambda: reminders.cancel(ME, created.reminder.id)
+    clock.now = at("2026-10-12 17:00")
+    await run.tick()
+    after = store.reminder(created.reminder.id)
+    assert after is not None and after.status == "cancelled"
+
+
 async def test_adding_a_reminder_wakes_the_scheduler_at_once(store: Store) -> None:
     clock = Clock()
     forever = asyncio.Event()
@@ -543,7 +623,7 @@ async def test_reminders_wait_while_she_is_on_a_call(store: Store) -> None:
     calling[0] = False
     clock.now += 600
     await run.tick()
-    assert sent.texts == [(ME, "Reminder: call mum")]
+    assert sent.texts == [(ME, "Late reminder (due 17:00): call mum")]
 
 
 async def test_old_reminders_are_pruned_after_30_days(store: Store) -> None:
@@ -669,7 +749,12 @@ async def test_cancelling_during_the_wait_stops_the_retry(store: Store) -> None:
 
 @pytest.mark.parametrize(
     ("ready", "why"),
-    [("not_ready", "the voice service is not ready"), ("in_call", "we were already on a call")],
+    [
+        ("not_ready", "the voice service is not ready"),
+        ("in_call", "we were already on a call"),
+        # owner, 25 Oct: no Supertonic-3 stand-in while jane's model of the language in use downloads
+        ("downloading", "her voice in the language in use is still downloading"),
+    ],
 )
 async def test_no_call_when_it_cannot_be_placed_the_text_says_why(store: Store, ready: str, why: str) -> None:
     clock = Clock()
@@ -906,7 +991,30 @@ async def test_reminders_wait_while_she_is_locked_and_come_after_the_unlock(stor
     assert reminder is not None and reminder.status == "open"
     locked[0] = False
     await run.tick()
+    assert sent.texts == [(ME, "Late reminder (due 17:00): call mum")]  # review O4: hours later, never as on time
+
+
+async def test_a_reminder_up_to_2_minutes_late_is_on_time_and_a_later_one_says_when_it_was_due(store: Store) -> None:
+    """Review O4 (0.9.7): a text reminder that waited (the lock, a call) more than ON_TIME_S says it is late and when
+    it was due, with a repeat's line after it; a day other than today is named."""
+    clock = Clock()
+    locked = [True]
+    reminders, run, sent = scheduler(store, clock, locked=lambda: locked[0])
+    reminders.set(ME, at="17:00", text="call mum")
+    reminders.set(ME, at="18:00", text="take the pills", repeat="daily")
+    clock.now = at("2026-10-12 17:02")
+    locked[0] = False
+    await run.tick()
     assert sent.texts == [(ME, "Reminder: call mum")]
+    locked[0] = True
+    clock.now = at("2026-10-13 07:30")
+    await run.tick()
+    locked[0] = False
+    await run.tick()
+    assert sent.texts[1] == (
+        ME,
+        "Late reminder (due Mon 12 Oct 18:00): take the pills (daily at 18:00 · /reminders to stop)",
+    )
 
 
 async def test_a_call_reminder_due_while_locked_never_calls(store: Store) -> None:
@@ -946,6 +1054,11 @@ async def test_a_call_reminder_due_while_locked_never_calls(store: Store) -> Non
         ("visit https://example.com/me", "remind me to visit https://example.com/me tonight", True),
         ("薬を飲む", "[voice] 9時に薬を飲むことを思い出させて", True),  # Japanese by characters
         ("請求書を払う", "それを思い出させて", False),
+        # second review of 0.9.8, redteam-06: by pairs of characters, a pair of hiragana only (grammar) left out
+        ("お金を送る", "それを送ってくれる?", False),
+        ("母に電話する", "母に電話するのを思い出させて", True),
+        ("엄마에게 전화하기", "엄마한테 전화하라고 알려줘", True),  # Korean: a word's stem, its particle apart
+        ("은행에 송금하기", "고마워", False),
         ("", "remind me", True),  # nothing to compare: the usual check says it is empty
     ],
 )

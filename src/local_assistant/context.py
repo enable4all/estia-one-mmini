@@ -1,11 +1,13 @@
 """What Gemma sees: rules, the style, the frozen profile snapshot and the summary, then the recent conversation.
 
 Fixed parts come first and changing parts last, so Ollama can reuse its prompt cache. The
-snapshot changes only at /new, after a summary, after /forget or /fix and at service start.
+snapshot changes only at /new, after a summary, after /forget or /fix, at service start and after setup's one-time
+import.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 import re
@@ -19,7 +21,7 @@ from local_assistant.code_notes import Note
 from local_assistant.config import DEFAULT_NAME, DEFAULT_STYLE
 from local_assistant.profile import Profile
 from local_assistant.soul import Soul, load_soul, soul_part
-from local_assistant.store import Conversation, Message, Store, ToolCallRecord
+from local_assistant.store import OUTSIDE_SEEN, Conversation, Message, Store, ToolCallRecord
 from local_assistant.timefmt import local_stamp
 
 log = logging.getLogger(__name__)
@@ -31,6 +33,13 @@ _NOTE_OVERHEAD = 60  # a note's call, its result's role markers and its line bef
 DEFAULT_CHARS_PER_TOKEN = 3.5
 _MESSAGE_OVERHEAD = 8  # role markers and the time stamp
 _TRACE_RESULT_CHARS = 300
+# beside what the code counts in a request: the chat template's own tokens and a photo or two (review I24)
+CONTEXT_MARGIN_TOKENS = 1_000
+# a photo in a request within an answer (`fit_turn`): Gemma 4's default image budget (280 soft tokens; 70 to 1,120
+# can be chosen), never its base64's length (final review of 0.9.8, guards-2-photo-cut); a budget of 1,120 would be
+# 840 more, within the margin for one photo
+IMAGE_TOKENS = 280
+HISTORY_SHARE = 0.6  # a trim to fit the context keeps the history within this share of its room (the cache's start)
 
 
 def without_fake_notices(text: str) -> str:
@@ -38,7 +47,16 @@ def without_fake_notices(text: str) -> str:
     Used on Gemma's new answers (it may imitate them) and on stored replies (before the fix, notices were sent inside
     the reply text)."""
     paragraphs = text.split("\n\n")
-    notices = ("profile changes", "(while we were quiet", "the bridge's note to the user")  # the last: code_notes
+    # the old quiet-time line, today's quiet-time note and /profile new's answer (P4), setup's note at her first start
+    # (P5: prompts.SETUP_FACTS_HEADER); the last: code_notes
+    notices = (
+        "profile changes",
+        "(while we were quiet",
+        "noted while we were quiet",
+        "noted in the last quiet time",
+        prompts.SETUP_FACTS_HEADER.lower(),
+        "the bridge's note to the user",
+    )
     kept = [p for p in paragraphs if not _STAMP.sub("", p.lstrip(" \t\n#*_~")).lower().startswith(notices)]
     return "\n\n".join(kept)
 
@@ -62,6 +80,24 @@ def _with_notes(chat: dict[str, Any], block: str) -> dict[str, Any]:
     return {**chat, "content": parts}
 
 
+def with_line(chat: dict[str, Any], line: str) -> dict[str, Any]:
+    """The newest message with code's line for this answer only (brain's lookup retry: prompts.LOOKUP_RETRY) right
+    before its words, after her notes when it has them (in its text part when it carries a photo): every message before
+    it stays as it was, so the prompt cache keeps them; never stored."""
+
+    def placed(words: str) -> str:
+        if words.startswith(prompts.NOTES_HEADER) and "\n\n" in words:
+            notes, rest = words.split("\n\n", 1)
+            return f"{notes}\n\n{line}\n\n{rest}"
+        return f"{line}\n\n{words}"
+
+    content = chat["content"]
+    if isinstance(content, str):
+        return {**chat, "content": placed(content)}
+    parts = [{**part, "text": placed(part["text"])} if part.get("type") == "text" else part for part in content]
+    return {**chat, "content": parts}
+
+
 def without_notes(text: str) -> str:
     """A user message's text as the user wrote it: her notes block before it (`_with_notes`) left out."""
     if text.startswith(prompts.NOTES_HEADER) and "\n\n" in text:
@@ -78,26 +114,31 @@ def _text_of(content: Any) -> str:
 
 _OUTSIDE_TEXT = frozenset({"read_link", "search_history", "search_documents", "read_document"})
 
-# code's mark on today's agenda lines (calendar_tools._mark), right after the times: true only when it was read, so a
-# replay keeps the times and drops the mark ("(in 6 h)" from 09:00 is wrong at 14:30); a title's own words stay
-_AGENDA_MARK = re.compile(
-    r"^(- [^\n]*?(?:\d{2}:\d{2}|\(\d{2}:\d{2}(?:–\d{2}:\d{2})? [^()\n]+\)))"  # the times, a trip's zone time last
-    r" \((?:over|now(?:, until \d{2}:\d{2})?|in \d+ (?:min|h(?: \d+ min)?))\)",
-    re.MULTILINE,
-)
+
+# a logged call's arguments that are no JSON object (an earlier release's chords stub, a call cut off): Ollama refuses
+# the whole request with such a replay (HTTP 400, probed 24 Oct), so it is replayed with this stub
+_ARGUMENTS_NOT_KEPT = json.dumps({"arguments": "not kept"})
+
+
+def _replayed_arguments(arguments: str) -> str:
+    try:
+        return arguments if isinstance(json.loads(arguments), dict) else _ARGUMENTS_NOT_KEPT
+    except ValueError:
+        return _ARGUMENTS_NOT_KEPT
 
 
 def _short_result(call: ToolCallRecord) -> str:
-    """Earlier tool results are replayed short: a learned page can be 6,000 tokens."""
+    """Earlier tool results are replayed short: a learned page can be 6,000 tokens. Mail, calendar, web, map, music
+    and document results come stored as Tools.call's stubs (tests/test_outside_tools.py ties the lists)."""
     if call.name == "learn_link" and call.ok and call.result.startswith("Page content"):
         return "Page read and stored (text not repeated here)."
-    if call.name in _OUTSIDE_TEXT or (call.name.startswith("project_") and call.name != "project_list"):
-        # outside text is never replayed: a line planted in it could otherwise act on a later "thanks"
+    if call.name in _OUTSIDE_TEXT or call.name.startswith("project_"):
+        # outside text is never replayed: a line planted in it could otherwise act on a later "thanks" (review I7: a
+        # README's first line in project_list's result too)
         return f"({call.name} result not repeated here: outside text; read it again if it is needed)"
-    result = _AGENDA_MARK.sub(r"\1", call.result) if call.name == "calendar_agenda" else call.result
-    if len(result) <= _TRACE_RESULT_CHARS:
-        return result
-    return result[:_TRACE_RESULT_CHARS] + " …"
+    if len(call.result) <= _TRACE_RESULT_CHARS:
+        return call.result
+    return call.result[:_TRACE_RESULT_CHARS] + " …"
 
 
 class ContextBuilder:
@@ -114,10 +155,13 @@ class ContextBuilder:
         name: str = DEFAULT_NAME,
         style: str = DEFAULT_STYLE,
         calm_on_worry: bool = True,
+        context_tokens: int | None = None,
     ) -> None:
         """`style`: her built-in style while there is no usable soul.md ([personality] style; KeyError for a name
         prompts.BUILT_IN_STYLES does not have). `calm_on_worry`: code's line right after a usable soul.md
-        ([personality] calm_on_worry)."""
+        ([personality] calm_on_worry). `context_tokens`: the model's context window (the config's; None: the
+        history's own limits only); each request is kept within it (`enforce_limit`), with `reserve`'s tools and
+        reply."""
         self._store = store
         self.name = name  # hers (the config's `name`): the style's header, the summary's transcript
         self._rules = prompts.rules(name=name) if rules is None else rules
@@ -131,6 +175,14 @@ class ContextBuilder:
         self._tz = tz
         self._window_tokens = window_tokens
         self._emergency_tokens = emergency_tokens
+        self.context_tokens = context_tokens
+        self._tools_chars = 0
+        self._reply_tokens = 0
+
+    def reserve(self, tools: Sequence[Mapping[str, Any]], reply_tokens: int) -> None:
+        """What each request holds beside its messages (review I24): this setup's tools and the reply's tokens."""
+        self._tools_chars = len(json.dumps(list(tools), ensure_ascii=False))
+        self._reply_tokens = reply_tokens
 
     def set_rules(self, rules: str) -> None:
         """New rules from the next answer on (another language)."""
@@ -160,6 +212,8 @@ class ContextBuilder:
         chars = sum(len(_text_of(message.get("content"))) for message in messages)
         if prompt_tokens <= 0 or chars <= 0:
             return
+        if self.context_tokens is not None and prompt_tokens >= self.context_tokens - self._reply_tokens:
+            return  # a prompt Ollama cut to fit: its count is the cut one's, and the ratio drifted to 5.0 (review I24)
         measured = max(1.5, min(5.0, chars / prompt_tokens))
         smoothed = 0.7 * self.chars_per_token() + 0.3 * measured
         self._store.set_state(RATIO_KEY, f"{smoothed:.3f}")
@@ -170,8 +224,10 @@ class ContextBuilder:
     def after_outside(self, conversation: Conversation, message_id: int) -> bool:
         """Whether her context for this message still holds a reply or summary that followed outside text: an earlier
         message of the conversation in the window, or summarised, whose answer read outside text (or that was an audio
-        file or a photo), or a note of code's in her input that quotes outside text (`outside_notes`). A new
-        conversation (/new) starts without it."""
+        file or a photo), one that keep_days' prune deleted (`store.OUTSIDE_SEEN`; review I8), or a note of code's in her
+        input that quotes outside text (`outside_notes`). A new conversation (/new) starts without it."""
+        if self._store.get_state(f"{OUTSIDE_SEEN}{conversation.id}"):
+            return True
         for found_id, seq in self._store.outside_seqs(conversation.id):
             if found_id == message_id:
                 continue
@@ -342,7 +398,11 @@ class ContextBuilder:
             "role": "assistant",
             "content": "",
             "tool_calls": [
-                {"id": f"call_{c.id}", "type": "function", "function": {"name": c.name, "arguments": c.arguments}}
+                {
+                    "id": f"call_{c.id}",
+                    "type": "function",
+                    "function": {"name": c.name, "arguments": _replayed_arguments(c.arguments)},
+                }
                 for c in calls
             ],
         }
@@ -351,25 +411,124 @@ class ContextBuilder:
 
     def enforce_limit(self, conversation: Conversation) -> Conversation:
         """Emergency trim: far over budget, drop the oldest messages without a summary (logged); code's notes keep to
-        their own limit (`_limit_notes`)."""
+        their own limit (`_limit_notes`). Then the whole request within the model's context window (`_fit`)."""
         self._limit_notes(conversation)
         messages = self.window(conversation)
         total = self.window_tokens_of(messages)
-        if total <= self._emergency_tokens or len(messages) < 2:
+        if total > self._emergency_tokens and len(messages) >= 2:
+            sizes = [self.window_tokens_of([message]) for message in messages]
+            conversation = self._keep_newest(conversation, messages, sizes, self._window_tokens, f"window at {total}")
+        return self._fit(conversation)
+
+    def history_limit(self, conversation: Conversation) -> int:
+        """The history's tokens a summary keeps it under (the profiler's): `window_tokens`, or less when the model's
+        context leaves the history less room (`HISTORY_SHARE` of it)."""
+        room = self._history_room(conversation)
+        return self._window_tokens if room is None else max(0, min(self._window_tokens, int(room * HISTORY_SHARE)))
+
+    def _fit(self, conversation: Conversation) -> Conversation:
+        """The whole request within the model's context window (review I24: the 16 GB tier's 16,384 tokens, where the
+        history's own limits let Ollama cut the prompt without a word). Over it, the oldest messages leave her input
+        without a summary (logged), down to `HISTORY_SHARE` of the room the rest leaves them, so the next requests
+        keep the same start for Ollama's cache. Checked again after a trim: the snapshot it takes may be longer."""
+        if self.context_tokens is None:
             return conversation
+        while True:
+            messages = self.window(conversation)
+            sizes = [self._cost(message) for message in messages]
+            request = self._request(conversation)
+            if request + self._reserved() <= self.context_tokens or len(messages) < 2:
+                return conversation
+            keep = int((self.context_tokens - self._reserved() - (request - sum(sizes))) * HISTORY_SHARE)
+            trimmed = self._keep_newest(conversation, messages, sizes, keep, f"request at {request + self._reserved()}")
+            if trimmed is conversation:  # nothing more to drop
+                return conversation
+            conversation = trimmed
+
+    def _history_room(self, conversation: Conversation) -> int | None:
+        """The tokens the context leaves the history: the window minus the tools, the reply, the margin and the rest
+        of the request (rules, style, profile, summary, code's notes, the notes block); None without a context."""
+        if self.context_tokens is None:
+            return None
+        history = sum(self._cost(message) for message in self.window(conversation))
+        return self.context_tokens - self._reserved() - (self._request(conversation) - history)
+
+    def _keep_newest(
+        self, conversation: Conversation, messages: list[Message], sizes: list[int], keep: int, why: str
+    ) -> Conversation:
+        """The newest messages within `keep` tokens (the newest always): the window starts after the others, which
+        leave without a summary (logged), and a new snapshot is taken, as after a summary (review of 0.9.8, memory-3: a
+        fact saved in this chat, in her input only through code's note, left with that note until the next start)."""
         keep_from = len(messages) - 1
-        kept = self.window_tokens_of(messages[keep_from:])
-        while keep_from > 0:
-            previous = self.window_tokens_of([messages[keep_from - 1]])
-            if kept + previous > self._window_tokens:
-                break
+        kept = sizes[keep_from]
+        while keep_from > 0 and kept + sizes[keep_from - 1] <= keep:
             keep_from -= 1
-            kept += previous
+            kept += sizes[keep_from]
         if keep_from == 0:
             return conversation
         self._store.move_window_start(conversation.id, messages[keep_from - 1].seq or 0)
-        log.warning("window at %d tokens: dropped %d oldest messages without a summary", total, keep_from)
+        self.refresh_snapshot()
+        log.warning("%s tokens: dropped %d oldest messages without a summary", why, keep_from)
         return self._store.conversation(conversation.id)
+
+    def fit_turn(
+        self, messages: list[dict[str, Any]], reply_tokens: int, start: int
+    ) -> tuple[list[dict[str, Any]], int]:
+        """This answer's next request within the model's context window, with `reply_tokens` for her answer (review of
+        0.9.8, guards-2: on a 16 GB Mac a 3-page read or two web results plus a 2,000-token answer passed 16,384
+        tokens, and Ollama cut the request with nothing logged). `enforce_limit` fits the history before the answer;
+        here, over the window, the newest tool result from `start` on (this answer's) is cut at its end and ends with
+        code's line (`prompts.TOOL_RESULT_CUT`), then the one before it, until the request fits. The messages (the cut
+        ones new dicts) and the characters cut; nothing without a context."""
+        if self.context_tokens is None:
+            return messages, 0
+        fitted, cut = list(messages), 0
+        index = len(fitted) - 1
+        while index >= start and (over := self._over(fitted, reply_tokens)) > 0:
+            message = fitted[index]
+            content = message.get("content")
+            if message.get("role") != "tool" or not isinstance(content, str) or content == prompts.TOOL_RESULT_CUT:
+                index -= 1
+                continue
+            body = content.removesuffix(f"\n{prompts.TOOL_RESULT_CUT}")
+            drop = math.ceil(over * self.chars_per_token()) + len(prompts.TOOL_RESULT_CUT) + 1
+            kept = body[: max(0, len(body) - drop)].rstrip()
+            cut += len(body) - len(kept)
+            fitted[index] = {
+                **message,
+                "content": f"{kept}\n{prompts.TOOL_RESULT_CUT}" if kept else prompts.TOOL_RESULT_CUT,
+            }
+        return fitted, cut
+
+    def _over(self, messages: list[dict[str, Any]], reply_tokens: int) -> int:
+        """How many tokens a request of these messages, this setup's tools, a reply of `reply_tokens` and the margin
+        passes the model's context by (0 or less: it fits)."""
+        assert self.context_tokens is not None
+        request = sum(self._message_tokens(message) for message in messages)
+        tools = math.ceil(self._tools_chars / self.chars_per_token())
+        return request + tools + reply_tokens + CONTEXT_MARGIN_TOKENS - self.context_tokens
+
+    def _message_tokens(self, message: dict[str, Any]) -> int:
+        """A message's tokens as `json.dumps` counts it, each photo in it as `IMAGE_TOKENS` instead of its base64."""
+        content = message.get("content")
+        if not isinstance(content, list):
+            return self.estimate(json.dumps(message, ensure_ascii=False))
+        images = [part for part in content if isinstance(part, dict) and part.get("type") == "image_url"]
+        kept = [part for part in content if not (isinstance(part, dict) and part.get("type") == "image_url")]
+        return self.estimate(json.dumps({**message, "content": kept}, ensure_ascii=False)) + IMAGE_TOKENS * len(images)
+
+    def _reserved(self) -> int:
+        """Each request's tokens beside its messages: the tools, the reply and the margin."""
+        return math.ceil(self._tools_chars / self.chars_per_token()) + self._reply_tokens + CONTEXT_MARGIN_TOKENS
+
+    def _request(self, conversation: Conversation) -> int:
+        """The messages of the next request as built now (a text's: a call's are smaller), in tokens."""
+        return sum(self.estimate(json.dumps(message, ensure_ascii=False)) for message in self.build(conversation))
+
+    def _cost(self, message: Message) -> int:
+        """A message's tokens in a request: its own and its replayed tool calls'."""
+        trace = self._trace(message.id) if message.direction == "in" else []
+        return self.window_tokens_of([message]) + sum(self.estimate(json.dumps(m, ensure_ascii=False)) for m in trace)
 
     def is_fresh(self, conversation: Conversation) -> bool:
         """No messages yet in this conversation's window (so no prompt cache to protect)."""

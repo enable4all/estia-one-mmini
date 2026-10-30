@@ -161,6 +161,44 @@ async def test_an_expired_sign_in_pauses_one_mailbox_with_one_note(tmp_path: Pat
     assert h.sync.status_line(TZ).startswith("Mail: family ok")
 
 
+async def test_the_sign_in_note_is_not_sent_again_after_a_restart(tmp_path: Path, store: Store) -> None:
+    """Review O7 (0.9.7): the note's memory is in the database (the mailbox and a fingerprint of its sign-in, never
+    the token): a restart (a deploy, a reboot) sends no second note; a new sign-in that fails too gets one; a sync
+    that works clears it."""
+
+    def expired(h: Harness) -> None:
+        h.http.answers[TOKEN_URL] = []
+        h.http.add(TOKEN_URL, 400, {"error": "invalid_grant"})
+        h.folder("inbox", {"value": [], "@odata.deltaLink": f"{GRAPH}/d"})
+        h.folder("sent", {"value": [], "@odata.deltaLink": f"{GRAPH}/d"})
+
+    first = Harness(tmp_path, store)
+    expired(first)
+    await first.sync.sync_all()
+    assert len(first.notes) == 2
+    assert not any("rt-family" in str(row[0]) for row in store._conn.execute("SELECT value FROM state"))
+    restarted = Harness(tmp_path, store)  # the same tokens, a new process
+    expired(restarted)
+    await restarted.sync.sync_all()
+    assert restarted.notes == []
+    assert restarted.sync.status_line(TZ) == "Mail: family needs sign-in · work needs sign-in"
+    restarted.tokens.save(FAMILY.address, "rt-new")  # signed in again, and that sign-in fails too
+    await restarted.sync.sync_all()
+    assert restarted.notes == [
+        "Mailbox family needs a new sign-in: run scripts/mail-login.sh info@example.com on the Mac."
+    ]
+    working = Harness(tmp_path, store)  # works again: the next expiry is noted again
+    working.tokens.save(FAMILY.address, "rt-new")
+    working.folder("inbox", {"value": [], "@odata.deltaLink": f"{GRAPH}/d"})
+    working.folder("sent", {"value": [], "@odata.deltaLink": f"{GRAPH}/d"})
+    await working.sync.sync_account(FAMILY)
+    again = Harness(tmp_path, store)
+    again.tokens.save(FAMILY.address, "rt-new")
+    expired(again)
+    await again.sync.sync_account(FAMILY)
+    assert again.notes == ["Mailbox family needs a new sign-in: run scripts/mail-login.sh info@example.com on the Mac."]
+
+
 async def test_an_expired_delta_link_starts_the_folder_afresh(tmp_path: Path, store: Store) -> None:
     h = Harness(tmp_path, store)
     store.set_mail_delta_link("family", "inbox", f"{GRAPH}/old-delta")

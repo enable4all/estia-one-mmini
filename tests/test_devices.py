@@ -1,4 +1,6 @@
+import asyncio
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -157,6 +159,17 @@ async def test_ask_first_waits_for_the_users_yes(home: Home) -> None:
     assert await devices.confirm("yes") is None  # nothing pending any more
 
 
+async def test_a_second_change_of_the_same_device_replaces_the_first_question(home: Home) -> None:
+    """Review O6 (0.9.7): two device_set calls on one ask-first device in an answer: the note asks one yes, for the
+    change a yes would make (the last), never two lines of which one yes does only the last."""
+    devices = home.make()
+    await devices.set("heater", power="on")
+    await devices.set("heater", power="off")
+    assert devices.take_note() == "Devices: reply yes within 2 minutes to switch heater off"
+    assert await devices.confirm("yes") == "Devices: heater off"
+    assert home.sets() == [["set", "192.168.1.30", "--power", "off"]]
+
+
 @pytest.mark.parametrize(
     "answer",
     ["y", "ok", "OK.", "ja", "ναι", "do it", "👍", "[voice] Yes.", "[call] Yes.", "[call] okay", "Yes, please!"],
@@ -301,6 +314,52 @@ async def test_a_helper_that_cannot_start_is_a_failure(home: Home) -> None:
     )
 
 
+async def test_a_change_cut_off_by_a_cancel_still_goes_through_and_is_told(home: Home) -> None:
+    """A call hung up while the helper switches (review I13): the change is on its way, so it is finished and told
+    (the note, `recently_switched`), never a light that switched with no word."""
+    home.devices["192.168.1.20"]["sleep"] = 1
+    home.save()
+    devices = home.make()
+    task = asyncio.create_task(devices.set("living room lamp", power="off"))
+    await asyncio.sleep(0.3)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert devices.take_note() == "Devices: living room lamp off"
+    assert "living room lamp" in devices.recently_switched()
+    assert json.loads(home.path.read_text())["192.168.1.20"]["on"] is False
+
+
+async def test_a_yes_cut_off_by_a_cancel_still_goes_through_and_is_told(home: Home) -> None:
+    home.devices["192.168.1.30"]["sleep"] = 1
+    home.save()
+    devices = home.make()
+    await devices.set("heater", power="off")
+    devices.take_note()  # "reply yes within ..."
+    task = asyncio.create_task(devices.confirm("yes"))
+    await asyncio.sleep(0.3)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert devices.take_note() == "Devices: heater off" and "heater" in devices.recently_switched()
+
+
+async def test_a_status_read_cut_off_by_a_cancel_stops_its_helper(home: Home) -> None:
+    home.devices["192.168.1.21"]["sleep"] = 5
+    home.save()
+    devices = home.make()
+    task = asyncio.create_task(devices.status("bedroom light"))
+    pid_file = Path(f"{home.path}.pid")
+    async with asyncio.timeout(5):
+        while not pid_file.exists():
+            await asyncio.sleep(0.02)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    with pytest.raises(ProcessLookupError):  # stopped and reaped, never left running
+        os.kill(int(pid_file.read_text()), 0)
+
+
 async def test_cancel_drops_a_pending_action(home: Home) -> None:
     devices = home.make()
     await devices.set("heater", power="off")
@@ -344,8 +403,22 @@ async def test_on_a_call_the_tool_asks_for_a_spoken_yes(home: Home) -> None:
     devices = home.make()
     result = await devices.set("heater", power="off", spoken=True)
     assert "Ask the user to say yes" in result and "reply" not in result
-    typed = await home.make().set("heater", power="off")
-    assert "Ask the user to reply yes" in typed
+    # code's texted note too (review of 0.9.7, C14: a typed yes during a call waits for its end, and then the question
+    # is gone)
+    assert devices.take_note() == "Devices: say yes on the call within 2 minutes to switch heater off"
+    typed = home.make()
+    assert "Ask the user to reply yes" in await typed.set("heater", power="off")
+    assert typed.take_note() == "Devices: reply yes within 2 minutes to switch heater off"
+
+
+async def test_a_spoken_question_is_dropped_from_the_note_by_a_cancel_or_an_answer(home: Home) -> None:
+    devices = home.make()
+    await devices.set("heater", power="off", spoken=True)
+    devices.cancel()
+    assert devices.take_note() == ""
+    await devices.set("heater", power="off", spoken=True)
+    assert await devices.confirm("[call] no") is None
+    assert devices.take_note() == ""
 
 
 @pytest.mark.parametrize(
@@ -738,3 +811,27 @@ async def test_a_light_gone_from_the_bridge_is_one_device_not_the_part(hue_home:
     hue_home.save()
     await devices.reachability()
     assert status.snapshot() == {"devices": Record(ok=NOW, failed=NOW, reason="no_light")}
+
+
+async def test_a_hold_names_its_own_reason_when_given(home: Home) -> None:
+    """Second review of 0.9.8, guards-4: after a photo the request came with no mail, page or file."""
+    devices = home.make()
+    result = await devices.set("living room lamp", power="off", confirm_first=True, held="a photo is shown with it")
+    assert result.startswith("Not done: living room lamp needs the user's yes first, because a photo is shown with it.")
+    assert "mail, page or file" not in result and home.sets() == []
+
+
+def test_the_set_for_later_guard_reads_a_device_word_only_one_device_holds(home: Home) -> None:
+    """Second review of 0.9.8, guards-3: SECURITY.md's own example, "the lamp is scheduled to be switched off", names the
+    living room lamp (the only lamp); "the lights" are no one device, and a word two devices hold names neither."""
+    devices = home.make()
+    assert devices.named_in("The lamp is scheduled to be switched off at 16:30.") == {"living room lamp"}
+    assert devices.named_in("The light will switch off at 22:00.") == {"bedroom light"}
+    assert devices.named_in("The Eiffel Tower's lights will be turned off at 23:45.") == set()
+    assert devices.named_in("The bedroom one turns off at 7.") == {"bedroom light"}  # a word of its own name, as before
+    specs = (
+        DeviceSpec("hall light", "192.168.1.40", "light", "normal"),
+        DeviceSpec("porch light", "192.168.1.41", "light", "normal"),
+    )
+    cfg = Config(bot_number="+306900000000", allowed_acis=frozenset({ME}), tapo_devices=specs, tapo_helper=home.helper)
+    assert Devices(cfg).named_in("The light will switch off at 22:00.") == set()

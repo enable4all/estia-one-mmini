@@ -8,7 +8,7 @@ The state file holds {"<host or light id>": device}; a device is {"alias", "kind
 unreachable. "hue-set" acts as "set" on a Hue light's id; "hue-status <id> [<id> ...]" answers like the real helper,
 {"ok": true, "lights": {"<id>": answer or failure}}, and a problem of the bridge ("not_paired", "key", "certificate") on
 any of them fails the whole run. Every call's arguments are appended to <state>.calls (one JSON list per line) and the
-names of its environment variables written to <state>.env.
+names of its environment variables written to <state>.env, its process id to <state>.pid.
 """
 
 from __future__ import annotations
@@ -54,6 +54,7 @@ def main() -> None:
     with Path(f"{path}.calls").open("a") as calls:
         calls.write(json.dumps(args) + "\n")
     Path(f"{path}.env").write_text(json.dumps(sorted(os.environ)))
+    Path(f"{path}.pid").write_text(str(os.getpid()))  # the latest run's process (a test checks it was stopped)
     devices: dict[str, dict[str, Any]] = json.loads(path.read_text())
     if args[0] == "discover":
         found = [{"host": host, "alias": d["alias"], "kind": d["kind"]} for host, d in devices.items() if "alias" in d]

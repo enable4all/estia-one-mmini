@@ -6,8 +6,8 @@ Thanks for looking at Estia. Keep changes small, tested and free of personal dat
 
 - Requirements: see the **Requirements** section of [GUIDE.md](GUIDE.md).
 - `uv sync` installs the bridge's development environment (Python 3.13).
-- `scripts/verify.sh` runs the privacy check (`scripts/privacy_scan.py`), ruff (lint and format), mypy in strict mode
-  and pytest. Run it before every commit. To run the privacy check on every commit as well:
+- `scripts/verify.sh` runs the privacy check (`scripts/privacy_scan.py`), ShellCheck over every shell script
+  (`brew install shellcheck`; without it, one line says so), ruff (lint and format), mypy in strict mode and pytest. Run it before every commit. To run the privacy check on every commit as well:
   `git config core.hooksPath .githooks` (this replaces `.git/hooks`; if you already have a pre-commit hook, call
   `.githooks/pre-commit` from it instead).
 - The helpers have their own tests:

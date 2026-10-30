@@ -53,6 +53,9 @@ def speech_probability(pcm16k: bytes) -> float:
     return 1.0 if blocks and tonal >= 0.3 * len(blocks) else 0.02
 
 
+ERASED_OFF_CALLS = frozenset({"thank you", "thank you.", "thanks.", "bye."})  # VoiceCore's cleanTranscript (review I23)
+
+
 class FakeVoiceService:
     """Answers like voice-service; tests set `transcript`, force a status per path, and read `requests` and the
     language each one asked for (`request_languages`)."""
@@ -61,7 +64,8 @@ class FakeVoiceService:
         self.transcript = "Turn off the lamp."
         self.duration = 2.4
         self.speech = wav()
-        self.health = {"stt": "ready", "tts": "ready"}
+        self.stand_in = ""  # X-Voice-Stand-In on speech once set: another voice said it in the asked one's place
+        self.health: dict[str, object] = {"stt": "ready", "tts": "ready"}
         self.languages: list[str] | None = None  # in the health once set (a service that can do languages)
         self.vad: str | None = None  # the detector's state in the health once set ("ready", "loading", ...)
         self.vad_delay = 0.0  # seconds before /vad answers (a slow service)
@@ -70,6 +74,7 @@ class FakeVoiceService:
         self.turn_p = 0.9  # how sure Smart Turn's stand-in is that the sentence is finished
         self.turn_delay = 0.0  # seconds before /turn answers (a slow service)
         self.turn_answer: bytes | None = None  # a /turn body to send instead of the probability
+        self.speech_delay = 0.0  # seconds before /v1/audio/speech answers (a slow voice)
         self.status: dict[str, int] = {}  # path → status to answer with instead
         self.requests: list[tuple[str, str, dict[str, str], bytes]] = []  # method, path (with query), headers, body
         self.request_languages: list[str] = []  # per transcription or speech request
@@ -79,9 +84,17 @@ class FakeVoiceService:
             def log_message(self, format: str, *args: Any) -> None:  # quiet tests
                 pass
 
-            def _answer(self, status: int, body: bytes, content_type: str = "application/json") -> None:
+            def _answer(
+                self,
+                status: int,
+                body: bytes,
+                content_type: str = "application/json",
+                extra: dict[str, str] | None = None,
+            ) -> None:
                 self.send_response(status)
                 self.send_header("Content-Type", content_type)
+                for name, value in (extra or {}).items():
+                    self.send_header(name, value)
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
@@ -120,10 +133,18 @@ class FakeVoiceService:
                 elif path.startswith("/v1/audio/") and language not in CODES:
                     self._answer(400, json.dumps({"error": f"unsupported language: {language}"}).encode())
                 elif path == "/v1/audio/transcriptions":
-                    answer = {"text": service.transcript, "duration": service.duration}
+                    # as VoiceCore's cleanTranscript: a bare thanks or bye is erased unless it is a call's (?call=1)
+                    called = "call=1" in query.split("&")
+                    erased = not called and service.transcript.lower() in ERASED_OFF_CALLS
+                    answer = {"text": "" if erased else service.transcript, "duration": service.duration}
                     self._answer(200, json.dumps(answer).encode())
                 elif path == "/v1/audio/speech":
-                    self._answer(200, service.speech, "audio/wav")
+                    time.sleep(service.speech_delay)
+                    stand_in = {"X-Voice-Stand-In": service.stand_in} if service.stand_in else {}
+                    if stand_in and language == "en" and json.loads(body).get("kokoro") is False:
+                        self._answer(409, b'{"error":"no_stand_in"}')  # Kokoro not asked: nothing said (calls-03)
+                    else:
+                        self._answer(200, service.speech, "audio/wav", stand_in)
                 else:
                     self._answer(404, b'{"error":"not_found"}')
 

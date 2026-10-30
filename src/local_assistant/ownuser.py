@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import functools
+import grp
 import json
 import os
 import plistlib
@@ -40,20 +41,39 @@ from local_assistant.hostsec import (
     CHOWN,
     DSCL,
     DSEDITGROUP,
+    ID_ASK,
+    ID_DIGITS,
+    KEY_ASK,
+    KEY_LENGTH,
     LAUNCHCTL,
     LINK_OUT,
+    NUMBERLESS_STEPS,
     RM,
+    SIGNAL_LOGIN_INTRO,
+    SIGNAL_LOGIN_STOPPED,
     SUDO,
     SYSADMINCTL,
     TAR,
+    TOTP_ASK,
+    TOTP_DIGITS,
+    TOTP_QUESTION,
+    USERNAME_ASK,
     VENDOR,
     Check,
     Host,
+    account_id,
+    ask_tty,
     clean,
     estia_root,
+    id_character,
+    key_character,
+    read_hidden_lines,
+    recovery_key,
     signal_account,
     strays,
     tail,
+    totp_code,
+    username,
 )
 
 __all__ = ["LAUNCHCTL", "Check", "Host"]
@@ -71,21 +91,24 @@ MARKER = CODE / "migration.json"  # the move: who, when, where her old folders a
 SAVED = CODE / "rollback"  # the old service files, kept for the rollback
 HELD = SAVED / "data"  # her old folders from your home, moved here (0700, root only) until the rollback or remove-old
 DAEMONS = Path("/Library/LaunchDaemons")
-# her services' output (stdout and stderr): launchd opens these files as root, so they are in a folder only root can
-# change (root's, 0755), never one of hers; each file is hers (0600), emptied in-process (app.cap_streams, LogCap)
+# her services' output (stdout and stderr): launchd opens and appends to these files as the job's user (UserName: her
+# account), never as root (M01, 30 Oct: with the file missing from this folder, launchd refused to start the job, exit
+# 78), so each must be there and hers (0600) before launchd starts the job (make_stream_logs, ollama_build.log_steps);
+# the folder is root's (0755), never one of hers, which stops a link being planted at those names. She empties them
+# in-process (app.cap_streams, LogCap)
 STREAM_LOGS = Path("/var/log/estia")
 NEWSYSLOG = Path("/etc/newsyslog.d/local-assistant.conf")  # the old log rotation rule (logs now rotate themselves)
 BRIDGE = "com.local-assistant.bridge"
 VOICE = "com.local-assistant.voice"
 LABELS = (BRIDGE, VOICE)
 STREAM_LOG = {BRIDGE: "launchd.log", VOICE: "voice.log"}  # each service's output file in STREAM_LOGS
-# her services' output in her own folder (an install from before STREAM_LOGS): launchd opens it as root, so a link
-# of hers there leads root's writes anywhere; a ✗ until the tools' update and one more deploy move it
-LOGS_IN_HER_FOLDER = (
-    "its output is in her own folder, which launchd opens as root: "
-    "a program of her account could make root write into a file it names"
-)
+# her services' output in her own folder (an install from before STREAM_LOGS): her account can plant a link at that
+# name, which launchd follows as her account (never as root: M01, 30 Oct), so only into files she can change already;
+# a ✗ until the tools' update and one more deploy move it
+LOGS_IN_HER_FOLDER = "its output is in her own folder, where her account can put a link in its place"
 ROLLBACK_DAYS = 7
+FAILED_LOG_LINES = 20  # launchd.log's last lines (bridge.log: its last 10 warnings and errors) after a failed move
+TAIL = "/usr/bin/tail"
 # her group's number (dseditgroup -i): the highest one in 450-499 no user and no group has. sysadminctl is given it as
 # -UID too, but ignores -UID (and -home) for a role account on macOS 27: her account's own number is the one it picks
 ROLE_IDS = range(499, 449, -1)
@@ -135,7 +158,30 @@ VOICE_LOADING_NO_CALLS = "voice: loading (up to about 15 minutes)"
 VOICE_WAIT_SECONDS = 120.0 + 2 * 15.0
 VOICE_POLL_SECONDS = 5.0
 VOICE_WAITING = f"voice: loading (checking again for up to {VOICE_WAIT_SECONDS:.0f} s)"
-VOICE_STOPPED = "voice: not checked to the end (stopped); curl -s http://127.0.0.1:8150/health shows it"
+VOICE_STOPPED = f"voice: not checked to the end (stopped); {ESTIA} check shows it"  # as her: it answers only her
+VOICE_STOPPED_YOURS = "voice: not checked to the end (stopped); scripts/check.sh shows it"  # before her own user
+CURL = "/usr/bin/curl"
+# her voice service answers only programs of her own account (owner, 25 Oct): root (the move, an update) and you
+# (setup) read its health with curl run as her, -n: root needs no password, you only an admin sign-in still running;
+# -q: no curlrc of hers; -f: a refusal (403) is curl's exit 22, never an answer; env -i: no PATH or proxy of anyone's
+VOICE_HEALTH_AS_HER = (
+    *(SUDO, "-n", "-u", ROLE_USER, "-H", "--", "/usr/bin/env", "-i", f"HOME={HOME}", "PATH=/usr/bin:/bin"),
+    *(CURL, "-q", "-s", "-f", "--max-time", "5", "--max-filesize", "10000", VOICE_HEALTH_URL),
+)
+VOICE_READ_SECONDS = 10.0  # sudo and curl together, at most
+SUDO_NEEDS_PASSWORD = 1  # sudo -n's exit when it would ask (curl's 1, an unsupported protocol, cannot happen here)
+CURL_HTTP_ERROR = 22  # curl -f: the service answered with an error (her voice service's 403)
+# why her voice was not read as her (review R2-F1, R2-F4: both printed the loading line, like a real load)
+# the wait for her voice after its install, as her, one admin command (scripts/install-voice-daemon.sh's own text, one
+# line: setup's window runs it too; up to 240 looks 5 s apart); it always ends with the last answer it read
+VOICE_WAIT_AS_HER = (
+    'state=""; for _ in $(seq 1 240); do state="$(curl -q -s --max-time 2 --max-filesize 10000 '
+    'http://127.0.0.1:8150/health || true)"; if [[ "$state" == *"\\"stt\\":\\"ready\\""* && "$state" == '
+    '*"\\"tts\\":\\"ready\\""* || "$state" == *failed* ]]; then break; fi; sleep 5; done; printf "%s" "$state"'
+)
+VOICE_NOT_SIGNED_IN = "no admin sign-in running"
+VOICE_REFUSED_HER = "her voice service refused it"
+VOICE_NOT_READ = "voice: not read as her ({why}); " + f"{ESTIA} check shows it"
 DEPLOY_CMD = f"{SUDO} {BIN}/estia-deploy"
 HER_PATH = f"{CURRENT}/.venv/bin:/usr/bin:/bin:/usr/sbin:/sbin"  # no folder you can change
 _PATH_ALLOWED = frozenset(HER_PATH.split(":"))
@@ -191,7 +237,23 @@ def free_id(uids: set[int], gids: set[int], candidates: range = ROLE_IDS) -> int
     for number in candidates:
         if number not in uids and number not in gids:
             return number
-    raise RuntimeError("no free number in 450-499 for her group (no user and no group may have it)")
+    raise RuntimeError(
+        f"no free number in {candidates[-1]}-{candidates[0]} for her group (no user and no group may have it)"
+    )
+
+
+# sysadminctl's own words for its role-account range ("UID in 450-499 range" in its usage on macOS 27)
+_RANGE = re.compile(r"\b(\d{2,5})\s*(?:-|–|to)\s*(\d{2,5})\b")
+
+
+def role_range(said: str) -> range | None:
+    """The role-account range sysadminctl names in `said` (on a line that says "range"), highest first; None when it
+    names none."""
+    for line in said.splitlines():
+        found = _RANGE.search(line) if "range" in line.lower() else None
+        if found and int(found.group(1)) < int(found.group(2)):
+            return range(int(found.group(2)), int(found.group(1)) - 1, -1)
+    return None
 
 
 def account_plan(number: int, *, group: bool = True) -> list[tuple[str, ...]]:
@@ -234,11 +296,34 @@ def account_settings() -> list[tuple[str, ...]]:
     ]
 
 
-def account_problem(record: str) -> str | None:
+STAFF = 20  # macOS's group of every person's account: the group of your home folder (drwxr-x---)
+
+
+def group_name(number: int | None) -> str:
+    """A group by its name and number ("staff (20)"), for a line a person reads."""
+    if number is None:
+        return "a group not read"
+    try:
+        return f"{grp.getgrgid(number).gr_name} ({number})"
+    except KeyError:
+        return f"group {number}"
+
+
+def her_group_id() -> int | None:
+    """Her own group's number, as the group database shows it to anyone (None: no such group)."""
+    try:
+        return grp.getgrnam(ROLE_GROUP).gr_gid
+    except KeyError:
+        return None
+
+
+def account_problem(record: str, group: int | None = None) -> str | None:
     """What is wrong with her directory record as `dscl . -read` shows it (UserShell, IsHidden, Password,
-    AuthenticationAuthority; None: no shell, hidden, no password). Its home stays /var/empty: macOS keeps it, and her
-    services get theirs explicitly. dscl names a native attribute with its prefix ("dsAttrTypeNative:IsHidden: 1",
-    live on macOS 27): the prefix is left out before the key is read."""
+    AuthenticationAuthority, PrimaryGroupID; None: no shell, hidden, no password, her own group). Its home stays
+    /var/empty: macOS keeps it, and her services get theirs explicitly. dscl names a native attribute with its prefix
+    ("dsAttrTypeNative:IsHidden: 1", live on macOS 27): the prefix is left out before the key is read. Her primary
+    group is never staff, and is `group` (her own group's number) when given (second deep scan,
+    macos-primary-group-unchecked: in staff her account reads every file your group may read in your home)."""
     values: dict[str, str] = {}
     for line in record.splitlines():
         key, sep, value = line.removeprefix(DSCL_NATIVE).partition(":")
@@ -252,17 +337,80 @@ def account_problem(record: str) -> str | None:
         return "it has a way to log in (AuthenticationAuthority)"
     if values.get("Password") != "*":
         return 'its password is not "*" (none)'
+    primary = values.get("PrimaryGroupID", "")
+    if primary.isdigit() and (int(primary) == STAFF or (group is not None and int(primary) != group)):
+        return (
+            f"its primary group is {group_name(int(primary))}, not {ROLE_GROUP}: it reads every file that group may "
+            "read"
+        )
     return None
+
+
+def _failed(argv: Sequence[str], code: int, out: str) -> RuntimeError:
+    why = tail(out)
+    return RuntimeError(
+        f"{Path(argv[0]).name} {' '.join(argv[1:3])} … failed (exit {code})" + (f": {why}" if why else "")
+    )
 
 
 def run_checked(host: Host, argv: Sequence[str]) -> None:
     """A fixed argv through `host`; a non-zero exit raises with the tool's last lines (it never prints a secret)."""
     code, out = host.run(list(argv))
     if code != 0:
-        why = tail(out)
+        raise _failed(argv, code, out)
+
+
+# sysadminctl may end without an error and make no account (an older macOS and its role-account numbers: untested);
+# the move then says what comes back, `estia account` prints it as its ✗, with what sysadminctl said and the macOS
+# version (second deep scan, macos-account-not-made-no-reason: its reason was dropped)
+ACCOUNT_NOT_MADE = (
+    "macOS made no account {user}: sysadminctl -addUser ended without an error, but the account is not there "
+    "(number {number}; macOS {version}; tested on macOS 27 only). sysadminctl said: {said}"
+)
+# her primary group set to her own group's number after sysadminctl (it may ignore -GID as it ignores -UID), and
+# refused (second deep scan, macos-primary-group-unchecked)
+GROUP_NOT_SET = (
+    "macOS kept {now} as {user}'s primary group, not {group} ({number}): {why}. In staff her account reads every "
+    "file your group may read in your home; tested on macOS 27 only"
+)
+SW_VERS = "/usr/bin/sw_vers"
+
+
+def _macos_version(host: Host) -> str:
+    """This Mac's macOS version for a line a person reports (sw_vers), or "not read"."""
+    code, out = host.run([SW_VERS, "-productVersion"], read_only=True)
+    version = out.strip()
+    return version if code == 0 and re.fullmatch(r"\d+(?:\.\d+){0,2}", version) else "not read"
+
+
+def _primary_group(host: Host) -> int | None:
+    """Her account's primary group as dscl shows it (None: not read)."""
+    code, record = host.run([DSCL, ".", "-read", f"/Users/{ROLE_USER}", "PrimaryGroupID"], read_only=True)
+    found = re.search(r"PrimaryGroupID:\s*(\d+)", record) if code == 0 else None
+    return int(found.group(1)) if found else None
+
+
+def _own_group(host: Host, number: int) -> None:
+    """Her primary group is her own group: set when dscl shows another (staff, when sysadminctl ignored -GID); one
+    macOS refuses raises GROUP_NOT_SET."""
+    now = _primary_group(host)
+    if now == number:
+        return
+    argv = [DSCL, ".", "-create", f"/Users/{ROLE_USER}", "PrimaryGroupID", str(number)]
+    code, out = host.run(argv)
+    if code != 0:
         raise RuntimeError(
-            f"{Path(argv[0]).name} {' '.join(argv[1:3])} … failed (exit {code})" + (f": {why}" if why else "")
+            GROUP_NOT_SET.format(
+                now=group_name(now), user=ROLE_USER, group=ROLE_GROUP, number=number, why=tail(out) or f"exit {code}"
+            )
         )
+
+
+def _account_there(host: Host) -> bool:
+    """Her account, right after sysadminctl: the user database, else dscl's own record of it."""
+    if lookup_uid(ROLE_USER) is not None:
+        return True
+    return host.run([DSCL, ".", "-read", f"/Users/{ROLE_USER}", "UniqueID"], read_only=True)[0] == 0
 
 
 def make_account(host: Host, say: Callable[[str], None], *, dry: bool = False) -> None:
@@ -278,15 +426,37 @@ def make_account(host: Host, say: Callable[[str], None], *, dry: bool = False) -
             number, group = int(found.group(1)), False  # an earlier run made her group
         else:
             number, group = free_id(ids_in(users), ids_in(groups)), True
-        for argv in account_plan(number, group=group):
+        *before, add = account_plan(number, group=group)
+        for argv in before:
             run_checked(host, argv)
+        code, said = host.run(list(add))  # its output kept: it may say why and still end with 0
+        other = role_range(said)
+        if (code != 0 or (host.live and not _account_there(host))) and other is not None and number not in other:
+            # plat-02: another macOS's role-account range, named in sysadminctl's own words: its highest free number
+            # (her group keeps its own; macOS 27 ignores -UID and picks one in 450-499 itself)
+            uid = free_id(ids_in(users), ids_in(groups), other)
+            add = (*add[: add.index("-UID") + 1], str(uid), *add[add.index("-UID") + 2 :])
+            code, said = host.run(list(add))
+        if code != 0:
+            raise _failed(add, code, said)
+        if host.live and not _account_there(host):  # review host-role-account: tested on macOS 27 only
+            version = _macos_version(host)
+            raise RuntimeError(
+                ACCOUNT_NOT_MADE.format(user=ROLE_USER, number=number, version=version, said=tail(said) or "nothing")
+            )
+        own: int | None = number
     else:
         say(f"user {ROLE_USER}: there already")
+        code, record = host.run([DSCL, ".", "-read", f"/Groups/{ROLE_GROUP}", "PrimaryGroupID"], read_only=True)
+        found = re.search(r"PrimaryGroupID:\s*(\d+)", record) if code == 0 else None
+        own = int(found.group(1)) if found else None
     for argv in account_settings():
         if "-delete" in argv:
             host.run(list(argv))  # fails when the attribute is not there: that is fine
         else:
             run_checked(host, argv)
+    if own is not None:
+        _own_group(host, own)
     home = host.path(HOME)
     if dry:
         say(f"would make {HOME} (0700)")
@@ -362,9 +532,11 @@ def read_plist(path: Path) -> dict[str, Any] | None:
 
 def plist_problem(plist: Mapping[str, Any], label: str) -> str | None:
     """What makes a service file anything but hers (None when it is): its label, her user and group, a program and
-    working folder under `current`, her home, a PATH of root-owned folders only, its output in /var/log/estia (a
-    root-owned folder: launchd opens it as root), and no other keys (no sockets, no other environment such as DYLD_*
-    or PYTHON*)."""
+    working folder under `current` (no ".." on the way), her home, a PATH of root-owned folders only, her templates'
+    settings (Umask 63: her files 0600 and folders 0700; RunAtLoad and KeepAlive true; ThrottleInterval a whole
+    number of 10 seconds or more: second deep scan, macos-plist-values-unchecked), its output in /var/log/estia (a
+    root-owned folder, so no link can be planted at its names; launchd opens it as her account, never as root), and no
+    other keys (no sockets, no other environment such as DYLD_* or PYTHON*)."""
     if plist.get("Label") != label:
         return f"Label is not {label}"
     extra = sorted(set(plist) - _PLIST_KEYS)
@@ -387,8 +559,16 @@ def plist_problem(plist: Mapping[str, Any], label: str) -> str | None:
     if "PATH" in env and any(entry not in _PATH_ALLOWED for entry in str(env["PATH"]).split(":")):
         return f"PATH has a folder outside {HER_PATH}"
     folder = str(plist.get("WorkingDirectory", CURRENT))
-    if folder != str(CURRENT) and not folder.startswith(f"{CURRENT}/"):
+    if (folder != str(CURRENT) and not folder.startswith(f"{CURRENT}/")) or ".." in Path(folder).parts:
         return f"WorkingDirectory is not under {CURRENT}"
+    if plist.get("Umask") != 0o77 or isinstance(plist.get("Umask"), bool):
+        return "Umask is not 63 (her files 0600, her folders 0700)"
+    for key in ("RunAtLoad", "KeepAlive"):
+        if plist.get(key) is not True:
+            return f"{key} is not true"
+    throttle = plist.get("ThrottleInterval")
+    if not isinstance(throttle, int) or isinstance(throttle, bool) or throttle < 10:
+        return "ThrottleInterval is not a whole number of 10 seconds or more"
     for key in ("StandardOutPath", "StandardErrorPath"):
         value = str(plist.get(key, ""))
         if value and Path(value).parent == HOME / "Library/Logs/local-assistant" and ".." not in value:
@@ -400,10 +580,11 @@ def plist_problem(plist: Mapping[str, Any], label: str) -> str | None:
 
 def make_stream_logs(host: Host) -> None:
     """/var/log/estia (root's, 0755) and each service's output file in it (0600; hers on the Mac), made before launchd
-    opens them as root: in a folder only root can change, so no link of hers is ever followed. A file there is kept
-    (never emptied). A name that is not a regular file of hers with one name (her account may `ln` her file from her
-    home: the same volume) is unlinked and made fresh, never followed and never refused: a refusal would let her
-    account stop every update."""
+    starts her services: launchd opens and appends to them as her account, never as root, so a missing one stops the
+    start (M01, 30 Oct). The folder is one only root can change, so no link of hers can be planted at those names and
+    root follows none. A file there is kept (never emptied). A name that is not a regular file of hers with one name
+    (her account may `ln` her file from her home: the same volume) is unlinked and made fresh, never followed and never
+    refused: a refusal would let her account stop every update."""
     folder = host.path(STREAM_LOGS)
     folder.parent.mkdir(parents=True, exist_ok=True)
     with contextlib.suppress(FileExistsError):
@@ -469,6 +650,7 @@ def read_account() -> str:
             "IsHidden",
             "Password",
             "AuthenticationAuthority",
+            "PrimaryGroupID",
         ],
         capture_output=True,
         text=True,
@@ -478,13 +660,13 @@ def read_account() -> str:
     return done.stdout
 
 
-def _user_check(root: Path, account: Callable[[], str] | None) -> Check:
+def _user_check(root: Path, account: Callable[[], str] | None, group: Callable[[], int | None] | None = None) -> Check:
     uid = lookup_uid(ROLE_USER)
     if uid is None:
         return Check(
             "own_user",
             "fail",
-            "Own user",
+            "Own macOS account",
             f"the user {ROLE_USER} does not exist",
             f"{ESTIA} account makes it again (no shell, hidden, no password)",
         )
@@ -497,7 +679,7 @@ def _user_check(root: Path, account: Callable[[], str] | None) -> Check:
         return Check(
             "own_user",
             "fail",
-            "Own user",
+            "Own macOS account",
             f"{HOME} is missing",
             f"{ESTIA} rollback brings back your copy of her data (within {ROLLBACK_DAYS} days of the move)"
             if held  # a new install keeps no copy; after the 7 days or remove-old none is left
@@ -507,22 +689,25 @@ def _user_check(root: Path, account: Callable[[], str] | None) -> Check:
         return Check(
             "own_user",
             "fail",
-            "Own user",
+            "Own macOS account",
             f"{HOME} is not hers alone (mode {stat.S_IMODE(info.st_mode):o})",
             f"{SUDO} {CHOWN} {ROLE_USER}:{ROLE_GROUP} {HOME} && {SUDO} {CHMOD} 700 {HOME}",
         )
     if account is not None:
-        problem = account_problem(account())
+        problem = account_problem(account(), group() if group is not None else None)
         if problem:
             return Check(
                 "own_user",
                 "fail",
-                "Own user",
+                "Own macOS account",
                 f"{ROLE_USER}: {problem}",
-                f"{ESTIA} account sets it again (no shell, hidden, no password)",
+                f"{ESTIA} account sets it again (no shell, hidden, no password, her own group)",
             )
     return Check(
-        "own_user", "ok", "Own user", f"she runs as {ROLE_USER} (no password, no login): only that user reads {HOME}"
+        "own_user",
+        "ok",
+        "Own macOS account",
+        f"she runs as {ROLE_USER} (no password, no login): only that user reads {HOME}",
     )
 
 
@@ -695,9 +880,12 @@ def read_marker(root: Path) -> dict[str, Any] | None:
 
 
 def held_copy(marker: Mapping[str, Any] | None) -> bool:
-    """Whether the move's record holds her old folders for a rollback: a move from an install that ran as you, not
-    rolled back and not removed. A new install (`fresh`) holds none."""
-    return marker is not None and not (marker.get("removed") or marker.get("rolled_back") or marker.get("fresh"))
+    """Whether the move's record holds her old folders: a move from an install that ran as you, not rolled back and
+    not removed; a move that did not finish (`moving`: a hard stop after the hold), a new install's too. A finished
+    new install (`fresh`) holds none."""
+    if marker is None or marker.get("removed") or marker.get("rolled_back"):
+        return False
+    return bool(marker.get("moving")) or not marker.get("fresh")
 
 
 def _rollback_check(root: Path, now: float) -> Check | None:
@@ -707,6 +895,15 @@ def _rollback_check(root: Path, now: float) -> Check | None:
     moved_at = float(marker.get("moved_at", 0))
     until = moved_at + ROLLBACK_DAYS * 86400
     day = time.strftime("%Y-%m-%d", time.localtime(until))
+    if marker.get("moving"):  # a hard stop after the hold: the record was written before each folder was held
+        back = "" if marker.get("fresh") else f" ({ESTIA} rollback goes back until {day})"
+        return Check(
+            "rollback",
+            "warn",
+            "Old copy",
+            f"the move did not finish: her old folders are held in {HELD} (root only){back}",
+            f"{ESTIA} remove-old",
+        )
     if now < until:
         return Check(
             "rollback",
@@ -723,10 +920,16 @@ def _rollback_check(root: Path, now: float) -> Check | None:
     )
 
 
-def install_checks(root: Path = Path("/"), *, account: Callable[[], str] | None = None) -> list[Check]:
+def install_checks(
+    root: Path = Path("/"),
+    *,
+    account: Callable[[], str] | None = None,
+    group: Callable[[], int | None] | None = None,
+) -> list[Check]:
     """Doctor's lines for her own user: the user and its home, the root-owned code, the service files and the rollback
     window. Read-only. Nothing installed at all: no line (doctor's daemon line covers it); the services running as the
-    owner: one warning that names the migration. `account`: her directory record (read on the real Mac only)."""
+    owner: one warning that names the migration. `account`: her directory record, `group`: her own group's number
+    (both read on the real Mac only)."""
     daemons = root / DAEMONS.relative_to("/")
     plists = {label: read_plist(daemons / f"{label}.plist") for label in LABELS}
     if not moved(root):
@@ -736,23 +939,66 @@ def install_checks(root: Path = Path("/"), *, account: Callable[[], str] | None 
             Check(
                 "own_user",
                 "warn",
-                "Own user",
+                "Own macOS account",
                 "she runs as your user: every program you run can read her data and change her code",
-                f"move her into her own user: {MIGRATE} --dry-run, then the same without --dry-run",
+                f"move her into her own macOS account: {MIGRATE} --dry-run, then the same without --dry-run",
             )
         ]
     if account is None and root == Path("/"):
         account = read_account
-    checks = [_user_check(root, account), _code_check(root), _plists_check(root, plists)]
-    window = _rollback_check(root, time.time())
-    if window is not None:
-        checks.append(window)
+    if group is None and root == Path("/"):
+        group = her_group_id
+    checks = [_user_check(root, account, group), _code_check(root), _plists_check(root, plists)]
+    checks += [check for check in (_tools_check(root), _rollback_check(root, time.time())) if check is not None]
     return checks
 
 
-def her_programs(cfg: Any, root: Path = Path("/")) -> list[tuple[str, Path]]:
+def _tools_check(root: Path) -> Check | None:
+    """Doctor's line when the root-run tools are not the live release's (a file root runs, or their Python): each
+    deploy says it once; this names it until --update-tools takes them. None when they are the same or cannot be
+    compared."""
+    from local_assistant import deploy  # deploy imports this module
+
+    code = root / CODE.relative_to("/")
+    if not (code / "tools" / "tools.json").is_file() or not (code / "current").is_dir():
+        return None
+    compromised = 'follow SECURITY.md, "If the Mac is compromised"'
+    for whose, folder, fix in (  # your account builds a release's Python; only root can change theirs
+        ("their own Python", code / "tools", f"only root can change it: {compromised}"),
+        (
+            "the live release's Python",
+            code / "current",
+            f"{DEPLOY_CMD} from a checkout you trust (it builds a new one); if it comes back, {compromised}",
+        ),
+    ):
+        found = deploy.startup_files(folder.resolve() / "python")
+        if found:
+            return Check(
+                "tools",
+                "fail",
+                "Root-run tools",
+                f"{whose} holds {deploy.startup_text(found)}, which Python runs at every start: "
+                "a clean Python holds none, and --update-tools never takes one",
+                fix,
+            )
+    differ = deploy.tools_differ(code / "tools", (code / "current").resolve())
+    if not differ:
+        return None
+    return Check(
+        "tools",
+        "warn",
+        "Root-run tools",
+        f"not the live release's ({', '.join(differ)}): root runs the installed ones",
+        f"{DEPLOY_CMD} --update-tools (it shows the diff and asks)",
+    )
+
+
+def her_programs(
+    cfg: Any, root: Path = Path("/"), *, java: Callable[[], Path | None] = lambda: None
+) -> list[tuple[str, Path]]:
     """What she runs, by name: her signal-cli (or the JVM build, its Java and the call helper with [calls]) and the
-    folders on her PATH (both service files)."""
+    folders on her PATH (both service files). Her Java is the config's, else the release's own JDK, else the one
+    macOS picks (`java`: /usr/libexec/java_home, as the bridge asks it), which may be a Homebrew keg of yours."""
     programs: list[tuple[str, Path]] = []
     daemons = root / DAEMONS.relative_to("/")
     folders: list[str] = []
@@ -765,20 +1011,34 @@ def her_programs(cfg: Any, root: Path = Path("/")) -> list[tuple[str, Path]]:
     if cfg.calls_enabled:
         programs.append(("signal-cli (calls)", Path(cfg.call_signal_cli)))
         programs.append(("the call helper", Path(cfg.call_tunnel)))
-        java = cfg.java_home  # the config's, else the release's own JDK
-        if java is not None:
-            programs.append(("Java", Path(java) / "bin" / "java"))
+        home = cfg.java_home or java()  # the config's, else the release's own JDK, else macOS's pick
+        if home is not None:
+            programs.append(("Java", Path(home) / "bin" / "java"))
     else:
         found = cfg.signal_cli if "/" in cfg.signal_cli else shutil.which(cfg.signal_cli, path=HER_PATH)
         programs.append(("signal-cli", Path(found or f"/{cfg.signal_cli} (not on her PATH)")))
     return programs
 
 
-def voice_health(live: bool) -> Mapping[str, object] | None:
+@dataclass(frozen=True)
+class VoiceNotRead:
+    """Her voice's state was not read as her: `why`, in plain words (VOICE_NOT_SIGNED_IN, VOICE_REFUSED_HER). Reading
+    again would not help, so the end of a move, a setup or an update says so at once, never "loading"."""
+
+    why: str
+
+
+VoiceHealth = Mapping[str, object] | VoiceNotRead | None
+
+
+def voice_health(live: bool, *, as_her: bool = False) -> VoiceHealth:
     """The voice service's /health answer (127.0.0.1 only, no proxy, 5 s); None when it does not answer, and always
-    off the live Mac (a test or a rehearsal never asks the running service)."""
+    off the live Mac (a test or a rehearsal never asks the running service). `as_her`: in her own user, read as her
+    (`her_voice_health`): her voice service answers only programs of her own account."""
     if not live:
         return None
+    if as_her:
+        return her_voice_health()
     try:
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         with opener.open(VOICE_HEALTH_URL, timeout=5) as response:
@@ -788,14 +1048,49 @@ def voice_health(live: bool) -> Mapping[str, object] | None:
     return data if isinstance(data, dict) else None
 
 
-def _voice_ready(health: Mapping[str, object] | None) -> bool:
-    return health is not None and health.get("stt") == "ready" and health.get("tts") == "ready"
+def _read_as_her(argv: Sequence[str]) -> tuple[int, str]:
+    try:
+        done = subprocess.run(
+            list(argv),
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=VOICE_READ_SECONDS,
+            cwd="/",  # her user cannot enter the folder it was started from
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return -1, ""  # no answer in time: never sudo's own 1 (a password it would ask for)
+    return done.returncode, done.stdout[:10_000].decode("utf-8", "replace")
 
 
-def voice_line(health: Mapping[str, object] | None, *, calls: bool = True) -> str:
+def her_voice_health(run: Callable[[Sequence[str]], tuple[int, str]] = _read_as_her) -> VoiceHealth:
+    """Her voice service's /health answer read as her (`VOICE_HEALTH_AS_HER`: curl run as _estia, one fixed command);
+    `VoiceNotRead` when sudo would ask for a password or her voice service refused curl run as her; None when it does
+    not answer (not up yet, restarting, too slow) or the answer is not JSON."""
+    code, out = run(VOICE_HEALTH_AS_HER)
+    if code == SUDO_NEEDS_PASSWORD:
+        return VoiceNotRead(VOICE_NOT_SIGNED_IN)
+    if code == CURL_HTTP_ERROR:
+        return VoiceNotRead(VOICE_REFUSED_HER)
+    if code != 0:
+        return None
+    try:
+        data = json.loads(out)
+    except ValueError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _voice_ready(health: VoiceHealth) -> bool:
+    return isinstance(health, Mapping) and health.get("stt") == "ready" and health.get("tts") == "ready"
+
+
+def voice_line(health: VoiceHealth, *, calls: bool = True) -> str:
     """What the end of a move, a setup or a deploy says about her voice: "voice: ready" when both engines are ready
-    (speech in, speech out), else with [calls] when calls work (the bridge texts once it is ready), else that it
-    loads."""
+    (speech in, speech out), not read as her and why, else with [calls] when calls work (the bridge texts once it is
+    ready), else that it loads."""
+    if isinstance(health, VoiceNotRead):
+        return VOICE_NOT_READ.format(why=health.why)
     if _voice_ready(health):
         return "voice: ready"
     return VOICE_LOADING if calls else VOICE_LOADING_NO_CALLS
@@ -811,30 +1106,32 @@ def calls_in(text: str) -> bool:
 
 
 def voice_end(
-    health: Callable[[], Mapping[str, object] | None],
+    health: Callable[[], VoiceHealth],
     *,
     calls: bool,
     clock: Callable[[], float],
     sleep: Callable[[float], None],
     say: Callable[[str], None],
+    moved: bool = True,
 ) -> str:
     """The voice line at the end of a move, a setup or a deploy, once the bridge was seen up. Without [calls]: the
     state now. With [calls] and the voice still loading: read again until ready or VOICE_WAIT_SECONDS from now, so
-    "she texts you then" is said only when the bridge will count a long load and text. Its caller is done by then: a
-    Ctrl-C or a hang-up ends only the wait (VOICE_STOPPED)."""
+    "she texts you then" is said only when the bridge will count a long load and text; not read as her ends it at once.
+    Its caller is done by then: a Ctrl-C or a hang-up ends only the wait (VOICE_STOPPED; before her own user, `moved`
+    False, VOICE_STOPPED_YOURS)."""
     try:
         found = health()
-        if not calls or _voice_ready(found):
+        if not calls or _voice_ready(found) or isinstance(found, VoiceNotRead):
             return voice_line(found, calls=calls)
         say(VOICE_WAITING)
         deadline = clock() + VOICE_WAIT_SECONDS
         while True:
             sleep(VOICE_POLL_SECONDS)
             found = health()
-            if _voice_ready(found) or clock() >= deadline:
+            if _voice_ready(found) or isinstance(found, VoiceNotRead) or clock() >= deadline:
                 return voice_line(found)
     except KeyboardInterrupt:
-        return VOICE_STOPPED
+        return VOICE_STOPPED if moved else VOICE_STOPPED_YOURS
 
 
 # ------------------------------------------------------------------ the move into her own user
@@ -933,7 +1230,7 @@ def _projects_note(text: str, out: str, old_home: Path) -> tuple[str, str]:
     if root != old_home and root.is_relative_to(old_home):
         return (
             new,
-            f'projects.root: set to "{root}" (~ now means {HOME}); her user reads it read-only once {SHARE} runs',
+            f'projects.root: set to "{root}" (~ now means {HOME}); her own macOS account reads it read-only once {SHARE} runs',
         )
     return new, f'projects.root: set to "{root}", outside your home: give {ROLE_USER} read access to it yourself'
 
@@ -1200,9 +1497,13 @@ class Migration:
         self.marker = host.path(MARKER)
         self.root = host.root
         self.started: list[str] = []
+        self.logs_due = False  # a failed move after she ran: the restore shows her logs first
         self.held_map: list[tuple[str, str]] = []
+        self.record_before: dict[str, Any] | None = None  # the move's record as it was before this run's journal
+        self.journaled = False  # this run wrote its record while moving (`_journal`)
         self.projects_root: Path | None = None  # your projects folder, as her config names it after the move
-        self.voice_health: Callable[[], Mapping[str, object] | None] = lambda: voice_health(self.host.live)
+        # her voice service answers only her own account: root reads it as her
+        self.voice_health: Callable[[], VoiceHealth] = lambda: voice_health(self.host.live, as_her=True)
         self.calls = False  # her config has [calls]: the bridge texts once her voice is ready after a long load
 
     # ---------------------------------------------------------------- small steps (printed in a dry run)
@@ -1284,7 +1585,10 @@ class Migration:
         if number is None:
             problems.append("no config in your home to move: set her up first (scripts/setup.sh)")
         elif not has_account(self.owner.home / ".local/share/signal-cli", number):
-            problems.append("her number is not verified with Signal yet: scripts/setup.sh registers it")
+            problems.append(  # setup runs no Signal step on a set-up install (c-5, round 3): its config renamed first
+                "her Signal account is not on this Mac: mv ~/.config/local-assistant ~/.config/local-assistant.old, "
+                "then scripts/setup.sh sets it up again"
+            )
         # her voice service: the release builds it from the commit's own sources (deploy.build_voice)
         need = sum(_size(folder) for folder in self._old_folders()) + 3 * 2**30  # her data, plus about 3 GB of code
         try:
@@ -1299,9 +1603,11 @@ class Migration:
 
     def run(self) -> int:
         marker = read_marker(self.root)
+        if marker is not None and marker.get("moving") and not moved(self.root) and not self.dry:
+            marker = self._finish_unfinished(marker)
         if marker is not None and not marker.get("rolled_back") and moved(self.root):
             when = time.strftime("%Y-%m-%d", time.localtime(float(marker.get("moved_at", 0))))
-            self.say(f"✓ She runs in her own user ({ROLE_USER}) since {when}. Updates: {DEPLOY_CMD}")
+            self.say(f"✓ She runs in her own macOS account ({ROLE_USER}) since {when}. Updates: {DEPLOY_CMD}")
             return 0
         # her old setup: the services that run as you (a service file of hers with no move on record is a failed
         # try's: never kept as her old setup, and gone again if this try fails)
@@ -1321,6 +1627,7 @@ class Migration:
         ):
             self.say("✗ A bridge runs in a terminal: stop it first (Ctrl-C there).")
             return 1
+        self.record_before = marker  # what a restore that gives every folder back puts back
         with interruptions_raise():  # a hang-up (a dropped SSH session) or a TERM raises from here on
             return self._move(labels, fresh, unchanged)
 
@@ -1335,14 +1642,14 @@ class Migration:
             self.say(f"✗ Her release was not built. {unchanged}")
             return 1
         offline = "she is offline for a minute or two" if labels else "she starts at the end"
-        self.say(f"Moving her into her own user {ROLE_USER} (home {HOME}, code {CODE}): {offline}.")
+        self.say(f"Moving her into her own macOS account {ROLE_USER} (home {HOME}, code {CODE}): {offline}.")
         try:
             self._save_old(labels)
             self._stop([label for label in LABELS if self._installed(label)])  # a failed try's service too
             self._make_user()
             self._copy_data()
             self._check_copy()
-            self._hold_old()
+            self._hold_old(voice, fresh)
             self._install_plists(voice)
             self._do(
                 f"remove {NEWSYSLOG} (her logs now rotate themselves)",
@@ -1361,15 +1668,19 @@ class Migration:
                 )
             else:
                 self.say(f"✗ {why}. Her old setup comes back.")
+            # the restore takes her services away (`estia logs` refuses after): it shows her logs first, inside its
+            # own guard (second deep scan, macos-move-logs-skip-restore: a Ctrl-C there skipped the restore)
+            self.logs_due = bool(self.started) and self.mode == "real" and not self.dry
             self._restore(labels)
             return 1
+        if fresh and self.mode != "rehearse" and not self.dry:
+            self._remove_held()  # before the record says so: a hard stop here leaves them on record (remove-old)
         self._write_marker(voice, fresh)
         until = time.strftime("%Y-%m-%d", time.localtime(self.clock() + ROLLBACK_DAYS * 86400))
         if self.mode == "rehearse":
             self.say(f"✓ Rehearsal done in {self.root}. It holds a copy of her keys: delete it when done (rm -rf).")
         elif not self.dry:
             if fresh:
-                self._remove_held()
                 self.say(
                     f"✓ She runs as {ROLE_USER}, from {CURRENT}; her files are only in {HOME}: a new install keeps "
                     "no other copy, so it has no rollback."
@@ -1398,6 +1709,27 @@ class Migration:
                 "or two after the release is built; on any failure her old setup comes back."
             )
         return 0
+
+    def _say_her_logs(self) -> None:
+        """After she ran and the move failed, where its cause is: the last lines of her bridge's output (launchd.log)
+        and bridge.log's last warnings and errors (metadata only), read as her, so what her account cannot read is
+        never shown (root follows no link of hers), each line in printable characters only (review host-move-logs).
+        A log not read is left out."""
+        found: list[str] = []
+        as_her = [SUDO, "-n", "-u", ROLE_USER, "-H", "--", "/usr/bin/env", "-i", f"HOME={HOME}", "PATH=/usr/bin:/bin"]
+        for path, read, kinds, shown in (
+            (STREAM_LOGS / STREAM_LOG[BRIDGE], FAILED_LOG_LINES, (), FAILED_LOG_LINES),
+            (HOME / "Library/Logs/local-assistant/bridge.log", 400, (" WARNING ", " ERROR ", " CRITICAL "), 10),
+        ):
+            code, out = self.host.run([*as_her, TAIL, "-n", str(read), "--", str(path)], read_only=True, cwd=Path("/"))
+            kept = [line for line in out.splitlines() if line.strip() and (not kinds or any(k in line for k in kinds))]
+            if code == 0 and kept:
+                found.append(f"  {path.name}:")
+                found += [f"    {clean(line)[:300]}" for line in kept[-shown:]]
+        if found:
+            self.say("Her logs, read as her before her old setup comes back (the cause is often here):")
+            for line in found:
+                self.say(line)
 
     def _check(self, since: float) -> None:
         from local_assistant import deploy
@@ -1610,19 +1942,49 @@ class Migration:
             more = f" (and {len(found) - 1} more)" if len(found) > 1 else ""
             raise RuntimeError(f"{clean(str(HOME / path.relative_to(self.her_home)))}: {what} in her copy{more}")
 
-    def _hold_old(self) -> None:
+    def _finish_unfinished(self, marker: dict[str, Any]) -> dict[str, Any]:
+        """A move cut off by a hard stop before her service files (yours still run): the folders it held go back
+        into your home from its record, so this run moves her from where they were."""
+        held = [
+            (str(pair[0]), str(pair[1]))
+            for pair in marker.get("held", [])
+            if isinstance(pair, list) and len(pair) == 2 and Path(str(pair[1])).is_relative_to(self.held)
+        ]
+        held = [pair for pair in held if os.path.lexists(pair[1])]  # one on record just before its rename stayed home
+        if self.mode != "rehearse":
+            self._unhold(held)
+        self.say(f"! An earlier move did not finish: her folders are back in your home ({len(held)} from {HELD}).")
+        marker = {**marker, "moving": False, "rolled_back": True, "rolled_back_at": self.clock()}
+        self._do(f"note it in {MARKER}", lambda: _write_json(self.marker, marker))
+        return marker
+
+    def _journal(self, voice: bool, fresh: bool, held: Sequence[tuple[str, str]]) -> None:
+        """The move's record before a folder is held: a hard stop later (a power cut) leaves the held folders on
+        record, for doctor, remove-old and the rollback."""
+        data = {**self._record(voice, fresh), "held": [list(pair) for pair in held], "moving": True}
+        _write_json(self.marker, data)
+        self.journaled = True
+
+    def _hold_old(self, voice: bool = False, fresh: bool = False) -> None:
         """Her old folders with secrets leave your home for a folder only root reaches (a rename: nothing in them is
-        re-owned or changed), kept for the rollback. The caches stay where they are."""
+        re-owned or changed), kept for the rollback, each on record first (`_journal`). The caches stay where they
+        are."""
         for folder in self._old_folders(secrets_only=True):
             if self.mode == "rehearse":
                 self.say(f"would move {folder} into {HELD} (left as it is in a rehearsal)")
                 continue
             target = self.held / f"{int(self.clock())}-{len(self.held_map)}"  # never one an earlier move left
             if self.dry:
-                self.say(f"would move {folder} into {HELD} (root only)")
+                kept = (
+                    "deleted after the move; no copy is kept (back them up first)"
+                    if fresh
+                    else f"held for {ROLLBACK_DAYS} days, for {ESTIA} rollback"
+                )
+                self.say(f"would move {folder} into {HELD} (root only): your folders are {kept}")
                 continue
             self.held.mkdir(parents=True, exist_ok=True, mode=0o700)
             self.held.chmod(0o700)
+            self._journal(voice, fresh, [*self.held_map, (str(folder), str(target))])
             os.rename(folder, target)
             self.held_map.append((str(folder), str(target)))
 
@@ -1718,20 +2080,22 @@ class Migration:
         """Her data folders the copy back takes (those that are there)."""
         return [rel for rel in OVERLAY if (self.her_home / rel).is_dir()]
 
-    def _overlay_problems(self, present: Sequence[str]) -> list[tuple[Path, str]]:
+    def _overlay_problems(self, present: Sequence[str], base: Path | None = None) -> list[tuple[Path, str]]:
         """What in her newer data must never reach your folders, where your bridge runs: a program (an execute bit),
-        a link out of her home, a FIFO or a device, as (path, what); her vendor/ is left out of the copy. Her data
-        holds none of them: one found means her account planted it, or a program of yours put it in your folder
-        before the move. Walked with lstat, nothing followed; a socket (a call's, left by a crash) is passed over:
-        tar never copies one."""
-        real = Path(os.path.realpath(self.her_home))
-        vendor = self.her_home / VENDOR
+        a link out of its own folder (one that stays in her home leads to your file of that name once copied back
+        into yours), a FIFO or a device, as (path, what); her vendor/ is left out of the copy. Her data holds none of
+        them: one found means her account planted it, or a program of yours put it in your folder before the move.
+        Walked with lstat, nothing followed; a socket (a call's, left by a crash) is passed over: tar never copies
+        one. `base`: where the folders are (her home, or the copy of them the rollback checks again)."""
+        base = base or self.her_home
+        real = Path(os.path.realpath(base))
+        vendor = base / VENDOR
         found: list[tuple[Path, str]] = []
         for rel in present:
             found += [
-                (path, what) for path, what in strays(self.her_home / rel, real, skip=[vendor]) if what != "a socket"
+                (path, what) for path, what in strays(base / rel, real / rel, skip=[vendor]) if what != "a socket"
             ]
-            for here, dirs, files in os.walk(self.her_home / rel):  # links are not followed
+            for here, dirs, files in os.walk(base / rel):  # links are not followed
                 dirs[:] = [name for name in dirs if Path(here) / name != vendor]
                 for name in files:
                     path = Path(here) / name
@@ -1761,9 +2125,10 @@ class Migration:
 
     def _overlay(self, owner: Owner) -> None:
         """What she saved since the move (her keys, messages and Signal sessions) on top of your old folders, read as
-        her and written as you; her config stays the one from before the move. The old -wal and -shm next to each
-        database she replaces are removed first (as you), so SQLite never replays them into her newer one. Anything
-        that stops the copy raises: your old services must never run on your old Signal sessions alone."""
+        her and written as you, into a folder of yours first and checked again there; her config stays the one from
+        before the move. The old -wal and -shm next to each database she replaces are removed first (as you), so
+        SQLite never replays them into her newer one. Anything that stops the copy raises: your old services must
+        never run on your old Signal sessions alone."""
         present = self._present()
         if not present:
             return
@@ -1793,10 +2158,34 @@ class Migration:
             VENDOR,  # code, never data (the move leaves it out too): your bridge runs what is there
             *present,
         ]
-        writer = [*self._as(owner.name), TAR, "-x", "-f", "-", "-C", str(owner.home)]
-        code, out = self.host.pipe(reader, writer, cwd=Path("/"))
+        # into a folder of yours first, checked again there: a process of hers still running may add to her data
+        # after the check above, and only what was checked reaches your folders
+        stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime(self.clock()))
+        staging = owner.home / f".estia-rollback-{stamp}"
+        mine = self._as(owner.name)
+        code, out = self.host.run([*mine, MKDIR, "-m", "700", "--", str(staging)], cwd=Path("/"))
         if code != 0:
-            raise RuntimeError(f"her newer data was not copied back ({tail(out)})")
+            raise RuntimeError(f"her newer data was not copied back: {staging} was not made ({tail(out)})")
+        try:
+            code, out = self.host.pipe(reader, [*mine, TAR, "-x", "-f", "-", "-C", str(staging)], cwd=Path("/"))
+            if code != 0:
+                raise RuntimeError(f"her newer data was not copied back ({tail(out)})")
+            late = self._overlay_problems(present, staging)
+            if late:
+                path, what = late[0]
+                shown = clean(str(HOME / path.relative_to(staging)))
+                raise RuntimeError(f"her newer data was not copied back ({shown}: {what}, added after the check)")
+            arrived = [rel for rel in present if os.path.lexists(staging / rel)]
+            if arrived:
+                code, out = self.host.pipe(
+                    [*mine, TAR, "-c", "-f", "-", "-C", str(staging), *arrived],
+                    [*mine, TAR, "-x", "-f", "-", "-C", str(owner.home)],
+                    cwd=Path("/"),
+                )
+                if code != 0:
+                    raise RuntimeError(f"her newer data was not copied back ({tail(out)})")
+        finally:
+            self.host.run([*mine, RM, "-rf", "--", str(staging)], cwd=Path("/"))
 
     def _restore(self, labels: list[str]) -> None:
         """Back to her old setup after a failed move: the new services out, the old folders and files back, with what
@@ -1804,6 +2193,10 @@ class Migration:
         files go back and her old services start even when a step before failed, and a folder still held is printed
         with the command that puts it back."""
         with interruptions_ignored():
+            if self.logs_due:  # before her services go; whatever goes wrong reading them, the restore goes on
+                self.logs_due = False
+                with contextlib.suppress(Exception):
+                    self._say_her_logs()
             ran = bool(self.started)
             held = list(self.held_map)
             why = ""
@@ -1822,7 +2215,23 @@ class Migration:
                 why = str(exc) or type(exc).__name__
             finally:
                 problems = self._bring_back(labels)
+            if self.journaled:
+                self._unjournal(labels, held)
             self._left_over(why, problems, held if self.mode != "rehearse" and not self.dry else [])
+
+    def _unjournal(self, labels: list[str], held: Sequence[tuple[str, str]]) -> None:
+        """After a restore, the record the hold wrote goes with it: every folder back, the record from before the move
+        (or none); one still held, the move's record with only those (doctor names them, remove-old reaches them)."""
+        still = [pair for pair in held if os.path.lexists(pair[1])]
+        try:
+            if still:
+                self._journal(VOICE in labels, not labels, still)
+            elif self.record_before is not None:
+                _write_json(self.marker, self.record_before)
+            else:
+                self.marker.unlink(missing_ok=True)
+        except OSError as exc:
+            self.say(f"✗ {MARKER} was not put back ({exc})")
 
     def _remove_new_plists(self, labels: list[str]) -> None:
         """The service files of a failed move that were not her old setup (a fresh install's, a failed try's) are
@@ -1834,6 +2243,25 @@ class Migration:
             target = self.daemons / f"{label}.plist"
             self._stop([label])
             self._do(f"remove {DAEMONS / target.name}", functools.partial(target.unlink, missing_ok=True))
+
+    def _remove_added(self, labels: Sequence[str]) -> list[str]:
+        """After a rollback, each service of hers set up after the move (not in your old setup: the voice service
+        installed later) is stopped and its file removed, each named: left, launchd would start it as her at the next
+        boot. What failed, as text."""
+        problems: list[str] = []
+        for label in LABELS:
+            if label in labels or not self._installed(label):
+                continue
+            target = self.daemons / f"{label}.plist"
+            self._stop([label])
+            try:
+                self._do(f"remove {DAEMONS / target.name}", functools.partial(target.unlink, missing_ok=True))
+            except OSError as exc:
+                problems.append(f"{DAEMONS / target.name} was not removed ({exc.strerror or exc})")
+                continue
+            if not self.dry:
+                self.say(f"{label}: set up after the move, so stopped and its service file removed")
+        return problems
 
     def _bring_back(self, labels: list[str]) -> list[str]:
         """Her old service files and log rule put back, then her old services started: each step on its own, so one
@@ -1905,8 +2333,8 @@ class Migration:
         tmp.chmod(0o644)
         os.replace(tmp, target)
 
-    def _write_marker(self, voice: bool, fresh: bool) -> None:
-        data = {
+    def _record(self, voice: bool, fresh: bool) -> dict[str, Any]:
+        return {
             "owner": self.owner.name,
             "home": str(self.owner.home),
             "moved_at": self.clock(),
@@ -1917,6 +2345,9 @@ class Migration:
             "removed": False,
             "projects_root": str(self.projects_root) if self.projects_root is not None else None,
         }
+
+    def _write_marker(self, voice: bool, fresh: bool) -> None:
+        data = self._record(voice, fresh)  # replaces the record written while moving
         self._do(f"note the move in {MARKER}", lambda: _write_json(self.marker, data))
 
     def _remove_held(self) -> None:
@@ -1937,6 +2368,11 @@ class Migration:
         marker = read_marker(self.root)
         if marker is None or not held_copy(marker):
             self.say("✗ Nothing to roll back to: no earlier setup is on record.")
+            return 1
+        if marker.get("fresh"):  # a first install's unfinished move: nothing ran as you before it
+            self.say(
+                f"✗ Nothing to roll back to: a first install has no rollback. {ESTIA} remove-old deletes the copy."
+            )
             return 1
         until = float(marker.get("moved_at", 0)) + ROLLBACK_DAYS * 86400
         if self.clock() > until:
@@ -1988,6 +2424,8 @@ class Migration:
                 why = str(exc) or type(exc).__name__
             finally:  # your old services only with what she saved since: else hers again
                 problems_left = self._bring_back(labels) if copied else self._start_again(stopped)
+            if copied:
+                problems_left += self._remove_added(labels)
             if not copied:
                 self._left_over(why, problems_left, [] if self.dry else held)
                 self.say(
@@ -2062,15 +2500,85 @@ def _owner() -> Owner:
     return Owner(entry.pw_name, Path(os.environ.get("HOME") or entry.pw_dir), entry.pw_uid)
 
 
+# ---------------------------------------------------------------- `estia signal-login`: root's half
+
+ReadHidden = Callable[[str, int, Callable[[str], bool]], str]
+
+
+def signal_login_ask(
+    *, say: Callable[[str], None], hidden: ReadHidden, ask: Callable[[str], str]
+) -> dict[str, str] | None:
+    """Root's half of `estia signal-login`, run from the tools (her user cannot open your terminal): the phone's
+    steps, then her Account ID and her Recovery key read hidden across lines (`hostsec.read_hidden_lines`, never a
+    shell's `read`, which would leave the rest of a pasted key to run as commands) and her username, each checked
+    and asked again with the reason; an Enter alone at the username question (the one after the key, say) is no
+    answer, asked again. Their checked forms, for her on stdin; None when q or the end of input (`ask` raises
+    EOFError) stops it (nothing is handed over, nothing changes)."""
+    say(SIGNAL_LOGIN_INTRO)
+    say(NUMBERLESS_STEPS)
+    found: list[str] = []
+    for prompt, needed, counted, check in (
+        (ID_ASK, ID_DIGITS, id_character, account_id),
+        (KEY_ASK, KEY_LENGTH, key_character, recovery_key),
+    ):
+        while True:
+            try:
+                typed = hidden(prompt, needed, counted)
+            except EOFError:
+                return None
+            if typed.strip().lower() == "q":
+                return None
+            try:
+                found.append(check(typed))
+                break
+            except ValueError as exc:  # the count, the place and a symbol: never the key, nor a letter or digit of it
+                say(f"  {exc}")
+    while True:
+        try:
+            answer = ask(USERNAME_ASK)
+        except EOFError:
+            return None
+        if not answer:
+            continue
+        if answer.lower() == "q":
+            return None
+        try:
+            name = username(answer)
+            break
+        except ValueError as exc:
+            say(f"  {exc}")
+    try:  # the six-digit code Signal may ask for (review S7): Enter is no
+        wanted = ask(TOTP_QUESTION).strip().lower().startswith("y")
+    except EOFError:
+        return None
+    code = ""
+    while wanted and not code:
+        try:
+            typed = hidden(TOTP_ASK, TOTP_DIGITS, str.isdigit)
+        except EOFError:
+            return None
+        if typed.strip().lower() == "q":
+            return None
+        try:
+            code = totp_code(typed)
+        except ValueError as exc:
+            say(f"  {exc}")
+    login = {"account": found[0], "recovery_key": found[1], "username": name}
+    return {**login, "totp": code} if code else login
+
+
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="ownuser", description="Her own user: the move, and the plist renderer.")
+    parser = argparse.ArgumentParser(
+        prog="ownuser", description="Her own macOS account: the move, and the plist renderer."
+    )
     sub = parser.add_subparsers(dest="command", required=True)
-    move = sub.add_parser("migrate", help="move her install into her own user")
+    move = sub.add_parser("migrate", help="move her install into her own macOS account")
     move.add_argument("--checkout", type=Path)
     group = move.add_mutually_exclusive_group()
     for flag in ("--dry-run", "--rehearse", "--rollback", "--remove-old"):
         group.add_argument(flag, action="store_true")
     sub.add_parser("account", help="her account again: no shell, hidden, no password (as root)")
+    sub.add_parser("signal-login", help="read an account without a number for her, from your terminal (as root)")
     render_cmd = sub.add_parser("render", help="fill in a launchd template")
     render_cmd.add_argument("template", type=Path)
     render_cmd.add_argument("out", type=Path)
@@ -2086,6 +2594,24 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         return 0
     root = estia_root()
+    if args.command == "signal-login":  # root reads; the JSON line goes to her on stdin (scripts/estia), never argv
+        if os.geteuid() != 0 and root == Path("/"):
+            print(f"run it with sudo: {SUDO} {BIN}/estia signal-login", file=sys.stderr)
+            return 2
+
+        def say(line: str) -> None:
+            print(line, file=sys.stderr, flush=True)  # stdout holds only the line for her (scripts/estia)
+
+        try:
+            login = signal_login_ask(say=say, hidden=read_hidden_lines, ask=ask_tty)
+        except OSError:
+            say("✗ No terminal: run it in your own Terminal window. Nothing changed.")
+            return 1
+        if login is None:
+            say(SIGNAL_LOGIN_STOPPED)
+            return 1
+        print(json.dumps(login), flush=True)
+        return 0
     if args.command == "account":
         if os.geteuid() != 0 and root == Path("/"):
             print(f"run it with sudo: {SUDO} {BIN}/estia account", file=sys.stderr)

@@ -65,9 +65,18 @@ public func downloadPinnedFiles(
 
 /// `fetchFile` with an ephemeral session: no cookies, no cache, nothing kept on disk but the file.
 public func fetchFile(_ url: URL, to destination: URL, maxBytes: Int) async throws {
+    try await fetchFile(url, to: destination, maxBytes: maxBytes, configuration: fetchConfiguration(maxBytes: maxBytes))
+}
+
+/// An ephemeral session's settings for a file of at most `maxBytes`: a stall ends after 60 s without data, and the
+/// whole download after 600 s (Smart Turn's files) or, for a larger cap, the time its cap takes at 64 KiB a second
+/// (the review of 25 Oct: a flat 600 s meant a language's 219 MB weights could never come below about 2.9 Mbit/s, and
+/// each failed try starts again from zero). A download that stops is then retried as its model's rules say.
+func fetchConfiguration(maxBytes: Int) -> URLSessionConfiguration {
     let configuration = URLSessionConfiguration.ephemeral
-    configuration.timeoutIntervalForResource = 600  // a download that stalls ends; the detector is then unavailable
-    try await fetchFile(url, to: destination, maxBytes: maxBytes, configuration: configuration)
+    configuration.timeoutIntervalForRequest = 60
+    configuration.timeoutIntervalForResource = max(600, Double(maxBytes) / 65_536)
+    return configuration
 }
 
 /// Writes the body of a GET of `url` to `destination` as it comes: https only (a redirect too), a 200 only, and at

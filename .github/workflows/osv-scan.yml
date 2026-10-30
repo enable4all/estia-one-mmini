@@ -1,0 +1,38 @@
+# Known security holes in every locked Python package (uv.lock and each helper's tools/*/uv.lock), checked against the
+# public OSV database (osv.dev) at every push and every Monday; a known hole fails the run. The same scan runs on the
+# Mac, offline: in scripts/verify.sh, and before each release with a fresh database (scripts/vuln-scan.sh --download).
+# The release workflow (release.yml) calls it on the tag it publishes, which waits for it: a known hole stops the release.
+# Read-only: the job reads the code and changes nothing (no upload, no comment, no stored login). Each action is pinned
+# to one commit; Google's action then runs its scanner image, ghcr.io/google/osv-scanner-action:v2.7.0, named by its
+# tag inside the action.
+name: osv-scan
+on:
+  push:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      ref:
+        description: The tag to scan (the release's); empty, the ref that started the run
+        type: string
+        required: false
+        default: ""
+permissions:
+  contents: read
+jobs:
+  scan:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.ref }}
+      - name: Scan the locked packages
+        uses: google/osv-scanner-action/osv-scanner-action@b1d267aea5211fa648d9d442fa64b90dbdcbdd36 # v2.7.0
+        with:
+          scan-args: |-
+            --lockfile=uv.lock
+            --lockfile=tools/ical/uv.lock
+            --lockfile=tools/tapo/uv.lock
+            --lockfile=tools/youtube/uv.lock

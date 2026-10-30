@@ -20,7 +20,7 @@ from zoneinfo import ZoneInfo
 
 from local_assistant import prompts
 from local_assistant.fetcher import strip_control_tokens
-from local_assistant.language import ENGLISH, function_words
+from local_assistant.language import ENGLISH, function_words, guard_pieces
 from local_assistant.signal_text import plain
 from local_assistant.store import Message
 from local_assistant.timefmt import local_stamp
@@ -32,8 +32,8 @@ COMMAND_MAX_CHARS = 200  # the command a note answers, as named in its line
 # one step (Ollama's prompt cache is rebuilt once, not at every note); a quiet user's digests never pile up
 NOTES_MAX_TOKENS = 4_000
 NOTES_KEEP_TOKENS = 2_000
-OUTSIDE_COMMANDS = frozenset({"/learn", "/docs"})  # their answers quote a page's title and facts, or PDF names
-PRIVATE_COMMANDS = frozenset({"/docs"})  # PDF names: never to a web search, Google Maps or Spotify
+OUTSIDE_COMMANDS = frozenset({"/learn", "/docs"})  # their answers quote a page's title and facts, or document names
+PRIVATE_COMMANDS = frozenset({"/docs"})  # document names: never to a web search, Google Maps or Spotify
 
 
 @dataclass(frozen=True)
@@ -63,13 +63,13 @@ class Note:
 
 
 def quotes_outside(command: str) -> bool:
-    """Whether a command's answer quotes outside text (a page's title and facts, PDF names)."""
+    """Whether a command's answer quotes outside text (a page's title and facts, document names)."""
     words = command.split()
     return bool(words) and words[0].lower() in OUTSIDE_COMMANDS
 
 
 def quotes_private(command: str) -> bool:
-    """Whether a command's answer quotes private outside text (PDF names)."""
+    """Whether a command's answer quotes private outside text (document names)."""
     words = command.split()
     return bool(words) and words[0].lower() in PRIVATE_COMMANDS
 
@@ -150,11 +150,17 @@ _CATEGORIES = {"about", "family", "work", "study", "music", "social", "home", "h
 _SKIP = frozenset({"user", "users", *_CATEGORIES, *(word.casefold() for word in function_words(ENGLISH))})
 
 
-def _words(text: str) -> set[str]:
+def _words(text: str, *, pairs: bool = False) -> set[str]:
+    """Links and mail addresses whole; Japanese, Chinese and Korean by `language.guard_pieces` (pairs of characters,
+    a Korean word's forms, with `pairs` also its pairs of syllables); other words of 3 letters or more or with a digit,
+    never one of `_SKIP`."""
     found = {link.casefold().rstrip(".,;:!?") for link in _LINK.findall(text)}
     for word in re.findall(r"\w+", _LINK.sub(" ", text).casefold()):
-        if (len(word) >= 3 or any(char.isdigit() for char in word)) and word not in _SKIP:
-            found.add(word)
+        pieces, others = guard_pieces(word, pairs=pairs)
+        found.update(pieces)
+        found.update(
+            other for other in others if (len(other) >= 3 or any(c.isdigit() for c in other)) and other not in _SKIP
+        )
     return found
 
 
@@ -169,15 +175,47 @@ def drawn_from_notes(argument: str, said: str, notes: Sequence[str], *, about: s
     number of it that a note holds and the message does not, or more than half of its words so. Never when the message
     shares a word with `about` (what a number names: the fact, the reminder). A translation of the user's words
     ("onthoud dat mijn zus Maria heet": "The user's sister is Maria.") takes nothing from a note, so it passes."""
-    words = _words(argument)
-    if not notes or not words:
+    if not notes or not _words(argument):
         return False
-    theirs = _words(said)
-    if about and _words(about) & theirs:
+    if about and _words(about) & _words(said):
         return False
-    noted = set().union(*(_words(text) for text in notes))
-    taken = {word for word in words if word in noted and word not in theirs}
+    return any(_drawn(argument, said, notes, pairs=pairs) for pairs in (False, True))
+
+
+def _drawn(argument: str, said: str, notes: Sequence[str], *, pairs: bool) -> bool:
+    """`drawn_from_notes`' measure in one reading of Korean (`pairs`: also a word's pairs of syllables): either one
+    refuses, so the pairs never let through what the word's forms alone refuse (release review of 0.9.8, G04)."""
+    words = _words(argument, pairs=pairs)
+    taken = _taken(argument, said, notes, pairs=pairs)
     return any(_strong(word) for word in taken) or 2 * len(taken) > len(words)
+
+
+def held_in(argument: str, sources: Sequence[str]) -> bool:
+    """Whether a tool's argument takes its words from `sources` (a learned page and the user's message): every link,
+    mail address and long number of it, and at least half of its words (review G9)."""
+    words = _words(argument)
+    if not words:
+        return True
+    held = set().union(*(_words(text) for text in sources))
+    if any(_strong(word) and word not in held for word in words):
+        return False
+    return 2 * len(words & held) >= len(words)
+
+
+def taken_words(argument: str, said: str, texts: Sequence[str]) -> set[str]:
+    """The words of a tool's argument that `texts` hold and `said` does not (`drawn_from_notes`' measure; for Google
+    Maps after a calendar read, any one of them refuses: review G7), a Korean word read both by its forms and by its
+    pairs of syllables, so a word from inside one of theirs counts ("연세치과" in "강남연세치과"; release review of
+    0.9.8, G04)."""
+    if not texts:
+        return set()
+    return _taken(argument, said, texts, pairs=False) | _taken(argument, said, texts, pairs=True)
+
+
+def _taken(argument: str, said: str, texts: Sequence[str], *, pairs: bool) -> set[str]:
+    held = set().union(*(_words(text, pairs=pairs) for text in texts))
+    theirs = _words(said, pairs=pairs)
+    return {word for word in _words(argument, pairs=pairs) if word in held and word not in theirs}
 
 
 # With a note quoting outside text in her input, a profile change or a cancel needs the user's own message to ask for
@@ -225,6 +263,18 @@ def asks_profile(text: str) -> bool:
 def asks_to_cancel(text: str) -> bool:
     """Whether the user's message asks to cancel, stop or delete something, in any of the 11 languages."""
     return _CANCEL.search(text) is not None
+
+
+def names_fact(said: str, fact: str, *, number: str = "") -> bool:
+    """Whether the user's message names a profile fact (review G5: after outside text a profile word alone, "I forgot",
+    "do you remember", "fun fact", asks for nothing): a word of it ("forget that I like tea", a name a translation keeps),
+    with every link, mail address and long number of it in the message too (a planted helpline never passes), or, for
+    a forget, the number it gave ("forget 3")."""
+    theirs = _words(said)
+    if number.isdecimal() and number in re.findall(r"\d+", said):
+        return True
+    words = _words(fact)
+    return bool(words & theirs) and not any(_strong(word) and word not in theirs for word in words)
 
 
 def names_reminder(said: str, number: str, words: str) -> bool:

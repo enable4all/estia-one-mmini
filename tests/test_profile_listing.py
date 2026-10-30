@@ -19,6 +19,8 @@ YOURS = "The user's daughter Mia plays the violin."
 NOTE = "The user often cycles to work along the river."
 TEA = "The user drinks green tea in the morning."
 PER_MESSAGE = "I see up to 1,500 characters of them with each message, the ones that match it first, then the newest."
+# the guide's limits when the user's part is empty (0.9.8)
+GUIDE_LIMITS = "Up to 300 characters a fact, 4,000 for all of yours. Kept on this Mac."
 
 
 async def status() -> StatusInfo:
@@ -102,7 +104,7 @@ async def test_profile_with_only_notes_says_nothing_of_yours_yet(store: Store) -
     profile.add(NOTE, source_kind="chat")
     assert await commands.handle(command(store, "/profile")) == (
         "**Your profile**: I see it with every message (0 of 4,000 characters, 0%)\n"
-        "\n" + prompts.PROFILE_NONE_YET + "\n"
+        "\n" + "\n".join([prompts.PROFILE_NONE_YET, prompts.PROFILE_WORTH_TELLING, GUIDE_LIMITS]) + "\n"
         "\n"
         f"**My notes from our chats**: 1 note ({len(NOTE)} of 12,000 characters, 0%). {PER_MESSAGE} /profile notes "
         "lists them.\n"
@@ -129,7 +131,7 @@ async def test_profile_without_notes_has_no_notes_line(store: Store) -> None:
 
 async def test_an_empty_profile_says_so_for_both_commands(store: Store) -> None:
     _, commands = make(store)
-    assert (await commands.handle(command(store, "/profile"))).startswith("Your profile is empty")
+    assert (await commands.handle(command(store, "/profile"))).startswith(prompts.PROFILE_EMPTY + "\n")
     assert await commands.handle(command(store, "/profile notes", T0 + 1)) == prompts.PROFILE_NO_NOTES
 
 
@@ -225,9 +227,9 @@ async def test_profile_with_other_words_is_the_profile(store: Store) -> None:
 # where /profile notes is named
 
 
-def test_help_and_the_learning_digest_name_profile_notes() -> None:
+def test_help_and_the_quiet_time_note_name_profile_notes() -> None:
     assert "/profile notes" in prompts.HELP
-    assert "/profile notes shows them" in prompts.DIGEST.format(count=2, things="things")
+    assert "/profile notes shows them all." in prompts.QUIET_CLOSING  # the quiet-time note's last line (0.9.8)
 
 
 # her notes for a message: English's small words never match

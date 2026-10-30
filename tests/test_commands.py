@@ -1,10 +1,12 @@
 import json
 import re
+from collections.abc import Awaitable, Callable
 from pathlib import Path
+from typing import Any
 
 import pytest
 
-from local_assistant import prompts
+from local_assistant import prompts, voice
 from local_assistant.babble import Babble, listing, listing_lines
 from local_assistant.commands import TRUST_DAYS, UNLOCK_WAIT_SECONDS, Commands, Guard, StatusInfo, VoiceLanguages
 from local_assistant.context import ContextBuilder
@@ -126,9 +128,24 @@ def test_help_groups_the_commands_under_bold_headings() -> None:
         *["/new", "/profile", "/fix", "/forget", "/learn", "/soul", "/docs"],
         *["/voice", "/language", "/babble"],
         *["/remind", "/reminders", "/initiative", "/quiet", "/evening"],
-        *["/status", "/lock", "/unlock", "/devices"],
+        *["/status", "/tools", "/lock", "/unlock", "/devices"],
         "/help",
     ]
+
+
+async def test_tools_shows_her_tools_list_as_code_builds_it(store: Store) -> None:
+    """/tools: her tools here and the programs behind them, the lines her rules carry (prompts.inventory_text)."""
+    profile = Profile(store)
+    context = ContextBuilder(store, profile, TZ)
+    listed = prompts.inventory([("web_search", "Search the web.")], voice=True)
+    commands = Commands(
+        store, profile, context, TZ, status, lambda: None, inventory=lambda: prompts.inventory_text(listed)
+    )
+    assert await commands.handle(command(store, "/tools")) == prompts.inventory_text(listed)
+    assert await commands.handle(command(store, "/Tools", T0 + 1)) == prompts.inventory_text(listed)
+    assert "/tools - my tools here" in prompts.HELP
+    bare = Commands(store, profile, context, TZ, status, lambda: None)  # without a list: an unknown command, as before
+    assert (await bare.handle(command(store, "/tools", T0 + 2))).startswith("Unknown command /tools.")
 
 
 async def test_new_starts_a_conversation_and_queues_learning(store: Store) -> None:
@@ -144,7 +161,7 @@ async def test_new_starts_a_conversation_and_queues_learning(store: Store) -> No
 
 async def test_profile_lists_facts_with_their_source(store: Store) -> None:
     profile, _, commands, _ = make(store)
-    assert (await commands.handle(command(store, "/profile"))).startswith("Your profile is empty")
+    assert (await commands.handle(command(store, "/profile"))).startswith("**Your profile is empty.** ")
     profile.add("The user likes tea.", source_kind="remember")
     listing = await commands.handle(command(store, "/profile", T0 + 1))
     lines = listing.splitlines()
@@ -300,7 +317,12 @@ async def test_voice_settings(store: Store) -> None:
     assert (store.get_state("voice_mode"), store.get_state("voice_echo")) == ("on", "on")
     assert await commands.handle(command(store, "/voice OFF", T0 + 3)) == "Voice replies: off."
     assert await commands.handle(command(store, "/voice echo off", T0 + 4)) == "Transcript echo: off."
-    assert (await commands.handle(command(store, "/voice loud", T0 + 5))).startswith("Usage: /voice")
+    assert await commands.handle(command(store, "/voice loud", T0 + 5)) == (
+        "There's no voice called Loud here yet. /voice voices lists them."
+    )
+    odd = ("/voice loud and clear", "/voice echo", "/voice name", "/voice echo maybe", "/voice name a b")
+    for at, line in enumerate(odd):
+        assert (await commands.handle(command(store, line, T0 + 6 + at))).startswith("Usage: /voice"), line
 
 
 async def test_voice_command_when_voice_is_not_set_up(store: Store) -> None:
@@ -405,16 +427,238 @@ async def test_voice_name_switches_the_voice_and_lists_the_choices(store: Store)
         assert message_id is not None
         return await commands.handle(store.message(message_id))
 
-    assert (await say("/voices", T0 - 1)).startswith("Voices (try one with /voice name <voice>)")
+    assert (await say("/voices", T0 - 1)).startswith("Voices (try one with /voice <voice>)")
     listed = await say("/voice voices", T0)
-    assert "bm_george" in listed and "am_michael" in listed
-    assert (
-        await say("/voice name bm_george", T0 + 1)
-        == "Voice: bm_george (British, male). Calls and voice notes use it now."
-    )
+    assert "bm_george: British, male" in listed and "am_michael: American, male, warm" in listed
+    assert await say("/voice name bm_george", T0 + 1) == "bm_george is on: calls and voice notes use his voice now."
     assert chosen == ["bm_george"] and store.get_state("voice_name") == "bm_george"
-    assert (await say("/voice name robot", T0 + 2)).startswith("Unknown voice robot.")
+    assert await say("/voice name robot", T0 + 2) == "There's no voice called Robot here yet. /voice voices lists them."
     assert chosen == ["bm_george"]
+    assert await say("/voice af_heart", T0 + 3) == "af_heart is on: calls and voice notes use her voice now."
+    assert chosen == ["bm_george", "af_heart"] and store.get_state("voice_name") == "af_heart"
+
+
+def voice_commands(store: Store, chosen: list[str], **options: Any) -> Callable[[str, int], Awaitable[str]]:
+    """A /voice command's answer, as the user sees it, with the voices chosen kept in `chosen`."""
+    profile = Profile(store)
+    commands = Commands(
+        store,
+        profile,
+        ContextBuilder(store, profile, TZ),
+        TZ,
+        status,
+        lambda: None,
+        voice=True,
+        set_voice=chosen.append,
+        **options,
+    )
+    conversation = store.current_conversation()
+
+    async def say(text: str, ts: int) -> str:
+        message_id = store.add_incoming(conversation.id, ME, ts, "command", text)
+        assert message_id is not None
+        return await commands.handle(store.message(message_id))
+
+    return say
+
+
+async def test_the_pocket_voices_and_af_heart_on_a_mac_with_the_large_model(store: Store) -> None:
+    """Owner, 26 Oct: "Jane is the default voice", "alba & michael for males, both on small and big", vera on the big
+    model, eve-full another name for eve; af_heart and am_michael stay Kokoro's. /voices names each voice's engine,
+    Pocket's first in its order, and `/voice <voice>` switches at once, as `/voice name` does."""
+    chosen: list[str] = []
+    say = voice_commands(store, chosen, pocket_standard=True)
+    lines = (await say("/voices", T0)).splitlines()
+    assert lines[:8] == [
+        "Voices (try one with /voice <voice>):",
+        "heart: female (Pocket TTS)",  # owner, 27 Oct: "call the voice Heart"
+        "jane: female (Pocket TTS)",
+        "eve: female (Pocket TTS)",
+        "vera: female (Pocket TTS)",  # owner, 25 Oct: vera on the big model
+        "alba: male (Pocket TTS)",  # "male, definitely" to the owner's ear (26 Oct)
+        "michael: male (Pocket TTS)",
+        "eve-full: another name for eve",
+    ]
+    assert "af_heart: American, female (Kokoro)" in lines and "am_michael: American, male, warm (Kokoro)" in lines
+    assert all(line.endswith(("(Pocket TTS)", "(Kokoro)", "another name for eve")) for line in lines[1:])
+    assert await say("/voice eve", T0 + 1) == "Eve is on: calls and voice notes use her voice now."
+    assert chosen == ["eve"] and store.get_state("voice_name") == "eve"
+    assert await say("/voice af_heart", T0 + 2) == "af_heart is on: calls and voice notes use her voice now."
+    assert await say("/voice name jane", T0 + 3) == "Jane is on: calls and voice notes use her voice now."
+    assert chosen == ["eve", "af_heart", "jane"]
+    assert await say("/voice marius", T0 + 4) == "There's no voice called Marius here yet. /voice voices lists them."
+    assert chosen == ["eve", "af_heart", "jane"] and store.get_state("voice_name") == "jane"
+    # eve-full is eve: chosen and kept by her name, and the reply says so
+    assert await say("/voice eve-full", T0 + 5) == (
+        "Eve is on: calls and voice notes use her voice now. eve-full is another name for eve."
+    )
+    assert chosen[-1] == "eve" and store.get_state("voice_name") == "eve"
+    assert await say("/voice vera", T0 + 6) == "Vera is on: calls and voice notes use her voice now."
+    assert chosen[-1] == "vera" and store.get_state("voice_name") == "vera"
+    assert await say("/voice alba", T0 + 7) == "Alba is on: calls and voice notes use his voice now."
+    assert await say("/voice michael", T0 + 8) == "Michael is on: calls and voice notes use his voice now."
+    assert await say("/voice am_michael", T0 + 9) == "am_michael is on: calls and voice notes use his voice now."
+    assert chosen[-3:] == ["alba", "michael", "am_michael"] and store.get_state("voice_name") == "am_michael"
+    # heart, af_heart's warmth on Pocket TTS (owner, 27 Oct: "not af_heart, do heart"): /voice heart picks it, and
+    # af_heart stays Kokoro's own, by its id
+    assert await say("/voice heart", T0 + 10) == "Heart is on: calls and voice notes use her voice now."
+    assert chosen[-1] == "heart" and store.get_state("voice_name") == "heart"
+    assert await say("/voice af_heart", T0 + 11) == "af_heart is on: calls and voice notes use her voice now."
+    assert chosen[-1] == "af_heart"
+
+
+async def test_a_mac_with_the_small_model_offers_no_vera(store: Store) -> None:
+    """Owner, 26 Oct: "vera stays on the 100M only": beside Gemma 4 12B (the 18M model) /voices leaves vera out, and
+    `/voice vera` says where she speaks and changes nothing; every other voice as on the large model, heart first (owner,
+    29 Oct: "just make the small heart", its own clone on the 18M)."""
+    chosen: list[str] = []
+    say = voice_commands(store, chosen, pocket_standard=False)
+    lines = (await say("/voices", T0)).splitlines()
+    assert lines[1:7] == [
+        "heart: female (Pocket TTS)",
+        "jane: female (Pocket TTS)",
+        "eve: female (Pocket TTS)",
+        "alba: male (Pocket TTS)",
+        "michael: male (Pocket TTS)",
+        "eve-full: another name for eve",
+    ]
+    assert not any(line.startswith("vera") for line in lines)
+    assert "af_heart: American, female (Kokoro)" in lines  # Kokoro's own stays on every Mac
+    assert await say("/voice jane", T0 + 1) == "Jane is on: calls and voice notes use her voice now."
+    assert await say("/voice vera", T0 + 2) == prompts.VOICE_STANDARD_ONLY.format(voice="Vera")
+    assert prompts.VOICE_STANDARD_ONLY.format(voice="Vera") == (
+        "Vera speaks only on a Mac with 32 GB of memory or more, where Pocket TTS runs its larger model. "
+        "/voice voices lists the voices on this one."
+    )
+    assert chosen == ["jane"] and store.get_state("voice_name") == "jane"
+    assert await say("/voice michael", T0 + 3) == "Michael is on: calls and voice notes use his voice now."
+    # heart speaks here too (owner, 29 Oct), on the 18M's own clone
+    assert await say("/voice heart", T0 + 4) == "Heart is on: calls and voice notes use her voice now."
+    assert chosen == ["jane", "michael", "heart"] and store.get_state("voice_name") == "heart"
+
+
+def test_without_a_figure_commands_read_the_macs_model(store: Store, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Commands without `pocket_standard` ask the voice module, which reads the Mac's memory (32 GB in the tests)."""
+    profile = Profile(store)
+    commands = Commands(store, profile, ContextBuilder(store, profile, TZ), TZ, status, lambda: None, voice=True)
+    assert commands.pocket_standard is True
+    monkeypatch.setattr(voice, "memory_gb", lambda: 16.0)
+    small = Commands(store, profile, ContextBuilder(store, profile, TZ), TZ, status, lambda: None, voice=True)
+    assert small.pocket_standard is False
+
+
+async def test_in_janes_languages_voice_says_she_speaks_them(store: Store) -> None:
+    """Owner, 25 Oct: "jane jane, lets have her as default for those languages". While Spanish, Italian, Portuguese,
+    Dutch, German or French is in use, /voice still chooses the English voice, and its reply and /voices say that this
+    language is spoken in Jane's voice; in English, or in Korean, Polish, Japanese and Russian (Supertonic-3's), the
+    replies stay as they were."""
+    chosen: list[str] = []
+    profile = Profile(store)
+    commands = Commands(
+        store,
+        profile,
+        ContextBuilder(store, profile, TZ),
+        TZ,
+        status,
+        lambda: None,
+        voice=True,
+        set_voice=chosen.append,
+        language="de",
+        language_voice="jane",
+    )
+    conversation = store.current_conversation()
+
+    async def say(text: str, ts: int) -> str:
+        message_id = store.add_incoming(conversation.id, ME, ts, "command", text)
+        assert message_id is not None
+        return await commands.handle(store.message(message_id))
+
+    assert await say("/voice eve", T0) == (
+        "Eve is on: calls and voice notes in English use her voice now. German is spoken in Jane's voice (Pocket TTS); "
+        "/voice sets the English voice."
+    )
+    assert chosen == ["eve"] and store.get_state("voice_name") == "eve"
+    assert await say("/voice am_michael", T0 + 1) == (
+        "am_michael is on: calls and voice notes in English use his voice now. German is spoken in Jane's voice "
+        "(Pocket TTS); /voice sets the English voice."
+    )
+    listed = (await say("/voices", T0 + 2)).splitlines()
+    assert listed[0] == "Voices (try one with /voice <voice>):" and "eve: female (Pocket TTS)" in listed
+    assert listed[-1] == "German is spoken in Jane's voice (Pocket TTS); /voice sets the English voice."
+    for step, (code, english) in enumerate((("en", None), ("ko", None), ("fr", "French"), ("nl", "Dutch"))):
+        commands = Commands(
+            store,
+            profile,
+            ContextBuilder(store, profile, TZ),
+            TZ,
+            status,
+            lambda: None,
+            voice=True,
+            set_voice=chosen.append,
+            language=code,
+            language_voice="jane",
+        )
+        reply = await say("/voice eve", T0 + 3 + step)
+        if english is None:
+            assert reply == "Eve is on: calls and voice notes use her voice now.", code
+        else:
+            assert reply.endswith(f"{english} is spoken in Jane's voice (Pocket TTS); /voice sets the English voice.")
+    # without a language voice (a voice service from before), as it was
+    bare = Commands(
+        store, profile, ContextBuilder(store, profile, TZ), TZ, status, lambda: None, voice=True, language="de"
+    )
+    commands = bare
+    assert await say("/voice eve", T0 + 9) == "Eve is on: calls and voice notes use her voice now."
+
+
+async def test_a_voice_command_answers_in_plain_words_whatever_the_spelling(store: Store) -> None:
+    """Owner, 25 Oct (the Tiffany line's /voice, on main's Kokoro voices): a voice matches in any case, by itself or
+    after `name`; a known voice answers "<voice> is on: ..." by its id as the owner types it ("af_heart", never
+    "Heart"), his for a male voice, her for a female one (the list's own word); a single word that is no mode, no
+    `voices` and no voice says so (an id as typed, a name capitalised) and never falls through to the usage line."""
+    chosen: list[str] = []
+    profile = Profile(store)
+    commands = Commands(
+        store,
+        profile,
+        ContextBuilder(store, profile, TZ),
+        TZ,
+        status,
+        lambda: None,
+        voice=True,
+        set_voice=chosen.append,
+    )
+    conversation = store.current_conversation()
+
+    async def say(text: str, ts: int) -> str:
+        message_id = store.add_incoming(conversation.id, ME, ts, "command", text)
+        assert message_id is not None
+        return await commands.handle(store.message(message_id))
+
+    assert await say("/voice AF_Heart", T0) == "af_heart is on: calls and voice notes use her voice now."
+    assert await say("/voice JANE", T0 + 30) == "Jane is on: calls and voice notes use her voice now."  # a Pocket name
+    assert await say("/voice BF_EMMA", T0 + 1) == "bf_emma is on: calls and voice notes use her voice now."
+    assert await say("/voice Name Am_Michael", T0 + 2) == "am_michael is on: calls and voice notes use his voice now."
+    assert await say("/voice am_puck", T0 + 3) == "am_puck is on: calls and voice notes use his voice now."
+    assert (
+        chosen == ["af_heart", "jane", "bf_emma", "am_michael", "am_puck"]
+        and store.get_state("voice_name") == "am_puck"
+    )
+    nobody = "There's no voice called {} here yet. /voice voices lists them."
+    assert await say("/voice Zoe", T0 + 4) == nobody.format("Zoe")
+    assert await say("/voice zoe", T0 + 5) == nobody.format("Zoe")
+    assert await say("/voice name ZOE", T0 + 6) == nobody.format("Zoe")
+    assert await say("/voice 12345", T0 + 7) == nobody.format("12345")
+    assert await say("/voice AF_Nova", T0 + 8) == nobody.format("af_nova")  # an id the owner types: never "Nova"
+    assert await say("/voice f1", T0 + 9) == nobody.format("F1")  # Supertonic's voice speaks the other languages
+    assert chosen == ["af_heart", "jane", "bf_emma", "am_michael", "am_puck"]  # nothing changed
+    assert store.get_state("voice_name") == "am_puck"
+    for at, mode in enumerate(("auto", "on", "off", "Auto", "ON")):  # the modes and the list keep their own answers
+        assert (await say(f"/voice {mode}", T0 + 10 + at)).startswith("Voice replies: ")
+    assert (await say("/voice Voices", T0 + 20)).startswith("Voices (try one with /voice <voice>)")
+    assert await say("/voice Echo ON", T0 + 21) == "Transcript echo: on (I show what I heard first)."
+    assert (await say("/voice loud and clear", T0 + 22)).endswith("/voice voices, /voice <voice>")  # the usage line
+    assert "(/voice voices, /voice <voice>)" in prompts.HELP
 
 
 async def test_fix_corrects_a_fact_in_place_in_the_users_own_words(store: Store) -> None:
@@ -616,6 +860,17 @@ async def test_remind_says_how_when_it_cannot(store: Store, typed: str, expected
     commands, _ = with_reminders(store)
     assert (await commands.handle(command(store, typed))).startswith(expected)
     assert store.open_reminders(ME) == []
+
+
+async def test_the_same_remind_typed_twice_says_it_is_already_set(store: Store) -> None:
+    """Review O1 (0.9.7): a repeat sets nothing new and gets no second confirmation, but the command's reply is never
+    empty (an empty text cannot be sent): code's line names the one already set, in words for the user."""
+    commands, _ = with_reminders(store)
+    first = await commands.handle(command(store, "/remind 17:00 call the dentist"))
+    again = await commands.handle(command(store, "/remind 17:00 call  the Dentist", T0 + 1))
+    assert first.startswith("**Reminder set** (#1):")
+    assert again == "Already set as #1 for Thu 8 Oct 17:00; nothing new was set."
+    assert len(store.open_reminders(ME)) == 1
 
 
 async def test_reminders_lists_and_cancels(store: Store) -> None:

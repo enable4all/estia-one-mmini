@@ -22,6 +22,7 @@ from local_assistant.spotify_auth import (
     pkce_pair,
 )
 from tests.fakes.fake_http import FakeHttp
+from tests.setup_helpers import noted
 
 CLIENT = "0123456789abcdef0123456789abcdef"
 NOW = 1_800_000_000.0
@@ -80,6 +81,22 @@ async def test_exchange_saves_a_private_refresh_token_with_its_sign_in_time(tmp_
     assert stat.S_IMODE(store.path.parent.stat().st_mode) == 0o700
     assert store.expires_at() == NOW + LIFETIME_SECONDS
     assert await store.access_token() == "A1"  # the exchange's access token is used first
+
+
+async def test_a_link_at_the_temporary_name_is_never_followed(tmp_path: Path) -> None:
+    """A link at spotify-tokens.json.tmp never makes the save write or chmod the file it names (review I37)."""
+    http = FakeHttp()
+    http.add(TOKEN_URL, 200, {"access_token": "A1", "refresh_token": "R1", "expires_in": 3600, "scope": SCOPES})
+    store = tokens(tmp_path, http)
+    store.path.parent.mkdir(mode=0o700)
+    victim = tmp_path / "authorized_keys"
+    victim.write_text("ssh-ed25519 AAAA kept\n")
+    victim.chmod(0o644)
+    (store.path.parent / "spotify-tokens.json.tmp").symlink_to("../authorized_keys")
+    await store.exchange("CODE", "VERIFIER")
+    assert victim.read_text() == "ssh-ed25519 AAAA kept\n" and stat.S_IMODE(victim.stat().st_mode) == 0o644
+    assert not store.path.is_symlink() and stat.S_IMODE(store.path.stat().st_mode) == 0o600
+    assert json.loads(store.path.read_text())["refresh_token"] == "R1"
 
 
 async def test_access_tokens_refresh_and_keep_the_sign_in_time(tmp_path: Path) -> None:
@@ -147,3 +164,46 @@ async def test_an_unreadable_token_file_is_not_signed_in_and_an_ended_sign_in_sh
     with pytest.raises(SpotifySignInExpired):
         await store.access_token()
     assert not store.signed_in()  # mini_status no longer says "signed in until …"
+
+
+# ------------------------------------------------------------------ the paste's question off a terminal (setup's window)
+
+
+def test_off_a_terminal_the_paste_is_asked_on_a_marked_line(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Setup's window runs the sign-in with a pipe for stdin: the question goes out on a line of its own after the
+    window's mark (as estia-deploy --ask-lines asks), and one line is read back."""
+    import io
+
+    from local_assistant import spotify_auth
+
+    out = io.StringIO()
+    monkeypatch.setattr("sys.stdin", io.StringIO("http://127.0.0.1:8888/callback?code=c&state=s\n"))
+    monkeypatch.setattr("sys.stdout", out)
+    assert spotify_auth.read_answer("3. Paste the address here: ") == "http://127.0.0.1:8888/callback?code=c&state=s\n"
+    assert out.getvalue() == "\x1f? 3. Paste the address here:\n"
+
+
+def test_at_a_terminal_the_paste_is_asked_as_before(monkeypatch: pytest.MonkeyPatch) -> None:
+    from local_assistant import spotify_auth
+
+    asked: list[str] = []
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda prompt: noted(asked, prompt, "typed"))
+    assert spotify_auth.read_answer("3. Paste the address here: ") == "typed"
+    assert asked == ["3. Paste the address here: "]
+
+
+def test_the_sign_in_reads_its_paste_with_that_reader() -> None:
+    from local_assistant import app, deploy, setup_admin, spotify_auth
+
+    assert "read=spotify_auth.read_answer" in Path(app.__file__).read_text(encoding="utf-8")
+    assert spotify_auth.ASK_MARK == deploy.ASK_MARK == setup_admin.ASK_MARK
+
+
+@pytest.mark.parametrize("pasted", ["", "  \n"])
+def test_nothing_pasted_says_so(pasted: str) -> None:
+    """Enter with nothing (or the window's Later, which ends its input): said plainly, never "state differs"."""
+    from local_assistant.spotify_auth import code_from
+
+    with pytest.raises(SpotifyAuthError, match=r"^nothing pasted; nothing saved$"):
+        code_from(pasted, "s")

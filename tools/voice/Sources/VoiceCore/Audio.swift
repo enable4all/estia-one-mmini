@@ -22,6 +22,42 @@ public func sniffAudio(_ data: Data) -> String? {
     return nil
 }
 
+/// The samples of a 16 kHz mono 16-bit PCM WAV, read in memory as AVAudioFile reads them (each value / 32768), or nil
+/// for any other audio or a broken file. Every call turn comes so (the bridge's `pcm48_to_wav16k`): it reaches Whisper
+/// without a file (review C5). The chunks are walked as RIFF lays them out (an odd size padded to even); fmt must come
+/// before data, and the data chunk must be whole.
+public func pcm16kMonoSamples(_ wav: Data) -> [Float]? {
+    let bytes = [UInt8](wav)
+    func le(_ at: Int, _ size: Int) -> Int {
+        (0..<size).reduce(0) { $0 | Int(bytes[at + $1]) << (8 * $1) }
+    }
+    func tag(_ at: Int) -> String? { String(bytes: bytes[at..<at + 4], encoding: .ascii) }
+    guard bytes.count >= 12, tag(0) == "RIFF", tag(8) == "WAVE" else { return nil }
+    var at = 12
+    var pcm16kMono = false
+    while at + 8 <= bytes.count {
+        let size = le(at + 4, 4)
+        let body = at + 8
+        switch tag(at) {
+        case "fmt ":
+            guard size >= 16, body + 16 <= bytes.count else { return nil }
+            // format 1 (PCM), 1 channel, 16,000 samples a second, 2 bytes a frame, 16 bits
+            pcm16kMono = le(body, 2) == 1 && le(body + 2, 2) == 1 && le(body + 4, 4) == 16_000
+                && le(body + 12, 2) == 2 && le(body + 14, 2) == 16
+            if !pcm16kMono { return nil }
+        case "data":
+            guard pcm16kMono, size % 2 == 0, body + size <= bytes.count else { return nil }
+            return stride(from: body, to: body + size, by: 2).map {
+                Float(Int16(bitPattern: UInt16(bytes[$0]) | UInt16(bytes[$0 + 1]) << 8)) / 32_768
+            }
+        default:
+            break
+        }
+        at = body + size + size % 2
+    }
+    return nil
+}
+
 /// A silent 16 kHz mono 16-bit WAV, for the warm-up transcription at start: the Neural Engine compiles
 /// the model on its first use (about 15 minutes after a macOS update), which must not be a user's voice note.
 public func silentWAV(seconds: Int) -> Data {

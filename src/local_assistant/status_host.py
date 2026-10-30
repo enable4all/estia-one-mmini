@@ -14,6 +14,7 @@ from local_assistant.commands import VOICE_MODE_KEY, StatusInfo
 from local_assistant.config import INTERRUPT_NEW
 from local_assistant.documents import shown_folder
 from local_assistant.initiative import Settings, evening_of, is_enabled
+from local_assistant.map_data import GOOGLE, OSM
 from local_assistant.part_status import lines as part_lines
 from local_assistant.part_status import security_lines
 from local_assistant.profiler import LAST_RUN_KEY
@@ -62,12 +63,53 @@ class StatusHost:
             music=cfg.spotify_enabled,
             web=cfg.web_enabled,
             maps=cfg.maps_enabled,
+            maps_service=OSM if self.osm() else GOOGLE,
             projects=cfg.projects_default if cfg.projects_enabled else "",
             project_levels=[level for level in others if level != cfg.projects_default],
             documents=shown_folder(cfg.documents_folder) if cfg.documents_enabled else "",
             chords=cfg.chords_enabled,
             security=self.level,
         )
+
+    def inventory(self) -> prompts.Inventory | None:
+        """Her tools' list (prompts.inventory): every tool this install offers her (Tools.inventory_tools), then the
+        programs behind them that are on here (the voice service, named with who speaks her voice in use, the call
+        helper, the calendar helper for the calendars it reads, the device helper, YouTube's, the documents helper). Her rules carry it and /tools shows it word for
+        word. None until her tools are built (her first rules come before them, App._wire_core)."""
+        cfg, tools = self.app.cfg, getattr(self.app, "tools", None)
+        if tools is None:
+            return None
+        return prompts.inventory(
+            tools.inventory_tools(),
+            host=cfg.host_label,
+            voice=cfg.voice_enabled or cfg.calls_enabled,
+            calls=cfg.calls_enabled,
+            wake_calls=cfg.reminders_enabled and cfg.wake_calls,
+            calendars=[source.service for source in cfg.calendars if source.kind != "outlook"],
+            devices=[spec.service for spec in cfg.tapo_devices],
+            ask_first=any(spec.rule == "ask first" for spec in cfg.tapo_devices),
+            documents=cfg.documents_enabled,
+            osm=self.osm(),
+            english_voice=self.english_voice(),
+            language_voice=cfg.voice_language_voice,
+            read_pages=tools.read_pages,
+        )
+
+    def english_voice(self) -> str:
+        """Her English voice in use: the voice clients' (a /voice choice, or the config's as this Mac speaks it), else
+        the config's."""
+        client = self.app.voice or self.app._call_voice
+        return client.voice if client is not None else self.app.cfg.voice_name
+
+    def osm(self) -> bool:
+        """Whether her places and routes are OpenStreetMap's (no Google Maps key); her first rules come before maps."""
+        maps = getattr(self.app, "maps", None)
+        return maps is not None and not maps.google
+
+    def inventory_text(self) -> str:
+        """/tools: her tools' list word for word as her rules carry it (built before any command can come)."""
+        listed = self.inventory()
+        return prompts.inventory_text(listed) if listed is not None else ""
 
     async def security_level_loop(self) -> None:
         while True:
@@ -135,8 +177,7 @@ class StatusHost:
         """A message signal-cli could not open. From an allowed account with a changed safety number: recorded (doctor
         and /status show it with the compare-then-trust steps), logged without the account."""
         if problem.untrusted_identity and problem.sender in self.app.cfg.allowed_acis:
-            self.app._identity_changed.add(problem.sender)
-            self.app.part_status.identity_changed()
+            self.app.signal_host.mark_identity_changed(problem.sender)
             log.error(
                 "a message from the user was dropped: their safety number changed. Compare it on the phone, then trust "
                 "it with signal-cli (setup_assistant.md, 7. Operations, 'Safety number changed')"
@@ -153,6 +194,16 @@ class StatusHost:
             except Exception:
                 log.exception("linked devices: the check failed")
             await asyncio.sleep(LINKED_DEVICES_SECONDS)
+
+    async def alert(self, text: str, *, private: bool = False) -> None:
+        """A watcher's alert or recovery, the digest: a note to every allowed user (`private`: mail or calendar text).
+        The log says "sent" only when every one went out; a failed one is sent again within the recovery window."""
+        conversation = self.app.store.current_conversation()
+        sent = True
+        for aci in sorted(self.app.cfg.allowed_acis):
+            note = self.app.store.add_outgoing(conversation.id, aci, "note", text, None, private=private)
+            sent &= await self.app._send(note)
+        log.warning("alert %s: %d line(s)", "sent" if sent else "not sent yet", text.count("\n") + 1)
 
     async def check_linked_devices(self) -> int | None:
         """Count her own Signal account's devices (only this Mac is expected): kept in status.json; one note when the

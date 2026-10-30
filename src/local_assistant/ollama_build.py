@@ -37,6 +37,7 @@ import grp
 import hashlib
 import itertools
 import json
+import math
 import os
 import plistlib
 import pwd
@@ -48,13 +49,15 @@ import subprocess
 import sys
 import tempfile
 import time
+import tomllib
+import urllib.parse
 import urllib.request
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
-from local_assistant import prompts
+from local_assistant import gemma, ownuser, prompts, setup_progress
 from local_assistant.hostsec import (
     CHMOD,
     CHOWN,
@@ -64,6 +67,7 @@ from local_assistant.hostsec import (
     LSOF,
     NETSTAT,
     PS,
+    RM,
     SUDO,
     TAR,
     Host,
@@ -74,6 +78,10 @@ from local_assistant.ownuser import STREAM_LOGS
 CURL = "/usr/bin/curl"
 SPCTL = "/usr/sbin/spctl"
 TEE = "/usr/bin/tee"
+SHASUM = "/usr/bin/shasum"
+MKDIR = "/bin/mkdir"
+MV = "/bin/mv"
+LN = "/bin/ln"
 TEAM_ID = "3MU9H2V9Y9"  # Developer ID Application: Infra Technologies, Inc (Ollama)
 # Apple's Developer ID chain (Apple's root, the Developer ID authority, a Developer ID Application leaf) with Ollama's
 # team as the leaf's OU: `codesign --verify --strict -R` refuses an ad-hoc signature that only claims the team ID
@@ -102,11 +110,15 @@ class Release:
 # this pin, after the smoke test and the Gemma test set pass on it
 RELEASE = Release("0.40.4", "a4ceae4b2aaf18df37ebcbfb56ba3a37a87838631112d66c2be07268693c8d58")
 RELEASE_MB = 168  # ollama-darwin.tgz v0.40.4: 167.9 MB
+RELEASE_BYTES = 167_900_000  # about its size: setup's five dots read the download against it (the fifth: once done)
 LABEL = "com.local-assistant.ollama"
 PORT = 11434
 BASE = f"http://127.0.0.1:{PORT}"
 DAEMON = Path("/Library/LaunchDaemons") / f"{LABEL}.plist"
-LOG_DIR = STREAM_LOGS  # root's: launchd opens the log as root, no link followed
+# root's: launchd opens and appends to the log as the job's user (UserName: you, or her account for her own Ollama),
+# never as root, so the log must be there and that user's before launchd starts the job (M01, 30 Oct: with none, the
+# start failed with exit 78); this root-owned folder is what stops a link being planted at that name
+LOG_DIR = STREAM_LOGS
 LOG = LOG_DIR / "ollama.log"
 LOG_CAP = 10 * 1024 * 1024  # setup empties a larger log of yours (launchd appends: writing goes on at the new end)
 LAUNCH_DAEMONS = Path("/Library/LaunchDaemons")
@@ -114,9 +126,38 @@ PLIST_BYTES = 1_000_000
 XGRAMMAR = ("mlx_metal_v3/libollama_xgrammar.dylib", "mlx_metal_v4/libollama_xgrammar.dylib")
 CELLARS = (Path("/opt/homebrew/Cellar"), Path("/usr/local/Cellar"))  # Homebrew on Apple silicon, and on Intel
 APP = Path("/Applications/Ollama.app")
-KEEP_ALIVE = "120m"  # the tested setup's (local-llm, with its watchdog: none here, see the docs' known gaps)
+APP_PROGRAM = Path("Contents/Resources/ollama")  # the app's own ollama program, inside it
+OPEN = "/usr/bin/open"
+# the tested setup's (local-llm, with its watchdog: none here, see the docs' known gaps); every request names it too
+# (gemma.KEEP_ALIVE), so it holds on the Ollama app, which reads no service file of setup's
+KEEP_ALIVE = gemma.KEEP_ALIVE
 WAIT_SECONDS = 60
+# the Ollama app's first open: macOS's "downloaded from the Internet, Open?" and the app's welcome window come first
+# (mac-ollama-app-first-open, round 1): 3 minutes, a still-waiting line every 15 s
+APP_WAIT_SECONDS = 180
+APP_WAITING_EVERY = 15
 PATH_LINE = 'export PATH="$HOME/opt/ollama/current:$PATH"'
+# Her own Ollama (owner, 29 Oct: "Her own, in _estia"): a new install that says yes to her own macOS account gets
+# Ollama's official build as a copy only admin rights can change, run as _estia from the Mac's start, on an address of
+# her own on the Mac itself, her model in her own folder. Every other install keeps today's ("older": ~/opt/ollama as
+# you on 11434), byte for byte; "app" is the Ollama app the person chose (11434 too).
+Layout = Literal["hers", "older", "app"]
+# the kill switch: the layout a new install with her own account gets. "older" ships today's path for every new
+# install. Its gate, Metal for a LaunchDaemon as _estia (/api/ps: size_vram == size), was measured on 30 Oct (M01, a
+# Mac mini with macOS 27.0.1, Ollama 0.40.4, gemma4:12b-mlx: size_vram == size == 7750467524, "library=Metal"): passed,
+# so "hers". The record: docs/e2e-checklist.md, 111a
+NEW_INSTALLS: Layout = "hers"
+# her address: not 11434 (Ollama's default: the app's, Homebrew's, anyone's own) nor 11435-11439 (a second Ollama's
+# usual place); in no /etc/services entry, below macOS's ephemeral range, next to her voice service's 8150
+HER_PORT = 8151
+HER_BASE = f"http://127.0.0.1:{HER_PORT}"
+HER_FOLDER = ownuser.CODE / "ollama"  # root's copy: v<version> folders and `current`, root:wheel, 0755/0644
+HER_PROGRAM = HER_FOLDER / "current" / "ollama"
+HER_MODELS = ownuser.HOME / ".ollama" / "models"  # hers alone (0700: her service's Umask)
+CURL_WRITE_FAILED = 23  # curl's exit code when it cannot write what it downloads: a full disk, as a rule
+HER_ROOM = 3_000_000_000  # free disk her Ollama needs besides her model: 548 MB unpacked, the download, 2 GB to spare
+HER_CACHE = Path("Library/Caches/estia-setup")  # your download of the release, in your home, before root's copy
+TAR_AS_ROOT = ("--no-same-owner", "--no-same-permissions", "--no-mac-metadata")  # root unpacks as your tar would
 _SIGNED_SUFFIXES = (".dylib", ".so", ".metallib")
 _MACHO = {
     b"\xfe\xed\xfa\xce",
@@ -128,6 +169,10 @@ _MACHO = {
 }
 # a listening socket in `netstat -anv -p tcp`: its local address (the port after the last dot), then its process:pid
 _LISTEN = re.compile(r"^tcp[46]*\s+\d+\s+\d+\s+(\S+)\s+\S+\s+LISTEN\s+(?:\d+\s+){4}(.+?):(\d+)\s")
+# `launchctl print system/<label>` (every account may read it): the job's own pid and environment, one tab in
+_LAUNCHD_PID = re.compile(r"^\tpid = (\d+)$", re.M)
+_LAUNCHD_ENVIRONMENT = re.compile(r"^\tenvironment = \{\n(.*?)^\t\}$", re.M | re.S)
+_LAUNCHD_HOST = re.compile(r"^\t\tOLLAMA_HOST => (.*)$", re.M)
 _VERSION = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)")
 
 
@@ -220,6 +265,21 @@ class Listener:
     others: tuple[Other, ...] = ()
 
 
+def host_address(value: str, port: int) -> str | None:
+    """OLLAMA_HOST ("127.0.0.1:8151", "http://0.0.0.0:8151", "[::1]:8151") as netstat shows its local address
+    ("127.0.0.1.8151", "*.8151", "::1.8151"); None when it names another port or none (Ollama's default: 11434)."""
+    text = value.strip()
+    try:
+        parts = urllib.parse.urlsplit(text if "://" in text else f"//{text}")
+        named = parts.port
+    except ValueError:
+        return None
+    if named != port:
+        return None
+    host = parts.hostname or ""
+    return f"{'*' if host in ('', '0.0.0.0', '::') else host}.{port}"
+
+
 def other_machines(addresses: Sequence[str], port: int = PORT) -> list[str]:
     """The addresses other machines can reach: all but 127.0.0.1 and ::1 (this Mac only)."""
     return [address for address in addresses if address not in (f"127.0.0.1.{port}", f"::1.{port}")]
@@ -247,17 +307,33 @@ def account_name(uid: int) -> str:
         return f"uid {uid}"
 
 
-def problem(found: Found, owner: int | None = None) -> tuple[str, str] | None:
+def app_on_mac(root: Path, home: Path | None) -> Path | None:
+    """The Ollama app on this Mac: /Applications/Ollama.app (under `root`), else your own ~/Applications/Ollama.app
+    (`home`; None off the live Mac, where no home is read). None when neither is there. Read-only, no link
+    followed."""
+    if os.path.lexists(root / APP.relative_to("/")):
+        return APP
+    if home is not None and os.path.lexists(home / "Applications/Ollama.app"):
+        return home / "Applications/Ollama.app"
+    return None
+
+
+def problem(
+    found: Found, owner: int | None = None, *, app_ok: bool = False, port: int = PORT, root: Path = Path("/")
+) -> tuple[str, str] | None:
     """What makes an Ollama that answers one setup cannot keep, and its fix; None when it is the official build.
-    `owner`: your account's uid; an Ollama another account runs gets her prompts, so that account controls her
-    answers (not checked when either is unknown)."""
+    `owner`: your account's uid (her own Ollama's account for hers: `owner_of`); an Ollama another account runs gets
+    her prompts, so that account controls her answers (not checked when either is unknown). `app_ok`: the person chose
+    the Ollama app (owner, 29 Oct), so the app's is checked like the official build, by everything but its being the
+    app. `port`: the one it answers on (hers: HER_PORT); `root`: the Mac's tree its libraries are looked for in (a
+    test's own)."""
     if not found.program:
         return prompts.OLLAMA_NOT_FOUND, prompts.OLLAMA_NOT_FOUND_FIX
     program = Path(found.program)
     if homebrews(program):
         return prompts.OLLAMA_HOMEBREW.format(program=program), prompts.OLLAMA_HOMEBREW_FIX
     app = app_of(program)
-    if app is not None:
+    if app is not None and not app_ok:
         return prompts.OLLAMA_APP.format(state="answers", path=app), prompts.OLLAMA_APP_FIX.format(path=app)
     reasons: list[str] = []
     if found.signature:
@@ -266,11 +342,12 @@ def problem(found: Found, owner: int | None = None) -> tuple[str, str] | None:
         parsed = parse_version(found.version)
         if parsed is None or parsed < MIN_VERSION:
             reasons.append(prompts.OLLAMA_WHY_OLD.format(version=found.version or "unknown", needed=MIN_TEXT))
-    missing, _unread = missing_libraries(found.program)
+    on_disk = root / program.relative_to("/") if program.is_absolute() else program
+    missing, _unread = missing_libraries(str(on_disk))
     reasons += [prompts.OLLAMA_WHY_LIBRARY.format(library=library) for library in missing]
-    reachable = other_machines(found.addresses or ())
+    reachable = other_machines(found.addresses or (), port)
     if reachable:
-        reasons.append(prompts.OLLAMA_WHY_OPEN.format(addresses=", ".join(reachable), port=PORT))
+        reasons.append(prompts.OLLAMA_WHY_OPEN.format(addresses=", ".join(reachable), port=port))
     if found.uid is not None and owner is not None and found.uid != owner:
         reasons.append(prompts.OLLAMA_WHY_ACCOUNT.format(account=account_name(found.uid)))
     for other, uid in found.others:
@@ -291,17 +368,77 @@ def someone_else_runs(found: Found, owner: int | None) -> bool:
     return bool(found.others) or (found.uid is not None and owner is not None and found.uid != owner)
 
 
-def endangers(found: Found, owner: int | None) -> bool:
+def endangers(found: Found, owner: int | None, port: int = PORT) -> bool:
     """Whether her prompts may reach someone other than you: its program not found, another account runs it or its
     account cannot be read, another program or account on its port too, other machines reach it, or (not Homebrew's
     or the app's, whose own signatures are named apart) its signature does not check out. These stop a re-run of
     setup too; Homebrew's, the app's and the other jobs are a "!" there."""
     if not found.program or found.uid is None or someone_else_runs(found, owner):
         return True
-    if other_machines(found.addresses or ()):
+    if other_machines(found.addresses or (), port):
         return True
     program = Path(found.program)
     return bool(found.signature) and not homebrews(program) and app_of(program) is None
+
+
+def hers(found: Found, root: Path = Path("/"), *, her_uid: int | None = None) -> bool:
+    """Her own Ollama, the one rule setup and doctor share: run by her account (_estia), its program's real path under
+    /usr/local/estia/ollama, and that program and every folder up to / root's alone (`ownuser._trusted`). `root`: the
+    Mac's tree (a test's own); `her_uid`: her account's number (None: read from the user database)."""
+    uid = ownuser.lookup_uid(ownuser.ROLE_USER) if her_uid is None else her_uid
+    if uid is None or found.uid != uid or not found.program.startswith("/"):
+        return False
+    on_disk = root / Path(found.program).relative_to("/")
+    real = Path(os.path.realpath(on_disk))
+    folder = Path(os.path.realpath(root / HER_FOLDER.relative_to("/")))
+    return real.is_relative_to(folder) and real != folder and ownuser._trusted(on_disk, root) is None
+
+
+def owner_of(found: Found, owner: int | None, root: Path = Path("/"), *, her_uid: int | None = None) -> int | None:
+    """The account an Ollama may run as and still be kept: hers for her own Ollama (`hers`), else yours (`owner`)."""
+    return found.uid if hers(found, root, her_uid=her_uid) else owner
+
+
+def layout_found(
+    root: Path, *, config_ollama: str | None = None, config_url: str | None = None, moved: bool = False
+) -> Layout | None:
+    """The layout an install has already, read only, first match wins: setup's own service file (every account reads
+    it: _estia is hers; any other older, once your config is set up or she moved); else your config set up
+    (`ollama = "app"`, or its ollama_base_url on her port: hers; else older); else older once she runs in her own
+    account (her config is hers alone). None for a first install: the plan decides (`layout_planned`). The first
+    install's layout sticks. Today's service file with no config and no move is an earlier try's leftover (c-2,
+    round 3): None too, and her own Ollama's service file takes its place (`Install.daemon`)."""
+    path = root / DAEMON.relative_to("/")
+    service = read_plist(path)
+    if service is not None and service.get("UserName") == ownuser.ROLE_USER:
+        return "hers"
+    installed = config_ollama is not None or config_url is not None or moved
+    if installed and (service is not None or os.path.lexists(path)):
+        return "older"  # one setup cannot read: today's code, which says what it finds
+    if config_ollama is not None or config_url is not None:
+        if config_ollama == "app":
+            return "app"
+        try:
+            port = urllib.parse.urlsplit(config_url or "").port
+        except ValueError:
+            port = None
+        return "hers" if port == HER_PORT else "older"
+    return "older" if moved else None
+
+
+def layout_planned(found: Layout | None, *, app: bool, move: bool) -> Layout:
+    """A first install's layout from the plan, once nothing is found (`layout_found`): the Ollama app when chosen;
+    her own Ollama (`NEW_INSTALLS`) with her own macOS account; else older (today's)."""
+    if found is not None:
+        return found
+    if app:
+        return "app"
+    return NEW_INSTALLS if move else "older"
+
+
+def base_of(layout: Layout) -> str:
+    """The address setup talks to Ollama on for this layout."""
+    return HER_BASE if layout == "hers" else BASE
 
 
 def stopped(text: str, fix: str) -> str:
@@ -496,6 +633,38 @@ def daemon_plist(*, user: str, group: str, home: Path, num_ctx: int) -> bytes:
     return plistlib.dumps(service)
 
 
+def her_plist(num_ctx: int) -> bytes:
+    """Her own Ollama's LaunchDaemon: root's copy of the official build, as her own macOS account (_estia), from boot,
+    on her own address on the Mac itself; her model in her own folder (Umask 63: 0700 and 0600); one model loaded, one
+    request at a time, no cloud model; its output in root's /var/log/estia. Her home given explicitly, as for her other
+    services: her account record keeps /var/empty."""
+    home = str(ownuser.HOME)
+    service: dict[str, Any] = {
+        "Label": LABEL,
+        "UserName": ownuser.ROLE_USER,
+        "GroupName": ownuser.ROLE_GROUP,
+        "ProgramArguments": [str(HER_PROGRAM), "serve"],
+        "EnvironmentVariables": {
+            "HOME": home,
+            "CFFIXED_USER_HOME": home,
+            "OLLAMA_HOST": f"127.0.0.1:{HER_PORT}",
+            "OLLAMA_MODELS": str(HER_MODELS),
+            "OLLAMA_KEEP_ALIVE": KEEP_ALIVE,
+            "OLLAMA_MAX_LOADED_MODELS": "1",
+            "OLLAMA_NUM_PARALLEL": "1",
+            "OLLAMA_CONTEXT_LENGTH": str(num_ctx),
+            "OLLAMA_NO_CLOUD": "1",
+        },
+        "WorkingDirectory": home,
+        "Umask": 63,
+        "RunAtLoad": True,
+        "KeepAlive": True,
+        "StandardOutPath": str(LOG),
+        "StandardErrorPath": str(LOG),
+    }
+    return plistlib.dumps(service)
+
+
 def service_file_changed(root: Path, num_ctx: int) -> bool | None:
     """Whether setup's own service file differs from the one setup writes now (`daemon_plist`) for the account it
     runs as (its UserName, its home and group from the user database); None when there is none or it cannot be read.
@@ -506,6 +675,8 @@ def service_file_changed(root: Path, num_ctx: int) -> bool | None:
     if data is None or service is None:
         return None
     user = service.get("UserName")
+    if user == ownuser.ROLE_USER:  # her own Ollama: its own bytes (her record's home is /var/empty)
+        return data != her_plist(num_ctx)
     try:
         account = pwd.getpwnam(user) if isinstance(user, str) else None
         group = grp.getgrgid(account.pw_gid).gr_name if account is not None else ""
@@ -630,17 +801,61 @@ def sha256_of(path: Path) -> str:
     return digest.hexdigest()
 
 
+def root_modes(folder: Path) -> str:
+    """Why root's copy of a release cannot be run as her, or can be changed by another account ("" when neither): every
+    file and folder root's (`ownuser.CODE_UID`), not group- or other-writable, readable by every account, folders and
+    programs runnable by every account, no set-user or set-group bit. At most five reasons, then a count."""
+    problems: list[str] = []
+    paths = [folder]  # the folder itself, then everything in it (a link is looked at, never followed)
+    for top, folders, files in os.walk(folder):
+        paths += [Path(top) / name for name in sorted([*folders, *files])]
+    for path in paths:
+        shown = path.relative_to(folder) if path != folder else Path(folder.name)
+        try:
+            info = path.lstat()
+        except OSError:
+            problems.append(prompts.OLLAMA_WHY_MODES.format(name=shown, why="could not be read"))
+            continue
+        mode = stat.S_IMODE(info.st_mode)
+        if info.st_uid != ownuser.CODE_UID:
+            problems.append(prompts.OLLAMA_WHY_MODES.format(name=shown, why="is not root's"))
+        elif stat.S_ISLNK(info.st_mode):
+            continue
+        elif mode & 0o022:
+            problems.append(prompts.OLLAMA_WHY_MODES.format(name=shown, why="can be changed by another account"))
+        elif mode & (stat.S_ISUID | stat.S_ISGID):
+            problems.append(prompts.OLLAMA_WHY_MODES.format(name=shown, why="has a set-user or set-group bit"))
+        elif not mode & 0o004 or ((stat.S_ISDIR(info.st_mode) or mode & 0o100) and not mode & 0o001):
+            problems.append(prompts.OLLAMA_WHY_MODES.format(name=shown, why="cannot be run by her account"))
+    more = f" (and {len(problems) - 5} more)" if len(problems) > 5 else ""
+    return "; ".join(problems[:5]) + more
+
+
 class Tools:
     """The Mac for this step (replaced in tests): Ollama's answer, the program on its port, read-only tools, and
-    changes, which run in the person's own terminal (sudo asks there). Off the live Mac (root not "/") nothing is read
-    or run: no Ollama answers, no program listens, and every change is printed."""
+    changes, which run in the person's own terminal (sudo asks there), or, given `change` (setup's window), through
+    the setup window (macOS's own box asks for admin rights). Off the live Mac (root not "/") nothing is read or run:
+    no Ollama answers, no program listens, and every change is printed."""
 
     def __init__(
-        self, root: Path | None = None, *, say: Callable[[str], None] = print, host: Host | None = None
+        self,
+        root: Path | None = None,
+        *,
+        say: Callable[[str], None] = print,
+        host: Host | None = None,
+        change: Callable[[Sequence[str], bytes | None], int | None] | None = None,
     ) -> None:
         self.root = estia_root() if root is None else root
         self.say = say
         self.host = host or Host(self.root, say=say)
+        self.changer = change  # the window's runner: an exit code, or None when the terminal runs it
+        # what the last change printed when it failed and the window kept it from view (a change with input runs
+        # captured there): its ✗ line is the step's reason, as Terminal shows it (review W23)
+        self.failed_output = ""
+
+    def kept_failure(self, output: str) -> None:
+        """The window's word for a change that failed: what it printed."""
+        self.failed_output = output
 
     @property
     def live(self) -> bool:
@@ -651,22 +866,25 @@ class Tools:
         the app)."""
         return os.path.realpath(program)
 
-    def version(self) -> str | None:
-        """/api/version's version ("" when the answer names none); None when nothing answers."""
+    def version(self, port: int = PORT) -> str | None:
+        """/api/version's version on that port of the Mac itself ("" when the answer names none); None when nothing
+        answers."""
         if not self.live:
             return None
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         try:
-            with opener.open(f"{BASE}/api/version", timeout=3) as response:
+            with opener.open(f"http://127.0.0.1:{port}/api/version", timeout=3) as response:
                 data = json.loads(response.read(100_000))
         except (OSError, ValueError):
             return None
         return str(data.get("version") or "") if isinstance(data, dict) else ""
 
-    def listener(self, port: int = PORT) -> Listener:
+    def listener(self, port: int = PORT, *, by_service: bool = True) -> Listener:
         """The program listening on the port, where it listens and the account that runs it: netstat names every
         user's sockets with their pid and local address (lsof as a user only that user's), proc_pidpath the program
-        and ps its account, both for any user's process; Listener("") when none."""
+        and ps its account, both for any user's process; Listener("") when none. When no socket can be seen at all
+        on her address, her own service's process stands for it (`her_service`; `by_service`: for an Ollama that
+        answered there, never as the proof that something holds it)."""
         if not self.live:
             return Listener("")
         sockets: dict[str, list[str]] = {}  # each listening pid and its local addresses on the port
@@ -685,6 +903,8 @@ class Tools:
                 elif line.startswith("n") and pid:  # lsof's "127.0.0.1:11434", "[::1]:11434", "*:11434": netstat's
                     host, _, at = line[1:].rpartition(":")
                     sockets[pid].append(f"{host.strip('[]')}.{at}")
+        if not sockets and port == HER_PORT and by_service:
+            return self.her_service(port)
         programs = {pid: self.host.program_path(pid) for pid in sockets}
         first = next((pid for pid in sockets if programs[pid]), None)
         if first is None:
@@ -696,6 +916,38 @@ class Tools:
         )
         addresses = tuple(dict.fromkeys(address for found in sockets.values() for address in found))
         return Listener(mine[0], addresses, mine[1], others)
+
+    def her_service(self, port: int) -> Listener:
+        """Her own Ollama when no socket can be seen (review of 30 Oct, P01: netstat started from a command tool's
+        shell lists none, lsof only your own): setup's service as launchd runs it (`launchctl print`, read-only, as
+        any account), kept only when its process's program is in root's copy (HER_FOLDER) and its OLLAMA_HOST is this
+        port; where it listens is that OLLAMA_HOST, its account from ps. `hers` then checks it as any listener.
+        Another account's second listener on the port cannot be seen this way. Listener("") otherwise."""
+        code, out = self.host.run([LAUNCHCTL, "print", f"system/{LABEL}"], read_only=True)
+        pid = _LAUNCHD_PID.search(out) if code == 0 else None
+        environment = _LAUNCHD_ENVIRONMENT.search(out) if code == 0 else None
+        named = _LAUNCHD_HOST.search(environment[1]) if environment is not None else None
+        address = host_address(named[1], port) if named is not None else None
+        if pid is None or address is None:
+            return Listener("")
+        program = self.host.program_path(pid[1])
+        if not program or not Path(program).is_relative_to(HER_FOLDER):
+            return Listener("")
+        return Listener(program, (address,), self.uid_of(pid[1]))
+
+    def her_uid(self) -> int | None:
+        """Her account's number (_estia), from the user database; None when there is none (or off the live Mac)."""
+        return ownuser.lookup_uid(ownuser.ROLE_USER) if self.live else None
+
+    def free_bytes(self, path: Path) -> int | None:
+        """Free space on the volume a path is on (its nearest folder that is there); None when it cannot be read."""
+        for folder in (path, *path.parents):
+            if folder.exists():
+                try:
+                    return shutil.disk_usage(folder).free
+                except OSError:
+                    return None
+        return None
 
     def uid_of(self, pid: str) -> int | None:
         """The account (uid) that runs a process: `ps -o uid= -p <pid>` (fixed argv, read-only); None when it says
@@ -710,14 +962,28 @@ class Tools:
             return 127, ""
         return self.host.run(argv, read_only=True)
 
-    def change(self, argv: Sequence[str], *, input: bytes | None = None) -> int:
-        """A change by its full path, in the person's terminal (sudo asks for the password there); with `input`, on
-        the tool's input, its output dropped. Off the live Mac only printed."""
+    def fetch(self, argv: Sequence[str], path: Path, watch: setup_progress.Watch) -> int:
+        """A download by its full path into `path`, its five dots lit by the file's size (setup_progress.fetch), in
+        the person's terminal. Off the live Mac only printed."""
         if not argv or not argv[0].startswith("/"):
             raise ValueError(f"tools are run by their absolute path, not {list(argv[:1])}")
         if not self.live:
             self.say("would run: " + " ".join(argv))
             return 0
+        return setup_progress.fetch(argv, path, RELEASE_BYTES, watch)
+
+    def change(self, argv: Sequence[str], *, input: bytes | None = None) -> int:
+        """A change by its full path, in the person's terminal (sudo asks for the password there), or through the
+        setup window (`changer`: macOS's own box asks); with `input`, on the tool's input, its output dropped. Off the
+        live Mac only printed."""
+        if not argv or not argv[0].startswith("/"):
+            raise ValueError(f"tools are run by their absolute path, not {list(argv[:1])}")
+        self.failed_output = ""
+        if not self.live:
+            self.say("would run: " + " ".join(argv))
+            return 0
+        if self.changer is not None and (code := self.changer(argv, input)) is not None:
+            return code
         try:
             done = subprocess.run(
                 list(argv), input=input, stdout=subprocess.DEVNULL if input is not None else None, check=False
@@ -744,10 +1010,32 @@ class Install:
         profile: Path | None = None,
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
+        watch: Callable[[str], setup_progress.Watch] | None = None,
+        command: Callable[[str], None] | None = None,
+        app: Path | None = None,
+        layout: Layout = "older",
+        account: Sequence[str] | None = None,
+        model_bytes: int = 0,
+        name: str = "Estia",
+        leftover: bool = False,
     ) -> None:
         self.tools = tools
+        self.app = app  # the Ollama app the person chose at setup's question (owner, 29 Oct): used, nothing installed
+        self.layout = layout  # "hers": her own Ollama (run_hers); any other: today's code, byte for byte
+        self.account = account  # setup's command that makes her account at step 1 (None: never, as install-ollama.sh)
+        self.model_bytes = model_bytes  # her model's bytes still to download (hers: the free disk it needs)
+        self.name = name
+        # setup's own service file is an earlier try's (no config, no move): beside the chosen app it goes (c-2)
+        self.leftover = leftover
+        self.used: Layout = "older"  # what run() ended with: "hers", "older" or "app"
+        self.trying_app = False  # her own Ollama's fallback: the app's refusal raises, a dry run too
+        self.app_said = False
+        self.password_said = False
         self.home = home
         self.say = say
+        self.watch = watch  # setup's: the download's five dots, curl's own meter off (None: curl's meter, as before)
+        # setup's: a command that asks nothing in Terminal, printed so the window keeps its screen (default: say)
+        self.command = command or say
         self.release = release
         self.user = user or pwd.getpwuid(os.getuid()).pw_name
         self.group = group or grp.getgrgid(os.getgid()).gr_name
@@ -757,6 +1045,24 @@ class Install:
         # off the live Mac (a test's root): nothing on this Mac is read, not even your home; every step only shown
         self.blind = not tools.live
         self.dry_run = dry_run or self.blind
+
+    @property
+    def her_own(self) -> bool:
+        return self.layout == "hers"
+
+    @property
+    def boxed(self) -> bool:
+        """Its admin rights come from macOS's own box (the setup window runs its changes): no password line here."""
+        return self.tools.changer is not None
+
+    @property
+    def port(self) -> int:
+        return HER_PORT if self.her_own else PORT
+
+    @property
+    def base(self) -> str:
+        """Where the Ollama setup uses answers: her own address, or 11434 (today's, the app's)."""
+        return HER_BASE if self.used == "hers" else BASE
 
     @property
     def folder(self) -> Path:
@@ -773,7 +1079,13 @@ class Install:
     def run(self, num_ctx: int) -> str:
         """The ollama program setup runs for the model step (any official one talks to the server that answers);
         SystemExit with what is wrong and the fix when it cannot go on. In a dry run, what would stop it is printed
-        and the rest follows as it would run after the fix."""
+        and the rest follows as it would run after the fix. With the Ollama app chosen: the app (`use_app`). Her own
+        Ollama (layout "hers"): `run_hers`."""
+        if self.her_own:
+            return self.run_hers(num_ctx)
+        if self.app is not None:
+            self.used = "app"
+            return self.use_app(self.app)
         self.cap_log()
         found = self.running()
         jobs = self.jobs()
@@ -795,13 +1107,93 @@ class Install:
         self.wait()
         return str(self.program)
 
-    def running(self) -> Found | None:
+    def use_app(self, app: Path) -> str:
+        """The Ollama app, as the person chose (owner, 29 Oct): nothing installed. Its own ollama program by its real
+        path inside the app (never one found on PATH), signed by Ollama; setup's own service beside it stops a first
+        install (two always-on Ollamas fight for the port); the app started with open -a when nothing answers, and
+        waited for; then the checks any Ollama gets, the app's own allowed: run by you, alone on its port, on this Mac
+        only. One someone other than you may control stops every run, as before. Off the live Mac only shown."""
+        shown = app / APP_PROGRAM
+        if self.blind:
+            self.say(prompts.OLLAMA_APP_WOULD.format(path=app))
+            self.step([OPEN, "-a", str(app)])
+            return str(shown)
+        program = Path(self.real(str(shown)))
+        on_disk = self._system(program)
+        if not program.is_relative_to(self.real(str(app))) or on_disk.is_symlink() or not on_disk.is_file():
+            why = prompts.OLLAMA_APP_NO_PROGRAM.format(path=shown)
+            self.refuse(stopped(why, prompts.OLLAMA_APP_REINSTALL), fatal=True)
+            return str(shown)
+        unsigned = signature_problem(self.tools.read, str(on_disk))
+        if unsigned:
+            why = prompts.OLLAMA_OTHER.format(program=program, why=unsigned)
+            self.refuse(stopped(why, prompts.OLLAMA_APP_REINSTALL), fatal=True)
+        if any(job.label == LABEL for job in self.jobs()):
+            self.app_beside_ours()
+        if self.tools.version() is None:
+            self.say(prompts.OLLAMA_APP_STARTING)
+            opened = self.step([OPEN, "-a", str(app)])
+            if self.dry_run:
+                return str(program)
+            if opened != 0:
+                raise SystemExit(prompts.OLLAMA_APP_NOT_OPENED.format(app=app, code=opened))
+            self._wait_for_app()
+        found = self.running(PORT)  # the app's own address, whatever layout setup planned
+        if found is None:
+            raise SystemExit(prompts.OLLAMA_APP_NOT_UP)
+        owner = os.getuid()
+        fatal = endangers(found, owner) or bool(found.signature)
+        if not found.program or Path(self.real(found.program)) != program:
+            heard = found.program or prompts.OLLAMA_SHARED_NOT_FOUND
+            self.refuse(
+                stopped(prompts.OLLAMA_APP_OTHER.format(program=heard), prompts.OLLAMA_APP_OTHER_FIX), fatal=fatal
+            )
+            return str(program)
+        wrong = problem(replace(found, program=str(on_disk)), owner=owner, app_ok=True)  # its files, on this Mac
+        if wrong is None and found.uid is None:
+            wrong = prompts.OLLAMA_OTHER.format(program=found.program, why=prompts.OLLAMA_WHY_ACCOUNT_UNREAD), ""
+        if wrong is not None:
+            self.refuse(stopped(wrong[0], prompts.OLLAMA_APP_FIX_IT.format(needed=MIN_TEXT)), fatal=fatal)
+            return str(program)
+        self.say(prompts.OLLAMA_APP_USED.format(version=found.version, program=program))
+        self.say(f"! Ollama: {prompts.OLLAMA_APP_LIMITS}")
+        return str(program)
+
+    def app_beside_ours(self) -> None:
+        """Setup's own service file beside the chosen app: two always-on Ollamas fight for the port. An earlier try's
+        (`leftover`) is booted out and removed with admin rights, then the app goes on (c-2, round 3); an install's
+        own stops a first install with the fix, as before (her own Ollama's fallback takes the refusal)."""
+        fix = prompts.OLLAMA_APP_OURS_FIX.format(label=LABEL, daemon=DAEMON)
+        refused = stopped(prompts.OLLAMA_APP_OURS.format(daemon=DAEMON), fix)
+        if not self.leftover or self.trying_app:
+            self.refuse(refused)
+            return
+        self.say(prompts.OLLAMA_APP_OURS_GOES.format(daemon=DAEMON))
+        self.step([SUDO, LAUNCHCTL, "bootout", f"system/{LABEL}"])  # not loaded: it says so, and that is fine
+        if self.step([SUDO, RM, "-f", str(DAEMON)]) != 0:
+            raise SystemExit(refused)
+
+    def _wait_for_app(self) -> None:
+        """Until the app answers, APP_WAIT_SECONDS at most, with a still-waiting line every APP_WAITING_EVERY s."""
+        start = self.clock()
+        said = start
+        while self.tools.version() is None:
+            now = self.clock()
+            if now - start >= APP_WAIT_SECONDS:
+                raise SystemExit(prompts.OLLAMA_APP_NOT_UP)
+            if now - said >= APP_WAITING_EVERY:
+                said = now
+                self.say(prompts.OLLAMA_APP_WAITING.format(seconds=round(now - start)))
+            self.sleep(1)
+
+    def running(self, port: int | None = None) -> Found | None:
         """The Ollama that answers on this Mac, with its program, its signature and where it listens; None when none
-        answers."""
-        version = self.tools.version()
+        answers. `port`: this layout's (her own address for hers); the app's is always 11434 (`use_app`)."""
+        port = self.port if port is None else port
+        version = self.tools.version(port)
         if version is None:
             return None
-        heard = self.tools.listener()
+        heard = self.tools.listener(port)
         if not heard.program:
             return Found("", version, addresses=heard.addresses)
         signature = signature_problem(self.tools.read, heard.program)
@@ -817,7 +1209,7 @@ class Install:
     def refuse(self, message: str, *, fatal: bool = False) -> None:
         """Setup stops here with the message (`Refusal`; `fatal`: a re-run stops too); a dry run prints it and goes
         on as it would after the fix."""
-        if not self.dry_run:
+        if not self.dry_run or self.trying_app:
             raise Refusal(message, fatal=fatal)
         self.say(message)
         self.say(prompts.OLLAMA_DRY_RUN_GOES_ON)
@@ -874,7 +1266,9 @@ class Install:
         else:
             log = self.log_steps() if any(job.label == LABEL for job in jobs) else []
             if log:
-                self.say(prompts.OLLAMA_LOG_PRIVATE.format(log=LOG))
+                self.say(
+                    (prompts.OLLAMA_LOG_PRIVATE_LEAD if self.boxed else prompts.OLLAMA_LOG_PRIVATE).format(log=LOG)
+                )
                 for argv in log:
                     self.step(argv)
         self.others(answering=True)
@@ -883,8 +1277,7 @@ class Install:
         """Setup's own service file is not the one `daemon` writes now (a missing or unreadable one counts)."""
         if self.blind:
             return False
-        wanted = daemon_plist(user=self.user, group=self.group, home=self.home, num_ctx=num_ctx)
-        return read_plist_bytes(self._system(DAEMON)) != wanted
+        return read_plist_bytes(self._system(DAEMON)) != self.wanted(num_ctx)
 
     def update(self, found: Found, num_ctx: int) -> str:
         """Setup's own service on another version than the pin: the pinned release downloaded and checked while the
@@ -939,7 +1332,12 @@ class Install:
                 )
 
     def step(self, argv: Sequence[str], *, input: bytes | None = None, shown: str = "") -> int:
-        """A change, printed first; in a dry run only printed."""
+        """A change, printed first; in a dry run only printed. Her own Ollama's first admin command comes after one
+        line on the password."""
+        if self.her_own and list(argv[:1]) == [SUDO] and not self.password_said:
+            self.password_said = True
+            if not self.boxed:  # the window's own line says where macOS asks
+                self.say(prompts.OLLAMA_HER_PASSWORD)
         self.say("  $ " + " ".join(argv) + (f"   ({shown})" if shown else ""))
         return 0 if self.dry_run else self.tools.change(argv, input=input)
 
@@ -953,14 +1351,10 @@ class Install:
                 self.say(prompts.OLLAMA_FOLDER_KEPT.format(folder=dest))
                 return
             self.refuse(prompts.OLLAMA_FOLDER_REFUSED.format(folder=dest, why=why))
-        self.say(
-            prompts.OLLAMA_INSTALL.format(
-                version=self.release.version, size=RELEASE_MB, team=TEAM_ID, folder=dest, needed=MIN_TEXT
-            )
-        )
+        self.say(prompts.OLLAMA_INSTALL.format(version=self.release.version, size=RELEASE_MB, folder=dest))
         if self.dry_run:
             work = self.folder / ".download-…"
-            self.step(self.curl(work / "ollama-darwin.tgz"))
+            self.step(self.curl(work / "ollama-darwin.tgz", quiet=self.watch is not None))
             self.say(f"  (its sha256 must be {self.release.sha256}; then unpacked into a new empty folder)")
             self.step([TAR, "-xzf", str(work / "ollama-darwin.tgz"), "-C", str(work / "unpacked")])
             self.say(prompts.OLLAMA_CHECKS.format(team=TEAM_ID))
@@ -970,8 +1364,9 @@ class Install:
         work = Path(tempfile.mkdtemp(prefix=".download-", dir=self.folder))
         try:
             tgz = work / "ollama-darwin.tgz"
-            if self.step(self.curl(tgz)) != 0 or not tgz.is_file():
-                raise SystemExit(prompts.OLLAMA_DOWNLOAD_FAILED)
+            code = self.download(tgz)
+            if code != 0 or not tgz.is_file():
+                raise SystemExit(self.download_failed(code))
             digest = sha256_of(tgz)
             if digest != self.release.sha256:
                 why = prompts.OLLAMA_WHY_FINGERPRINT.format(got=digest, want=self.release.sha256)
@@ -988,14 +1383,34 @@ class Install:
             shutil.rmtree(work, ignore_errors=True)  # the folder mkdtemp made for this download, and only that
         self.say(prompts.OLLAMA_INSTALLED.format(version=self.release.version, folder=dest))
 
-    def curl(self, tgz: Path) -> list[str]:
+    def download(self, tgz: Path) -> int:
+        """The release into `tgz`: printed first; with setup's `watch`, its five dots lit by the file's size (curl's
+        own meter off), else curl's own meter. curl asks nothing (its input is empty): its line is a `command`, so
+        the setup window keeps its screen (review PROM-08)."""
+        if self.watch is None:
+            return self.step(self.curl(tgz))
+        argv = self.curl(tgz, quiet=True)
+        self.command("  $ " + " ".join(argv))
+        return self.tools.fetch(argv, tgz, self.watch(f"Ollama {self.release.version}"))
+
+    def download_failed(self, code: int) -> str:
+        """Why the release's download stopped: curl's exit 23 (it could not write) is a full disk, with how much to
+        free as `her_disk` counts it (c-11, round 3; round 1's issue 8); anything else, the network."""
+        if code != CURL_WRITE_FAILED:
+            return prompts.OLLAMA_DOWNLOAD_FAILED
+        free = None if self.blind else self.tools.free_bytes(self.home)
+        need = math.ceil((self.model_bytes + HER_ROOM) / 1e9)
+        more = need if free is None else max(1, need - math.floor(free / 1e9))
+        return stopped(prompts.OLLAMA_DOWNLOAD_DISK_FULL, prompts.OLLAMA_HER_DISK_FIX.format(more=more))
+
+    def curl(self, tgz: Path, *, quiet: bool = False) -> list[str]:
         """The download: HTTPS only, redirects too (GitHub sends it on to its file host), never ~/.curlrc (-q, first);
         a stalled line ends it (under 10 KB/s for a minute), as does a file far larger than the release; a failure is
-        an exit code."""
+        an exit code. `quiet`: curl's own meter off, its errors still shown (-sS), for setup's five dots."""
         return [
             CURL,
             "-q",
-            "-fL",
+            "-fsSL" if quiet else "-fL",
             "--proto",
             "=https",
             "--proto-redir",
@@ -1110,9 +1525,12 @@ class Install:
             self.refuse(unsafe)
 
     def log_steps(self) -> list[list[str]]:
-        """Root makes the log yours, 0600, before launchd opens it (launchd appends to it as root): only when it is
-        missing or not already your private, regular file with one name. install(1) replaces the name, never
-        following a link there."""
+        """Root makes the log the service's account's (yours; hers for her own Ollama), 0600, before launchd starts
+        the job: launchd opens and appends to it as that account, never as root, so with none there in root's folder
+        the job does not start (M01, 30 Oct: exit 78, spawn failed). Only when it is missing or not already that
+        account's private, regular file with one name. install(1) replaces the name, never following a link there;
+        root's folder (LOG_DIR) stops a link being planted at that name."""
+        owner = self.tools.her_uid() if self.her_own else os.getuid()
         if not self.blind:
             try:
                 info = os.lstat(self._system(LOG))
@@ -1122,11 +1540,12 @@ class Install:
                 info is not None
                 and stat.S_ISREG(info.st_mode)
                 and info.st_nlink == 1
-                and info.st_uid == os.getuid()
+                and info.st_uid == owner
                 and stat.S_IMODE(info.st_mode) == 0o600
             ):
                 return []
-        return [[SUDO, INSTALL, "-m", "600", "-o", self.user, "-g", self.group, "/dev/null", str(LOG)]]
+        user, group = (ownuser.ROLE_USER, ownuser.ROLE_GROUP) if self.her_own else (self.user, self.group)
+        return [[SUDO, INSTALL, "-m", "600", "-o", user, "-g", group, "/dev/null", str(LOG)]]
 
     def cap_log(self) -> None:
         """Your private log over LOG_CAP is emptied (no admin rights: it is yours; launchd goes on at the new end).
@@ -1167,13 +1586,22 @@ class Install:
         """The LaunchDaemon: written by root from tee's input (root:wheel, 644), its log made yours and private, then
         loaded; one already in place with the same text is started again instead. Nothing runs as root while a
         folder on the way to the program is not yours alone."""
-        wanted = daemon_plist(user=self.user, group=self.group, home=self.home, num_ctx=num_ctx)
+        wanted = self.wanted(num_ctx)
         try:
             existing: bytes | None = None if self.blind else self._system(DAEMON).read_bytes()
         except OSError:
             existing = None
-        self.say(prompts.OLLAMA_SERVICE.format(daemon=DAEMON, log=LOG))
-        self.check_safe()
+        if self.her_own:
+            self.say(
+                prompts.OLLAMA_HER_SERVICE.format(
+                    user=ownuser.ROLE_USER, port=HER_PORT, models=HER_MODELS.parent, daemon=DAEMON, log=LOG
+                )
+            )
+        else:
+            self.say(
+                (prompts.OLLAMA_SERVICE_LEAD if self.boxed else prompts.OLLAMA_SERVICE).format(daemon=DAEMON, log=LOG)
+            )
+            self.check_safe()
         log = self.log_steps()
         steps: list[list[str]] = []
         if existing != wanted or log:
@@ -1198,25 +1626,357 @@ class Install:
                 self.sleep(1)  # launchd refuses a bootstrap right after a bootout (error 5)
         self.bootstrap()
 
+    def wanted(self, num_ctx: int) -> bytes:
+        """The service file setup writes for this layout."""
+        if self.her_own:
+            return her_plist(num_ctx)
+        return daemon_plist(user=self.user, group=self.group, home=self.home, num_ctx=num_ctx)
+
     def wait(self) -> None:
-        """Until the pinned version answers (WAIT_SECONDS at most), then the same checks as for one already there."""
+        """Until the pinned version answers (WAIT_SECONDS at most), then the same checks as for one already there (her
+        own Ollama: on her address, its account hers by `hers`). No answer names her log's read with admin rights (her
+        account's, 0600: `cat` is refused); today's is yours, its path alone."""
         if self.dry_run:
             return
         deadline = self.clock() + WAIT_SECONDS
-        while self.tools.version() != self.release.version:
+        while self.tools.version(self.port) != self.release.version:
             if self.clock() >= deadline:
-                raise SystemExit(prompts.OLLAMA_NOT_UP.format(seconds=WAIT_SECONDS, label=LABEL, log=LOG))
+                log = f"{SUDO} {ownuser.TAIL} -n 50 {LOG}" if self.her_own else str(LOG)
+                raise SystemExit(prompts.OLLAMA_NOT_UP.format(seconds=WAIT_SECONDS, label=LABEL, log=log))
             self.sleep(1)
         found = self.running()
+        if self.her_own:
+            wrong = None if found is None else self.her_problem(found)
+            if wrong is not None:
+                raise SystemExit(stopped(*wrong))
+            self.say(prompts.OLLAMA_HER_UP.format(version=self.release.version, user=ownuser.ROLE_USER))
+            return
         wrong = problem(found, owner=os.getuid()) if found is not None else None
         if wrong is not None:
             raise SystemExit(stopped(*wrong))
         self.say(prompts.OLLAMA_UP.format(version=self.release.version))
 
+    # ---------------------------------------------------------------- her own Ollama (layout "hers")
+
+    def her_problem(self, found: Found) -> tuple[str, str] | None:
+        """What makes the Ollama on her address not hers to keep, and its fix (None: hers): today's checks on her port,
+        its account hers when `hers` holds (root's copy, run by her account), any other account a stop as before."""
+        her_uid = self.tools.her_uid()
+        if her_uid is None or not hers(found, self.tools.root, her_uid=her_uid):
+            return self.taken(found)
+        wrong = problem(found, owner=found.uid, port=HER_PORT, root=self.tools.root)
+        if wrong is None:  # root's copy it runs: every program, library and metallib as at its install
+            why = self.her_check(self._system(Path(found.program)).parent)
+            if why:
+                wrong = prompts.OLLAMA_OTHER.format(program=found.program, why=why), prompts.OLLAMA_HER_ADDRESS_FIX
+        return wrong
+
+    def taken(self, found: Found) -> tuple[str, str]:
+        """Another program on her address: what it is and who runs it, and the fix."""
+        account = prompts.OLLAMA_SHARED_UNREAD if found.uid is None else account_name(found.uid)
+        program = found.program or prompts.OLLAMA_SHARED_NOT_FOUND
+        text = prompts.OLLAMA_HER_ADDRESS_TAKEN.format(port=HER_PORT, program=program, account=account)
+        return text, prompts.OLLAMA_HER_ADDRESS_FIX
+
+    def run_hers(self, num_ctx: int) -> str:
+        """Her own Ollama: the Ollama app when chosen and usable (else one line, then hers); hers that answers on her
+        address kept (a "!" on another version; her service file written again when it is not the one setup writes);
+        else installed: the read-only checks first (another program on her address, the folders on the way, the free
+        disk, what else is on the Mac: one line each, never a stop), her account (setup's), the release downloaded
+        and checked as you, root's copy made, hashed and checked, `current`, her log, her service, the wait. Safe to
+        run again after a stop at any point."""
+        if self.app is not None:
+            used = self.try_app(self.app)
+            if used is not None:
+                return used
+        self.used = "hers"
+        found = self.running()
+        if found is None:  # something may hold her address without answering as Ollama does: its socket says so
+            heard = self.tools.listener(HER_PORT, by_service=False)
+            found = Found(heard.program, None, addresses=heard.addresses, uid=heard.uid) if heard.program else None
+        if found is not None:
+            wrong = self.her_problem(found)
+            if wrong is not None:
+                raise SystemExit(stopped(*wrong))
+            return self.keep_hers(found, num_ctx)
+        self.found_lines()
+        self.her_safe()
+        self.her_disk()
+        self.her_account()
+        self.her_copy()
+        self.her_link()
+        self.daemon(num_ctx)
+        self.wait()
+        return str(HER_PROGRAM)
+
+    def try_app(self, app: Path) -> str | None:
+        """The Ollama app the person chose: used when it can be (`use_app`); else one line, and None (her own)."""
+        self.trying_app = True
+        try:
+            program = self.use_app(app)
+        except SystemExit as refused:
+            if not isinstance(refused.code, str):
+                raise
+            why = refused.code.splitlines()[0].removeprefix("✗ Ollama: ").rstrip(".")
+            self.say(prompts.OLLAMA_HER_APP_NOT_USABLE.format(why=why, name=self.name))
+            self.app_said = True  # named once: the found lines leave it out
+            return None
+        finally:
+            self.trying_app = False
+        self.used = "app"
+        return program
+
+    def keep_hers(self, found: Found, num_ctx: int) -> str:
+        """Her own Ollama answers: kept (no update in 0.9.8: another version is a "!"); her service file written again
+        when it is not the one setup writes; her log made hers when it is not. No admin rights otherwise."""
+        self.say(prompts.OLLAMA_HER_KEPT.format(version=found.version, program=found.program))
+        if found.version != self.release.version:
+            text = prompts.OLLAMA_UNTESTED.format(version=found.version, pin=self.release.version)
+            self.say(f"! Ollama: {text}\n  Fix: {prompts.OLLAMA_HER_UNTESTED_FIX}")
+        if self.service_changed(num_ctx):
+            self.say(prompts.OLLAMA_SERVICE_CHANGED.format(daemon=DAEMON))
+            self.daemon(num_ctx)
+            self.wait()
+        else:
+            log = self.log_steps()
+            if log:
+                self.say(
+                    (prompts.OLLAMA_LOG_PRIVATE_LEAD if self.boxed else prompts.OLLAMA_LOG_PRIVATE).format(log=LOG)
+                )
+                for argv in log:
+                    self.step(argv)
+        self.found_lines()
+        return str(HER_PROGRAM)
+
+    def leftover_program(self) -> str | None:
+        """The program of setup's service file from an earlier try (today's layout, not hers), which her own
+        Ollama's service file replaces (`daemon`: written, the old one booted out); "" when it names none, None when
+        there is no such file."""
+        path = self._system(DAEMON)
+        if not os.path.lexists(path):
+            return None
+        service = read_plist(path)
+        if service is not None and service.get("UserName") == ownuser.ROLE_USER:
+            return None
+        arguments = service.get("ProgramArguments") if service is not None else None
+        first = arguments[0] if isinstance(arguments, list) and arguments and isinstance(arguments[0], str) else ""
+        return self.real(first) if first.startswith("/") else ""
+
+    def found_lines(self) -> None:
+        """Every other Ollama on the Mac, one line each: it stays as it is, beside hers (never a stop, nothing to do);
+        setup's own from an earlier try gives way to hers, said once (c-2, round 3)."""
+        found: list[str] = []
+        leftover = self.leftover_program()
+        if leftover is not None:
+            self.say(prompts.OLLAMA_HER_REPLACES.format(daemon=DAEMON))
+        if not self.blind and self.tools.version(PORT) is not None:
+            program = self.tools.listener(PORT).program
+            ours = bool(program) and bool(leftover) and self.real(program) == leftover
+            if not ours and (not program or (app_of(Path(program)) is None and not homebrews(Path(program)))):
+                found.append(prompts.OLLAMA_FOUND_ANSWERING.format(program=program or prompts.OLLAMA_SHARED_NOT_FOUND))
+        apps = ((self._system(APP), APP), *(() if self.blind else ((self.home / "Applications/Ollama.app", None),)))
+        for app, shown in apps:
+            if os.path.lexists(app) and not self.app_said:
+                found.append(prompts.OLLAMA_FOUND_APP.format(path=shown or app))
+        for cellar in CELLARS:
+            if os.path.lexists(self._system(cellar / "ollama")):
+                found.append(prompts.OLLAMA_FOUND_HOMEBREW.format(path=cellar / "ollama"))
+        for what in found:
+            self.say(prompts.OLLAMA_HER_FOUND.format(what=what, name=self.name))
+
+    def her_safe(self) -> None:
+        """Stops before any admin command when a folder on the way to root's copy (/usr, /usr/local, /usr/local/estia,
+        its ollama folder) can be changed by an account other than root: whoever can rename it replaces her Ollama."""
+        for path in (Path("/usr"), Path("/usr/local"), ownuser.CODE, HER_FOLDER):
+            try:
+                info = os.lstat(self._system(path))
+            except FileNotFoundError:
+                continue  # made by root's install -d
+            except OSError:
+                info = None
+            if info is None or info.st_uid != ownuser.CODE_UID or stat.S_IMODE(info.st_mode) & 0o022:
+                fix = f"{SUDO} {CHOWN} root:wheel {path} && {SUDO} {CHMOD} go-w {path}, then run scripts/setup.sh again"
+                raise SystemExit(stopped(prompts.OLLAMA_HER_UNSAFE.format(path=path), fix))
+
+    def her_disk(self) -> None:
+        """Stops before any download or admin command when the volume her Ollama and her model go to is too full."""
+        if self.blind:
+            return
+        free = self.tools.free_bytes(self._system(Path("/usr/local")))
+        need = self.model_bytes + HER_ROOM
+        if free is not None and free < need:  # as the plan's check rounds (c-6, round 3): free down, the need up
+            shown, total = math.floor(free / 1e9), math.ceil(need / 1e9)
+            raise SystemExit(
+                stopped(
+                    prompts.OLLAMA_HER_DISK.format(free=shown, need=total),
+                    prompts.OLLAMA_HER_DISK_FIX.format(more=max(1, total - shown)),
+                )
+            )
+
+    def her_account(self) -> None:
+        """Her own macOS account, made by setup's command when it is not there yet, before anything downloads (her
+        model then goes straight into her folder). Its output is not shown: setup says its own line. A failure stops
+        here, nothing downloaded or installed."""
+        if self.account is None or (not self.blind and self.tools.her_uid() is not None):
+            return
+        self.say(prompts.OLLAMA_HER_ACCOUNT.format(user=ownuser.ROLE_USER))
+        if self.step(self.account, input=b"") != 0:
+            text = prompts.OLLAMA_HER_ACCOUNT_FAILED.format(user=ownuser.ROLE_USER)
+            # in the window its ✗ line (sysadminctl's words, the macOS version) is the reason (review W23)
+            why = next(
+                (
+                    line.strip()[2:]
+                    for line in reversed(self.tools.failed_output.splitlines())
+                    if line.strip()[:2] == "✗ "
+                ),
+                "",
+            )
+            raise SystemExit(stopped(f"{text}: {why}" if why else text, prompts.OLLAMA_HER_ACCOUNT_FIX))
+        if not self.dry_run:
+            self.say(prompts.OLLAMA_HER_ACCOUNT_MADE.format(user=ownuser.ROLE_USER))
+
+    @property
+    def her_dest(self) -> Path:
+        return HER_FOLDER / f"v{self.release.version}"
+
+    def her_check(self, folder: Path) -> str:
+        """Why root's copy of a release (on this Mac, `folder`) cannot be run as her ("" when it can): today's checks
+        (`check_tree`) and its modes (`root_modes`)."""
+        why = self.check_tree(folder)
+        modes = root_modes(folder)
+        return "; ".join(part for part in (why, modes) if part)
+
+    def her_copy(self) -> None:
+        """Root's copy of the pinned release in /usr/local/estia/ollama/v<version>: one there already is checked and
+        kept (no download); else your download, checked first, copied by root, hashed again by root (by its exit code),
+        unpacked, its modes fixed, checked, then renamed into place whole. A leftover from a stopped run is removed
+        first, and every failure removes what this run made there."""
+        dest = self.her_dest
+        on_disk = self._system(dest)
+        if not self.blind and os.path.lexists(on_disk):
+            why = (
+                self.her_check(on_disk)
+                if on_disk.is_dir() and not on_disk.is_symlink()
+                else prompts.OLLAMA_NOT_A_FOLDER
+            )
+            if why:
+                raise SystemExit(prompts.OLLAMA_HER_FOLDER_REFUSED.format(folder=dest, why=why))
+            self.say(prompts.OLLAMA_FOLDER_KEPT.format(folder=dest))
+            return
+        self.say(prompts.OLLAMA_HER_INSTALL.format(version=self.release.version, size=RELEASE_MB, folder=HER_FOLDER))
+        cache = self.home / HER_CACHE
+        if self.dry_run:
+            work: Path | None = None
+            tgz = cache / ".ollama-…" / "ollama-darwin.tgz"
+            self.step(self.curl(tgz, quiet=self.watch is not None))
+            self.say(f"  (its sha256 must be {self.release.sha256}; root then hashes its own copy again)")
+        else:
+            cache.mkdir(parents=True, exist_ok=True, mode=0o700)
+            work = Path(tempfile.mkdtemp(prefix=".ollama-", dir=cache))
+            tgz = work / "ollama-darwin.tgz"
+        try:
+            if work is not None:
+                code = self.download(tgz)
+                if code != 0 or not tgz.is_file():
+                    raise SystemExit(self.download_failed(code))
+                digest = sha256_of(tgz)
+                if digest != self.release.sha256:
+                    why = prompts.OLLAMA_WHY_FINGERPRINT.format(got=digest, want=self.release.sha256)
+                    raise SystemExit(prompts.OLLAMA_REFUSED.format(why=why))
+            self.her_unpack(tgz)
+        finally:
+            if work is not None:
+                shutil.rmtree(work, ignore_errors=True)  # your download, the folder mkdtemp made for it, only that
+        if not self.dry_run:
+            self.say(prompts.OLLAMA_INSTALLED.format(version=self.release.version, folder=dest))
+
+    def her_unpack(self, tgz: Path) -> None:
+        """Root's steps for its copy: its two folders, a leftover removed, your download copied (root's alone),
+        hashed by root against the pin, unpacked as your tar would (root:wheel, no owner, modes, file flags or
+        metadata from the archive), its modes made the same whatever sudo's umask, checked as you, then renamed into
+        place. Each failure removes .unpacked and .download.tgz."""
+        root_tgz = HER_FOLDER / ".download.tgz"
+        unpacked = HER_FOLDER / ".unpacked"
+        for folder in (ownuser.CODE, HER_FOLDER):
+            self.root_step([INSTALL, "-d", "-m", "755", "-o", "root", "-g", "wheel", str(folder)])
+        self.clean_up(root_tgz, unpacked)
+        self.root_step([INSTALL, "-m", "600", "-o", "root", "-g", "wheel", str(tgz), str(root_tgz)])
+        hashed = f"{self.release.sha256}  {root_tgz}\n".encode()
+        if self.step([SUDO, SHASUM, "-a", "256", "-c"], input=hashed) != 0:
+            self.clean_up(root_tgz, unpacked, always=True)
+            why = prompts.OLLAMA_WHY_FINGERPRINT.format(got="not the pin", want=self.release.sha256)
+            raise SystemExit(prompts.OLLAMA_REFUSED.format(why=why))
+        self.root_step([MKDIR, "-m", "755", str(unpacked)], undo=(root_tgz, unpacked))
+        tar = [TAR, "-xzf", str(root_tgz), *TAR_AS_ROOT, "-C", str(unpacked)]
+        if self.step([SUDO, *tar]) != 0:
+            self.clean_up(root_tgz, unpacked, always=True)
+            raise SystemExit(prompts.OLLAMA_REFUSED.format(why=prompts.OLLAMA_WHY_UNPACKED))
+        self.root_step([CHMOD, "-R", "u=rwX,go=rX", str(unpacked)], undo=(root_tgz, unpacked))
+        self.root_step([RM, "-f", str(root_tgz)], undo=(root_tgz, unpacked))
+        if self.dry_run:
+            self.say(prompts.OLLAMA_CHECKS.format(team=TEAM_ID))
+        else:
+            why = self.her_check(self._system(unpacked))
+            if why:
+                self.clean_up(root_tgz, unpacked, always=True)
+                raise SystemExit(prompts.OLLAMA_REFUSED.format(why=why))
+        self.root_step([MV, str(unpacked), str(self.her_dest)], undo=(root_tgz, unpacked))
+
+    def root_step(self, argv: Sequence[str], *, undo: tuple[Path, ...] = ()) -> None:
+        """One of root's commands (sudo asks, or macOS's box): a failure removes `undo`'s leftovers, then stops."""
+        if self.step([SUDO, *argv]) != 0:
+            if undo:
+                self.clean_up(*undo, always=True)
+            raise SystemExit(prompts.OLLAMA_SERVICE_FAILED.format(label=LABEL))
+
+    def clean_up(self, *paths: Path, always: bool = False) -> None:
+        """A stopped run's .download.tgz and .unpacked in root's folder, removed by root (only when there; `always`:
+        after this run's own failure, there or not as far as you can tell)."""
+        for path in paths:
+            if self.dry_run:
+                continue
+            if always or os.path.lexists(self._system(path)):
+                self.step([SUDO, RM, "-rf" if path.name == ".unpacked" else "-f", str(path)])
+
+    def her_link(self) -> None:
+        """/usr/local/estia/ollama/current names this release (relative, inside root's folder), swapped in one rename
+        by root; already so: nothing."""
+        current = HER_FOLDER / "current"
+        temporary = HER_FOLDER / ".current"
+        target = f"v{self.release.version}"
+        on_disk = self._system(current)
+        if not self.blind:
+            if on_disk.is_symlink() and os.readlink(on_disk) == target:
+                return
+            if os.path.lexists(on_disk) and not on_disk.is_symlink():
+                raise SystemExit(prompts.OLLAMA_HER_CURRENT_NOT_LINK.format(path=current))
+            if os.path.lexists(self._system(temporary)):
+                self.root_step([RM, "-f", str(temporary)])
+        self.root_step([LN, "-s", target, str(temporary)])
+        self.root_step([MV, "-h", "-f", str(temporary), str(current)])
+
+
+def config_values(path: Path) -> tuple[str | None, str | None]:
+    """Your config's `ollama` and `ollama_base_url` (the layout's rule 2), read only: (None, None) when there is no
+    config that reads; a config without the line gives its default."""
+    try:
+        with path.open("rb") as handle:
+            data = tomllib.load(handle)
+    except (OSError, tomllib.TOMLDecodeError):
+        return None, None
+    ollama, url = data.get("ollama", "build"), data.get("ollama_base_url", f"{BASE}/v1")
+    return (ollama if isinstance(ollama, str) else None), (url if isinstance(url, str) else None)
+
 
 def main(argv: list[str] | None = None) -> int:
     """`scripts/install-ollama.sh`: setup's Ollama step on its own (by hand, or again after a failure). Without a
-    terminal (an AI's command tool) it changes nothing: sudo needs the person's own window."""
+    terminal (an AI's command tool) it changes nothing and reads nothing: sudo asks only in the person's own Terminal
+    window, and it has no window of its own (setup's Ollama step asks in the Estia Setup window). Her own Ollama only
+    when her account is there already and the install has no layout yet (it never makes her account); the Ollama app
+    when the person chose it and it is on the Mac, as setup does (review of 30 Oct, P05: nothing installed beside
+    it): by your config, or, once no config of yours reads (the move holds it), by setup's kept answer, read as
+    untrusted (fix review, setup-macos-03); else today's."""
+    from local_assistant import setup_answers
     from local_assistant.setup import choose_model, has_terminal, memory_gb  # setup imports this module
 
     parser = argparse.ArgumentParser(
@@ -1233,7 +1993,16 @@ def main(argv: list[str] | None = None) -> int:
         print(prompts.SETUP_TOO_SMALL.format(memory=memory, name="Estia"), file=sys.stderr)
         return 1
     tools = Tools()
-    Install(tools, owner_home(), dry_run=args.dry_run or not tools.live).run(choice.num_ctx)
+    home = owner_home()
+    ollama, url = config_values(home / ".config/local-assistant/config.toml")
+    found = layout_found(tools.root, config_ollama=ollama, config_url=url, moved=ownuser.moved(tools.root))
+    there = ownuser.lookup_uid(ownuser.ROLE_USER) is not None
+    layout: Layout = "hers" if found == "hers" or (found is None and NEW_INSTALLS == "hers" and there) else "older"
+    unread = found == "older" and ollama is None and url is None  # no config of yours reads (moved: root holds it)
+    kept = setup_answers.Answers.load(setup_answers.default_path(), say=print, writable=False) if unread else None
+    chosen = found == "app" or (kept is not None and kept.get("ollama_app") == "app")  # setup's kept answer, as setup's
+    app = app_on_mac(tools.root, home if tools.live else None) if chosen else None
+    Install(tools, home, dry_run=args.dry_run or not tools.live, layout=layout, app=app).run(choice.num_ctx)
     return 0
 
 

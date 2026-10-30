@@ -1,4 +1,5 @@
-"""Documents: code's words for the PDFs she can read, /docs, a sent PDF and the document tools (documents.py)."""
+"""Documents: code's words for the PDFs and text files she can read, /docs, a sent document and the document tools
+(documents.py)."""
 
 from __future__ import annotations
 
@@ -10,7 +11,8 @@ __all__ = [
     "DOCUMENTS_OFF_RESULT", "DOCUMENTS_PASSAGES", "DOCUMENTS_PER_MESSAGE", "DOCUMENTS_REFUSED_RESULT",
     "DOCUMENT_BY_VISION", "DOCUMENT_CUT", "DOCUMENT_ERRORS", "DOCUMENT_GOES_ON", "DOCUMENT_NONE_SAVED",
     "DOCUMENT_NOT_FOUND", "DOCUMENT_NOT_KB", "DOCUMENT_NOT_SAVED", "DOCUMENT_NO_PAGE", "DOCUMENT_PAGE",
-    "DOCUMENT_PAGE_SKIPPED", "DOCUMENT_PAGE_WHY", "DOCUMENT_READ_LATER", "DOCUMENT_READ_ON", "DOCUMENT_SAVED",
+    "DOCUMENT_PAGE_SKIPPED", "DOCUMENT_PAGE_WHY", "DOCUMENT_READ_LATER", "DOCUMENT_READ_ON", "DOCUMENT_READ_ON_ONE",
+    "DOCUMENT_SAVED",
     "DOCUMENT_SAVED_BEFORE", "DOCUMENT_SAVED_UNREAD", "DOCUMENT_SEVERAL", "DOCUMENT_SKIPPED_PAGES",
     "DOCUMENT_UNREADABLE",
 ]
@@ -19,18 +21,21 @@ __all__ = [
 # Documents ([documents]; documents.py): code's words. A document's text is outside text and stays in her index only.
 DOCUMENT_ERRORS = {  # why a document cannot be read (the helper's codes, and the bridge's own)
     "not_pdf": "it is not a PDF",
+    "not_text": "it is not a text file",
     "encrypted": "it is encrypted",
     "too_big": "it is over 25 MB",
+    "text_too_big": "it is a text file over 1 MB",
+    "text_too_many_pages": "it is a text file of over 667 pages",
     "too_many_pages": "it has over 300 pages",
     "timeout": "reading it took over 60 seconds",
     "unreadable": "its text cannot be read",
     "no_access": "I may not open it yet: on the Mac, as you, run scripts/share-documents.sh again",
 }
-DOCUMENTS_FOUND = "I found {count} new {documents}: {names}."  # code's note after a look (never for a PDF she saved)
+DOCUMENTS_FOUND = "I found {count} new {documents}: {names}."  # code's note after a look (never for one she saved)
 DOCS_HEADER = "**Documents** (newest first)"
 DOCS_NONE = (
-    "No documents yet. PDFs you send me are saved in your Estia-KB folder on the Mac, and PDFs you put there are found "
-    "within the hour."
+    "No documents yet. PDFs and text files you send me are saved in your Estia-KB folder on the Mac, and those you put "
+    "there are found within the hour."
 )
 DOCS_CANNOT = "cannot be read: {why}"
 DOCS_MORE = "… and {count} older"
@@ -47,6 +52,8 @@ DOCS_NOT_SENT_WHY = {
     "gone": "it is no longer in the folder (/docs lists what is there now)",
     "too_big": "it is over 25 MB",
     "not_pdf": "it is not a PDF any more",
+    "text_too_big": "it is over 1 MB",
+    "not_text": "it is not a text file any more",
     "failed": "Signal did not take it; try again in a minute",
 }
 DOCS_CLOSED = (
@@ -65,8 +72,8 @@ DOCS_REFUSED = (
     "I cannot read your documents folder: macOS refuses it to my account, whatever the share allows. macOS guards "
     "Documents, Desktop and Downloads: on the Mac, the folder belongs in your home, as ~/Estia-KB."
 )
-# a PDF the user sent: saved, or why not (code's notes)
-DOCUMENTS_PER_MESSAGE = 5  # PDFs of one message saved at most
+# a PDF or text file the user sent: saved, or why not (code's notes)
+DOCUMENTS_PER_MESSAGE = 5  # documents of one message saved at most
 DOCUMENT_SAVED = "Saved in your Estia-KB folder: {path} ({about})."
 DOCUMENT_SAVED_BEFORE = "Saved in your Estia-KB folder: {path}."  # after a restart: saved, its note not sent yet
 DOCUMENT_READ_LATER = "its text is read at my next look"
@@ -75,6 +82,9 @@ DOCUMENT_SAVED_UNREAD = "Saved in your Estia-KB folder: {path}, but its text can
 DOCUMENT_NOT_SAVED = {
     "not_pdf": "Not saved: that file is not a PDF.",
     "too_big": "Not saved: the PDF is over 25 MB.",
+    "not_text": "Not saved: that file is not a text file.",
+    "text_too_big": "Not saved: the text file is over 1 MB.",
+    "text_too_many_pages": "Not saved: the text file has over 667 pages.",
     "not_shared": "Not saved: I cannot write to your Estia-KB folder. On the Mac, as you: scripts/share-documents.sh",
     "refused": (
         "Not saved: macOS refuses my account your documents folder, whatever the share allows. macOS guards Documents, "
@@ -83,13 +93,13 @@ DOCUMENT_NOT_SAVED = {
     "failed": "Not saved: something went wrong; send it again in a minute.",
 }
 # her config names a folder in the owner's home other than ~/Estia-KB: DOCS_NOT_KB's fix, never the share's ({folder}:
-# as "~/…"); the share opens only ~/Estia-KB, so the next PDF would fail the same way
+# as "~/…"); the share opens only ~/Estia-KB, so the next document would fail the same way
 DOCUMENT_NOT_KB = (
     "Not saved: I cannot write to {folder}: my config names that folder, and documents are always your ~/Estia-KB. On "
     'the Mac, in my config under [documents]: folder = "/Users/<you>/Estia-KB", then restart me (doctor shows how).'
 )
-DOCUMENTS_LIMIT = "Only the first {count} PDFs of a message are saved."
-DOCUMENT_NONE_SAVED = "(not saved)"  # in the stored message when none of its PDFs was saved
+DOCUMENTS_LIMIT = "Only the first {count} documents of a message are saved."
+DOCUMENT_NONE_SAVED = "(not saved)"  # in the stored message when none of its documents was saved
 # Gemma's tools (outside text: data, never instructions)
 DOCUMENTS_OFF_RESULT = (
     "documents are off on this Mac (no [documents] in the config). Tell the user: the owner turns them on with "
@@ -124,6 +134,7 @@ DOCUMENT_PAGE = (
 DOCUMENT_BY_VISION = "; this page is a scan, its text recognised on the Mac (a word may be misread)"
 DOCUMENT_CUT = "\n(the page goes on: cut here; search_documents finds words further down)"
 DOCUMENT_READ_ON = "(at most {pages} pages in one read: page {next} comes next)"
+DOCUMENT_READ_ON_ONE = "(one page in one read: page {next} comes next)"  # under a 32k context (guards-2)
 DOCUMENT_GOES_ON = "(page {next} follows: the text may go on there)"  # code's words at a page's end
 DOCUMENT_SEVERAL = (
     'Several documents fit "{document}": {names}. Ask the user which one, or read one by its full name or number.'

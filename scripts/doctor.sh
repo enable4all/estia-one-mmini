@@ -5,7 +5,7 @@ set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 source "$here/own-user.sh"  # moved, and her commands' fixed paths ($estia, $estia_deploy)
 if moved && [[ "$(id -un)" != _estia ]]; then
-  echo "She runs as her own user _estia: her data is readable only by that user. Run: /usr/bin/sudo /usr/local/estia/bin/estia doctor"
+  echo "She runs as her own macOS account _estia: her data is readable only by that account. Run: /usr/bin/sudo /usr/local/estia/bin/estia doctor"
   exit 1
 fi
 cd "$here/.."

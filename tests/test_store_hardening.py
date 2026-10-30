@@ -165,7 +165,7 @@ def test_prune_deletes_old_messages_pages_and_tool_calls_with_their_search_rows(
     assert [hit.kind for hit in store.search("pumpernickel")] == ["message"]
 
 
-def test_prune_never_touches_open_reminders_or_the_initiative_log(store: Store) -> None:
+def test_prune_never_touches_open_reminders_or_open_check_ins(store: Store) -> None:
     asked = _incoming(store, "remind me at 7 to stretch", OLD, T0)
     note = _reply(store, "Reminder: stretch", OLD, None)
     open_id = store.add_reminder(
@@ -186,14 +186,37 @@ def test_prune_never_touches_open_reminders_or_the_initiative_log(store: Store) 
     store.prune(30, now=NOW)
 
     left = {row[0] for row in store._conn.execute("SELECT id FROM messages")}
-    assert {asked, note, started, plan} <= left  # an open reminder, the log's message and an open check-in's source
-    assert done_from not in left and gone not in left
+    assert {asked, note, plan} <= left  # an open reminder and an open check-in's source
+    assert done_from not in left and gone not in left and started not in left
     reminder = store.reminder(open_id)
     assert reminder is not None and (reminder.source_message_id, reminder.message_id) == (asked, note)
     done = store.reminder(done_id)
     assert done is not None and done.source_message_id is None  # a finished one only loses its link
     entries = store.initiative_entries(since=iso(NOW - 400 * DAY))
-    assert [entry.message_id for entry in entries] == [started]
+    assert [entry.message_id for entry in entries] == [None]  # the log keeps its row (a year), never the message
+
+
+def test_prune_deletes_her_own_messages_with_the_rest(store: Store) -> None:
+    """Review I27: the messages she started (an early start with an event's title, a look back from the user's week)
+    stayed a year whatever keep_days said; they go as every message does, and the log keeps only its metadata."""
+    early = _reply(store, "Early start tomorrow: 07:30 oncology check.", OLD, None)
+    store.log_initiative("early_start", "2026-09-01", "sent", message_id=early, at=OLD)
+    lookback = _reply(store, "This week you saw the oncologist twice.", OLD, None)
+    store.log_initiative("lookback", "2026-09-01", "sent", message_id=lookback, at=OLD)
+    today = _reply(store, "How did the oncology talk go?", NEW, None)
+    store.log_initiative("followup", "2026-10-20", "sent", message_id=today, at=NEW)
+
+    assert store.prune(7, now=NOW).messages == 2
+
+    left = {row[0] for row in store._conn.execute("SELECT id FROM messages")}
+    assert early not in left and lookback not in left and today in left
+    assert _search(store, "oncology") == [today]
+    entries = store.initiative_entries(since=iso(NOW - 400 * DAY))
+    assert [(entry.kind, entry.message_id) for entry in entries] == [
+        ("early_start", None),
+        ("lookback", None),
+        ("followup", today),
+    ]
 
 
 def test_prune_keeps_the_profile_and_unlinks_its_sources(store: Store) -> None:
@@ -212,6 +235,41 @@ def test_prune_keeps_the_profile_and_unlinks_its_sources(store: Store) -> None:
     assert facts[linked].source_document_id is None
     assert store.changes(fact)[0].source_message_id is None
     assert store.message(reply).reply_to_id is None
+
+
+def test_prune_keeps_the_outside_text_guard_while_its_conversation_is_open(store: Store) -> None:
+    """Review I8: after_outside read its evidence from the rows prune deletes (an old page read, a photo), while the
+    summary that may hold its residue stays: the guard ended silently after keep_days. The open conversation keeps the
+    mark (state outside_seen:<id>) until /new; an ended one's mark goes."""
+    from local_assistant.context import ContextBuilder
+    from local_assistant.profile import Profile
+    from tests.conftest import TZ
+
+    context = ContextBuilder(store, Profile(store), TZ)
+    read = _incoming(store, "what does https://club.example.org/news say?", OLD, T0)
+    store.log_tool_call(read, "read_link", "{}", "Log in at https://evil.example/login", True, 5)
+    store._conn.execute("UPDATE tool_calls SET created_at = ? WHERE message_id = ?", (OLD, read))
+    _reply(store, "The bank's link is evil[.]example/login.", OLD, read)
+    conv = store.current_conversation()
+    store.set_summary(conv.id, "The club page gave the bank's link https://evil.example/login.", 2)
+    asked = _incoming(store, "what was the bank's link again?", NEW, T0 + 1)
+    assert context.after_outside(store.conversation(conv.id), asked)
+
+    pruned = store.prune(30, now=NOW)
+
+    assert pruned.messages == 2 and store.outside_seqs(conv.id) == []
+    assert context.after_outside(store.conversation(conv.id), asked)  # the summary still holds the residue
+    fresh = store.start_new_conversation()
+    later = store.add_incoming(fresh.id, ME, T0 + 2, "text", "hello")
+    assert later is not None and not context.after_outside(fresh, later)
+    store.prune(30, now=NOW)
+    assert store.states_with_prefix("outside_seen:") == []  # the ended conversation's mark goes
+
+
+def test_prune_marks_nothing_without_outside_text(store: Store) -> None:
+    _incoming(store, "just chat", OLD, T0)
+    store.prune(30, now=NOW)
+    assert store.states_with_prefix("outside_seen:") == []
 
 
 def test_prune_drops_an_ended_conversation_once_it_is_empty(store: Store) -> None:

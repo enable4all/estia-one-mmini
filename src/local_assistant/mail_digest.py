@@ -34,6 +34,9 @@ NUMBERS_KEY = "mail:numbers"
 LAST_DIGEST_KEY = "mail:last_digest_at"  # set by the morning digest: actions since then are new
 BLOCK_LIMIT = 10
 EMPTY = "Mail: nothing needs you today."
+# mail the sorter has not sorted yet (behind, or down), beside what it sorted: never "nothing needs you" (review O8)
+EMPTY_SORTED = "Mail: nothing sorted needs you today."
+UNSORTED = "{count} {mails} not sorted yet."
 GLANCE_EMPTY = "Mail digest: nothing needs a reply or an action."
 STALE_ROUNDS = 2  # a failing mailbox whose last good read is older than this many sync rounds has not been read
 NOTE_CHARS = 255  # a sender or a subject in the digest: Outlook's own limit, so a real one is never cut
@@ -54,32 +57,38 @@ def _iso(epoch: float) -> str:
 
 
 class MailNumbers:
-    """Numbers for mails, stable for one local day (stored in the state table)."""
+    """Numbers for mails, stable for one local day (stored in the state table). A number keeps its mail's mailbox and
+    Graph id, never the row id: SQLite gives a removed row's id to the next mail (review I28). An older release's bare
+    row ids ("ids") name no mail: that day's numbers start again."""
 
     def __init__(self, store: Store, tz: ZoneInfo, clock: Callable[[], float] = time.time) -> None:
         self._store = store
         self._tz = tz
         self._clock = clock
 
-    def number(self, mail_id: int) -> int:
-        day, ids = self._load()
-        if mail_id not in ids:
-            ids.append(mail_id)
-            self._store.set_state(NUMBERS_KEY, json.dumps({"day": day, "ids": ids}))
-        return ids.index(mail_id) + 1
+    def number(self, mail: MailHeader) -> int:
+        day, keys = self._load()
+        key = (mail.account, mail.graph_id)
+        if key not in keys:
+            keys.append(key)
+            self._store.set_state(NUMBERS_KEY, json.dumps({"day": day, "mails": keys}))
+        return keys.index(key) + 1
 
-    def mail_id(self, number: int) -> int | None:
-        _, ids = self._load()
-        return ids[number - 1] if 1 <= number <= len(ids) else None
+    def mail_key(self, number: int) -> tuple[str, str] | None:
+        """The (mailbox, Graph id) of the day's mail number `number`."""
+        _, keys = self._load()
+        return keys[number - 1] if 1 <= number <= len(keys) else None
 
-    def _load(self) -> tuple[str, list[int]]:
+    def _load(self) -> tuple[str, list[tuple[str, str]]]:
         today = datetime.fromtimestamp(self._clock(), self._tz).date().isoformat()
         try:
             data = json.loads(self._store.get_state(NUMBERS_KEY) or "{}")
         except json.JSONDecodeError:
             data = {}
-        ids = data.get("ids") if isinstance(data, dict) and data.get("day") == today else None
-        return today, [int(i) for i in ids] if isinstance(ids, list) else []
+        mails = data.get("mails") if isinstance(data, dict) and data.get("day") == today else None
+        if not isinstance(mails, list):
+            return today, []
+        return today, [(str(pair[0]), str(pair[1])) for pair in mails if isinstance(pair, list) and len(pair) == 2]
 
 
 class MailDigest:
@@ -105,8 +114,9 @@ class MailDigest:
         """The mail digest now (also what the mail_digest tool returns); `header` replaces the dated first line."""
         now = self._clock()
         needs, known, actions = self._pending(now)
+        unsorted = self._unsorted(now, known)
         if not (needs or known or actions):
-            return EMPTY
+            return f"{EMPTY_SORTED}\n{unsorted}" if unsorted else EMPTY
         local = datetime.fromtimestamp(now, self._tz)
         self._number([*needs, *known], actions)
         lines = [header or f"Mail, {local:%a} {local.day} {local:%b}:"]
@@ -116,7 +126,7 @@ class MailDigest:
         if actions:
             lines.append("Actions:")
             lines += self._block(actions, local)
-        return "\n".join(lines)
+        return "\n".join([*lines, *([unsorted] if unsorted else [])])
 
     def digest_part(self) -> str:
         """The morning digest's mail: each mailbox its own block under a bold heading ("**Mail (work)**", as /status
@@ -126,10 +136,11 @@ class MailDigest:
         counted under its mailbox; a blank line between mailboxes (markup: sent as Signal's text styles)."""
         needs, known, actions = self._pending(self._clock())
         replies = [*needs, *known]
-        stale = self.stale_lines()
+        unsorted = self._unsorted(self._clock(), known)
+        stale = [*self.stale_lines(), *([unsorted] if unsorted else [])]
         tail = "\n\n" + "\n".join(stale) if stale else ""  # after the mail, a block of its own
         if not (replies or actions):
-            return EMPTY + tail
+            return (EMPTY_SORTED if unsorted else EMPTY) + tail
         local = datetime.fromtimestamp(self._clock(), self._tz)
         self._number(replies, actions)
         several = len({*self._mailboxes, *(mail.account for mail in [*replies, *actions])}) > 1
@@ -197,7 +208,7 @@ class MailDigest:
             for mails in (replies[:BLOCK_LIMIT], actions[:BLOCK_LIMIT]):
                 for mail in mails:
                     if mail.account == name:
-                        self._numbers.number(mail.id)
+                        self._numbers.number(mail)
 
     def glance(self) -> str:
         """The digest as numbers only, for the start of a call: no sender, subject or summary (outside text), and no
@@ -224,6 +235,12 @@ class MailDigest:
         known = [m for m in self._store.unlabelled_from_known(since) if m.id not in {n.id for n in needs}]
         return needs, known, self._store.mail_actions(_iso(last), since)
 
+    def _unsorted(self, now: float, known: list[MailHeader]) -> str:
+        """ "12 mails not sorted yet.": unsorted mail in the reply window, less what the digest lists already (unsorted
+        mail from people the user writes to); "" when there is none."""
+        count = self._store.count_unsorted_mail(_iso(now - self._reply_days * 86_400)) - len(known)
+        return UNSORTED.format(count=count, mails="mail" if count == 1 else "mails") if count > 0 else ""
+
     def _block(self, mails: list[MailHeader], local: datetime) -> list[str]:
         lines = [self._line(mail, local) for mail in mails[:BLOCK_LIMIT]]
         if len(mails) > BLOCK_LIMIT:
@@ -242,7 +259,7 @@ class MailDigest:
             local_part = mail.sender_address.partition("@")[0]
             who = clean_note(mail.sender_name, NOTE_CHARS) or clean_note(local_part, NOTE_CHARS) or NO_NAME
             what = clean_note(mail.summary, NOTE_CHARS) or clean_note(mail.subject, NOTE_CHARS) or "(no subject)"
-            return f"{self._numbers.number(mail.id)}. {' '.join(who.split())}: {' '.join(what.split())} ({age})"
+            return f"{self._numbers.number(mail)}. {' '.join(who.split())}: {' '.join(what.split())} ({age})"
         who = " ".join((mail.sender_name or mail.sender_address).split())
         what = " ".join((mail.summary or mail.subject or "(no subject)").split())
-        return f"{self._numbers.number(mail.id)}. [{mail.account}] {who}: {what} ({age})"
+        return f"{self._numbers.number(mail)}. [{mail.account}] {who}: {what} ({age})"

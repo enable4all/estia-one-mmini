@@ -459,14 +459,23 @@ def test_the_log_takes_the_evening_note_and_an_older_database_moves_up(tmp_path:
 # her tools, then the chat's with /initiative on
 # 16 Oct, the profile in two parts: her rules as before, the profile's header says 4,000 (its own part); chat
 # 7a8cd927…, call e355cbf5… before (owner, 15 Oct: asking for a joke counts); 18 Oct, hearth with the owner's soul.md
-# lines (A/B and the full suite twice): chat 2b726b0f…, call 399fc23f… before
+# lines (A/B and the full suite twice): chat 2b726b0f…, call 399fc23f… before; 24 Oct, "her own macOS account" in the
+# projects-off rule (the owner's wording; the Gemma test set twice): chat 6fd8137b…, call 015017af… before; 24 Oct, her
+# tools' list in a text's rules (owner, 23 Oct; the A/B in docs/agents/prompts-evals.md): chat 6ce1de73… before, a
+# call's and the tools unchanged; with its reminders' lines naming no call in an install without calls: 4106183d…;
+# before the review of 24 Oct changed her list's lines and its rule (docs/agents/prompts-evals.md): e210d8d4…; before
+# review G11 and G12 (25 Oct: her photo line, no model size): chat 06568cb2…, call b81b5c4c…; before how long she
+# answers on a call (26 Oct, owner: a deep question gets the full answer; docs/agents/prompts-evals.md): call 4e30986b…
 BEFORE_EVENING_SHA256 = {
-    "chat": "6fd8137b5adf2076b05921dc3f1cf3fb68232546b7bd30518460f631f19017c8",
-    "call": "015017af8f492811219c254a6654aca5c53eef1ce7d3b45ec8b6abcfa5144f1d",
+    "chat": "7efa0b855f9d3cbcae3a73ca6cef3a2f36c8609d4673721d73d477905a7eab05",
+    "call": "aa18eb7814ca13004f6208e230ee02dcbca015e1f8c2b8eff5383a8d3e922826",
     "tools": "42afa6769c213febcdab193788d983d0543a8158c28f83d3215c5176ee06b7ae",
 }
 BEFORE_EVENING_INITIATIVE_ON_SHA256 = (
-    "a82b00b5931d7a2052da6390aa227e22cb7bb110e76902434e22eda22eaf696d"  # f4731c56… before 18 Oct, 22bef8cf… before 16
+    # e80197d9… before review G11 and G12 (25 Oct), cc1bbfd6… before the review of 24 Oct changed her list's lines and
+    # its rule, 33d03577… before her tools' list named no call without calls, e6ee0da8… before the list (24 Oct),
+    # a82b00b5… before the owner's wording (24 Oct), f4731c56… before 18 Oct, 22bef8cf… before 16
+    "843b04309bcb9897623f7ba3e1383838fe8d47242b883958bd1db484749beb34"
 )
 # the evening note inside the line of the messages she starts, never a line of its own: a line of its own took
 # video_auto from 8 of 8 to 3 of 8, this from 8 of 8 to 7 of 8 (15 Oct, run in turn, a fresh prefix each run). It says

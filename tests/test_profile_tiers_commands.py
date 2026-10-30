@@ -96,7 +96,9 @@ async def test_profile_with_only_notes_says_nothing_of_yours_yet_then_the_notes_
     assert await commands.handle(command(store, "/profile")) == (
         "**Your profile**: I see it with every message (0 of 4,000 characters, 0%)\n"
         "\n"
-        'Nothing of yours yet: say "remember that ...".\n'
+        'Nothing of yours yet. Say "remember that ...": my "Saved" note confirms each one.\n'
+        f"{prompts.PROFILE_WORTH_TELLING}\n"
+        "Up to 300 characters a fact, 4,000 for all of yours. Kept on this Mac.\n"
         "\n"
         f"**My notes from our chats**: 2 notes ({used} of 12,000 characters, 1%). I see up to 1,500 characters of "
         "them with each message, the ones that match it first, then the newest. /profile notes lists them.\n"
@@ -331,7 +333,7 @@ async def test_forget_by_words_looks_in_both_parts(store: Store) -> None:
         "Forgotten: #1 The user's sister lives in Rotterdam."
     )
     assert profile.facts() == []
-    assert (await commands.handle(command(store, "/profile", T0 + 3))).startswith("Your profile is empty")
+    assert (await commands.handle(command(store, "/profile", T0 + 3))).startswith("**Your profile is empty.** ")
 
 
 # /new

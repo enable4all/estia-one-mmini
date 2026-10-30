@@ -1,0 +1,8 @@
+data: {"id":"chatcmpl-555","object":"chat.completion.chunk","created":1792681709,"model":"local-worker","system_fingerprint":"fp_ollama","choices":[{"index":0,"delta":{"role":"assistant","content":"","tool_calls":[{"id":"call_h40f2cxk","index":0,"type":"function","function":{"name":"web_search","arguments":"{\"query\":\"Ajax vs PSV score 4 October 2026\"}"}}]},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-555","object":"chat.completion.chunk","created":1792681709,"model":"local-worker","system_fingerprint":"fp_ollama","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}
+
+data: {"id":"chatcmpl-555","object":"chat.completion.chunk","created":1792681709,"model":"local-worker","system_fingerprint":"fp_ollama","choices":[],"usage":{"prompt_tokens":6720,"prompt_tokens_details":{"cached_tokens":5},"completion_tokens":26,"total_tokens":6746},"timings":{"prompt_n":6720,"prompt_ms":4487,"prompt_per_token_ms":0.6677083333333333,"prompt_per_second":1497.6599063962558,"predicted_n":26,"predicted_ms":677,"predicted_per_token_ms":26.03846153846154,"predicted_per_second":38.404726735598224}}
+
+data: [DONE]
+

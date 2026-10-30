@@ -2,7 +2,10 @@
 # CHANGELOG.md: from "## [0.9.4]" to the next "## [" (or the links at the file's end), so the notes are reviewed with
 # the code; the page around them is .github/release-page.md ({{VERSION}} and {{SECTION}} filled in: the tagline, the
 # section under "What changed in", then what is in 0.9; owner, 18 Oct: "leave also the 0.9"). A tag whose CHANGELOG.md has no such section stops here, before anything is published. GitHub Actions
-# publishes it, so the release names no person's account. Only GitHub's own `gh` runs here, no other action.
+# publishes it, so the release names no person's account. The publishing job runs only GitHub's own `gh`, no other
+# action. Before it, the scan job runs osv-scan.yml (the pinned scan of every push, read-only) over the tag's lock
+# files: a known security hole stops the release before anything is published (review X6, 0.9.7: that rested on one
+# step on the Mac).
 # Started by hand (Actions, "Run workflow"), it runs a tag again after a failed run. It reads CHANGELOG.md as that tag
 # has it: a tag from before the file (v0.9.3 and older) stops at that read, and a tag without its section stays so
 # until the tag is moved to a commit that has it.
@@ -16,10 +19,19 @@ on:
         description: The version tag to release (v0.9.4)
         required: true
 permissions:
-  contents: write
+  contents: read
 jobs:
+  scan:
+    uses: ./.github/workflows/osv-scan.yml
+    with:
+      ref: ${{ inputs.tag || github.ref_name }}
+    permissions:
+      contents: read
   release:
+    needs: scan
     runs-on: ubuntu-24.04
+    permissions:
+      contents: write
     steps:
       - name: Publish the release
         env:

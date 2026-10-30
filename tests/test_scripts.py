@@ -143,11 +143,15 @@ def fake_mac(tmp_path: Path, *, git: bool = True) -> tuple[Path, Path, Path, dic
     clone = tmp_path / "clone"
     (clone / "scripts").mkdir(parents=True)
     shutil.copy2(ROOT / "scripts" / "setup.sh", clone / "scripts" / "setup.sh")
+    (clone / "src/local_assistant").mkdir(parents=True)  # setup.sh reads the signal-cli series there
+    shutil.copy2(ROOT / "src/local_assistant/config.py", clone / "src/local_assistant/config.py")
     if git:
         (clone / ".git").mkdir()
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     stub(bin_dir, "uname", 'case "$1" in -s) echo Darwin ;; -m) echo arm64 ;; esac')
+    stub(bin_dir, "sw_vers", '[ "$1" = -productVersion ] && echo 27.0.1')
+    stub(bin_dir, "id", '[ "$1" = -Gn ] && echo "staff everyone localaccounts admin"')
     stub(bin_dir, "sleep", "exit 0")
     stub(bin_dir, "open", f'echo "open $*" >> "{tmp_path / "called.log"}"')
     for name in REAL_TOOLS:
@@ -186,7 +190,7 @@ def setup_dry_run(tmp_path: Path, *, tools: bool) -> tuple[str, Path]:
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert not called.exists(), called.read_text(encoding="utf-8")  # no tool was run
-    assert sorted(p.name for p in clone.iterdir()) == [".git", "scripts"]  # no .venv, nothing else
+    assert sorted(p.name for p in clone.iterdir()) == [".git", "scripts", "src"]  # no .venv, nothing else
     assert not (tmp_path / "home").exists()
     return result.stdout, clone
 
@@ -195,12 +199,17 @@ def setup_dry_run(tmp_path: Path, *, tools: bool) -> tuple[str, Path]:
 def test_setup_dry_run_installs_runs_and_creates_nothing(tmp_path: Path, tools: bool) -> None:
     """The first step SETUP-WITH-YOUR-AI.md gives: it only prints, even on a fresh clone, and needs no terminal."""
     out, _ = setup_dry_run(tmp_path, tools=tools)
-    assert "$ uv python install 3.13" in out and "$ uv sync --frozen" in out and "Then: Ollama's official build" in out
-    assert "the model for this Mac's memory" in out
+    assert "$ uv python install 3.13" in out and "$ uv sync --frozen" in out
     assert ("Homebrew: would offer to install it" in out) is not tools
     assert ("$ brew install signal-cli uv" in out) is not tools
     assert "brew install signal-cli ollama" not in out and "brew services" not in out  # never Homebrew's Ollama
-    assert "Ollama's official build" in out
+    # a fresh clone's summary, which a friend's AI briefs from first, in 0.9.8's facts (c-8, round 3)
+    summary = " ".join(out.split("uv sync --frozen", 1)[1].split())
+    made_first = "her own macOS account and her own Ollama, made first on a yes to always on (any other Ollama on"
+    assert made_first in summary and "the Mac stays as it is;" in summary
+    assert "her model for this Mac's memory" in summary
+    assert "a spare SIM's number, or an account without a number" in summary
+    assert "kept when it answers" not in summary and "SMS code typed" not in summary
 
 
 def tools_stubs(bin_dir: Path, called: Path, *, signal_version: str = "0.14.9", ollama_formula: bool = True) -> None:
@@ -238,15 +247,231 @@ def test_setup_runs_homebrew_without_its_analytics(tmp_path: Path) -> None:
     assert brew == ["1 brew install signal-cli"]  # uv is there; Ollama is never Homebrew's (setup's Ollama step)
 
 
-def test_setup_without_a_terminal_stops_before_anything(tmp_path: Path) -> None:
-    """An AI's command tool has no terminal: setup asks questions and Signal's one-time codes, so it says where to run
-    it and runs nothing (finding 19, 38)."""
+def test_setup_started_by_an_ai_goes_on_to_its_window(tmp_path: Path) -> None:
+    """Owner, 29 Oct: a friend's AI starts setup itself. Without a terminal, at the desk, setup.sh installs the tools
+    as in Terminal and hands over to setup's Python step (its window asks everything), with -I: PYTHONPATH and the
+    like never reach it."""
     clone, bin_dir, called, env = fake_mac(tmp_path)
     tools_stubs(bin_dir, called)
-    result = subprocess.run(setup_sh(clone), env=env, capture_output=True, text=True, stdin=subprocess.DEVNULL)
-    assert result.returncode == 1
-    assert "run scripts/setup.sh in your own Terminal window" in result.stderr
+    result = subprocess.run(
+        setup_sh(clone), env=env, capture_output=True, text=True, stdin=subprocess.DEVNULL, check=False
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    log = called.read_text(encoding="utf-8")
+    assert "1 brew install signal-cli" in log and "uv run --quiet python -I -m local_assistant.setup" in log
+
+
+@pytest.mark.parametrize(
+    ("key", "words"),
+    [
+        ("SSH_CONNECTION", "SETUP_AI_NOT_AT_DESK"),
+        ("SSH_CLIENT", "SETUP_AI_NOT_AT_DESK"),
+        ("SSH_TTY", "SETUP_AI_NOT_AT_DESK"),
+        ("STY", "SETUP_AI_IN_SESSION"),
+        ("TMUX", "SETUP_AI_IN_SESSION"),
+        ("HERDR_ENV", "SETUP_AI_IN_SESSION"),
+    ],
+)
+def test_setup_started_by_an_ai_away_from_the_desk_installs_nothing(tmp_path: Path, key: str, words: str) -> None:
+    """Architect, 29 Oct: without a terminal its window is the only face, and it opens only at the Mac's own screen:
+    over SSH or inside screen, tmux or herdr setup.sh stops before Homebrew, brew install, uv python install and
+    uv sync, in the words of setup's Python step."""
+    from local_assistant import prompts
+
+    clone, bin_dir, called, env = fake_mac(tmp_path)
+    tools_stubs(bin_dir, called)
+    result = subprocess.run(
+        setup_sh(clone), env={**env, key: "1"}, capture_output=True, text=True, stdin=subprocess.DEVNULL, check=False
+    )
+    assert result.returncode == 2
+    assert result.stderr == getattr(prompts, words) + "\n" and result.stdout == ""
     assert not called.exists()
+
+
+def test_setup_sh_says_its_stops_in_the_python_steps_words() -> None:
+    from local_assistant import prompts
+
+    script = (ROOT / "scripts" / "setup.sh").read_text(encoding="utf-8")
+    for words in (
+        prompts.SETUP_AI_NOT_AT_DESK,
+        prompts.SETUP_AI_IN_SESSION,
+        prompts.SETUP_AI_EXTRAS,
+        prompts.SETUP_AI_FILES,
+        prompts.SETUP_AI_HOME,
+        prompts.SETUP_AI_TERMINAL_FLAG.replace("{flag}", "$flag"),
+    ):
+        assert f'echo "{words}" >&2' in script
+
+
+def an_account(bin_dir: Path, home: Path) -> None:
+    """`id -P` gives the account's entry in the user database, its home folder the 9th field (as macOS prints it)."""
+    entry = f"friend:********:501:20::0:0:Friend:{home}:/bin/zsh"
+    stub(bin_dir, "id", f'case "$1" in -Gn) echo "staff everyone localaccounts admin" ;; -P) echo "{entry}" ;; esac')
+
+
+@pytest.mark.parametrize(
+    ("argv", "words"),
+    [
+        (["--extras"], "SETUP_AI_EXTRAS"),
+        (["--ext"], "SETUP_AI_EXTRAS"),  # argparse takes a unique prefix: so does setup.sh
+        (["--answers", "x"], "SETUP_AI_FILES"),
+        (["--answers=x"], "SETUP_AI_FILES"),
+        (["--config", "x"], "SETUP_AI_FILES"),
+        (["--plain"], "--plain"),
+        (["--term"], "--terminal"),
+        ([], "SETUP_AI_HOME"),  # HOME is not the account's home folder
+    ],
+)
+def test_setup_started_by_an_ai_refuses_what_it_cannot_run_before_any_tool(
+    tmp_path: Path, argv: list[str], words: str
+) -> None:
+    """Review of 30 Oct (P02): without a terminal setup.sh wrote Homebrew's line in $HOME/.zprofile and ran brew and
+    uv before setup's Python step refused the flags and a foreign HOME ("Refused before anything runs"). Refused
+    first, in the Python step's words, exit 2: no brew, no uv, no profile line."""
+    from local_assistant import prompts
+
+    clone, bin_dir, called, env = fake_mac(tmp_path)
+    tools_stubs(bin_dir, called)
+    an_account(bin_dir, tmp_path / "elsewhere" if not argv else Path(env["HOME"]))
+    result = subprocess.run(
+        [*setup_sh(clone), *argv], env=env, capture_output=True, text=True, stdin=subprocess.DEVNULL, check=False
+    )
+    said = prompts.SETUP_AI_TERMINAL_FLAG.format(flag=words) if words.startswith("--") else getattr(prompts, words)
+    assert (result.returncode, result.stderr, result.stdout) == (2, said + "\n", "")
+    assert not called.exists() and not (tmp_path / "home").exists()
+
+
+def test_setup_started_by_an_ai_with_its_own_home_goes_on(tmp_path: Path) -> None:
+    """HOME is the account's own (dscl's, a slash at the end or not): the tools install, then setup's Python step."""
+    clone, bin_dir, called, env = fake_mac(tmp_path)
+    tools_stubs(bin_dir, called)
+    an_account(bin_dir, Path(env["HOME"]))
+    result = subprocess.run(
+        setup_sh(clone), env={**env, "HOME": env["HOME"] + "/"}, capture_output=True, text=True,
+        stdin=subprocess.DEVNULL, check=False,
+    )  # fmt: skip
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "uv run --quiet python -I -m local_assistant.setup" in called.read_text(encoding="utf-8")
+
+
+def test_without_a_terminal_homebrew_is_never_installed_from_a_pipe(tmp_path: Path) -> None:
+    """No terminal, no Homebrew: its own installer needs a terminal (it ends "Need sudo access"), so setup.sh names
+    Homebrew.pkg, which macOS's own Installer opens; a pipe holding y never answers the question."""
+    clone, bin_dir, called, env = fake_mac(tmp_path)
+    stub(bin_dir, "curl", f'echo "curl $*" >> "{called}"; exit 0')
+    result = subprocess.run(setup_sh(clone), env=env, input="y\n", capture_output=True, text=True, check=False)
+    assert result.returncode == 1
+    assert "Install Homebrew now?" not in result.stdout + result.stderr
+    assert "Homebrew.pkg from https://github.com/Homebrew/brew/releases/latest" in result.stderr
+    assert not called.exists()  # nothing downloaded, nothing run
+
+
+def test_without_a_terminal_an_older_signal_cli_is_never_upgraded_from_a_pipe(tmp_path: Path) -> None:
+    """No terminal: the upgrade's "Press Enter to run it" is never read from a pipe; setup.sh names the command."""
+    clone, bin_dir, called, env = fake_mac(tmp_path)
+    tools_stubs(bin_dir, called)
+    stub(bin_dir, "signal-cli", "echo signal-cli 0.13.24")
+    stub(bin_dir, "uv", "exit 0")
+    result = subprocess.run(setup_sh(clone), env=env, input="\n", capture_output=True, text=True, check=False)
+    assert result.returncode == 1
+    assert "Press Enter" not in result.stdout + result.stderr
+    assert "Install signal-cli 0.14.x (brew upgrade signal-cli), then run setup again." in result.stderr
+    assert "brew upgrade" not in (called.read_text(encoding="utf-8") if called.exists() else "")
+
+
+def test_setup_refuses_to_run_as_root_before_anything() -> None:
+    """Review MAC-7: `sudo scripts/setup.sh` would make setup's own folders root's, and every run of yours after it
+    would refuse the answers file and lose gum. Setup refuses root first, as the move does (a test cannot be root:
+    the line itself, before anything runs)."""
+    from local_assistant import prompts
+
+    lines = (ROOT / "scripts" / "setup.sh").read_text(encoding="utf-8").splitlines()
+    guard = f'[[ $EUID -ne 0 ]] || {{ echo "{prompts.SETUP_NOT_ROOT}" >&2; exit 2; }}'
+    assert guard in lines
+    first = next(i for i, line in enumerate(lines) if line and not line.startswith(("#", "set -", "export ")))
+    assert lines[first] == guard
+
+
+@pytest.mark.parametrize("dry", [False, True], ids=["real", "dry"])
+@pytest.mark.parametrize("version", ["15.7.2", "26.6", "", "abc"])
+def test_setup_refuses_a_macos_older_than_27_before_anything(tmp_path: Path, version: str, dry: bool) -> None:
+    """Owner, 29 Oct: macOS 27 or later only (it runs on every Apple silicon Mac, M1 included). An older macOS is
+    refused at once, before Homebrew, a download or a question, with the update's way in one line."""
+    from local_assistant import prompts
+
+    clone, bin_dir, called, env = fake_mac(tmp_path, git=False)  # refused before the clone check too
+    stub(bin_dir, "sw_vers", f'[ "$1" = -productVersion ] && echo "{version}"')
+    tools_stubs(bin_dir, called)
+    result = in_a_terminal([*setup_sh(clone), *(["--dry-run"] if dry else [])], env)
+    assert result.returncode == 1
+    assert result.stderr.strip() == prompts.SETUP_MACOS_OLD
+    assert prompts.SETUP_MACOS_OLD == (
+        "Estia needs macOS 27 or later. Update macOS (System Settings → General → Software Update), "
+        "then run setup again."
+    )
+    assert result.stdout == "" and not called.exists()
+
+
+@pytest.mark.parametrize("dry", [False, True], ids=["real", "dry"])
+@pytest.mark.parametrize("groups", ["staff everyone localaccounts", "staff administrators", ""])
+def test_setup_refuses_a_standard_account_before_anything(tmp_path: Path, groups: str, dry: bool) -> None:
+    """mac-ollama-standard-account: Homebrew, her own account and the security step need admin rights, and a
+    standard account ran into each late, with \"run setup again\". Setup says so first, before anything."""
+    from local_assistant import prompts
+
+    clone, bin_dir, called, env = fake_mac(tmp_path, git=False)
+    stub(bin_dir, "id", f'[ "$1" = -Gn ] && echo "{groups}"')
+    tools_stubs(bin_dir, called)
+    result = in_a_terminal([*setup_sh(clone), *(["--dry-run"] if dry else [])], env)
+    assert result.returncode == 1 and result.stderr.strip() == prompts.SETUP_NOT_ADMIN
+    assert prompts.SETUP_NOT_ADMIN == (
+        "Setup needs an admin account. Log in as an admin, or have an admin make this account one "
+        "(System Settings → Users and Groups), then run setup again."
+    )
+    assert result.stdout == "" and not called.exists()
+
+
+@pytest.mark.parametrize("translated", ["1", "0", ""], ids=["rosetta", "intel", "old-intel"])
+def test_setup_names_terminal_under_rosetta_before_anything(tmp_path: Path, translated: str) -> None:
+    """plat-14 (round 1): Terminal set to "Open using Rosetta" on an Apple silicon Mac reports an Intel chip, and was
+    refused as an Intel Mac. It is told how to turn Rosetta off; an Intel Mac is refused as before."""
+    from local_assistant import prompts
+
+    clone, bin_dir, called, env = fake_mac(tmp_path, git=False)
+    stub(bin_dir, "uname", 'case "$1" in -s) echo Darwin ;; -m) echo x86_64 ;; esac')
+    stub(bin_dir, "sysctl", f'[ "$2" = sysctl.proc_translated ] && echo "{translated}"')
+    tools_stubs(bin_dir, called)
+    result = in_a_terminal(setup_sh(clone), env)
+    assert result.returncode == 1 and result.stdout == "" and not called.exists()
+    if translated == "1":
+        assert result.stderr.strip() == prompts.SETUP_ROSETTA
+        assert prompts.SETUP_ROSETTA == (
+            'Terminal runs under Rosetta here. Turn off "Open using Rosetta" (Finder: Applications → Utilities, '
+            "Terminal, Get Info), then quit Terminal, open it again and run setup."
+        )
+    else:
+        assert result.stderr.strip() == "Estia needs a Mac with Apple silicon (M1 or later)."
+
+
+@pytest.mark.parametrize("memory", [8, 14])
+def test_setup_refuses_a_mac_below_16_gb_before_anything(tmp_path: Path, memory: int) -> None:
+    """mac-ollama-memory-after-tools (round 1): on an 8 GB Mac, Homebrew, the Command Line Tools, signal-cli, uv and
+    Python installed before "Estia needs 16 GB". Said first, in setup's own words."""
+    clone, bin_dir, called, env = fake_mac(tmp_path, git=False)
+    stub(bin_dir, "sysctl", f'[ "$2" = hw.memsize ] && echo {memory * 2**30}')
+    tools_stubs(bin_dir, called)
+    result = in_a_terminal(setup_sh(clone), env)
+    assert result.returncode == 1 and result.stdout == "" and not called.exists()
+    assert result.stderr.strip() == f"✗ This Mac has {memory} GB of memory. Estia needs 16 GB or more."
+
+
+@pytest.mark.parametrize("version", ["27.0", "27.0.1", "28.1"])
+def test_setup_goes_on_on_macos_27_or_later(tmp_path: Path, version: str) -> None:
+    clone, bin_dir, _called, env = fake_mac(tmp_path, git=False)
+    stub(bin_dir, "sw_vers", f'[ "$1" = -productVersion ] && echo "{version}"')
+    result = in_a_terminal(setup_sh(clone), env)
+    assert "macOS 27 or later" not in result.stderr
+    assert "git clone https://github.com/enable4all/estia-one-mmini.git ~/estia" in result.stderr  # the next check
 
 
 @pytest.mark.parametrize("dry", [False, True], ids=["real", "dry"])
@@ -307,16 +532,30 @@ def test_a_failed_homebrew_download_names_the_network_and_runs_nothing(tmp_path:
 
 
 def test_the_homebrew_question_says_why_and_what_is_recommended(tmp_path: Path) -> None:
-    """What Homebrew is for, what a no does, that nothing shows at the password, and "Recommendation: yes" before the
-    hint; Enter keeps the no (not a safety question: a no only stops setup)."""
+    """What Homebrew is for, what a no does, that nothing shows at the password, and "Yes (recommended)." before the
+    hint; Enter takes that yes (owner's call, 29 Oct: Enter takes the recommended answer wherever a line says it is
+    recommended), n stops setup."""
     clone, bin_dir, called, env = fake_mac(tmp_path)
     stub(bin_dir, "curl", f'echo "curl $*" >> "{called}"; exit 7')
-    result = in_a_terminal(setup_sh(clone), env, typed="\n")
+    result = in_a_terminal(setup_sh(clone), env, typed="n\n")
     out = result.stdout + result.stderr
     assert result.returncode == 1 and "curl" not in (called.read_text() if called.exists() else "")
     assert "signal-cli (for Signal) and uv (for Python)" in out and "nothing shows while you type" in out
-    assert "No stops setup." in out and "Install Homebrew now? Recommendation: yes. [y/N] " in out
+    assert "No stops setup." in out and "Install Homebrew now? [Y/n] " in out and "Yes (recommended)." in out
+    entered = in_a_terminal(setup_sh(clone), env, typed="\n")
+    assert "Could not download Homebrew's installer" in entered.stderr and "curl -fsSL" in called.read_text()
     assert all(len(line) <= 135 for line in out.splitlines() if "Homebrew" in line)
+
+
+def test_the_homebrew_question_is_short_lines_with_a_blank_line_before_its_recommendation(tmp_path: Path) -> None:
+    """Owner, 27 Oct ("in terminal, we also need some blank rows, too much text"): lines of 88 characters or less, a
+    blank line between the paragraphs and before "Yes (recommended)."."""
+    clone, bin_dir, called, env = fake_mac(tmp_path)
+    stub(bin_dir, "curl", f'echo "curl $*" >> "{called}"; exit 7')
+    out = in_a_terminal(setup_sh(clone), env, typed="n\n").stdout
+    before = out.split("Install Homebrew now?", 1)[0]
+    assert all(len(line) <= 88 for line in before.splitlines()), before
+    assert "\n\nYes (recommended).\n" in before and "Its installer asks" in before.split("\n\n")[1]
 
 
 def test_the_homebrew_installer_is_shown_as_one_line_never_its_text(tmp_path: Path) -> None:
@@ -351,7 +590,7 @@ def test_setup_sh_never_installs_or_starts_ollama_itself(tmp_path: Path) -> None
     assert result.returncode == 0, result.stdout + result.stderr
     log = called.read_text(encoding="utf-8")
     assert "ollama" not in log.replace("local_assistant", "") and "open " not in log and "curl" not in log
-    assert "uv run --quiet python -m local_assistant.setup" in log
+    assert "uv run --quiet python -I -m local_assistant.setup" in log
     script = (ROOT / "scripts" / "setup.sh").read_text(encoding="utf-8")
     assert "brew services" not in script and "open -a Ollama" not in script
 
@@ -363,9 +602,48 @@ def test_a_signal_cli_of_another_version_is_refused(tmp_path: Path) -> None:
     stub(bin_dir, "signal-cli", "echo signal-cli 0.13.24")
     stub(bin_dir, "ollama", "exit 0")
     stub(bin_dir, "uv", "exit 0")
-    result = in_a_terminal(setup_sh(clone), env)
+    result = in_a_terminal(setup_sh(clone), env, typed="s\n")  # its upgrade, offered: skipped
     assert result.returncode == 1
     assert "signal-cli 0.14" in result.stderr and "0.13.24" in result.stderr
+    assert "brew upgrade signal-cli" in result.stderr and "git pull" not in result.stderr
+
+
+@pytest.mark.parametrize("version", ["0.15.0", "1.0.2"])
+def test_a_signal_cli_newer_than_estia_supports_asks_for_an_estia_update(tmp_path: Path, version: str) -> None:
+    """Once Homebrew moves past 0.14, "brew install or brew upgrade signal-cli" can never give a 0.14.x: a newer one
+    asks for a newer Estia instead (release review D10)."""
+    clone, bin_dir, called, env = fake_mac(tmp_path)
+    tools_stubs(bin_dir, called)
+    stub(bin_dir, "signal-cli", f"echo signal-cli {version}")
+    stub(bin_dir, "ollama", "exit 0")
+    stub(bin_dir, "uv", "exit 0")
+    result = in_a_terminal(setup_sh(clone), env)
+    assert result.returncode == 1
+    assert "newer than Estia supports" in result.stderr and version in result.stderr, result.stderr
+    assert "git pull" in result.stderr and "next Estia release" in result.stderr
+    assert "brew upgrade" not in result.stderr and "brew install" not in result.stderr
+
+
+def test_setup_takes_the_signal_cli_series_from_the_one_constant(tmp_path: Path) -> None:
+    """setup.sh, doctor and config share one constant for the signal-cli versions Estia supports
+    (config.SIGNAL_CLI_SERIES): a release that moves it moves setup's check too (release review D10)."""
+    from local_assistant import config
+
+    clone, bin_dir, called, env = fake_mac(tmp_path)
+    module = clone / "src/local_assistant/config.py"
+    line = f'SIGNAL_CLI_SERIES = "{config.SIGNAL_CLI_SERIES}"'
+    assert line in module.read_text(encoding="utf-8")
+    module.write_text(module.read_text(encoding="utf-8").replace(line, 'SIGNAL_CLI_SERIES = "0.15"'), encoding="utf-8")
+    tools_stubs(bin_dir, called)
+    stub(bin_dir, "signal-cli", "echo signal-cli 0.15.0")
+    stub(bin_dir, "ollama", "exit 0")
+    stub(bin_dir, "uv", "exit 0")
+    result = in_a_terminal(setup_sh(clone), env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "✓ Tools: signal-cli, uv" in result.stdout
+    module.write_text("# no series here\n", encoding="utf-8")
+    result = in_a_terminal(setup_sh(clone), env)
+    assert result.returncode == 1 and "src/local_assistant/config.py" in result.stderr, result.stderr
 
 
 SET_CALENDAR = ROOT / "scripts" / "set-calendar-url.sh"
@@ -625,9 +903,11 @@ def test_estia_config_runs_nano_as_her_so_no_copy_of_her_config_lands_in_your_ac
     env = {"PATH": "/usr/bin:/bin", "ESTIA_ROOT": str(tmp_path), "TERM": "xterm-ghostty"}
     done = run_script("estia", "--dry-run", "config", env=env)
     assert done.returncode == 0, done.stderr
-    assert done.stdout.strip().endswith(
+    nano, check = done.stdout.strip().splitlines()
+    assert nano.endswith(
         "LANG=en_US.UTF-8 TERM=xterm-ghostty /usr/bin/nano /var/estia/.config/local-assistant/config.toml"
     )
+    assert check.endswith(".venv/bin/python -I -c from local_assistant.config import load_config; load_config()")
     assert "/usr/bin/sudo -u _estia -H -- /usr/bin/env -i HOME=/var/estia " in done.stdout
     odd = run_script("estia", "--dry-run", "config", env=env | {"TERM": "x;rm -rf ~"})
     assert "TERM=xterm-256color /usr/bin/nano" in odd.stdout  # an odd TERM is never passed on
@@ -823,17 +1103,23 @@ def test_the_wrappers_need_root_without_a_dry_run(tmp_path: Path) -> None:
 
 
 def fake_release(root: Path, checkout: Path) -> None:
-    """A current release, and the root-run tools: their Python is this test run's and their code this checkout's (the
-    deploy module itself runs in its dry-run mode). The release's own Python is never run."""
+    """A current release, and the root-run tools: their Python is this test run's and their code exactly this
+    checkout's TOOL_FILES, as root has them (the deploy module itself runs in its dry-run mode): a tool that imports
+    a module of ours root lacks fails here (review I16). The release's own Python is never run."""
+    from local_assistant.deploy import TOOL_FILES
+
     release = root / "usr/local/estia/releases/20261013T120000Z-abc"
     release.mkdir(parents=True)
     (release / "release.json").write_text(json.dumps({"source": str(checkout)}))
     (root / "usr/local/estia/current").symlink_to("releases/20261013T120000Z-abc")
     tools = root / "usr/local/estia/tools"
     tools.mkdir()
-    (tools / "python3").write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
+    (tools / "python3").write_text(f'#!/bin/sh\nexec "{sys.executable}" -B "$@"\n')  # -B: no bytecode in the tree
     (tools / "python3").chmod(0o755)
-    (tools / "src").symlink_to(ROOT / "src")
+    for rel in TOOL_FILES:
+        if rel.startswith("src/"):
+            (tools / rel).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(ROOT / rel, tools / rel)
 
 
 def test_estia_deploy_dry_run_changes_nothing(tmp_path: Path) -> None:
@@ -965,11 +1251,9 @@ def owner_stubs(tmp_path: Path) -> tuple[Path, Path, Path]:
     log, given = tmp_path / "sudo.log", tmp_path / "stdin.log"
     stub(folder, "sudo", f'echo "sudo $*" >> "{log}"; cat >> "{given}"; exit 0')
     root_sudo(tmp_path / "root", f'echo "sudo $*" >> "{log}"; cat >> "{given}"; exit 0')
-    stub(
-        folder,
-        "security",
-        'case "$*" in *"-s brave-search"*) echo sk-brave-made-up ;; *"-s ollama"*) echo ollama-made-up ;; *) exit 44 ;; esac',
-    )
+    keychain = 'case "$*" in *"-s brave-search"*) echo sk-brave-made-up ;; *"-s ollama"*) echo ollama-made-up ;; *) exit 44 ;; esac'
+    stub(folder, "security", 'echo "a security on your PATH ran" >&2; exit 1')  # never: /usr/bin/security only
+    stub(tmp_path / "root/usr/bin", "security", keychain)  # its full path, under the test's fake tree
     return folder, log, given
 
 
@@ -1083,7 +1367,7 @@ def test_an_estia_root_left_from_a_rehearsal_never_reaches_sudo(tmp_path: Path) 
     """A rehearsal's tree (ESTIA_ROOT) holds a stub bin/estia: the owner's scripts never pipe a key into it."""
     stubs, log, _ = owner_stubs(tmp_path)
     own_user(tmp_path / "rehearsal")
-    env = {"PATH": f"{stubs}:/usr/bin:/bin", "HOME": str(tmp_path / "home"), "ESTIA_ROOT": str(tmp_path / "rehearsal")}
+    env = {**owner_env(tmp_path, stubs), "ESTIA_ROOT": str(tmp_path / "rehearsal")}
     done = run_script("set-web-keys.sh", env=env)
     assert done.returncode == 0, done.stderr
     assert not log.exists() or "rehearsal" not in log.read_text()
@@ -1102,16 +1386,36 @@ def test_after_a_rollback_the_scripts_take_your_path_again(tmp_path: Path, scrip
 @pytest.mark.parametrize(
     ("args", "lines"),
     [
-        (["restart"], ["would run: /bin/launchctl kickstart -k system/com.local-assistant.bridge"]),
+        (
+            ["restart"],  # her config is loaded as her first: a typo never restarts her into a loop (review I31)
+            [
+                "-I -c from local_assistant.config import load_config; load_config()",
+                "would run: /bin/launchctl kickstart -k system/com.local-assistant.bridge",
+            ],
+        ),
         (
             ["signal", "listIdentities"],
             [
                 "would run: /bin/launchctl bootout system/com.local-assistant.bridge",
                 "-m local_assistant.admin signal listIdentities",
-                "would run: /bin/launchctl bootstrap system /Library/LaunchDaemons/com.local-assistant.bridge.plist",
+                "would run: /bin/launchctl bootstrap system /Library/LaunchDaemons/com.local-assistant.bridge.plist"
+                " (only when she ran before)",
             ],
         ),
-        (["unlock"], ["would run: /bin/launchctl bootout", "-m local_assistant.admin unlock", "bootstrap system"]),
+        (
+            ["unlock"],
+            ["would run: /bin/launchctl bootout", "-m local_assistant.admin unlock", "(only when she ran before)"],
+        ),
+        (
+            ["signal-login"],  # root reads your terminal (her user cannot), then she takes the account over
+            [
+                "local_assistant.ownuser signal-login",
+                "would run: /bin/launchctl bootout system/com.local-assistant.bridge",
+                "-m local_assistant.admin signal-login",
+                "would run: /bin/launchctl bootstrap system /Library/LaunchDaemons/com.local-assistant.bridge.plist"
+                " (only when she ran before)",
+            ],
+        ),
         (["rollback"], ["tools/python3 -I -c"]),
         (["remove-old"], ["tools/python3 -I -c"]),
     ],
@@ -1126,7 +1430,188 @@ def test_the_wrappers_maintenance_commands(tmp_path: Path, args: list[str], line
     if args[0] in ("rollback", "remove-old"):
         assert done.stdout.rstrip().endswith(f"local_assistant.ownuser migrate --{args[0]}")
         assert "/usr/local/estia/current" not in done.stdout  # root runs the tools, never a release
+    if args[0] == "signal-login":
+        assert "tools/python3 -I -c" in out[0] and "/usr/local/estia/current" not in out[0]  # root: the tools only
+        assert out[2].startswith("would run: /usr/bin/sudo -u _estia -H -- /usr/bin/env -i HOME=/var/estia")
     assert not log.exists()
+
+
+def wrapper_function(name: str) -> str:
+    """One function of scripts/estia, as written: from its `name() {` line to the `}` that ends it."""
+    text = (ROOT / "scripts" / "estia").read_text(encoding="utf-8")
+    found = re.search(rf"^{name}\(\) \{{\n.*?^\}}\n", text, re.MULTILINE | re.DOTALL)
+    assert found, name
+    # every system program by a variable the test points at a stub: the Mac's own launchctl and sudo never run here
+    assert not re.search(r"/bin/launchctl|/usr/bin/sudo -", found.group(0)), found.group(0)
+    return found.group(0)
+
+
+def run_wrapper_function(
+    tmp_path: Path, name: str, call: str, *, setup: str = ""
+) -> tuple[subprocess.CompletedProcess[str], list[str]]:
+    """`call` run in bash with one function of scripts/estia, the wrapper's variables pointed at stubs: launchctl
+    (its `print` answers from tmp_path/state: running, gone or unread) and her user (her command logged, as the
+    root-only paths never run in a test). (the run, the calls in order)."""
+    log = tmp_path / "calls.log"
+    state = tmp_path / "state"
+    launchctl = tmp_path / "launchctl"
+    launchctl.write_text(
+        f"""#!/bin/sh
+echo "launchctl $*" >> "{log}"
+case "$1" in
+  print)
+    case "$(cat "{state}")" in
+      running) echo "state = running"; exit 0 ;;
+      gone) echo 'Could not find service "com.local-assistant.bridge" in domain for system'; exit 113 ;;
+      *) echo "Operation timed out"; exit 1 ;;
+    esac ;;
+  bootout) echo gone > "{state}"; [ -z "${{HANG_UP:-}}" ] || kill -HUP "$PPID" ;;
+  bootstrap) echo running > "{state}" ;;
+esac
+""",
+        encoding="utf-8",
+    )
+    launchctl.chmod(0o755)
+    her = tmp_path / "her"
+    her.write_text(f'#!/bin/sh\necho "her $*" >> "{log}"\nexit "${{HER_EXIT:-0}}"\n', encoding="utf-8")
+    her.chmod(0o755)
+    script = "\n".join(
+        [
+            "set -euo pipefail",
+            'dry=""',
+            "bridge=com.local-assistant.bridge",
+            f"launchctl={launchctl}",
+            f"as_her=({her})",
+            setup,
+            wrapper_function(name),
+            call,
+        ]
+    )
+    done = subprocess.run(
+        ["/bin/bash", "-c", script],
+        env={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path)},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return done, log.read_text().splitlines() if log.exists() else []
+
+
+@pytest.mark.parametrize("before", ["running", "gone", "unread"])
+def test_her_signal_cli_by_hand_starts_her_again_only_when_she_ran_before(tmp_path: Path, before: str) -> None:
+    """After a compromise she is stopped first (`estia stop`), and step 8 lists her linked devices: `estia signal`
+    must leave her stopped, so no device is checked while she answers, and the last step's `estia start` works
+    (review I20). As harden's --new-pin: a state launchd cannot tell keeps her stopped too."""
+    (tmp_path / "state").write_text(before)
+    done, calls = run_wrapper_function(
+        tmp_path, "stopped", "stopped python -I -m local_assistant.admin signal listDevices"
+    )
+    assert done.returncode == 0, done.stderr
+    assert "her python -I -m local_assistant.admin signal listDevices" in calls
+    bootstrap = "launchctl bootstrap system /Library/LaunchDaemons/com.local-assistant.bridge.plist"
+    start = "/usr/bin/sudo /usr/local/estia/bin/estia start"
+    if before == "running":
+        her = "her python -I -m local_assistant.admin signal listDevices"
+        assert calls.index("launchctl bootout system/com.local-assistant.bridge") < calls.index(her)
+        assert calls[-1] == bootstrap and "she runs again" in done.stderr
+    else:
+        assert bootstrap not in calls, calls
+        assert ("launchctl bootout system/com.local-assistant.bridge" in calls) is (before == "unread")
+        reason = "she was stopped before" if before == "gone" else "whether she ran before could not be read"
+        assert f"she stays stopped ({reason}): start her with {start}" in done.stderr, done.stderr
+    assert (tmp_path / "state").read_text().strip() == ("running" if before == "running" else "gone")
+
+
+def test_a_hang_up_while_she_stops_starts_her_again(tmp_path: Path) -> None:
+    """A dropped SSH connection (a hang-up through sudo) or a Ctrl-C while the wrapper waits up to 10 s for her to
+    stop left her stopped without a word: the step that starts her again is set before she is stopped (release
+    review D3)."""
+    (tmp_path / "state").write_text("running")
+    done, calls = run_wrapper_function(tmp_path, "stopped", "HANG_UP=1 stopped python -m local_assistant.admin unlock")
+    assert done.returncode != 0
+    assert "her python -m local_assistant.admin unlock" not in calls  # cut off before her command
+    assert calls[-1].startswith("launchctl bootstrap system ") and "she runs again" in done.stderr, (calls, done)
+    assert (tmp_path / "state").read_text().strip() == "running"
+
+
+def test_her_signal_cli_by_hand_keeps_its_exit_code_and_starts_her_again(tmp_path: Path) -> None:
+    (tmp_path / "state").write_text("running")
+    done, calls = run_wrapper_function(tmp_path, "stopped", "HER_EXIT=3 stopped python -m local_assistant.admin unlock")
+    assert done.returncode == 3 and "she runs again" in done.stderr
+    assert calls[-1].startswith("launchctl bootstrap system ")
+
+
+@pytest.mark.parametrize("config", ["good", "a missing quote", "none"])
+def test_her_config_is_loaded_as_the_bridge_loads_it_before_a_restart(tmp_path: Path, config: str) -> None:
+    """`estia config` then `estia restart`: a typo would stop her start, and launchd would restart her every 30 s,
+    offline, with no text to say why. The wrapper loads her config first (as her, with the release's own loader) and
+    names the line (review I31)."""
+    home = tmp_path / "home"
+    path = home / ".config/local-assistant/config.toml"
+    path.parent.mkdir(parents=True)
+    text = 'bot_number = "+306900000000"\nallowed_acis = ["11111111-2222-4333-8444-555555555555"]\n[web]\nprovider = "brave'
+    if config != "none":
+        path.write_text(text + ('"\n' if config == "good" else "\n"))
+        path.chmod(0o600)
+    load = re.search(r"^load=.*$", (ROOT / "scripts" / "estia").read_text(encoding="utf-8"), re.MULTILINE)
+    assert load  # the wrapper's own check, as it runs
+    setup = f'python={sys.executable}\nas_her=(/usr/bin/env -i "HOME={home}")\n{load.group(0)}'
+    call = 'why="$(config_problem)" || { echo "$why"; exit 1; }'
+    done, _calls = run_wrapper_function(tmp_path, "config_problem", call, setup=setup)
+    if config == "good":
+        assert done.returncode == 0 and done.stdout == "", done.stdout + done.stderr
+    else:
+        assert done.returncode == 1, done.stdout + done.stderr
+        lines = done.stdout.strip().splitlines()
+        assert len(lines) == 1 and "Traceback" not in done.stdout, done.stdout
+        assert ("line 4" if config != "none" else "config not found") in lines[0], lines[0]
+
+
+def test_a_config_reason_reaches_your_terminal_in_printable_characters_only(tmp_path: Path) -> None:
+    """Second deep scan, macos-raw-text-to-owner-terminal: scripts/estia runs as root and printed the reason her config
+    does not load as it came; a value of hers that the reason quotes can hold terminal control codes. Each one that is
+    not printable shows as "?"."""
+    loader = tmp_path / "python"
+    loader.write_text(
+        "#!/bin/sh\nprintf 'Traceback\\nlocal_assistant.config.ConfigError: [web] provider \\033[2J\\033]0;x\\007\\n' >&2\n"
+        "exit 1\n"
+    )
+    loader.chmod(0o755)
+    setup = f"python={loader}\nas_her=(/usr/bin/env -i)\nload=x"
+    call = 'why="$(config_problem)" || { echo "$why"; exit 1; }'
+    done, _calls = run_wrapper_function(tmp_path, "config_problem", call, setup=setup)
+    assert done.returncode == 1 and "\x1b" not in done.stdout and "\x07" not in done.stdout, repr(done.stdout)
+    assert done.stdout.strip() == "[web] provider ?[2J?]0;x?", repr(done.stdout)
+
+
+def test_the_voice_answer_reaches_your_terminal_in_printable_characters_only(tmp_path: Path) -> None:
+    """macos-raw-text-to-owner-terminal: while her voice service restarts, another account's program may answer at its
+    address; `estia check` (root) printed that answer as it came. Only its printable characters are shown."""
+    stubs = tmp_path / "bin"
+    stubs.mkdir()
+    for name, body in (
+        ("curl", 'printf \'{"stt":"ready"}\\033[2J\\007\''),
+        ("launchctl", "exit 1"),
+        ("pgrep", "exit 1"),
+    ):
+        (stubs / name).write_text(f"#!/bin/sh\n{body}\n")
+        (stubs / name).chmod(0o755)
+    done = run_script("check.sh", env={"PATH": f"{stubs}:/usr/bin:/bin", "HOME": str(tmp_path)})
+    line = next(line for line in done.stdout.splitlines() if line.startswith("voice:"))
+    assert "\x1b" not in done.stdout and "\x07" not in done.stdout, repr(done.stdout)
+    assert line == 'voice:      {"stt":"ready"}[2J', repr(line)
+
+
+def test_estia_restart_and_config_stop_on_a_config_she_cannot_start_with() -> None:
+    """The lines a person reads: a restart is refused (she keeps running as she was), a saved config is named."""
+    text = (ROOT / "scripts" / "estia").read_text(encoding="utf-8")
+    restart = text.split("\n  restart)", 1)[1].split(";;", 1)[0]
+    assert 'why="$(config_problem)"' in restart and "exit 1" in restart
+    assert restart.index("config_problem") < restart.index("exec /bin/launchctl kickstart -k")
+    assert "she keeps running as she was" in restart.lower()
+    edit = text.split("\n  config)", 1)[1].split("\n  account)", 1)[0]
+    assert edit.index("/usr/bin/nano") < edit.index("config_problem")
+    assert "saved, but she will not start with this config" in edit
 
 
 def test_rollback_and_remove_old_after_the_move_run_from_the_root_owned_tools(tmp_path: Path) -> None:
@@ -1162,7 +1647,7 @@ def test_after_the_move_the_migration_stops_before_any_sudo(tmp_path: Path) -> N
     own_user(tmp_path / "root")
     done = run_script("migrate-to-own-user.sh", env=owner_env(tmp_path, stubs))
     assert done.returncode == 0, done.stderr
-    assert "already in her own user" in done.stdout
+    assert "already in her own macOS account" in done.stdout
     assert "/usr/bin/sudo /usr/local/estia/bin/estia-deploy" in done.stdout
     assert not log.exists()  # sudo never called
     header = (ROOT / "scripts" / "migrate-to-own-user.sh").read_text(encoding="utf-8").split("set -euo", 1)[0]
@@ -1286,6 +1771,163 @@ def test_the_documents_helper_is_built_and_tested() -> None:
     assert verify.index("uv run pytest -q") < verify.index("(cd tools/documents && swift test --quiet --no-parallel)")
 
 
+def tracked_shell_scripts() -> list[str]:
+    """Every shell script git tracks: a .sh name, or a first line that starts sh or bash."""
+    names = subprocess.run(["git", "ls-files", "-z"], cwd=ROOT, capture_output=True, check=True).stdout.split(b"\0")
+    found: list[str] = []
+    for raw in names:
+        name = raw.decode()
+        path = ROOT / name
+        if not name or not path.is_file() or path.is_symlink():
+            continue
+        with path.open("rb") as handle:
+            first = handle.readline(200)
+        if name.endswith(".sh") or re.match(rb"#!\S*(/|env )(ba)?sh(\s|$)", first):
+            found.append(name)
+    return sorted(found)
+
+
+def shellcheck_step(tmp_path: Path, *, installed: bool) -> subprocess.CompletedProcess[str]:
+    """verify.sh's ShellCheck step as written (between its markers), with a stub shellcheck that logs its argv."""
+    verify = (ROOT / "scripts/verify.sh").read_text(encoding="utf-8")
+    step = verify.split("# the ShellCheck step: begin\n", 1)[1].split("# the ShellCheck step: end\n", 1)[0]
+    stubs = tmp_path / "bin"
+    stubs.mkdir()
+    if installed:
+        stub(stubs, "shellcheck", f'printf "%s\\n" "$@" > "{tmp_path}/args"')
+    script = f"set -euo pipefail\ncd {ROOT}\n{step}"
+    return subprocess.run(
+        ["/bin/bash", "-c", script],
+        env={"PATH": f"{stubs}:/usr/bin:/bin"},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+@pytest.mark.skipif(not (ROOT / ".git").exists(), reason="a git checkout: verify.sh runs only there")
+def test_verify_runs_shellcheck_over_every_shell_script(tmp_path: Path) -> None:
+    """ShellCheck over every script git tracks (setup's, the owner's, the root-run wrappers, the hook, the call
+    helper's), following what each sources (own-user.sh): a new script is checked without a list to update."""
+    done = shellcheck_step(tmp_path, installed=True)
+    assert done.returncode == 0, done.stderr
+    args = (tmp_path / "args").read_text().splitlines()
+    assert args[:3] == ["-x", "-P", "SCRIPTDIR"]
+    assert sorted(args[3:]) == tracked_shell_scripts()
+    assert {"scripts/estia", "scripts/estia-deploy", ".githooks/pre-commit", "scripts/setup.sh"} <= set(args)
+
+
+@pytest.mark.skipif(not (ROOT / ".git").exists(), reason="a git checkout: verify.sh runs only there")
+def test_without_shellcheck_verify_says_so_and_goes_on(tmp_path: Path) -> None:
+    done = shellcheck_step(tmp_path, installed=False)
+    assert done.returncode == 0, done.stderr
+    assert "shellcheck is not installed" in done.stdout + done.stderr and "brew install shellcheck" in done.stderr
+
+
+# her voice service's own-account suites, and (the review of 26 Oct, R2-F6) the offline Pocket ones: the sandbox behind
+# SECURITY.md's promise (PocketPrograms) and the pins (PocketPins) passed verify.sh weakened; RealPocket needs the network.
+# The second deep scan of 0.9.8 (swift-3): the other offline suites that hold a promise too: the six languages' pins,
+# call audio only in memory (hard rule 7), the 27.0.x warning, a request's "kokoro": false and the service's arguments
+# (`\.Speech/`: VoiceCoreTests' Speech suite alone, never SpeechDetection's real model)
+VOICE_FILTER = (
+    "PeerChecking|PeerLookup|RefusalLogging|OnlyItsOwnAccount"
+    "|PocketPins|PocketRunning|PocketPrograms|PocketRouting|PocketAudio|PocketPacing|PocketSpeaking"
+    "|PocketLanguageRouting|PocketLanguagePins|PocketLanguagePacing|CallAudioInMemory|KokoroOnThisMac"
+    "|TranscriptionRequests|HTTPParsing|ServiceArgumentsParsing|\\.Speech/"
+)
+VOICE_SUITES = f"(cd tools/voice && swift test --quiet --filter '{VOICE_FILTER}')"
+
+
+def voice_step(tmp_path: Path, change: str) -> list[str]:
+    """verify.sh's voice step as written (between its markers), in a git repository of its own with tools/voice on
+    main and `change` made after it, and a stub swift that logs its argv: what it ran."""
+    verify = (ROOT / "scripts/verify.sh").read_text(encoding="utf-8")
+    step = verify.split("# the voice step: begin\n", 1)[1].split("# the voice step: end\n", 1)[0]
+    repo, stubs = tmp_path / "repo", tmp_path / "bin"
+    (repo / "tools/voice").mkdir(parents=True)
+    stubs.mkdir()
+    stub(stubs, "swift", f'printf "%s\\n" "$*" >> "{tmp_path}/swift"')
+    git = ["git", "-c", "user.name=Alex Example", "-c", "user.email=alex@example.com", "-c", "commit.gpgsign=false"]
+
+    def run(*argv: str) -> None:
+        subprocess.run([*git, *argv], cwd=repo, check=True, capture_output=True)
+
+    run("init", "-q", "-b", "main")
+    (repo / "tools/voice/Package.swift").write_text("// 1\n")
+    (repo / "README.md").write_text("one\n")
+    run("add", ".")
+    run("commit", "-q", "-m", "one")
+    if change == "branch":
+        run("switch", "-q", "-c", "voice-change")
+        (repo / "tools/voice/Package.swift").write_text("// 2\n")
+        run("commit", "-q", "-am", "two")
+    elif change == "uncommitted":
+        (repo / "tools/voice/Package.swift").write_text("// 2\n")
+    elif change == "new file":
+        (repo / "tools/voice/New.swift").write_text("// new\n")
+    elif change == "elsewhere":
+        run("switch", "-q", "-c", "docs-change")
+        (repo / "README.md").write_text("two\n")
+        run("commit", "-q", "-am", "two")
+    done = subprocess.run(
+        ["/bin/bash", "-c", f"set -euo pipefail\ncd {repo}\n{step}"],
+        env={"PATH": f"{stubs}:/usr/bin:/bin", "HOME": str(tmp_path)},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert done.returncode == 0, done.stderr
+    log = tmp_path / "swift"
+    return log.read_text().splitlines() if log.exists() else []
+
+
+@pytest.mark.parametrize(
+    ("change", "tested"),
+    [("none", False), ("elsewhere", False), ("branch", True), ("uncommitted", True), ("new file", True)],
+)
+def test_verify_runs_the_voice_services_own_account_suites_whenever_tools_voice_changed(
+    tmp_path: Path, change: str, tested: bool
+) -> None:
+    """Review R1-F6: her voice service's own-account check (PeerCheck) had no gate in verify.sh; a change that answered
+    another account passed it. Its suites run when tools/voice differs from main, committed or not (the full voice
+    build fetches WhisperKit and FluidAudio, so not on every run)."""
+    assert VOICE_SUITES in (ROOT / "scripts/verify.sh").read_text(encoding="utf-8")
+    ran = voice_step(tmp_path, change)
+    assert ran == ([f"test --quiet --filter {VOICE_FILTER}"] if tested else [])
+
+
+def test_every_suite_verify_runs_in_the_voice_service_is_one_of_its_tests() -> None:
+    """A name in the filter that matches no suite (a rename) would pass verify.sh silently; RealPocket stays out (it
+    needs the network and its environment variable)."""
+    sources = "\n".join(path.read_text(encoding="utf-8") for path in (ROOT / "tools/voice/Tests").rglob("*.swift"))
+    suites = set(re.findall(r"@Suite[^\n]*?\n?\s*struct (\w+)", sources))
+    named = [re.sub(r"^\\\.|/$", "", name) for name in VOICE_FILTER.split("|")]  # "\.Speech/": the suite Speech
+    assert set(named) <= suites, set(named) - suites
+    assert "RealPocket" in suites and "RealPocket" not in named
+
+
+@pytest.mark.parametrize(
+    ("test", "run"),
+    [
+        ("VoiceCoreTests.PocketLanguagePins/eachLanguageIsPinned()", True),
+        ("VoiceServiceTests.CallAudioInMemory/aCallsTurnNeverTouchesTheDisk()", True),
+        ("VoiceCoreTests.KokoroOnThisMac/theWarningNamesTheFixOrThatThereIsNoneYet()", True),
+        ("VoiceCoreTests.Speech/aCallsLineMayAskForNoKokoro()", True),
+        ("VoiceCoreTests.ServiceArgumentsParsing/aTypoIsRefused()", True),
+        ("VoiceServiceTests.SpeechDetection/thePinnedModelDownloadsLoadsAndAnswers()", False),  # the real model
+        ("VoiceServiceTests.WhisperStart/whisperLoadsOnlyFromItsCheckedFoldersAndNeverDownloads()", False),
+        ("VoiceServiceTests.TurnDetection/aChangedModelIsNeverLoaded()", False),
+        ("VoiceServiceTests.RealPocket/eachVoiceSpeaks()", False),  # the network
+    ],
+)
+def test_verify_runs_the_voice_suites_that_hold_promises(test: str, run: bool) -> None:
+    """The second deep scan of 0.9.8 (swift-3): a change to the six languages' pins, to call audio staying in memory
+    (hard rule 7), to a request's "kokoro": false or to the 27.0.x warning passed verify.sh, whose filter named only the
+    own-account and Pocket suites. Matched as `swift test --filter` matches a test's name; the suites that need a real
+    model or the network stay out."""
+    assert (re.search(VOICE_FILTER, test) is not None) is run
+
+
 def test_every_python_helper_is_synced_tested_and_built() -> None:
     """Each helper in its own uv environment (tools/<name>/pyproject.toml): run.sh syncs it, verify.sh runs its tests
     and mypy, and estia-deploy builds it into the release and checks that it imports."""
@@ -1389,6 +2031,17 @@ def test_doctor_finds_homebrew_off_path(tmp_path: Path) -> None:
 # ------------------------------------------------------------------ the web keys (findings 17, 54)
 
 
+def fake_bin(tmp_path: Path) -> Path:
+    """The fake tree's /usr/bin (ESTIA_TEST_ROOT=tmp_path/root), where the owner's scripts find security and sudo."""
+    folder = tmp_path / "root/usr/bin"
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder
+
+
+def tree_env(tmp_path: Path) -> dict[str, str]:
+    return {"PATH": "/usr/bin:/bin", "HOME": str(tmp_path / "home"), "ESTIA_TEST_ROOT": str(tmp_path / "root")}
+
+
 def keychain_stub(folder: Path, log: Path, *, items: dict[str, str], locked: bool) -> None:
     """security: `items` are the keychain's (service: key); with `locked`, a key's value (-w) is refused until
     unlock-keychain ran, while finding an item without its value works, as on a locked login keychain."""
@@ -1408,23 +2061,77 @@ def keychain_stub(folder: Path, log: Path, *, items: dict[str, str], locked: boo
     )
 
 
-def test_web_keys_without_any_key_say_how_to_add_one_and_never_unlock(tmp_path: Path) -> None:
-    stubs = tmp_path / "stubs"
-    stubs.mkdir()
+# the owner's scripts that handle a key or run an admin command (release review D11)
+KEY_AND_ADMIN_SCRIPTS = (
+    "set-web-keys.sh",
+    "set-calendar-url.sh",
+    "set-calendar-password.sh",
+    "set-tapo-credentials.sh",
+    "setup-google-maps.sh",
+    "harden.sh",
+    "install-daemon.sh",
+    "install-voice-daemon.sh",
+    "install-ollama.sh",
+    "migrate-to-own-user.sh",
+    "hue-pair.sh",
+    "mail-login.sh",
+    "spotify-login.sh",
+    "tapo-discover.sh",
+)
+
+
+@pytest.mark.parametrize("script", KEY_AND_ADMIN_SCRIPTS)
+def test_key_and_admin_scripts_take_bash_and_the_macs_tools_from_its_own_folders(script: str) -> None:
+    """`#!/usr/bin/env bash` and a bare `security` or `tr` were found through your PATH, where Homebrew's folder
+    (which your account can write) comes first: a fake one there would catch the keychain password, often the Mac
+    password itself, or a key (release review D11). macOS's own bash, the Mac's own folders first, and security by
+    its full path."""
+    lines = (ROOT / "scripts" / script).read_text(encoding="utf-8").splitlines()
+    assert lines[0] == "#!/bin/bash", lines[0]
+    after = lines[lines.index("set -euo pipefail") + 1]
+    assert re.fullmatch(r'PATH="?/usr/bin:/bin:/usr/sbin:/sbin(:\$PATH)?"?( +#.*)?', after), after
+    code = [re.sub(r"\s+#\s.*$", "", line) for line in lines if not line.lstrip().startswith("#")]
+    bare = [line for line in code if re.search(r"(^|[\s;|&(])security\s", line) and "echo" not in line]
+    assert bare == [], bare
+
+
+def test_setup_runs_under_macos_bash() -> None:
+    lines = (ROOT / "scripts" / "setup.sh").read_text(encoding="utf-8").splitlines()
+    assert lines[0] == "#!/bin/bash"
+
+
+def test_a_planted_security_on_your_path_never_sees_the_keychain(tmp_path: Path) -> None:
+    """A program of yours that puts `security`, `tr` or `bash` in Homebrew's folder (first on your PATH) never runs:
+    the keychain is asked by /usr/bin/security only (release review D11)."""
+    planted = tmp_path / "planted"
+    planted.mkdir()
+    caught = tmp_path / "caught.log"
+    for name in ("security", "tr", "bash", "grep", "mktemp"):
+        stub(planted, name, f'echo "{name} $*" >> "{caught}"; exit 1')
+    root = tmp_path / "root"
+    (root / "usr/bin").mkdir(parents=True)
     log = tmp_path / "security.log"
-    keychain_stub(stubs, log, items={}, locked=False)
-    done = run_script("set-web-keys.sh", env={"PATH": f"{stubs}:/usr/bin:/bin", "HOME": str(tmp_path / "home")})
+    keychain_stub(root / "usr/bin", log, items={"brave-search": "sk-brave-made-up"}, locked=True)
+    env = {"PATH": f"{planted}:/usr/bin:/bin", "HOME": str(tmp_path / "home"), "ESTIA_TEST_ROOT": str(root)}
+    done = run_script("set-web-keys.sh", env=env)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert not caught.exists(), caught.read_text()
+    assert "unlock-keychain" in log.read_text() and "Brave key 16" in done.stdout
+
+
+def test_web_keys_without_any_key_say_how_to_add_one_and_never_unlock(tmp_path: Path) -> None:
+    log = tmp_path / "security.log"
+    keychain_stub(fake_bin(tmp_path), log, items={}, locked=False)
+    done = run_script("set-web-keys.sh", env=tree_env(tmp_path))
     assert done.returncode == 1
     assert 'security add-generic-password -U -a "$USER" -s brave-search -w' in done.stderr
     assert "unlock" not in log.read_text() and "locked" not in done.stdout + done.stderr
 
 
 def test_web_keys_in_a_locked_keychain_are_read_after_unlocking_it(tmp_path: Path) -> None:
-    stubs = tmp_path / "stubs"
-    stubs.mkdir()
     log = tmp_path / "security.log"
-    keychain_stub(stubs, log, items={"brave-search": "sk-brave-made-up"}, locked=True)
-    done = run_script("set-web-keys.sh", env={"PATH": f"{stubs}:/usr/bin:/bin", "HOME": str(tmp_path / "home")})
+    keychain_stub(fake_bin(tmp_path), log, items={"brave-search": "sk-brave-made-up"}, locked=True)
+    done = run_script("set-web-keys.sh", env=tree_env(tmp_path))
     assert done.returncode == 0, done.stderr
     assert "The login keychain is locked: unlocking it." in done.stdout
     assert "Brave key 16" in done.stdout and "made-up" not in done.stdout + done.stderr
@@ -1433,11 +2140,9 @@ def test_web_keys_in_a_locked_keychain_are_read_after_unlocking_it(tmp_path: Pat
 
 
 def test_web_keys_in_her_own_user_without_a_key_name_her_hidden_prompt(tmp_path: Path) -> None:
-    stubs = tmp_path / "stubs"
-    stubs.mkdir()
-    keychain_stub(stubs, tmp_path / "security.log", items={}, locked=False)
+    keychain_stub(fake_bin(tmp_path), tmp_path / "security.log", items={}, locked=False)
     own_user(tmp_path / "root")
-    done = run_script("set-web-keys.sh", env=owner_env(tmp_path, stubs))
+    done = run_script("set-web-keys.sh", env=tree_env(tmp_path))
     assert done.returncode == 1
     assert "/usr/bin/sudo /usr/local/estia/bin/estia secret set web.env BRAVE_API_KEY" in done.stderr
 
@@ -1500,3 +2205,57 @@ def test_maps_setup_shows_why_a_key_could_not_be_made(tmp_path: Path) -> None:
     assert done.returncode == 1
     assert "PERMISSION_DENIED: API keys API not ready" in done.stderr
     assert 'scripts/setup-google-maps.sh "Estia AI" estia-ai-0a1b2c' in done.stderr
+
+
+def test_an_older_signal_cli_is_upgraded_on_enter_never_typed(tmp_path: Path) -> None:
+    """Owner, 27 Oct ("pre-fill the command so that the user does not have to type"): the command is shown, then
+    "Press Enter to run it (or s to skip)", and setup.sh runs it, then itself again; once only."""
+    clone, bin_dir, called, env = fake_mac(tmp_path)
+    tools_stubs(bin_dir, called)
+    stub(bin_dir, "signal-cli", "echo signal-cli 0.13.24")
+    stub(bin_dir, "ollama", "exit 0")
+    stub(bin_dir, "uv", "exit 0")
+    result = in_a_terminal(setup_sh(clone), env, typed="\n")
+    out = result.stdout + result.stderr
+    assert "  $ brew upgrade signal-cli" in out and "Press Enter to run it (or s to skip)" in out
+    assert "brew upgrade signal-cli" in called.read_text(encoding="utf-8")
+    assert result.returncode == 1 and out.count("Press Enter to run it") == 1  # still old: asked once, then stops
+
+
+def test_after_the_upgrade_setup_runs_itself_again_from_any_folder(tmp_path: Path) -> None:
+    """Review CODE-5: setup.sh moves to the repo's root first, so `exec "$0"` with a relative $0 (`./setup.sh` from
+    scripts/, `estia/scripts/setup.sh` from home) found no file right after a good upgrade: it runs scripts/setup.sh
+    from the root."""
+    clone, bin_dir, called, env = fake_mac(tmp_path)
+    tools_stubs(bin_dir, called)
+    stub(bin_dir, "signal-cli", "echo signal-cli 0.13.24")
+    stub(bin_dir, "ollama", "exit 0")
+    stub(bin_dir, "uv", "exit 0")
+    master, slave = os.openpty()
+    try:
+        os.write(master, b"\n")
+        result = subprocess.run(
+            [shutil.which("bash") or "/bin/bash", "./setup.sh"],
+            cwd=clone / "scripts",
+            stdin=slave,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=60,
+        )
+    finally:
+        os.close(master)
+        os.close(slave)
+    out = result.stdout + result.stderr
+    assert "No such file" not in out and "not found" not in out, out
+    assert out.count("Estia is written for signal-cli") == 2 and out.count("Press Enter to run it") == 1  # again, once
+    assert result.returncode == 1
+
+
+def test_the_homebrew_question_keeps_its_recommendation_out_of_the_question(tmp_path: Path) -> None:
+    clone, bin_dir, called, env = fake_mac(tmp_path)
+    stub(bin_dir, "curl", f'echo "curl $*" >> "{called}"; exit 7')
+    result = in_a_terminal(setup_sh(clone), env, typed="\n")
+    out = result.stdout + result.stderr
+    assert "Yes (recommended).\n" in out and "Install Homebrew now? [Y/n] " in out and "Recommendation" not in out

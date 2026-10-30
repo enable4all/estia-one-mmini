@@ -6,13 +6,13 @@ The file says who may talk to the bot, so it must be private (mode 0600).
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import ipaddress
 import os
 import re
 import stat
 import subprocess
 import tomllib
-import unicodedata
 import urllib.parse
 import uuid
 from dataclasses import dataclass, field
@@ -21,6 +21,7 @@ from typing import Any, TypedDict
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from local_assistant.hostsec import is_account_id
 from local_assistant.language import CODES
 
 # the folder the code runs from: a checkout, or a release of an install in its own user (root-owned, read-only)
@@ -33,9 +34,13 @@ DEFAULT_NAME = "Estia"  # the assistant's name until the config's `name` gives h
 # her built-in styles ([personality] style), used while there is no usable soul.md; hearth when left out
 STYLES = ("hearth", "playful")
 DEFAULT_STYLE = "hearth"
-# the Signal profile picture until the config's `avatar` names another ("" for none): Estia's e., when the repo has it
+# the Signal profile picture until the config's `avatar` names another ("" for none): Estia's mark, when the repo has it,
+# whatever her name (owner, 25 Oct: "just the mark, no letters at all")
 DEFAULT_AVATAR = CODE_ROOT / "docs" / "brand" / "estia-avatar.png"
-LETTER_AVATARS = CODE_ROOT / "docs" / "brand" / "letters"  # a.png to z.png: a name's first letter, the orange stop
+# the letter pictures (a name's first letter, docs/brand/letters/a.png to z.png, 15 to 25 Oct) are gone: an `avatar`
+# that still names one, in any checkout or release, gets the mark (`is_old_letter`)
+_OLD_LETTERS = ("docs", "brand", "letters")
+_OLD_LETTER = re.compile(r"[a-z]\.png")
 AVATAR_MAX_BYTES = 5_000_000
 _IMAGE_STARTS = (b"\x89PNG\r\n\x1a\n", b"\xff\xd8\xff")  # PNG, JPEG
 _NUMBER = re.compile(r"^\+[0-9]{8,15}$")
@@ -122,11 +127,67 @@ def _default_documents_folder() -> Path:
 
 
 PROJECT_LEVELS = ("summary", "docs", "code")
+FULL_CONTEXT_TOKENS = 32_768  # what her reads' sizes and the history's own limits count on (Config.small_context)
 _ACCOUNT_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]{0,19}$")
 _ADDRESS = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 _HHMM = re.compile(r"^([01][0-9]|2[0-3]):[0-5][0-9]$")
 _VOICE_URL = re.compile(r"^http://(127\.0\.0\.1|localhost):[0-9]{1,5}$")
-_VOICE_NAME = re.compile(r"^[a-z]{2}_[a-z]{2,20}$")
+_VOICE_NAME = re.compile(r"^[a-z]{2}_[a-z]{2,20}$")  # Kokoro's
+# Pocket TTS's English voices in their order (VoiceCore `PocketTTS.order`, pinned equal by a test): heart, the default
+# (owner, 27 Oct: "call the voice Heart", "not af_heart, do heart, and make it default": Kokoro's af_heart cloned onto
+# each model, its files shipped with the voice service; 29 Oct, the 18M's too: "just make the small heart"), jane, eve,
+# vera, and alba and michael for a male name ("alba & michael for males, both on small and big"), all on the Mac's one
+# model, by its Gemma (owner, 26 Oct: the 100M beside Gemma 4 26B, the 18M beside 12B; `voice.pocket_standard`),
+# fetched at the voice service's start (heart's copied); vera on the 100M only
+POCKET_ORDER = ("heart", "jane", "eve", "vera", "alba", "michael")
+POCKET_VOICES = frozenset(POCKET_ORDER)
+# the default English voice (an empty [voice], setup for a female name) on either model (owner, 29 Oct: "on 16gb make
+# Heart the default as well", in place of 27 Oct's "for small, do Jane"), which also speaks for vera beside the 18M
+DEFAULT_VOICE = "heart"
+# the Pocket voices setup gives a male name; what they cannot say Kokoro's am_michael says (VoiceCore
+# `PocketTTS.maleVoices`, `maleStandIn`, pinned equal by a test; the review of 26 Oct, R1-F1), the others' af_heart
+MALE_POCKET_VOICES = frozenset({"alba", "michael"})
+# the voices only the 100M model has (VoiceCore `PocketModel.english18M` has none of them): offered only beside it
+STANDARD_ONLY = frozenset({"vera"})
+# other names for them (owner, 26 Oct): eve-full was eve on the 100M model beside the 18M's eve, so an old config or a
+# habit's /voice eve-full is eve; the voice service never sees these
+VOICE_ALIASES = {"eve-full": "eve"}
+
+
+def canonical_voice(name: str) -> str:
+    """A voice by the name the voice service knows: another name (`VOICE_ALIASES`) as its voice, any other as given."""
+    return VOICE_ALIASES.get(name, name)
+
+
+def kokoro_stand_in(name: str) -> str:
+    """Who says a line in the English voice `name` that Pocket TTS cannot: Kokoro's am_michael for alba and michael,
+    af_heart for heart (the voice it was cloned from), jane, eve and vera, as the voice service picks it; a Kokoro voice
+    says its own."""
+    if name in MALE_POCKET_VOICES:
+        return "am_michael"
+    return "af_heart" if name in POCKET_VOICES else name
+
+
+def voice_here(name: str, standard: bool) -> str:
+    """The English voice that speaks for `name` (a config's) on this Mac: one only the 100M model has (`STANDARD_ONLY`:
+    vera) beside the 18M (`standard` false) is the default, heart (the review of 26 Oct, R1-F4: used as written, every
+    line was Kokoro's af_heart, as a stand-in, and no canned call line was kept); any other as it is. Config load still
+    takes them: a config may move between Macs."""
+    return DEFAULT_VOICE if not standard and name in STANDARD_ONLY else name
+
+
+def default_voice(standard: bool) -> str:
+    """The default English voice of a Mac: heart, beside either of Pocket TTS's models (owner, 29 Oct)."""
+    return voice_here(DEFAULT_VOICE, standard)
+
+
+# the six languages jane speaks in Pocket TTS (VoiceCore `PocketTTS.languages`, pinned equal by a test; owner, 25 Oct:
+# "jane jane, lets have her as default for those languages"), each its language's full model, fetched only for the
+# language in use; Korean, Polish, Japanese and Russian (no Pocket model) stay Supertonic-3's F1
+POCKET_LANGUAGES = ("es", "it", "pt", "nl", "de", "fr")
+# the voices pinned for them (VoiceCore `PocketTTS.languageVoice`): only jane's; `[voice] language_voice = ""` gives
+# the six back to Supertonic-3's F1, as before (the review of 25 Oct)
+LANGUAGE_VOICES = frozenset({"jane"})
 
 
 @dataclass(frozen=True)
@@ -256,6 +317,22 @@ def _default_documents_helper() -> tuple[str, ...]:
     return (str(CODE_ROOT / "tools" / "documents" / ".build" / "release" / "documents-helper"),)
 
 
+# the signal-cli releases Estia is written for (its register, verify and receive requests): the one constant setup.sh
+# (which reads this line as it is written), doctor and the JVM build's default share
+SIGNAL_CLI_SERIES = "0.14"
+
+
+def signal_cli_series(version: str) -> int:
+    """Where a signal-cli version ("0.14.9") stands against SIGNAL_CLI_SERIES: 0 within it, -1 older or unreadable,
+    1 newer."""
+    want = tuple(int(part) for part in SIGNAL_CLI_SERIES.split("."))
+    found = re.match(r"(\d+)\.(\d+)(?:\.|$)", version)
+    if found is None:
+        return -1
+    have = (int(found.group(1)), int(found.group(2)))
+    return 0 if have == want else (1 if have > want else -1)
+
+
 # what a release of her own user holds in vendor/ besides the call helpers: Homebrew's signal-cli and a JDK, copied by
 # estia-deploy, so nothing she runs sits in a folder the owner can change
 _NATIVE_SIGNAL_CLI = Path("signal-cli-native/bin/signal-cli")
@@ -268,9 +345,64 @@ def default_signal_cli() -> str:
     return str(native) if native.is_file() else "signal-cli"
 
 
-# where tools/call-tunnel's scripts put the JVM signal-cli and our call helper, under <data_dir>/vendor
-_CALLS_SIGNAL_CLI = Path("signal-cli-0.14.9-jvm/signal-cli-0.14.9/bin/signal-cli")
+# where tools/call-tunnel's scripts put the JVM signal-cli and our call helper, under <data_dir>/vendor; the JVM
+# installer's own default version (when Homebrew names none) is this one, its path the default while none is installed
+CALLS_SIGNAL_CLI_VERSION = "0.14.9"
+_CALLS_SIGNAL_CLI = Path(
+    f"signal-cli-{CALLS_SIGNAL_CLI_VERSION}-jvm/signal-cli-{CALLS_SIGNAL_CLI_VERSION}/bin/signal-cli"
+)
 _CALLS_TUNNEL = Path("signal-call-tunnel/signal-call-tunnel/target/release/signal-call-tunnel")
+_JVM_FOLDER = re.compile(r"signal-cli-(\d+(?:\.\d+){2,3})-jvm")
+# the call helper's sources: tools/call-tunnel/build.sh pins them (PR5_HEAD, RINGRTC) and applies local.patch, then
+# writes them beside the helper it built (`<helper>.stamp`), so setup and doctor can tell a helper built from other
+# sources, a later Estia's patch among them (second deep scan, signal-06)
+_TUNNEL_PIN = re.compile(r"^(PR5_HEAD|RINGRTC)=([0-9a-f]{40})\b", re.MULTILINE)
+
+
+def tunnel_stamp(code_root: Path = CODE_ROOT) -> str | None:
+    """The stamp tools/call-tunnel/build.sh writes beside the call helper it built from `code_root`'s sources: its
+    PR head, its RingRTC pin and local.patch's sha256, a line each. None when they cannot be read."""
+    folder = code_root / "tools" / "call-tunnel"
+    try:
+        pins = dict(_TUNNEL_PIN.findall((folder / "build.sh").read_text(encoding="utf-8")))
+        patch = hashlib.sha256((folder / "local.patch").read_bytes()).hexdigest()
+    except OSError:
+        return None
+    if set(pins) != {"PR5_HEAD", "RINGRTC"}:
+        return None
+    return f"pr5_head={pins['PR5_HEAD']}\nringrtc={pins['RINGRTC']}\nlocal_patch={patch}\n"
+
+
+def tunnel_stamp_differs(tunnel: Path, code_root: Path = CODE_ROOT) -> bool:
+    """The call helper at `tunnel` was not built from `code_root`'s sources: its stamp is missing (built before Estia
+    noted them) or names others. False when the helper is not there or the sources cannot be read: nothing to
+    compare."""
+    wanted = tunnel_stamp(code_root)
+    if wanted is None or not tunnel.is_file():
+        return False
+    try:
+        return tunnel.with_name(tunnel.name + ".stamp").read_text(encoding="utf-8") != wanted
+    except (OSError, UnicodeDecodeError):
+        return True
+
+
+def jvm_signal_cli(vendor: Path) -> Path | None:
+    """The newest JVM signal-cli in a vendor folder, as install-signal-cli-jvm.sh leaves it
+    (signal-cli-<v>-jvm/signal-cli-<v>/bin/signal-cli, the same version twice); None: none there. Setup installs it at
+    Homebrew's version, Homebrew never goes back, and a release keeps the builds before it: the newest is the one."""
+    found: list[tuple[tuple[int, ...], Path]] = []
+    try:
+        folders = list(vendor.iterdir())
+    except OSError:
+        return None
+    for folder in folders:
+        named = _JVM_FOLDER.fullmatch(folder.name)
+        if named is None:
+            continue
+        program = folder / f"signal-cli-{named.group(1)}" / "bin" / "signal-cli"
+        if program.is_file():
+            found.append((tuple(int(part) for part in named.group(1).split(".")), program))
+    return max(found)[1] if found else None
 
 
 # the longest socket path the call helper makes in the folder: "<dir>/signal-call-<u64>.sock" (sun_path is 104 bytes)
@@ -301,10 +433,16 @@ class Config:
     model: str = "local-worker"
     # the Ollama digest the model alias must have (64 hex digits); "" = not pinned: answers never pause for it
     model_digest: str = ""
+    # which Ollama answers her: "build", Ollama's official build as setup's background service, or "app", the Ollama
+    # app the person chose at setup's question (owner, 29 Oct): doctor and setup's re-runs read it
+    ollama: str = "build"
     signal_cli: str = "signal-cli"
     data_dir: Path = field(default_factory=_default_data_dir)
     log_dir: Path = field(default_factory=_default_log_dir)
     reply_max_tokens: int = 600
+    # the model's context window, as local-worker was made (setup writes it): each request is kept within it; None:
+    # the history's own limits only (window_tokens, emergency_tokens), sized for 32,768 or more
+    context_tokens: int | None = None
     window_tokens: int = 12_000
     emergency_tokens: int = 20_000
     summary_tokens: int = 500
@@ -353,7 +491,8 @@ class Config:
     mail_reply_days: int = 7
     # voice notes through the local voice service (tools/voice); off without [voice]
     voice_url: str = ""
-    voice_name: str = "af_heart"  # a female Kokoro voice
+    voice_name: str = DEFAULT_VOICE  # Pocket TTS's heart (alba for a male name)
+    voice_language_voice: str = "jane"  # the voice of POCKET_LANGUAGES (Pocket TTS; "": F1); English's is voice_name
     voice_speed: float = 1.05
     voice_max_spoken_chars: int = 1500
     voice_max_audio_bytes: int = 10_000_000
@@ -373,9 +512,9 @@ class Config:
     # helper stops itself after 20 s
     youtube_helper_timeout: float = 30
     youtube_helper: tuple[str, ...] = field(default_factory=_default_youtube_helper)  # the command, without arguments
-    # documents: the PDFs in the owner's ~/Estia-KB (her access: one ACL, scripts/share-documents.sh) and the
-    # ones the user sends on Signal, read by tools/documents (PDFKit, Vision on the Mac) into her database's index;
-    # off without [documents]
+    # documents: the PDFs and text files in the owner's ~/Estia-KB (her access: one ACL, scripts/share-documents.sh)
+    # and the ones the user sends on Signal, read into her database's index (a PDF by tools/documents: PDFKit, Vision
+    # on the Mac; a text file by the bridge itself); off without [documents]
     documents_enabled: bool = False
     documents_folder: Path = field(default_factory=_default_documents_folder)  # always absolute
     documents_look_minutes: float = 60  # how often she lists the folder (and whenever the user asks about documents)
@@ -413,6 +552,9 @@ class Config:
     calls_early_end: bool = True
     calls_early_end_pause_seconds: float = 0.6
     calls_pause: str = "speech"
+    # how long a call waits for one answer before it gives up on it ([calls] turn_timeout_seconds); None: the Mac's
+    # tier decides (owner, 28 Oct: 45 s beside Gemma 4 26B, 60 s beside 12B: `calls.call_limits`)
+    calls_turn_timeout_seconds: float | None = None
 
     # reminders the user sets ("remind me at 17:00 to ..."): on without the [reminders] section
     reminders_enabled: bool = True
@@ -446,9 +588,11 @@ class Config:
     # web search: Ollama's search first, Brave's as backup; keys only in web.env (0600); off without [web]
     web_enabled: bool = False
     web_country: str = "ALL"
-    web_brave_monthly_cap: int = 2000  # Brave's free plan: 2,000 a month (Brave is the backup; Ollama comes first)
+    # Brave (the backup; Ollama comes first): its free plan is a $5 monthly credit, about 1,000 searches; a higher
+    # number loads, and web search still stops at 900 of its own searches a month (web_search.BRAVE_MONTHLY_MAX)
+    web_brave_monthly_cap: int = 900
     web_keys_path: Path = DEFAULT_CONFIG_PATH.parent / "web.env"
-    # places and routes (Google Places and Routes; key GOOGLE_MAPS_API_KEY in web.env); off without [maps]
+    # places and routes (OpenStreetMap; Google Maps first once GOOGLE_MAPS_API_KEY is in web.env); off without [maps]
     maps_enabled: bool = False
     maps_home: str = ""  # the home address: the start of a route and, rounded to ~1 km, "near me" without a pin
     maps_daily_cap: int = 30  # per API and day: Google's free monthly allowance with room to spare
@@ -456,6 +600,9 @@ class Config:
 
     # her personality (the user's own soul.md, style only); None: no style file (the tests)
     soul_path: Path | None = None
+    # what setup handed over for her first start (About you, the home area: setup_handover), beside the config that
+    # was loaded; None: none (the tests)
+    setup_answers_path: Path | None = None
     # [personality] style: her built-in style while there is no usable soul.md (hearth or playful)
     personality_style: str = DEFAULT_STYLE
     # [personality] calm_on_worry: code's line after a usable soul.md (no joke on a worry); the user may turn it off
@@ -481,8 +628,11 @@ class Config:
 
     @property
     def call_signal_cli(self) -> Path:
-        """The JVM signal-cli that places and answers calls."""
-        return self.calls_signal_cli or self.vendor_dir / _CALLS_SIGNAL_CLI
+        """The JVM signal-cli that places and answers calls: the config's, else the newest one installed in the vendor
+        folder (`jvm_signal_cli`), else the pinned version's path."""
+        if self.calls_signal_cli is not None:
+            return self.calls_signal_cli
+        return jvm_signal_cli(self.vendor_dir) or self.vendor_dir / _CALLS_SIGNAL_CLI
 
     @property
     def java_home(self) -> Path | None:
@@ -510,6 +660,12 @@ class Config:
     @property
     def tapo_enabled(self) -> bool:
         return bool(self.tapo_devices)
+
+    @property
+    def small_context(self) -> bool:
+        """The model reads less than 32,768 tokens at once (the 16 GB tier's 16,384): a document read gives one page
+        and a web search half as much (review of 0.9.8, guards-2)."""
+        return self.context_tokens is not None and self.context_tokens < FULL_CONTEXT_TOKENS
 
     @property
     def voice_enabled(self) -> bool:
@@ -556,15 +712,23 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> Config:
         raw = tomllib.loads(path.read_text(encoding="utf-8"))
     except tomllib.TOMLDecodeError as exc:
         raise ConfigError(f"{path}: {exc}") from exc
-    # her style file lives next to the config that was loaded (another --config never reads the default soul.md)
-    return dataclasses.replace(parse_config(raw), soul_path=path.parent / "soul.md")
+    # her style file and setup's handover live next to the config that was loaded (another --config never reads the
+    # default ones)
+    return dataclasses.replace(
+        parse_config(raw), soul_path=path.parent / "soul.md", setup_answers_path=path.parent / "setup-answers.toml"
+    )
 
 
 def parse_config(raw: dict[str, object]) -> Config:
     """Validate raw TOML values and build a Config."""
-    number = raw.get("bot_number")
-    if not isinstance(number, str) or not _NUMBER.match(number):
-        raise ConfigError("bot_number must look like +306900000000")
+    number = raw.get("bot_number")  # her Signal account: its number, or an account without one by its Account ID
+    if isinstance(number, str) and is_account_id(number):
+        number = number.lower()  # as signal-cli lists it
+    elif not isinstance(number, str) or not _NUMBER.match(number):
+        raise ConfigError(
+            "bot_number must be her Signal number, like +306900000000, or the Account ID of her account without a "
+            "number (a UUID)"
+        )
     acis_raw = raw.get("allowed_acis")
     if not isinstance(acis_raw, list) or not acis_raw:
         raise ConfigError("allowed_acis must list at least one Signal ACI (UUID)")
@@ -574,6 +738,10 @@ def parse_config(raw: dict[str, object]) -> Config:
             acis.add(str(uuid.UUID(str(item))))
         except ValueError as exc:
             raise ConfigError(f"allowed_acis: not a UUID: {item!r}") from exc
+    if number in acis:  # an allowed person's own account: she would take it over (review S9)
+        raise ConfigError(
+            "bot_number is one of allowed_acis: her account must be her own, never the account of someone she answers"
+        )
     tz = system_timezone()
     if "timezone" in raw:
         tz_name = str(raw["timezone"])
@@ -611,11 +779,13 @@ def parse_config(raw: dict[str, object]) -> Config:
         timezone=tz,
         host_label=_host_label(raw),
         name=_name(raw),
-        avatar=_avatar(raw, _name(raw)),
+        avatar=_avatar(raw),
         language=_language(raw),
         ollama_base_url=strings["ollama_base_url"],
         model=_model(strings["model"]),
         model_digest=_model_digest(raw),
+        ollama=_ollama(raw),
+        context_tokens=_context_tokens(raw),
         signal_cli=strings["signal_cli"],
         health_interval_hours=_positive(health, "interval_hours", 4, "health"),
         health_confirm_minutes=_positive(health, "confirm_minutes", 5, "health"),
@@ -671,6 +841,27 @@ def _model_digest(raw: dict[str, object]) -> str:
     if found is None:
         raise ConfigError('model_digest must be the model\'s sha256 digest, like "sha256:" and 64 hex digits')
     return found.group(1)
+
+
+OLLAMA_KINDS = ("build", "app")
+
+
+def _ollama(raw: dict[str, object]) -> str:
+    """Which Ollama she uses: "build" (left out too) or "app", the Ollama app the person chose at setup."""
+    value = raw.get("ollama", "build")
+    if value not in OLLAMA_KINDS:
+        raise ConfigError('ollama must be "build" or "app": the Ollama app only when you chose it at setup')
+    return str(value)
+
+
+def _context_tokens(raw: dict[str, object]) -> int | None:
+    """The model's context window in tokens (setup writes the one local-worker was made with); left out: None."""
+    if "context_tokens" not in raw:
+        return None
+    value = raw["context_tokens"]
+    if isinstance(value, bool) or not isinstance(value, int) or not 4_096 <= value <= 1_048_576:
+        raise ConfigError("context_tokens must be the model's context window: a whole number from 4096 to 1048576")
+    return value
 
 
 def _keep_days(privacy: object) -> int | None:
@@ -735,25 +926,25 @@ def check_name(value: object) -> str:
     return name
 
 
-def default_avatar(name: str) -> Path | None:
-    """The picture for an `avatar` left out (owner, 15 Oct): for a name other than Estia, its first letter, a to z,
-    with Estia's orange full stop ("t." for ours, Tiffany, docs/brand/letters, drawn by docs/brand/source/letters.py),
-    an accented letter as its base letter (NFKD: Á, É, Ñ, Ö); else, and for any other first letter (another script, or
-    Ø and Ł, which have no base letter), Estia's e. None when the repo's file is not there."""
-    letter = unicodedata.normalize("NFKD", name[:1])[:1].lower()
-    if name.casefold() != DEFAULT_NAME.casefold() and len(letter) == 1 and "a" <= letter <= "z":
-        picture = LETTER_AVATARS / f"{letter}.png"
-        if picture.is_file():
-            return picture
+def default_avatar() -> Path | None:
+    """The picture for an `avatar` left out: Estia's mark, whatever her name (owner, 25 Oct). None when the repo's
+    file is not there."""
     return DEFAULT_AVATAR if DEFAULT_AVATAR.is_file() else None
 
 
-def _avatar(raw: dict[str, object], name: str) -> Path | None:
-    """The Signal profile picture: a full path (~ allowed); "" for none; left out: `default_avatar` for her name.
-    Only the setting's form is checked here: the file is checked where it is used (`read_avatar`, at the bridge's
-    start and in doctor), so a picture that was moved or deleted never stops the bridge."""
+def is_old_letter(path: Path) -> bool:
+    """Whether `path` names one of the letter pictures, a.png to z.png in a docs/brand/letters folder (a checkout's or
+    a release's), that a name other than Estia got from 15 to 25 Oct. They are gone: such an `avatar` gets the mark,
+    never a missing file."""
+    return path.parent.parts[-3:] == _OLD_LETTERS and _OLD_LETTER.fullmatch(path.name) is not None
+
+
+def _avatar(raw: dict[str, object]) -> Path | None:
+    """The Signal profile picture: a full path (~ allowed); "" for none; left out, or an old letter picture:
+    `default_avatar`. Only the setting's form is checked here: the file is checked where it is used (`read_avatar`, at
+    the bridge's start and in doctor), so a picture that was moved or deleted never stops the bridge."""
     if "avatar" not in raw:
-        return default_avatar(name)
+        return default_avatar()
     value = raw["avatar"]
     if not isinstance(value, str):
         raise ConfigError('avatar must be the path of a PNG or JPEG file, or "" for none')
@@ -762,7 +953,7 @@ def _avatar(raw: dict[str, object], name: str) -> Path | None:
     path = Path(value.strip()).expanduser()
     if not path.is_absolute():
         raise ConfigError(f"avatar: {path} must be a full path (or start with ~/)")
-    return path
+    return default_avatar() if is_old_letter(path) else path
 
 
 class AvatarError(Exception):
@@ -999,6 +1190,7 @@ def _mail_settings(mail: dict[str, object]) -> _MailSettings:
 class _VoiceSettings(TypedDict, total=False):
     voice_url: str
     voice_name: str
+    voice_language_voice: str
     voice_speed: float
     voice_max_spoken_chars: int
     voice_max_audio_bytes: int
@@ -1013,9 +1205,19 @@ def _voice_settings(voice: object) -> _VoiceSettings:
     url = voice.get("url", "http://127.0.0.1:8150")
     if not isinstance(url, str) or not _VOICE_URL.match(url):
         raise ConfigError("voice.url must be the local voice service, like http://127.0.0.1:8150")
-    name = voice.get("voice", "af_heart")
-    if not isinstance(name, str) or not _VOICE_NAME.match(name):
-        raise ConfigError("voice.voice must be a Kokoro voice name like af_heart")
+    name = voice.get("voice", DEFAULT_VOICE)
+    if not isinstance(name, str) or not (_VOICE_NAME.match(name) or name in POCKET_VOICES or name in VOICE_ALIASES):
+        raise ConfigError(
+            "voice.voice must be heart, jane, eve, vera, alba or michael (Pocket TTS; eve-full is another name for eve)"
+            " or a Kokoro voice name like af_heart"
+        )
+    name = canonical_voice(name)
+    language_voice = voice.get("language_voice", "jane")
+    if not isinstance(language_voice, str) or language_voice not in LANGUAGE_VOICES | {""}:
+        raise ConfigError(
+            "voice.language_voice must be jane, the only Pocket TTS voice pinned for Spanish, Italian, Portuguese,"
+            ' Dutch, German and French, or "" for Supertonic-3\'s F1 in them, as before'
+        )
     speed = voice.get("speed", 1.05)
     if isinstance(speed, bool) or not isinstance(speed, int | float) or not 0.7 <= speed <= 1.5:
         raise ConfigError("voice.speed must be between 0.7 and 1.5")
@@ -1031,6 +1233,7 @@ def _voice_settings(voice: object) -> _VoiceSettings:
     return {
         "voice_url": url,
         "voice_name": name,
+        "voice_language_voice": language_voice,
         "voice_speed": float(speed),
         "voice_max_spoken_chars": limits["max_spoken_chars"],
         "voice_max_audio_bytes": limits["max_audio_bytes"],
@@ -1245,6 +1448,7 @@ class _CallsSettings(TypedDict, total=False):
     calls_early_end: bool
     calls_early_end_pause_seconds: float
     calls_pause: str
+    calls_turn_timeout_seconds: float
 
 
 # [calls] interrupt, in the words people read, and the rule each one means (owner, 14 Oct; call_audio.Barge's names)
@@ -1257,6 +1461,7 @@ INTERRUPT_ERROR = 'calls.interrupt must be "only speech" or "any sound"'
 PAUSE = {"no speech": "speech", "quiet": "loudness"}
 PAUSE_ERROR = 'calls.pause must be "no speech" or "quiet"'
 EARLY_END_PAUSE = (0.3, 1.5)  # [calls] early_end_pause_seconds: from, to
+TURN_TIMEOUT = (15, 180)  # [calls] turn_timeout_seconds: from, to (seconds a call waits for one answer)
 
 
 def _interrupt(calls: dict[str, object]) -> tuple[str, str, str]:
@@ -1347,6 +1552,12 @@ def _calls_settings(calls: object, *, voice: bool) -> _CallsSettings:
         raise ConfigError("calls.max_calls_per_day must be a whole number from 1 to 10")
     barge, interrupt_old, barge_unread = _interrupt(calls)
     early_end, early_pause, pause = _early_end(calls, numbers["end_of_turn_seconds"])
+    timeout = calls.get("turn_timeout_seconds")
+    low, high = TURN_TIMEOUT
+    if timeout is not None and (
+        isinstance(timeout, bool) or not isinstance(timeout, int | float) or not low <= timeout <= high
+    ):
+        raise ConfigError(f"calls.turn_timeout_seconds must be from {low} to {high}")
     settings: _CallsSettings = {
         "calls_enabled": True,
         "calls_speed": float(speed),
@@ -1374,6 +1585,8 @@ def _calls_settings(calls: object, *, voice: bool) -> _CallsSettings:
         settings["calls_tunnel"] = paths["tunnel"]
     if "socket_dir" in paths:
         settings["calls_socket_dir"] = paths["socket_dir"]
+    if timeout is not None:
+        settings["calls_turn_timeout_seconds"] = float(timeout)
     return settings
 
 
@@ -1444,7 +1657,7 @@ def _web_settings(web: object) -> _WebSettings:
     country = web.get("country", "ALL")
     if not isinstance(country, str) or not re.fullmatch(r"[A-Za-z]{2}|ALL", country):
         raise ConfigError("web.country must be a two-letter country code, like NL, or ALL")
-    cap = web.get("brave_monthly_cap", 2000)
+    cap = web.get("brave_monthly_cap", 900)
     if isinstance(cap, bool) or not isinstance(cap, int) or not 0 <= cap <= 100_000:
         raise ConfigError("web.brave_monthly_cap must be a whole number from 0 to 100000 (0: Ollama only)")
     return {"web_enabled": True, "web_country": country.upper(), "web_brave_monthly_cap": cap}

@@ -725,3 +725,28 @@ enum LanguageTable {
         #expect(SpokenLanguage.order("en").isEmpty)
     }
 }
+
+/// Review 0.9.7 (C7): the ten languages' chord pattern could take exponential time on a chord-like letter, a long
+/// run of digits and then a letter ("C" + 40 digits + "x"; the same pattern in Python's engine: about x1.6 a digit),
+/// and its reading runs before every non-English request. Each such text is read at once, and as before.
+@Suite struct ChordPatternTime {
+    static let texts = [
+        "C" + String(repeating: "1", count: 40) + "x",
+        "C" + String(repeating: "1", count: 50) + "x",
+        "Am" + String(repeating: "7", count: 34) + "y",
+        "Ré" + String(repeating: "9", count: 34) + "z",
+        "Esus4" + String(repeating: "sus4", count: 24) + "x",
+        "G" + String(repeating: "dim7", count: 24) + "q",
+    ]
+
+    @Test(arguments: SpokenLanguage.packs.map(\.code))
+    func aLongTailAfterAChordLetterIsReadAtOnce(language: String) {
+        let clock = ContinuousClock()
+        for text in Self.texts {
+            let began = clock.now
+            _ = SpokenLanguage.spoken(text, language: language)
+            let took = clock.now - began
+            #expect(took < .milliseconds(200), "\(language): \(text.prefix(8))… took \(took)")
+        }
+    }
+}

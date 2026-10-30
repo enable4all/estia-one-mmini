@@ -593,6 +593,13 @@ def _session(raw: str | None) -> Session | None:
     return session if session.code in OFFERED and session.level in LEVELS else None
 
 
+def running_language(raw: str | None) -> str | None:
+    """The language of a running session as the state table keeps it (SESSION_KEY), or None: none, ended or
+    unreadable (doctor reads it from the database alone)."""
+    session = _session(raw)
+    return session.code if session is not None and not session.ended else None
+
+
 def _saved(session: Session) -> str:
     data = asdict(session)
     data["conversation"] = data.pop("conversation_id")
@@ -612,7 +619,7 @@ class Babble:
         gemma: GemmaClient,
         tz: ZoneInfo,
         *,
-        send: Callable[[int], Awaitable[None]],
+        send: Callable[[int], Awaitable[object]],
         user_language: Callable[[], str],
         quiet_hours: tuple[int, int] | None,
         rules: Callable[[str, str], str],

@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash
 # Lists the Kasa and Tapo devices on the home network (local broadcast; nothing is switched), to fill
 # [[tapo.devices]] in ~/.config/local-assistant/config.toml. Older Kasa devices need no login; newer Kasa firmware
 # and Tapo devices need the TP-Link login (Tapo is untested). The listing never sends that login: any device on the
@@ -8,6 +8,7 @@
 # Once the Hue Bridge is paired (scripts/hue-pair.sh), its lights follow: read from the bridge, with its certificate
 # checked as saved at pairing; also when the TP-Link listing fails.
 set -euo pipefail
+PATH="/usr/bin:/bin:/usr/sbin:/sbin:$PATH"  # the Mac's own tools first, then your PATH's (uv, Homebrew's)
 source "$(dirname "$0")/own-user.sh"  # moved, and her commands' fixed paths ($estia, $estia_deploy)
 if moved && [[ "$(id -un)" != _estia ]]; then exec "$sudo" "$estia" tapo-discover; fi  # her TP-Link login is hers
 tapo="$(cd "$(dirname "$0")/../tools/tapo" && pwd)"

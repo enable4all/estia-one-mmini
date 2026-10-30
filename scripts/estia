@@ -3,8 +3,8 @@
 #   /usr/bin/sudo /usr/local/estia/bin/estia doctor                   the read-only check (exit 1 on ✗)
 #   /usr/bin/sudo /usr/local/estia/bin/estia logs [bridge|voice|launchd] [-n N]
 #   /usr/bin/sudo /usr/local/estia/bin/estia check                    the service, signal-cli, the last messages
-#   /usr/bin/sudo /usr/local/estia/bin/estia restart                  the bridge, after a change to her config
-#   /usr/bin/sudo /usr/local/estia/bin/estia config [soul]            her config (or style file) in nano, as her
+#   /usr/bin/sudo /usr/local/estia/bin/estia restart                  the bridge, after a change to her config (once it loads)
+#   /usr/bin/sudo /usr/local/estia/bin/estia config [soul]            her config (or style file) in nano, as her, then loaded
 #   /usr/bin/sudo /usr/local/estia/bin/estia stop [voice]             the bridge (or the voice service) until start or a reboot
 #   /usr/bin/sudo /usr/local/estia/bin/estia start [voice]            it again
 #   /usr/bin/sudo /usr/local/estia/bin/estia mail-login <address> [--mail-only]
@@ -14,13 +14,15 @@
 #   /usr/bin/sudo /usr/local/estia/bin/estia hue-pair [address]       pair the Hue Bridge: press its button when asked
 #   /usr/bin/sudo /usr/local/estia/bin/estia signal listIdentities|trust|listDevices|removeDevice [options]
 #                                                                     her signal-cli, the bridge stopped meanwhile
-#   /usr/bin/sudo /usr/local/estia/bin/estia unlock                   ends /lock from the Mac (the bridge restarts)
+#   /usr/bin/sudo /usr/local/estia/bin/estia unlock                   ends /lock from the Mac
+#   /usr/bin/sudo /usr/local/estia/bin/estia signal-login             her account moves to one without a number
+# signal, unlock and signal-login start her again only when she was running before (after `estia stop` she stays stopped).
 #   /usr/bin/sudo /usr/local/estia/bin/estia rollback                 back to your user, within 7 days of the move
 #   /usr/bin/sudo /usr/local/estia/bin/estia remove-old               delete her old folders held since the move
 #   /usr/bin/sudo /usr/local/estia/bin/estia account                  her account again: no shell, hidden, no password
 # Each runs as her own user _estia (env -i, a PATH of root-owned folders, the release's Python in isolated mode),
-# except launchctl (restart, stop, start) and the last three, which run as root from the root-owned tools, never from
-# a release. Every program after sudo is named by its full path: sudo looks a bare name up in your PATH.
+# except launchctl (restart, stop, start), the last three and signal-login's reading of your terminal, which run as
+# root from the root-owned tools, never from a release. Every program after sudo is named by its full path: sudo looks a bare name up in your PATH.
 # A value typed on a command line lands in sudo's log: if that happened, change the key.
 # --dry-run (first) prints the command instead of running it, and needs no root.
 set -euo pipefail
@@ -39,6 +41,8 @@ user=_estia
 home=/var/estia
 bridge=com.local-assistant.bridge
 plist="$root/Library/LaunchDaemons/$bridge.plist"
+launchctl=/bin/launchctl
+load='from local_assistant.config import load_config; load_config()'  # her config, as the bridge loads it
 as_her=(/usr/bin/sudo -u "$user" -H -- /usr/bin/env -i "HOME=$home" "PATH=/usr/local/estia/current/.venv/bin:/usr/bin:/bin:/usr/sbin:/sbin" LANG=en_US.UTF-8)
 as_root=("$tools/python3" -I -c 'import runpy, sys; sys.path.insert(0, sys.argv.pop(1)); runpy.run_module(sys.argv.pop(1), run_name="__main__", alter_sys=True)' "$tools/src")
 
@@ -49,16 +53,43 @@ run() {
   exec "${as_her[@]}" "$@"
 }
 moved() { [[ "$(/usr/libexec/PlistBuddy -c 'Print :UserName' "$plist" 2>/dev/null)" == "$user" ]]; }
-# the bridge stopped while her signal-cli runs by hand (one signal-cli per account), and always started again
+# the bridge stopped while her signal-cli runs by hand (one signal-cli per account), and started again only when she
+# ran before: after `estia stop` (a compromise's first step) she stays stopped until `estia start`; a state launchd
+# does not tell is taken as stopped (as harden's --new-pin)
 stopped() {
   if [[ -n "$dry" ]]; then
-    show /bin/launchctl bootout "system/$bridge"; show "${as_her[@]}" "$@"; show /bin/launchctl bootstrap system "/Library/LaunchDaemons/$bridge.plist"
+    show "$launchctl" bootout "system/$bridge"; show "${as_her[@]}" "$@"
+    show "$launchctl" bootstrap system "/Library/LaunchDaemons/$bridge.plist" "(only when she ran before)"
     exit 0
   fi
-  /bin/launchctl bootout "system/$bridge" 2>/dev/null || true
-  for _ in $(seq 1 50); do /bin/launchctl print "system/$bridge" >/dev/null 2>&1 || break; sleep 0.2; done
-  trap '/bin/launchctl bootstrap system "/Library/LaunchDaemons/$bridge.plist" || true; echo "she runs again" >&2' EXIT
+  local shown was=""
+  shown="$("$launchctl" print "system/$bridge" 2>&1)" && was=1
+  # the step that starts her again is set before she stops: a hang-up or a Ctrl-C in the wait below runs it too,
+  # after the same wait (a bootstrap while launchd still holds her fails)
+  if [[ -n "$was" ]]; then
+    trap 'for _ in $(seq 1 50); do "$launchctl" print "system/$bridge" >/dev/null 2>&1 || break; sleep 0.2; done
+      "$launchctl" bootstrap system "/Library/LaunchDaemons/$bridge.plist" || true; echo "she runs again" >&2' EXIT
+  elif [[ "$shown" == *"Could not find service"* ]]; then
+    trap 'echo "she stays stopped (she was stopped before): start her with /usr/bin/sudo /usr/local/estia/bin/estia start" >&2' EXIT
+  else
+    trap 'echo "she stays stopped (whether she ran before could not be read): start her with /usr/bin/sudo /usr/local/estia/bin/estia start" >&2' EXIT
+  fi
+  if [[ -n "$was" || "$shown" != *"Could not find service"* ]]; then
+    "$launchctl" bootout "system/$bridge" 2>/dev/null || true
+    for _ in $(seq 1 50); do "$launchctl" print "system/$bridge" >/dev/null 2>&1 || break; sleep 0.2; done
+  fi
   "${as_her[@]}" "$@"
+}
+# her config loaded as her by her release, as the bridge loads it at its start: nothing printed when it loads, else
+# the reason on one line (a typo stops her start, and launchd restarts her every 30 s, offline), in printable
+# characters only: it may quote a value of hers, and this runs as root on your terminal
+config_problem() {
+  local out
+  out="$("${as_her[@]}" "$python" -I -c "$load" 2>&1)" && return 0
+  out="${out##*$'\n'}"
+  out="${out#*ConfigError: }"
+  echo "${out//[^[:print:]]/?}"
+  return 1
 }
 
 [[ -n "$dry" || $EUID -eq 0 ]] || { echo "run it with sudo: /usr/bin/sudo /usr/local/estia/bin/estia ${1:-doctor}" >&2; exit 2; }
@@ -103,14 +134,26 @@ case "$command" in
         "${as_her[@]}" /usr/bin/install -m 600 /usr/local/estia/current/soul.example.md "$file"
       fi
     fi
-    run "TERM=$term" /usr/bin/nano "$file" ;;
+    [[ "${1:-}" != soul ]] || run "TERM=$term" /usr/bin/nano "$file"  # style only: nothing to load
+    if [[ -n "$dry" ]]; then show "${as_her[@]}" "TERM=$term" /usr/bin/nano "$file"; show "${as_her[@]}" "$python" -I -c "$load"; exit 0; fi
+    "${as_her[@]}" "TERM=$term" /usr/bin/nano "$file"
+    if ! why="$(config_problem)"; then
+      echo "✗ saved, but she will not start with this config: $why" >&2
+      echo "  Fix it with /usr/bin/sudo /usr/local/estia/bin/estia config before she starts again (a restart, a deploy or a reboot)." >&2
+      exit 1
+    fi ;;
   account)  # as root from the tools: fixed dscl commands, never her code
     [[ $# -eq 0 ]] || usage
     if [[ -n "$dry" ]]; then show "${as_root[@]}" local_assistant.ownuser account; exit 0; fi
     exec "${as_root[@]}" local_assistant.ownuser account ;;
-  restart)
+  restart)  # only onto a config she starts with
     [[ $# -eq 0 ]] || usage
-    if [[ -n "$dry" ]]; then show /bin/launchctl kickstart -k "system/$bridge"; exit 0; fi
+    if [[ -n "$dry" ]]; then show "${as_her[@]}" "$python" -I -c "$load"; show /bin/launchctl kickstart -k "system/$bridge"; exit 0; fi
+    if ! why="$(config_problem)"; then
+      echo "✗ not restarted: she would not start with this config: $why" >&2
+      echo "  She keeps running as she was. Fix it with /usr/bin/sudo /usr/local/estia/bin/estia config before a deploy or a reboot." >&2
+      exit 1
+    fi
     exec /bin/launchctl kickstart -k "system/$bridge" ;;
   stop|start)  # as root, launchctl by its full path (her compromise steps, the voice service's undo)
     [[ $# -le 1 ]] || usage
@@ -170,5 +213,13 @@ case "$command" in
   unlock)
     [[ $# -eq 0 ]] || usage
     stopped "$python" -I -m local_assistant.admin unlock ;;
+  signal-login)  # root's code from the tools reads the Account ID, the Recovery key (hidden, across lines: never a
+    # shell's read) and her username from your terminal, which her user cannot open; she gets them on stdin, never
+    # argv, through process substitution (an EXIT trap set in a pipeline's subshell never runs in bash 3.2: the
+    # bridge would stay stopped), then takes the account over with the bridge stopped
+    [[ $# -eq 0 ]] || usage
+    if [[ -n "$dry" ]]; then show "${as_root[@]}" local_assistant.ownuser signal-login; stopped "$python" -I -m local_assistant.admin signal-login; fi
+    login="$("${as_root[@]}" local_assistant.ownuser signal-login)" || exit 1
+    stopped "$python" -I -m local_assistant.admin signal-login < <(printf '%s\n' "$login") ;;
   *) usage ;;
 esac

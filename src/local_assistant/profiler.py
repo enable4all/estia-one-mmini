@@ -12,7 +12,7 @@ import dataclasses
 import json
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from typing import Any, Protocol
 from zoneinfo import ZoneInfo
 
@@ -20,17 +20,39 @@ from local_assistant import prompts
 from local_assistant.context import ContextBuilder
 from local_assistant.fetcher import Page
 from local_assistant.gemma import GemmaClient, GemmaError
+from local_assistant.maps import home_area_text
 from local_assistant.profile import ApplyResult, Op, Profile
-from local_assistant.store import Message, SourceKind, Store
+from local_assistant.store import Conversation, Message, SourceKind, Store
 from local_assistant.timefmt import local_stamp, utc_now
 
 log = logging.getLogger(__name__)
 
 LAST_LEARNED_KEY = "last_learned_message_id"
 LAST_RUN_KEY = "last_learning_run"
-UNANNOUNCED_KEY = "unannounced_learned"  # facts learned in the background, announced with the next reply
 FAILURES_KEY = "learn_failures"  # "<learned-up-to pointer>:<failed passes on the batch after it>"
+# 0.9.6's count of the notes learned in quiet times and not told yet; 0.9.8 tells the last quiet time's instead
+LEARNED_BEFORE_KEY = "unannounced_learned"
 _ACTIONS = ("add", "replace", "remove")
+
+
+def learned_before_update(store: Store, allowed_acis: Iterable[str]) -> list[int]:
+    """The first start after an update from 0.9.6 (review of 0.9.8, memory-7: its count of the notes learned and not
+    told yet, `unannounced_learned`, had no reader, so it was dropped without a word): above 0, one line to each
+    allowed account, "N notes from before the update: /profile notes shows them.", stored as code's other notes are,
+    and the key deleted in the same transaction; the notes' ids, for the caller to send."""
+    raw = store.get_state(LEARNED_BEFORE_KEY)
+    if raw is None:
+        return []
+    count = int(raw) if raw.strip().isdecimal() else 0
+    notes: list[int] = []
+    with store.tx():
+        if count > 0:
+            text = prompts.NOTE_BEFORE_UPDATE if count == 1 else prompts.NOTES_BEFORE_UPDATE.format(count=count)
+            conversation = store.current_conversation().id
+            notes = [store.add_outgoing(conversation, aci, "note", text, None) for aci in sorted(allowed_acis)]
+        store.delete_state(LEARNED_BEFORE_KEY)
+    log.info("notes from before the update: %d told", count)
+    return notes
 
 
 def _count(result: ApplyResult) -> int:
@@ -116,7 +138,11 @@ class Profiler:
     async def run_forever(self) -> None:
         while True:
             await asyncio.sleep(self._poll)
-            if not self.due():
+            try:
+                if not self.due():
+                    continue
+            except Exception:  # due() reads the database: one error must not take the bridge down (review D13)
+                log.exception("learning: could not tell whether a pass is due")
                 continue
             self._task = asyncio.create_task(self.run_once(), name="learning-pass")
             try:
@@ -224,7 +250,7 @@ class Profiler:
         with self._store.tx():
             result = self._profile.apply(operations, source_kind="chat")
             if not result.over_cap_by:
-                self._advance(batch, _count(result))
+                self._advance(batch, result)
         if result.over_cap_by:
             conversation.append(
                 {
@@ -235,7 +261,7 @@ class Profiler:
             operations = await self._ask_ops(conversation, valid_ids, effort=effort)
             with self._store.tx():
                 result = self._profile.apply(operations, source_kind="chat")
-                self._advance(batch, _count(result))
+                self._advance(batch, result)
             if result.over_cap_by:
                 log.warning("profile full: a learning pass skipped changes worth %d characters", result.over_cap_by)
         for operation, reason in result.rejected:
@@ -249,7 +275,7 @@ class Profiler:
         conversation = self._store.current_conversation()
         messages = self._context.window(conversation)
         total = self._context.window_tokens_of(messages)
-        if total <= self._window_tokens or len(messages) < 6:
+        if total <= self._limit(conversation) or len(messages) < 6:
             return False
         older: list[Message] = []
         counted = 0
@@ -309,7 +335,7 @@ class Profiler:
             dataclasses.replace(o, source_message_id=source_message_id) if o.action == "add" else o for o in operations
         ]
         return self._profile.apply(
-            operations,
+            _own_home_area(operations, fact, {f.id: f.text for f in self._profile.yours()}),
             source_kind=source_kind,
             source_document_id=source_document_id,
             allowed_url=allowed_url,  # a link fact keeps its page's own link through the strict check
@@ -320,9 +346,7 @@ class Profiler:
         """A page the user asked to learn from: one structured Gemma call extracts the facts about the user,
         then the strict link checks apply. Deterministic where a chain of remember calls was not."""
         facts = "\n".join(f"#{f.id}: {f.text}" for f in self._profile.facts()) or "(empty)"
-        content = (
-            f"CURRENT PROFILE (fact_id: text)\n{facts}\n\nPAGE: {page.title}\nURL: {page.final_url}\n\n{page.text}"
-        )
+        content = f"CURRENT PROFILE (fact_id: text)\n{facts}\n\nPAGE: {page.title}\nURL: {page.url}\n\n{page.text}"
         completion = await self._gemma.chat(
             [{"role": "system", "content": prompts.PAGE_FACTS_RULES}, {"role": "user", "content": content}],
             max_tokens=1_500,
@@ -345,7 +369,11 @@ class Profiler:
             if isinstance(item, str)
         ]
         result = self._profile.apply(
-            operations, source_kind="link", source_document_id=document_id, allowed_url=page.final_url
+            # the link the user sent, never where it led: a redirect's target is the page's choice (redteam-02)
+            operations,
+            source_kind="link",
+            source_document_id=document_id,
+            allowed_url=page.url,
         )
         for _operation, reason in result.rejected:
             log.info("page learning: fact rejected (%s)", reason)
@@ -357,7 +385,11 @@ class Profiler:
 
     def _needs_summary(self) -> bool:
         conversation = self._store.current_conversation()
-        return self._context.window_tokens_of(self._context.window(conversation)) > self._window_tokens
+        return self._context.window_tokens_of(self._context.window(conversation)) > self._limit(conversation)
+
+    def _limit(self, conversation: Conversation) -> int:
+        """The history's tokens a summary keeps it under: `window_tokens`, less in a small context (review I24)."""
+        return min(self._window_tokens, self._context.history_limit(conversation))
 
     def _failures(self, after: int) -> int:
         pointer, _, count = (self._store.get_state(FAILURES_KEY) or "").partition(":")
@@ -373,21 +405,24 @@ class Profiler:
             size += len(message.text)
         return batch
 
-    def _advance(self, batch: list[Message], changes: int = 0) -> None:
+    def _advance(self, batch: list[Message], result: ApplyResult | None = None) -> None:
         self._store.set_state(LAST_LEARNED_KEY, str(batch[-1].id))
         self._store.set_state(LAST_RUN_KEY, utc_now())
         self._store.set_state(FAILURES_KEY, "")
-        if changes:
-            unannounced = int(self._store.get_state(UNANNOUNCED_KEY) or 0)
-            self._store.set_state(UNANNOUNCED_KEY, str(unannounced + changes))
+        # the pass's changes, for the next reply's note and /profile new, in the transaction of the facts
+        if result is not None:
+            self._profile.record_quiet(result)
 
     def _learn_prompt(self, batch: list[Message]) -> str:
         """Both parts, by number: the user's own facts (never changed by learning: `Profile.apply` keeps them) and
-        her notes, which learning adds to, merges and tidies within their own limit."""
+        her notes, which learning adds to, merges and tidies within their own limit. Of a sent document only its
+        caption is the user's (`Message.own_text`: a name is the file's); one without a caption is left out."""
         yours = "\n".join(f"#{f.id}: {f.text}" for f in self._profile.yours()) or "(empty)"
         notes = "\n".join(f"#{f.id}: {f.text}" for f in self._profile.notes()) or "(empty)"
         lines = "\n".join(
-            f"#{m.id} {local_stamp(m.signal_ts, self._tz) if m.signal_ts else ''} {m.text}" for m in batch
+            f"#{m.id} {local_stamp(m.signal_ts, self._tz) if m.signal_ts else ''} {m.own_text}"
+            for m in batch
+            if m.own_text
         )
         return (
             f"CURRENT PROFILE: THE USER'S OWN FACTS (fact_id: text; never replace or remove these)\n{yours}\n\n"
@@ -429,3 +464,19 @@ class Profiler:
                 )
             )
         return operations
+
+
+def _own_home_area(operations: list[Op], fact: str, texts: dict[int, str]) -> list[Op]:
+    """A merge never makes another "Home area:" the user's own (`maps.home_area` trusts a remember fact): an add or
+    replace naming a home area is kept only when it is the one being saved now, or, for a replace, the one its fact
+    already named. Gemma sees link facts beside the user's, and a replace keeps its fact's kind (review of P3, G5)."""
+    wanted = home_area_text(fact).casefold()
+    kept: list[Op] = []
+    for op in operations:
+        area = home_area_text(op.text).casefold() if op.action in ("add", "replace") else ""
+        before = home_area_text(texts.get(op.fact_id, "")).casefold() if op.action == "replace" else ""
+        if area and area not in (wanted, before):
+            log.info("consolidation: a %s naming another home area was left out", op.action)
+            continue
+        kept.append(op)
+    return kept

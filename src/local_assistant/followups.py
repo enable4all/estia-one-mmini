@@ -55,11 +55,12 @@ _NOT_OWN = (prompts.AUDIO_MARK, "[photo]")  # someone else's voice; a photo (its
 
 
 def own_words(message: Message) -> str | None:
-    """The user's own words in a message, without the voice or call mark; None when the message is not theirs to
-    plan from: an audio file, a photo, a command, a link, or too long (likely pasted)."""
+    """The user's own words in a message, without the voice or call mark, and of a sent document only its caption
+    (`Message.own_text`: a name is the file's); None when the message is not theirs to plan from: an audio file, a
+    photo, a command, a link, too long (likely pasted), or nothing left."""
     if message.direction != "in" or message.kind != "text" or message.text.startswith(_NOT_OWN):
         return None
-    text = message.text
+    text = message.own_text
     for mark in _MARKS:
         if text.startswith(mark):
             text = text[len(mark) :].removeprefix(f" {prompts.CUTTING_IN}")

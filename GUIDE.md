@@ -558,6 +558,8 @@ scripts/setup.sh
 
 A Mac without Apple's Command Line Tools, which hold git, asks to install them in a window on its own screen. Over a remote login (SSH), run Homebrew's installer first, which installs them (your Mac password once): `/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"`, then the two lines above.
 
+**Or ask your AI.** Paste `can you help me install this? https://github.com/enable4all/estia-one-mmini` into Claude, ChatGPT or another AI assistant: it offers two ways, as [SETUP-WITH-YOUR-AI.md](SETUP-WITH-YOUR-AI.md) tells it: it runs the two lines on the Mac while you type the password and codes, or you run them and it helps when something stalls.
+
 Or open the folder in an AI coding assistant (Claude Code, Codex, ...) and say **"set me up"**. It follows [SETUP-WITH-YOUR-AI.md](SETUP-WITH-YOUR-AI.md): it checks the Mac, starts setup at the Mac's own screen and says what each screen needs. Every answer is typed in the Estia Setup window, the Mac password only in macOS's own box; setup shows the AI only its step lines, never an answer, a code, a PIN or a key. Over a remote login (SSH), you run `scripts/setup.sh` in your own Terminal window instead, where the Signal codes, passwords and keys are typed hidden. `/usr/bin/sudo /usr/local/estia/bin/estia doctor` checks the result.
 
 With calls set up, calls work once her voice is ready (up to about 15 minutes after an install, a move or a macOS update); she texts you then. In quiet hours (22:00 to 08:00 by default) that text waits until they end, unless a call rang meanwhile.

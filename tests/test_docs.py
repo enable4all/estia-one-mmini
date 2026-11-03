@@ -4351,11 +4351,23 @@ KEYCHAIN_LIMITS = (
 )
 
 
-@pytest.mark.parametrize("name", ["README.md", "GUIDE.md", "SECURITY.md", "setup_assistant.md"])
+@pytest.mark.parametrize("name", ["GUIDE.md", "SECURITY.md", "setup_assistant.md"])
 def test_the_keychain_copies_say_their_limits_in_the_same_words(name: str) -> None:
     text = site_flat(ROOT / name)
     for sentence in KEYCHAIN_LIMITS:
         assert sentence in text, (name, sentence)
+
+
+def test_the_readme_keys_line_is_short_and_its_limits_are_one_link_away() -> None:
+    """Owner, 3 Nov: "shorten that in README". The README's Keys stay put line keeps where Signal's two keys are and the
+    read prompt with its Always Allow limit, in the same words as the other docs; the other limits stay in GUIDE.md's
+    Keys stay put and SECURITY.md, linked right under the promises."""
+    raw = (ROOT / "README.md").read_text(encoding="utf-8")
+    keys = raw.split("- **Keys stay put.**", 1)[1].split("\n", 1)[0]
+    assert KEYCHAIN_LIMITS[0] in keys and KEYCHAIN_LIMITS[1] in keys
+    assert len(keys.split()) <= 100, len(keys.split())
+    links = "All of it in plain words: [Safe and private](GUIDE.md#safe-and-private-in-plain-words)."
+    assert links in raw and raw.index(links) > raw.index("- **Keys stay put.**")
 
 
 def test_the_keychain_copies_are_a_known_gap_and_in_the_changelog() -> None:

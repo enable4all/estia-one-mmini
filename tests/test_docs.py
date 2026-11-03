@@ -3030,17 +3030,23 @@ def test_the_readme_stays_a_short_front_page() -> None:
     assert "[GUIDE.md](GUIDE.md)" in readme
 
 
-def test_the_readme_shows_the_dark_architecture_diagram_and_both_files_are_there() -> None:
-    """Owner, 22 Oct: GitHub shows the dark diagram only, no light/dark swap; the site shows the light one, and its drift
-    test compares that file with the repo's, so both stay in docs/images."""
+ARCHITECTURE_PICTURE = (
+    '<a href="https://estia.one/#architecture"><picture>'
+    '<source media="(prefers-color-scheme: dark)" srcset="docs/images/estia-architecture-dark.svg">'
+    '<img src="docs/images/estia-architecture-light.svg" width="100%"'
+)
+
+
+def test_the_readme_shows_the_architecture_diagram_light_and_dark_and_both_files_are_there() -> None:
+    """Owner, 3 Nov: GitHub shows the light diagram in light mode and the dark one in dark mode (was dark only, 22 Oct);
+    the site shows the light one, and its drift test compares that file with the repo's."""
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
-    assert '<img src="docs/images/estia-architecture-dark.svg"' in readme
     # a click on it opens it on estia.one, where each part has its note (owner, 22 Oct)
-    assert '<a href="https://estia.one/#architecture"><img src="docs/images/estia-architecture-dark.svg"' in readme
+    assert readme.count(ARCHITECTURE_PICTURE) == 1
     assert "Click the diagram to open it on estia.one, where each part has a short note." in readme
     # the drawing's part of the section: the setup window's picture comes after it (owner, 30 Oct)
     section = readme.split("## Architecture")[1].split("\n## ")[0].split(SETUP_WINDOW_PICTURE, 1)[0]
-    assert "estia-architecture-light.svg" not in readme and "<picture>" not in section
+    assert ARCHITECTURE_PICTURE in section and section.count("<picture>") == 1 and "</picture></a></p>" in section
     # its caption: a plain paragraph, left-aligned as the rest of the page (owner, 22 Oct), never centered or small
     caption = next(line for line in section.splitlines() if line.startswith("Estia runs on one Mac mini at home"))
     assert "<" not in caption and "<sub>" not in section and section.count('align="center"') == 1  # the image's only

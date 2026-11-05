@@ -18,8 +18,9 @@ Environment:
   FAKE_SIGNAL_CAPTCHA      register needs this captcha token (unset: none needed)
   FAKE_SIGNAL_CODE         the SMS code verify takes (default 111111)
   FAKE_SIGNAL_PIN          verify needs this registration-lock PIN too (unset: none)
-  FAKE_SIGNAL_VERIFY_ERROR verify answers this error: -5 (Signal's limit, with when) or -3 (signal-cli's IO error,
-                           here a network failure: no answer from Signal)
+  FAKE_SIGNAL_VERIFY_ERROR verify answers this error: -5 (Signal's limit, with when), -3 (signal-cli's IO error,
+                           here a network failure: no answer from Signal) or "expired" (-3, an SMS code Signal no
+                           longer takes: EXPIRED_CODE)
   FAKE_SIGNAL_RECOVERY_KEY register with a recoveryKey takes this one (default: 64 made-up characters, KEY below)
   FAKE_SIGNAL_TAKEN        updateAccount refuses this username, as Signal does one that is taken
   FAKE_SIGNAL_USERNAME_ERROR  updateAccount fails for this username for another reason (-3, signal-cli's IO
@@ -86,6 +87,9 @@ UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}
 # code's are signal-service's status form, a stand-in until the desk check records 0.14.9's own (desk-checklist)
 WRONG_KEY = "Failed to register: Account key or recovery key is incorrect (RecoveryRequestFailedException)"
 WRONG_CODE = "Verify error: StatusCode: 403"
+# an SMS code Signal no longer takes (its MustRequestNewCodeException): 0.14.9's own words, read in its jar (31 Oct):
+# RegistrationManagerImpl.verifyAccountWithCode's IOException, given by VerifyCommand as "Verify error: " and it, -3
+EXPIRED_CODE = "Verify error: Verification code expired, please request a new one by registering again."
 
 
 def registration(method: str, params: dict[str, Any]) -> dict[str, Any]:
@@ -116,6 +120,8 @@ def registration(method: str, params: dict[str, Any]) -> dict[str, Any]:
         return {"error": {"code": -5, "message": "Rate limit reached\nNext attempt may be tried at 2026-10-25T09:40Z"}}
     if error == "-3":
         return {"error": {"code": -3, "message": "Verify error: java.net.SocketException: Network is unreachable"}}
+    if error == "expired":
+        return {"error": {"code": -3, "message": EXPIRED_CODE}}
     if params.get("verificationCode") != os.environ.get("FAKE_SIGNAL_CODE", "111111"):
         return {"error": {"code": -3, "message": WRONG_CODE}}
     pin = os.environ.get("FAKE_SIGNAL_PIN")

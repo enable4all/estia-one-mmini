@@ -915,8 +915,34 @@ async def test_end_call_works_only_on_a_call(store: Store) -> None:
     conversation = store.current_conversation()
     said = store.add_call_turn(conversation.id, ME, "[call] that's all, thanks")
     on_call = Turn(message=store.message(said))
-    assert (await tools.call(on_call, "end_call", "{}")).startswith("Done") and on_call.end_call
+    assert await tools.call(on_call, "end_call", "{}") == "Done: the call ends after your answer. Say a short goodbye."
+    assert on_call.end_call
     assert "end_call" not in [s["function"]["name"] for s in Tools(store, Profile(store), TZ, FakeFetch()).schemas]
+
+
+async def test_end_call_with_a_device_question_waiting_holds_her_goodbye(
+    store: Store, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Third fix review of 0.9.8, voice-calls-fixrev3-07: with a device change waiting for the caller's yes, end_call
+    said "Say a short goodbye", so the caller heard her goodbye and then code's question, and the call stayed up for
+    the yes. The call still ends once the question is answered (calls._Call.ends_after_question)."""
+    home = Home(tmp_path, monkeypatch)
+    tools = Tools(
+        store,
+        Profile(store, max_chars=6_000),
+        TZ,
+        FakeFetch(),
+        devices=home.make(),
+        calls=True,
+        language=lambda: "en",
+    )
+    current = turn(store, "[call] Have a look at https://example.com/party. Thanks, bye!")
+    await tools.call(current, "read_link", '{"url": "https://example.com/party"}')
+    switched = await tools.call(current, "device_set", '{"device": "living room lamp", "power": "off"}')
+    assert switched.startswith("Not done: living room lamp needs the user's yes first") and home.sets() == []
+    result = await tools.call(current, "end_call", "{}")
+    assert result == prompts.END_CALL_AFTER_QUESTION and current.end_call
+    assert result.startswith("Done: the call ends")  # as the other rows read it
 
 
 NOS = WebResult("Ajax wint van PSV", "https://nos.nl/artikel/1", "nos.nl", "2026-10-09", "Ajax won 2-1 on Sunday.")
@@ -930,7 +956,7 @@ def web_tools(store: Store, web: FakeWeb, **kwargs: object) -> Tools:
 async def test_web_search_is_offered_only_with_web(store: Store) -> None:
     _, plain, _ = make(store)
     assert "web_search" not in [s["function"]["name"] for s in plain.schemas]
-    assert [s["function"]["name"] for s in web_tools(store, FakeWeb()).schemas][-1] == "web_search"
+    assert [s["function"]["name"] for s in web_tools(store, FakeWeb()).schemas][-2:] == ["web_search", "find_video"]
 
 
 async def test_web_results_for_gemma_are_data_and_never_kept(store: Store) -> None:
@@ -2182,6 +2208,12 @@ async def test_outside_text_of_an_earlier_turn_ends_no_call_on_a_plain_question(
         # third fix review of 0.9.8, voice-calls-fixrev3-02: a "no problem" is no wrap-up
         ("[call] That's all right.", "en", False),
         ("[call] That's all good, thanks.", "en", False),
+        ("[call] That is enough for today, thanks.", "en", True),  # voice-calls-fixrev3-04
+        ("[call] Gracias, buenas noches.", "es", True),
+        ("[call] ¡Buenas noches!", "es", False),  # also "good evening"
+        ("[call] じゃあ、またあとで", "ja", True),  # dialogue-F4
+        ("[call] Na razie, dzięki!", "pl", True),
+        ("[call] Ну пока!", "ru", True),  # dialogue-F5
     ],
 )
 async def test_after_outside_text_the_callers_goodbye_in_the_call_language_ends_the_call(

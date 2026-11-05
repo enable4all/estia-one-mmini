@@ -698,10 +698,34 @@ def test_setup_os_error_outside_home_no_finder_fix(monkeypatch: pytest.MonkeyPat
         assert "Read and Write" not in os_error_stop(other)
     dotted = os_error_stop(PermissionError(13, "Permission denied", str(tmp_path / ".zprofile")))
     assert "Read and Write" in dotted and "Command-Shift-. (period)" in dotted
-    plain = os_error_stop(PermissionError(1, "Operation not permitted", str(tmp_path / "Documents/x")))
+    plain = os_error_stop(PermissionError(1, "Operation not permitted", str(tmp_path / "Projects/x")))
     assert "Read and Write" in plain and "Command-Shift" not in plain
     escape = os_error_stop(PermissionError(13, "Permission denied", f"{tmp_path}/../../var/estia/x"))
     assert "Read and Write" not in escape
+
+
+@pytest.mark.parametrize("folder", ["Documents", "Desktop", "Downloads", "documents"])
+def test_setup_os_error_guarded_folder_names_privacy_and_security(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, folder: str
+) -> None:
+    """setup-macos-04: EPERM in Documents, Desktop or Downloads is macOS's privacy guard (doctor's _GUARDED), which
+    Finder's Sharing and Permissions does not change; it got the Finder fix. It names Privacy & Security; EPERM
+    elsewhere in your home (a root-owned ~/.zprofile) and EACCES there keep the Finder fix."""
+    from local_assistant.setup import os_error_stop
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    path = str(tmp_path / folder / "x")
+    guarded = os_error_stop(PermissionError(1, "Operation not permitted", path))
+    assert guarded == (
+        f"✗ Setup: could not use {path} (Operation not permitted).\n"
+        "  Fix: System Settings → Privacy & Security → Files & Folders: let the app setup runs in (Terminal, or your"
+        " AI tool) use that folder, then run setup again: your answers are kept."
+    )
+    assert "Read and Write" not in guarded and "Finder" not in guarded
+    dotted = os_error_stop(PermissionError(1, "Operation not permitted", str(tmp_path / ".zprofile")))
+    assert "Read and Write" in dotted and "Command-Shift-. (period)" in dotted and "Privacy" not in dotted
+    access = os_error_stop(PermissionError(13, "Permission denied", path))
+    assert "Read and Write" in access and "Privacy" not in access
 
 
 @pytest.mark.parametrize("code", [errno.ENOSPC, errno.EDQUOT], ids=["ENOSPC", "EDQUOT"])
@@ -743,7 +767,7 @@ def test_setup_says_the_configured_name(
     assert setup.main(["--dry-run", "--config", str(path)]) == 0
     out = capsys.readouterr().out
     assert out.startswith("Estia setup:") and "Estia's number" in out and "like estia-4821" in out
-    assert "Estia listens and speaks" in out and "Tiffany setup" not in out and "Tiffany's" not in out
+    assert "Estia listens and answers" in out and "Tiffany setup" not in out and "Tiffany's" not in out
 
 
 def test_the_config_gets_the_chosen_language() -> None:
@@ -1996,12 +2020,27 @@ def test_enter_takes_the_safe_answer_only_from_a_terminal(
 def test_a_steps_yes_or_no_asks_again_in_a_terminal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """answers-extras-yes-no-other-words: "ok" or "1" was a no; "ναι" too. Asked again, with the keyboard's hint."""
+    """answers-extras-yes-no-other-words: "ok" or "1" was a no; "ναι" too. Asked again: "ok" holds no Greek letter,
+    so without the keyboard's hint (P06)."""
     in_a_terminal(monkeypatch)
     typed = iter(["ok", "ναι"])
     monkeypatch.setattr("builtins.input", lambda prompt="": next(typed))
     assert Wizard(tmp_path / "config.toml", dry_run=False).yes("Safe?", default=False) is True
-    assert capsys.readouterr().out.count(prompts.SETUP_YES_NO_AGAIN) == 1
+    assert capsys.readouterr().out.count(prompts.SETUP_YES_NO_AGAIN_PLAIN) == 1
+
+
+@pytest.mark.parametrize(("first", "greek"), [("ja", False), ("υεσ", True)])
+def test_a_steps_yes_or_no_names_the_greek_keyboard_only_for_greek_letters(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], first: str, greek: bool
+) -> None:
+    """P06, the Wizard's own yes or no: "ja" got "the keyboard may be on Greek"; only a Greek letter gets it now."""
+    in_a_terminal(monkeypatch)
+    typed = iter([first, "y"])
+    monkeypatch.setattr("builtins.input", lambda prompt="": next(typed))
+    assert Wizard(tmp_path / "config.toml", dry_run=False).yes("Safe?", default=False) is True
+    out = capsys.readouterr().out
+    assert out.count(prompts.SETUP_YES_NO_AGAIN if greek else prompts.SETUP_YES_NO_AGAIN_PLAIN) == 1
+    assert ("Greek" in out) is greek
 
 
 def test_the_wizard_takes_its_terminal_from_both_ends(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -2426,6 +2465,24 @@ def test_ollamas_step_line_is_as_short_as_its_facts_allow() -> None:
     assert "Her notes, /status and /help **stay English**." in prompts.SETUP_LANGUAGE  # words-18: no "What code writes"
 
 
+def test_setup_says_which_languages_have_a_voice_before_one_is_chosen() -> None:
+    """The review of 4 Nov: setup said the other ten languages have one voice, and the language list marked none as
+    text only, so a Mac set to Japanese took Japanese by Enter and its first call rang out. The voice screen names
+    the six with jane and the four with none; the language list marks those four; she listens and answers in one."""
+    from local_assistant import setup_plan
+
+    english, others = prompts.SETUP_VOICE.split("\n\n")  # two paragraphs: a paragraph holds at most two lines
+    assert english.startswith("Her **English voice**") and "\n" not in english
+    assert others.splitlines() == [
+        "Spanish, Italian, Portuguese, Dutch, German and French have **one voice**, jane.",
+        "Korean, Polish, Russian and Japanese have **no voice**: text only.",
+    ]
+    assert "{name} listens and answers in **one language** at a time" in prompts.SETUP_LANGUAGE
+    listing = setup_plan.CORE_CONFIG[0].listing
+    assert "  • 日本語, Japanese (ja) (text only: no voice)" in listing.splitlines()
+    assert "  • Español, Spanish (es)" in listing.splitlines()
+
+
 def test_the_dry_runs_show_the_enter_default_where_it_is_yes(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -2634,7 +2691,7 @@ def test_a_dry_run_on_a_mac_too_small_still_shows_the_plan(
 def test_the_mac_stays_awake_for_the_whole_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, dry: bool) -> None:
     """plat-09: only the model download kept the Mac awake; the voice build, the voice service's model wait and the
     calls build had nothing, while the screen said "the Mac stays awake". Setup holds macOS's caffeinate for the whole
-    run (a dry run changes nothing and holds none); the screen says to keep it plugged in, its lid open."""
+    run (a dry run changes nothing and holds none); the screen says to keep it plugged in (a MacBook, its lid open)."""
     import contextlib
     from collections.abc import Iterator
 
@@ -2654,5 +2711,42 @@ def test_the_mac_stays_awake_for_the_whole_run(tmp_path: Path, monkeypatch: pyte
     assert wizard_module.run_setup(argv) == 0
     assert held == (["run"] if dry else ["on", "run", "off"])
     assert prompts.SETUP_DOWNLOAD.splitlines()[0] == (
-        "  Nothing to answer meanwhile. Keep the Mac plugged in, with its lid open: setup keeps it awake until it ends."
+        "  Nothing to answer meanwhile. Keep the Mac plugged in (a MacBook with its lid open): setup keeps it awake"
+        " until it ends."
     )
+
+
+class AtThePull(Exception):
+    """The test's stand-in for the model's download: setup stops there, its lines said."""
+
+
+@pytest.mark.parametrize(("route", "phone"), [("2", True), ("", False)], ids=["route-2", "route-1"])
+def test_route_2_says_the_phones_part_after_the_plan_and_never_nothing_to_answer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], route: str, phone: bool
+) -> None:
+    """W14, in Terminal: route 2's "Meanwhile, on the spare or borrowed Android phone" came the moment the route was
+    picked, mid-plan, and the model step then said "Nothing to answer meanwhile.". It comes once the plan is
+    answered, before Step 1, and the model step leaves that sentence out; route 1 keeps SETUP_DOWNLOAD whole."""
+
+    def pull(self: Wizard, tag: str, *, size: int = 0) -> str:
+        raise AtThePull
+
+    monkeypatch.setattr(Wizard, "ollama", lambda self: None)
+    monkeypatch.setattr(Wizard, "pull", pull)
+    monkeypatch.setattr("local_assistant.setup.memory_gb", lambda: 32.0)
+    number = [] if phone else ["+30 690 000 0000", "y", "n"]  # her number, right, no Registration Lock
+    nothing = [""] * 8  # Extra Features as recommended; no home area; About you left out
+    answers = iter(["Juno", "m", "y", route, *number, "nl", "playful", "n", *nothing, "n", "n"])
+    monkeypatch.setattr("builtins.input", lambda prompt="": next(answers))
+    with pytest.raises(AtThePull):
+        main(["--config", str(tmp_path / "config.toml"), "--plain"])
+    out = capsys.readouterr().out
+    heads_up = plain_text(prompts.SETUP_ROUTE_NO_NUMBER_NEXT)
+    assert out.count(heads_up) == (1 if phone else 0)
+    assert ("Nothing to answer meanwhile" in out) is not phone
+    assert prompts.SETUP_DOWNLOAD.splitlines()[1] in out  # the download's own line stays on both routes
+    if phone:
+        plan_end = out.index(prompts.SETUP_ANSWERS_WHERE.split("{", 1)[0])  # said once the plan is in the file
+        assert plan_end < out.index(heads_up) < out.index("Step 1 of")
+    else:
+        assert prompts.SETUP_DOWNLOAD in out

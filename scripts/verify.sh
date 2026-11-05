@@ -59,11 +59,13 @@ fi
 # the voice step: begin
 # her voice service's own-account check (VoiceCore PeerCheck and the service's refusals), Pocket TTS's offline
 # suites (its pins, its sandbox, its runs, its six languages; RealPocket needs the network) and the other offline ones
-# that hold a promise (call audio only in memory, the 27.0.x warning, a request's "kokoro": false, the service's
-# arguments; \.Speech/ is VoiceCore's Speech suite alone, never SpeechDetection's real model): whenever tools/voice
+# that hold a promise (call audio only in memory, a line Pocket cannot say refused (PocketOnly), a request's
+# "kokoro": false, the service's arguments, the health's speaking state that decides whether a call is picked up
+# (\.LanguageChoice/) and the refusals' status and code (\.Errors/); \.Speech/ is VoiceCore's Speech suite alone,
+# never SpeechDetection's real model): whenever tools/voice
 # differs from main, committed or not (the voice package's first build fetches WhisperKit and FluidAudio: minutes)
 voice_base="$(git merge-base HEAD main 2>/dev/null || git rev-parse HEAD)"
 if [[ -f tools/voice/Package.swift ]] && ! { git diff --quiet "$voice_base" -- tools/voice && [[ -z "$(git ls-files --others --exclude-standard -- tools/voice)" ]]; }; then
-  (cd tools/voice && swift test --quiet --filter 'PeerChecking|PeerLookup|RefusalLogging|OnlyItsOwnAccount|PocketPins|PocketRunning|PocketPrograms|PocketRouting|PocketAudio|PocketPacing|PocketSpeaking|PocketLanguageRouting|PocketLanguagePins|PocketLanguagePacing|CallAudioInMemory|KokoroOnThisMac|TranscriptionRequests|HTTPParsing|ServiceArgumentsParsing|\.Speech/')
+  (cd tools/voice && swift test --quiet --filter 'PeerChecking|PeerLookup|RefusalLogging|OnlyItsOwnAccount|PocketPins|PocketRunning|PocketPrograms|PocketRouting|PocketAudio|PocketPacing|PocketSpeaking|PocketLanguageRouting|PocketLanguagePins|PocketLanguagePacing|CallAudioInMemory|PocketOnly|TranscriptionRequests|HTTPParsing|ServiceArgumentsParsing|\.Speech/|\.LanguageChoice/|\.Errors/')
 fi
 # the voice step: end

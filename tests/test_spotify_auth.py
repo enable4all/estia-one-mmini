@@ -194,9 +194,9 @@ def test_at_a_terminal_the_paste_is_asked_as_before(monkeypatch: pytest.MonkeyPa
 
 
 def test_the_sign_in_reads_its_paste_with_that_reader() -> None:
-    from local_assistant import app, deploy, setup_admin, spotify_auth
+    from local_assistant import deploy, entry, setup_admin, spotify_auth
 
-    assert "read=spotify_auth.read_answer" in Path(app.__file__).read_text(encoding="utf-8")
+    assert "read=spotify_auth.read_answer" in Path(entry.__file__).read_text(encoding="utf-8")
     assert spotify_auth.ASK_MARK == deploy.ASK_MARK == setup_admin.ASK_MARK
 
 

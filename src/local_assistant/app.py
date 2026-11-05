@@ -11,30 +11,31 @@ documents_host.py, lifecycle.py and status_host.py. App keeps one-line delegates
 
 from __future__ import annotations
 
-import argparse
 import asyncio
 import contextlib
 import logging
-import logging.handlers
-import os
-import signal as os_signal
-import stat
-import sys
 import time
 from collections.abc import Callable
 from functools import partial
 from pathlib import Path
-from typing import Any, TextIO
+from typing import Any
 
 from local_assistant import code_notes, hostsec, prompts, spotify_auth
 from local_assistant.babble import Babble, Session, tidy
-from local_assistant.brain import Brain
+from local_assistant.brain import Brain, Interrupted
 from local_assistant.calendar_feed import CalendarFeed
 from local_assistant.calendar_graph import OutlookCalendars
 from local_assistant.calendar_tools import CalendarTools, clean_note
 from local_assistant.calendar_watch import CalendarWatch
-from local_assistant.call_host import CallGlance, CallHost, rundown_reads
-from local_assistant.calls import CALL_MAX_TOKENS, CallManager, CallSettings, Turn, without_last_questions
+from local_assistant.call_host import CallGlance, CallHost
+from local_assistant.calls import (
+    CALL_MAX_TOKENS,
+    CallManager,
+    CallSettings,
+    Turn,
+    rundown_reads,
+    without_last_questions,
+)
 from local_assistant.chords import ChordTool
 from local_assistant.commands import (
     VOICE_ECHO_KEY,
@@ -43,15 +44,14 @@ from local_assistant.commands import (
     Commands,
     Guard,
     StatusInfo,
+    answered_at_once,
     voices_here,
 )
 from local_assistant.config import (
-    DEFAULT_CONFIG_PATH,
     Config,
-    ConfigError,
-    canonical_voice,
-    find_java_home,
-    load_config,
+    has_voice,
+    kokoro_voice,
+    pocket_voice,
     quiet_hours_of,
     voice_here,
 )
@@ -62,6 +62,7 @@ from local_assistant.documents import (
     Helper,
 )
 from local_assistant.documents_host import DocumentsHost
+from local_assistant.entry import main, model_pin, setup_logging, signal_client
 from local_assistant.fetcher import Fetcher, FetchError, Page
 from local_assistant.followups import FollowUps
 from local_assistant.gate import LONG_TEXT, AttachmentRef, Decision, Kind, classify, sender_aci
@@ -73,9 +74,9 @@ from local_assistant.initiative import (
     Settings,
     Writer,
 )
-from local_assistant.language import CODES, ENGLISH, LANGUAGE_KEY
+from local_assistant.language import CODES, ENGLISH, LANGUAGE_KEY, LANGUAGES
 from local_assistant.lifecycle import ALIVE_KEY, ALIVE_SECONDS, WELCOME_KEY, Lifecycle
-from local_assistant.mail_auth import AccessTokens, MailAuthError, TokenStore, device_login
+from local_assistant.mail_auth import AccessTokens, TokenStore
 from local_assistant.mail_digest import MailDigest, MailNumbers
 from local_assistant.mail_http import http
 from local_assistant.mail_prefilter import Jev
@@ -98,18 +99,18 @@ from local_assistant.signal_io import (
     SignalClient,
     SignalError,
     UntrustedIdentityError,
-    call_env,
     shown_error,
-    signal_cli_command,
-    signal_data,
 )
 from local_assistant.signal_text import Styled, netted, styled, unlinked
 from local_assistant.spotify import Spotify
-from local_assistant.spotify_auth import SpotifyAuthError, SpotifyTokens, login
 from local_assistant.status_host import StatusHost
 from local_assistant.store import Attachment, Message, MessageKind, MessageStatus, Store
+from local_assistant.thinking import BUDGET_TOKENS as THINKING_TOKENS
+from local_assistant.thinking import DeepThinking
+from local_assistant.timefmt import iso_to_epoch
 from local_assistant.tools import Tools, project_schemas, tool_schemas
 from local_assistant.video import CaptionHelper, VideoReader, video_id
+from local_assistant.video_find import Offer, Reading, VideoOffers, match_message
 from local_assistant.voice import (
     VoiceClient,
     VoiceError,
@@ -161,6 +162,8 @@ WARM_UP_GLANCE_SECONDS = 8.0
 DOCUMENTS_FIRST_SECONDS = 30.0  # [documents]: the folder's first check, this long after the start (given to the host)
 # shorter than this is a slip of the thumb, not speech (OpenClaw's minimum)
 MIN_AUDIO_BYTES = 1024
+# by account: the language her voice does not speak whose note (VOICE_NO_LANGUAGE) that account got with an answer
+NO_VOICE_TOLD_KEY = "no_voice_told"
 PAGE_TITLE_CHARS = 200  # a page's title in the /learn reply: the fetcher's own cap
 # a photo message is stored as text "[photo] caption", a voice message as "[voice] transcript";
 # their files are in the attachments table
@@ -269,6 +272,11 @@ class App:
         # one language at a time: the config's is the starting value, a typed /language (kept in the database) wins
         chosen_language = store.get_state(LANGUAGE_KEY)
         self.language = chosen_language if chosen_language in CODES else cfg.language
+        # Deep Thinking (/thinking): her answers to texts and voice notes think first, until 30 minutes pass without a
+        # message from the user; never on a model context under 32,768 tokens (the 16 GB tier: no room for the thought)
+        # nor on one the config does not say (no context_tokens line: nothing says there is room for it)
+        known = cfg.context_tokens is not None
+        self.thinking = DeepThinking(store, clock=clock, room=known and not cfg.small_context, known=known)
         self.queue: asyncio.Queue[int] = asyncio.Queue()
         self._no_call = asyncio.Event()
         self._no_call.set()
@@ -362,7 +370,7 @@ class App:
         # Spotify by text message (the official Web API, the user's own app); notes and the sign-in reminder are code
         self.music: MusicTools | None = None
         if cfg.spotify_enabled:
-            spotify_tokens = SpotifyTokens(cfg.spotify_token_path, cfg.spotify_client_id)
+            spotify_tokens = spotify_auth.SpotifyTokens(cfg.spotify_token_path, cfg.spotify_client_id)
             self.music = MusicTools(Spotify(spotify_tokens, status=self.part_status), spotify_tokens, cfg)
         # web search (Brave, Ollama as backup); results are never stored, their links are a code-written note
         self.web: WebSearch | None = None
@@ -387,6 +395,8 @@ class App:
     def _wire_voice_and_calls(self) -> None:
         """The voice service and voice calls."""
         cfg, clock, signal = self.cfg, self._clock, self.signal
+        for note in cfg.voice_notes:  # a setting that named Kokoro or Supertonic-3 (removed, 3 Nov 2026): once a start
+            log.warning("voice: %s", note)
         english = voice_here(cfg.voice_name, pocket_standard())  # vera beside the 18M model: heart, the default
         if english != cfg.voice_name:
             log.warning(
@@ -395,17 +405,10 @@ class App:
                 english,
             )
 
-        def client(speed: float) -> VoiceClient:  # voice notes' and calls' (each its own speed), the same service
-            return VoiceClient(
-                cfg.voice_url,
-                voice=english,
-                speed=speed,
-                status=self.part_status,
-                language=self.language,
-                language_voice=cfg.voice_language_voice,
-            )
+        def client() -> VoiceClient:  # voice notes' and calls', the same service
+            return VoiceClient(cfg.voice_url, voice=english, status=self.part_status, language=self.language)
 
-        self.voice = client(cfg.voice_speed) if cfg.voice_enabled else None
+        self.voice = client() if cfg.voice_enabled else None
         # voice calls (the JVM signal-cli and our call helper): calls.py talks, this app is its Host (turns, notes)
         self._background: set[asyncio.Task[None]] = set()  # commands answered during a call, code's line on a text
         self._worker_idle = asyncio.Event()  # no text being answered (a call turn waits for it)
@@ -421,14 +424,13 @@ class App:
             warm_up_glance=WARM_UP_GLANCE_SECONDS,
         )
         if cfg.calls_enabled:
-            self._call_voice = client(cfg.calls_speed)
+            self._call_voice = client()
         call_voice = self._call_voice
-        # jane's model of a language downloading (owner, 25 Oct): nothing in it is spoken, never Supertonic-3 meanwhile
+        # jane's model of a language downloading (owner, 25 Oct): nothing in it is spoken meanwhile
         self.downloads = LanguageDownload(
             self.voice or self._call_voice,
             cfg.data_dir / "voice-models",  # the voice service's, in her home
             self.call_host.call_note,
-            language_voice=cfg.voice_language_voice,
             in_use=lambda code: code == self.language or code == self._practised_language(),
             locked=lambda: self.guard.locked,
         )
@@ -443,6 +445,9 @@ class App:
                 quiet_hours=quiet_hours_of(cfg.initiative_quiet_hours) or QUIET_HOURS,
                 locked=lambda: self.guard.locked,  # waits for /unlock
                 clock=clock,
+                # no "call me now" where calls ring out: the call's language has no voice (the review of 4 Nov)
+                speaks=lambda aci: has_voice(self._practised(aci) or self.language),
+                busy=lambda aci: self.calls is not None and self.calls.busy_with(aci),  # held for the call's end
             )
             self.calls = CallManager(
                 signal,
@@ -490,6 +495,7 @@ class App:
                 calls=cfg.wake_calls,
                 name=cfg.name,
                 clock=clock,
+                language=lambda: self.language,  # her calls for reminders are in it (never practice)
             )
             self.reminder_scheduler = ReminderScheduler(
                 store,
@@ -545,6 +551,7 @@ class App:
             CaptionHelper(cfg.youtube_helper, cfg.youtube_helper_timeout, status=self.part_status), gemma
         )
         self._busy: dict[int, asyncio.Task[None]] = {}  # each answer's busy note, until it is sent or not needed
+        self.video_offers = VideoOffers()  # find_video's waiting matches, per account and conversation (memory only)
         # documents: the PDFs in the owner's ~/Estia-KB and the ones the user sends, read by tools/documents (no AI
         # model) into her index; off without [documents]
         self.documents: Documents | None = None
@@ -620,6 +627,7 @@ class App:
         self.tools.set_consolidate(self.profiler.consolidate_for)
         self.tools.set_learn_page(self.profiler.learn_page)
         self.tools.set_notify(self._tool_note)
+        self.tools.set_present(self._video_present)
 
     def _wire_commands(self) -> None:
         """The slash commands and the chosen voice."""
@@ -636,7 +644,6 @@ class App:
             voice=self.voice is not None,
             set_voice=self._set_voice,
             language=self.language,
-            language_voice=self.cfg.voice_language_voice if self.voice is not None else "",
             set_language=self._set_language,
             voice_languages=voice_client.languages if voice_client else None,
             reminders=self.reminders,
@@ -649,9 +656,16 @@ class App:
             docs=self.documents_host.docs_command if self.documents is not None else None,
             downloads=self.downloads,
             has_home=self.maps.has_home if self.maps is not None else None,
+            thinking=self.thinking,
         )
-        # eve-full chosen before 26 Oct is eve; vera chosen on a Mac with the 18M model (a database moved) is not used
-        chosen = canonical_voice(store.get_state(VOICE_NAME_KEY) or "")
+        # eve-full chosen before 26 Oct is eve; a Kokoro voice chosen before 3 Nov 2026 the closest Pocket voice, said
+        # once a start; vera chosen on a Mac with the 18M model (a database moved) is not used
+        stored = store.get_state(VOICE_NAME_KEY) or ""
+        chosen = pocket_voice(stored)
+        if kokoro_voice(stored):
+            log.warning(
+                "voice: /voice %s was a Kokoro voice, and Kokoro was removed (3 Nov 2026): %s speaks", stored, chosen
+            )
         if chosen in voices_here(self.commands.pocket_standard):
             self._set_voice(chosen)
 
@@ -812,10 +826,17 @@ class App:
         for client in (self.voice, self._call_voice):
             if client is not None:
                 client.set_voice(name)
-        self._settings_changed()  # her list names who speaks it (Pocket TTS or Kokoro): her rules follow
+        self._settings_changed()  # her list names her voice's level and settings: her rules follow
 
     def _is_busy(self) -> bool:
         return self._processing or not self.queue.empty() or not self._no_call.is_set()
+
+    def call_began(self) -> None:
+        """A call started (CallHost.call_started): texts wait until it ends, and the Deep Thinking answer on its way, if
+        any, of whichever account, stops asking the model (no tool of it has run) or finishes without its thought
+        (Brain's `interrupt`)."""
+        self._no_call.clear()
+        self.thinking.interrupt()
 
     # voice calls: CallHost (call_host.py) does the work; these names stay for the tests and calls.Host, one release
     def call_started(self, aci: str, *, practice: bool = False) -> None:
@@ -841,8 +862,8 @@ class App:
     async def practice_call_ended(self, aci: str) -> None:
         await self.call_host.practice_call_ended(aci)
 
-    async def call_drop_waiting(self, aci: str) -> None:
-        await self.call_host.call_drop_waiting(aci)
+    async def call_drop_waiting(self, aci: str, *, unheard: bool = False) -> None:
+        await self.call_host.call_drop_waiting(aci, unheard=unheard)
 
     async def call_standby(self, aci: str) -> None:
         await self.call_host.call_standby(aci)
@@ -856,8 +877,8 @@ class App:
     async def call_chords(self, aci: str) -> None:
         await self.call_host.call_chords(aci)
 
-    async def call_summary(self, aci: str, lines: list[str], minutes: int) -> None:
-        await self.call_host.call_summary(aci, lines, minutes)
+    async def call_summary(self, aci: str, lines: list[str], span: str) -> bool:
+        return await self.call_host.call_summary(aci, lines, span)
 
     @property
     def _glance(self) -> CallGlance | None:
@@ -917,14 +938,14 @@ class App:
         self.signal_host.identity_opened(aci)  # their message opened: trusted again
         if not self.guard.known(aci, decision.device):  # a device she does not answer (yet): held, never read
             self._discard(decision.photos + decision.audio + decision.documents)
-            note = self.guard.hold(aci, decision.device)
+            note = self.guard.hold(aci, decision.device, envelope.get("serverReceivedTimestamp"))  # Signal's own time
             if note and (sent := await self._deliver(aci, note, "the held-device note")):  # also while locked
                 self.lifecycle.keep_sent(aci, note, sent)  # in her history: she knows a message was held
             return
         self.guard.seen(aci, decision.device)  # a device she answers: its days of silence start again
         words = decision.text.split() if decision.kind is Kind.COMMAND else []
         command = words[0].lower() if words else ""
-        if self.guard.locked:  # nothing works but /unlock from the device that locked her
+        if self.guard.locked:  # nothing works but /unlock from the device that locked her or that account's phone
             self._discard(decision.photos + decision.audio + decision.documents)
             reply = self.guard.unlock(aci, decision.device) if command == "/unlock" else None
             if reply is None:
@@ -974,12 +995,17 @@ class App:
             len(decision.documents),
         )
         self.profiler.note_activity()
+        self.thinking.touch(aci)  # this account's Deep Thinking 30 minutes start again (its own only, while it is on)
         if self.initiative is not None:
             self.initiative.note_activity()  # a text she is writing waits: Gemma's slot is the user's
         # queued before anything is awaited: a practice call that ends meanwhile drains the queue first, so a text
         # stored during the call is its practice turn even while its read receipt is still on its way
-        if kind == "command" and not self._no_call.is_set() and text.split()[0].lower() not in WAITING_COMMANDS:
-            # during a call a command (no Gemma) is answered at once; /voice <voice> even changes the call's voice
+        at_once = kind == "command" and (
+            answered_at_once(text) or (not self._no_call.is_set() and text.split()[0].lower() not in WAITING_COMMANDS)
+        )
+        if at_once:
+            # during a call a command (no Gemma) is answered at once; /voice <voice> even changes the call's voice. So is
+            # /thinking off at any time (owner, 4 Nov): it stops the answer of its account that thinks, never waits for it
             self._background.add(task := asyncio.create_task(self._command_now(message_id)))
             task.add_done_callback(self._background.discard)
         else:
@@ -988,25 +1014,34 @@ class App:
         with contextlib.suppress(SignalError, NotAllowedError):
             await self.signal.receipt(aci, timestamp)
 
-    async def process(self, message_id: int) -> None:
+    async def process(self, message_id: int, *, redo: bool = False) -> bool:
+        """Answer one message. True: a call started, or its account switched Deep Thinking off, while it worked on a text
+        or voice note and nothing of that answer had run, so it was stopped; the message waits as it was and the worker
+        answers it again (after the call; at once, without thinking, when its account switched it off). `redo`: that
+        answer again, which is never judged stale: she was on a call, not down (review of 4 Nov, calls-6: after a call
+        longer than the recovery window it got the offline note instead of its answer)."""
         message = self.store.message(message_id)
         if message.status != "received" or self.signal_host.set_aside_if_not_allowed(message):
-            return
+            return False
         if self.guard.locked:  # it came in before /lock: never answered (nor later)
             self.store.set_status(message.id, "ignored")
             self._drop_attachments(message.id)
             log.info("message %d not answered: locked", message.id)
-            return
-        if self.devices is not None and message.kind != "text":
+            return False
+        # a command answered ahead of the queue (/thinking off) is no next message of the ones that still wait before it:
+        # it neither reads a found video's match nor cancels a device's question, so the yes typed earlier is read in the
+        # queue's order (or the two minutes end them)
+        ahead = message.kind == "command" and answered_at_once(message.text)
+        if self.devices is not None and message.kind != "text" and not ahead:
             self.devices.cancel()  # only a text (typed or spoken) can be the yes
-        if self._is_stale(message):
+        if not redo and self._is_stale(message):
             if self.devices is not None:
                 self.devices.cancel()
             self.store.set_status(message.id, "failed")
             self._drop_attachments(message.id)
             await self._offline_note(message)
             log.info("message %d arrived after downtime: offline note instead of an answer", message.id)
-            return
+            return False
         self.profiler.note_activity()
         pin = find_pin(message.text) if self.maps else None
         if self.maps and pin:
@@ -1024,16 +1059,42 @@ class App:
         message = self.store.message(message.id)
         if practising is not None and self.devices is not None:
             self.devices.cancel()  # a practice message is never a device's yes
+        # a found video's match waits for this account's next message in this conversation: read here, by code, in the
+        # queue's order (video_find); a yes goes on to a normal answer with its one link unlocked
+        reading = Reading("none") if ahead else self.video_offers.read(message)
+        video_yes: tuple[str, str] | None = None
+        if reading.offer is not None and reading.kind == "yes":
+            video_yes = (reading.offer.match.link, reading.offer.request)
+            log.info("message %d: a typed yes took the found video", message.id)
+        elif reading.offer is not None and reading.kind in ("late", "another"):
+            # answered by code alone, never by her: the typed message becomes a command, and code's line is in her
+            # history as code's note. The late line (and "no more") quotes nothing; the next match (`another`) quotes
+            # outside text (its title and channel), so its note is marked as such (_video_show)
+            self.store.set_kind(message.id, "command")
+            command = self.store.message(message.id)
+            if reading.kind == "late":
+                await self._reply(command, prompts.VIDEO_LATE_YES, "command", "answered")
+            elif reading.over:
+                await self._reply(command, prompts.VIDEO_NO_MORE, "command", "answered")
+            else:
+                await self._video_show(command, reading.offer, kind="command")
+            return False
         if message.kind == "command":
             answer = await self.commands.handle(message)
             quotes = code_notes.quotes_outside(message.text), code_notes.quotes_private(message.text)
-            await self._reply(message, answer, "command", "answered", outside=quotes[0], private=quotes[1])
-            return
+            once = answer == prompts.THINKING_OFF_STOPPED  # true only as sent: never after the answer it speaks of
+            await self._reply(message, answer, "command", "answered", outside=quotes[0], private=quotes[1], once=once)
+            return False
         if message.kind == "unsupported":
             await self._reply(message, prompts.TEXT_ONLY_VOICE if self.voice else prompts.TEXT_ONLY, "note", "answered")
-            return
+            return False
+        # Deep Thinking: the sender's own switch, for texts and voice notes, never practice
+        thinking = practising is None and self.thinking.on(message.peer_aci)
+        stop = self.thinking.begin(message.peer_aci) if thinking else None  # a call or its /thinking off sets it
+        if stop is not None and not self._no_call.is_set():  # one that started before it (the recap above): not seen
+            stop.set()  # the answer stops before its first request (review of 4 Nov, correctness-5)
         typing = asyncio.create_task(self._typing_loop(message.peer_aci))
-        busy = asyncio.create_task(self._busy_note(message))
+        busy = asyncio.create_task(self._busy_note(message, thinking=thinking))
         self._busy[message.id] = busy
         text: str
         notes: list[str] = []
@@ -1041,6 +1102,7 @@ class App:
         private: set[str] = set()  # those quoting mail, a calendar or documents
         kind: MessageKind
         status: MessageStatus
+        again = False  # a call or /thinking off stopped her thinking: nothing is sent, the message is answered again
         try:
             attachments = self.store.attachments(message.id)
             unheard: tuple[str, MessageStatus] | None = None
@@ -1090,7 +1152,9 @@ class App:
             elif attachments and not images:  # no usable photo: a note, no Gemma (files go first, in finally)
                 text, kind, status = prompts.PHOTO_FAILED, "note", "answered"
             else:
-                conversation = self.context.enforce_limit(self.store.conversation(message.conversation_id))
+                conversation = self.context.enforce_limit(
+                    self.store.conversation(message.conversation_id), extra_reply=THINKING_TOKENS if thinking else 0
+                )
                 spoken = message.text.startswith((prompts.VOICE_MARK, prompts.AUDIO_MARK))
                 began = self._clock()  # a photo is shown from the start of its answer (memory-2)
                 reply = await self.brain.answer(
@@ -1100,11 +1164,18 @@ class App:
                     recent=self.shown_photo.recent(message.conversation_id, began),
                     photo_left=self.shown_photo.left(message.conversation_id, began, new=bool(images)),  # guards-4
                     practice=self.babble.turn(spoken=spoken) if practising is not None else None,
+                    video_yes=video_yes,
+                    thinking=thinking,
+                    interrupt=stop,
+                    # a typed yes to a found video has taken its offer: asked again, the answer would lack it, so a
+                    # call only makes that answer drop its thought
+                    stoppable=video_yes is None,
                 )
                 if images:
                     self.shown_photo.keep(message.conversation_id, message.id, images, began)
                 text = reply.text  # when no reminder was set: without her talk of it, code's line why after hers
                 if self.devices is not None and self.devices.pending:
+                    self.video_offers.drop(message.peer_aci)  # a device's question is the one yes that counts now
                     # a change waits: her text ends with code's question, never hers, so a yes answers only code's
                     # (redteam-05); in another language code's words only (she may claim it is done)
                     hers = without_last_questions(reply.hers) if self.language == ENGLISH else ""
@@ -1137,6 +1208,9 @@ class App:
                     reply.tool_calls,
                     reply.timing.line(),
                 )
+        except Interrupted:
+            again = True
+            self.store.unassign_seq(message.id)  # it waits for the call with no place in the conversation (calls-2)
         except GemmaError as exc:
             log.error("message %d: Gemma failed: %s", message.id, exc)
             unavailable = prompts.UNAVAILABLE.format(name=self.cfg.name)
@@ -1153,10 +1227,20 @@ class App:
             typing.cancel()
             busy.cancel()
             self._busy.pop(message.id, None)
-            if message.text.split("\n", 1)[0] != prompts.DOCUMENT_MARK:  # else stopped mid-save: kept for the restart
-                self._drop_attachments(message.id)  # photos live only until answered
+            if stop is not None:
+                self.thinking.end(stop)
+            if not again and message.text.split("\n", 1)[0] != prompts.DOCUMENT_MARK:  # else kept for the restart
+                self._drop_attachments(message.id)  # photos live only until answered (also after a call stopped her)
             with contextlib.suppress(SignalError, NotAllowedError):
                 await self.signal.typing(message.peer_aci, stop=True)
+        if again:
+            log.info(
+                "message %d: she was stopped while she thought (a call, or /thinking off); it is answered again",
+                message.id,
+            )
+            # a call is on: it waits for the call's end, code's line once a call; stopped by /thinking off, no line
+            self.call_host.text_waits(message.peer_aci, message.id, stopped=True)
+            return True
         await self._reply(message, text, kind, status, outside=text in outside, private=text in private)
         for note in notes:
             out_id = self.store.add_outgoing(
@@ -1166,6 +1250,7 @@ class App:
         if kind == "text" and self._speaks(message):
             await self._speak(message, text)
         self.profiler.note_activity()
+        return False
 
     # documents: DocumentsHost (documents_host.py) does the work; these names stay for the tests and `process`
     async def documents_tick(self) -> None:
@@ -1252,6 +1337,10 @@ class App:
                 self.store.add_outgoing(message.conversation_id, message.peer_aci, "note", note, message.id)
             )
             return
+        spoken_in = practice.code if practice is not None else self.voice.language
+        if not has_voice(spoken_in):  # no voice in it (owner, 3 Nov 2026): the text stands, said why once
+            await self._no_voice_note(message, spoken_in)
+            return
         path: Path | None = None
         try:
             language = practice.code if practice is not None else None
@@ -1264,6 +1353,18 @@ class App:
         finally:
             if path is not None:
                 path.unlink(missing_ok=True)
+
+    async def _no_voice_note(self, message: Message, language: str) -> None:
+        """An answer that would be spoken in a language her voice does not speak: /language's sentence as code's note,
+        once for each account and language (the review of 4 Nov: an account whose language had no voice before the
+        update saw voice answers stop with no word why)."""
+        key = f"{NO_VOICE_TOLD_KEY}:{message.peer_aci.lower()}"
+        if self.store.get_state(key) == language:
+            return
+        self.store.set_state(key, language)
+        note = prompts.VOICE_NO_LANGUAGE.format(language=LANGUAGES[language].english)
+        log.info("message %d: no voice in %s; said so once", message.id, language)
+        await self._send(self.store.add_outgoing(message.conversation_id, message.peer_aci, "note", note, message.id))
 
     async def _load_photos(self, message: Message, attachments: list[Attachment]) -> tuple[list[str], list[str]]:
         """Data URIs of the message's photos (at most photo_max_count) and notes about the ones left out."""
@@ -1327,6 +1428,45 @@ class App:
         """/new: learn from the closing conversation soon; the kept video's captions go (memory only)."""
         self.profiler.request_soon()
         self.videos.clear()
+        self.video_offers.clear()
+
+    async def _video_present(self, message: Message, offer: Offer) -> bool:
+        """find_video's first match: texted at once, in the middle of her answer (also on a call), and kept for the
+        user's YES. False when it could not be texted."""
+        return await self._video_show(message, offer, kind="note")
+
+    async def _video_show(self, message: Message, offer: Offer, *, kind: MessageKind) -> bool:
+        """The match shown now as one message of code's own, in reply to `message` (a note during her answer, or the
+        answer to a typed `another`), in her history as code's note that quotes outside text (its title and channel).
+        The time it was stored starts its 2 minutes (and, for the first, the list's 10); a text stored before it is no
+        answer to it. Sending it cancels a device's question that waits (one yes at a time). Whether it went out."""
+        if self.devices is not None and self.devices.pending:
+            self.devices.cancel()
+        busy = self._busy.get(message.id)
+        if busy is not None:
+            busy.cancel()  # it says what is happening: the busy note is not needed
+        with self.store.tx():
+            out_id = self.store.add_outgoing(
+                message.conversation_id, message.peer_aci, kind, match_message(offer), message.id, outside=True
+            )
+            if kind == "command":
+                self.store.set_status(message.id, "answered")
+        offer.shown = iso_to_epoch(self.store.message(out_id).created_at)
+        offer.shown_id = out_id
+        offer.started = offer.started or offer.shown
+        self.video_offers.put(offer)
+        log.info("video match %d of %d shown", offer.index + 1, len(offer.matches))
+        try:
+            sent = await self._send(out_id)
+        except asyncio.CancelledError:  # the call's turn was cut off while it went out: never sent after a restart
+            self.store.set_status(out_id, "ignored")
+            self.video_offers.drop(offer.aci, offer.conversation_id)
+            raise
+        if not sent:  # no match reached the user, so none waits
+            self.store.set_status(out_id, "ignored")
+            self.video_offers.drop(offer.aci, offer.conversation_id)
+            log.warning("a video match's message was not sent; its list is dropped")
+        return sent
 
     async def _tool_note(self, message: Message, text: str) -> None:
         """Code's note during an answer (before a long video is read): sent at once, never in that answer's own history
@@ -1392,18 +1532,37 @@ class App:
     async def _worker(self) -> None:
         while True:
             message_id = await self.queue.get()
-            await self._no_call.wait()  # texts that come in during a call are answered after it
+            # busy from here, also while it holds the message for a call's end and its notes: the mail sorter and the
+            # nightly prune keep away from Ollama (review of 4 Nov, calls-3)
             self._processing = True
-            self._worker_idle.clear()
             try:
-                await self.process(message_id)
-            except Exception:
-                log.exception("message %d failed", message_id)
-                await self._reply_after_failure(message_id)
+                again = True
+                redo = False
+                while again:  # a text a call stopped while she thought (Deep Thinking) is answered again, first
+                    # texts that come in during a call are answered after it (and after its notes, if the sender thinks)
+                    await self.thinking.when_calls_are_over(
+                        self._no_call, self.calls.after_notes if self.calls else None, self._sender_of(message_id)
+                    )
+                    self._worker_idle.clear()
+                    again = False
+                    try:
+                        again = await self.process(message_id, redo=redo)
+                    except Exception:
+                        log.exception("message %d failed", message_id)
+                        await self._reply_after_failure(message_id)
+                    finally:
+                        self._worker_idle.set()  # also while it waits for the call's end: the call's turn never waits
+                    redo = True
             finally:
                 self._processing = False
-                self._worker_idle.set()
                 self.queue.task_done()
+
+    def _sender_of(self, message_id: int) -> str:
+        """The account a queued message is from; "" when it is gone, so no switch is on for it."""
+        try:
+            return self.store.message(message_id).peer_aci
+        except KeyError:
+            return ""
 
     async def _reply_after_failure(self, message_id: int) -> None:
         """Whatever went wrong, the user hears back instead of silence."""
@@ -1425,18 +1584,20 @@ class App:
         *,
         outside: bool = False,
         private: bool = False,
+        once: bool = False,
     ) -> None:
         with self.store.tx():
             out_id = self.store.add_outgoing(
                 message.conversation_id, message.peer_aci, kind, text, message.id, outside=outside, private=private
             )
             self.store.set_status(message.id, status)
-        await self._send(out_id)
+        await self._send(out_id, once=once)
 
     async def _send(self, out_id: int, *, once: bool = False) -> bool:
         """Send a stored message (its footer, code's line, in italics) and mark it; whether it went out. One sent or set
         aside already never goes out again (the resend pass, then a reminder's own retry); `once`: a note for this
-        moment only (the busy note), set aside when it did not go out, so it never follows the answer (review S19)."""
+        moment only (the busy note, the line for an answer on its way), set aside when it did not go out, so it never
+        follows the answer (review S19)."""
         out = self.store.message(out_id)
         if out.status in ("sent", "ignored"):
             return out.status == "sent"
@@ -1447,7 +1608,7 @@ class App:
         text = f"{out.text}\n*{out.footer}*" if out.footer else out.text
         timestamp = await self._deliver(out.peer_aci, text, f"message {out_id}")
         if timestamp is None:
-            self.store.set_status(out_id, "ignored" if once else "failed")
+            self.store.set_status(out_id, "ignored" if once or self.guard.locked else "failed")
             return False
         self.store.mark_sent(out_id, timestamp)
         log.info("message %d sent: %s, %d chars", out_id, out.kind, len(out.text))
@@ -1466,6 +1627,8 @@ class App:
             log.exception("%s: text styles failed; sent as written", what)  # never the text
             message = Styled(text, ())
         for attempt in range(3):
+            if attempt and self.guard.locked:
+                return None  # /lock landed since the failed try: nothing more goes out
             try:
                 return await self.signal.send(aci, message.text, styles=message.styles)
             except UntrustedIdentityError:
@@ -1493,8 +1656,9 @@ class App:
                 await self.signal.typing(aci)
             await asyncio.sleep(self.cfg.typing_refresh_seconds)
 
-    async def _busy_note(self, message: Message) -> None:
-        await asyncio.sleep(self.cfg.busy_note_seconds)
+    async def _busy_note(self, message: Message, *, thinking: bool = False) -> None:
+        wait = self.cfg.busy_note_seconds
+        await asyncio.sleep(self.thinking.busy_wait(wait) if thinking else wait)  # a thinking answer takes longer
         busy = prompts.BUSY.format(name=self.cfg.name)
         out_id = self.store.add_outgoing(message.conversation_id, message.peer_aci, "note", busy, message.id)
         await asyncio.shield(self._send(out_id, once=True))  # once started, finish sending even if the answer arrives
@@ -1511,6 +1675,7 @@ class App:
         """Locked: a running call ends, and one she is placing; a device waiting for a yes waits no more."""
         if self.devices is not None:
             self.devices.cancel()
+        self.video_offers.clear()  # a found video's match waits no more
         if self.calls is not None:  # also while her call for a reminder rings (review C1)
             await self.calls.hangup()
 
@@ -1571,187 +1736,3 @@ class App:
                 await self.model_pin.check()
             except Exception:
                 log.exception("model pin: the check failed")
-
-
-BRIDGE_LOG_BYTES = 10_000_000  # bridge.log is rotated in-process at this size ...
-BRIDGE_LOG_FILES = 5  # ... keeping this many older files (bridge.log.1 to .5)
-STREAM_LOG_BYTES = 10_000_000  # launchd.log (what the bridge writes to stdout and stderr) is emptied over this size
-
-
-def cap_file(fd: int, limit: int) -> bool:
-    """Empty the regular file behind `fd` when it is larger than `limit` (a terminal or a pipe is left alone);
-    whether it was emptied. launchd opens the daemon's log for appending, so writing goes on at the new end."""
-    try:
-        info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode) or info.st_size <= limit:
-            return False
-        os.ftruncate(fd, 0)
-        with contextlib.suppress(OSError):
-            os.lseek(fd, 0, os.SEEK_SET)
-        return True
-    except OSError:
-        return False
-
-
-class CappedStream:
-    """sys.stdout or sys.stderr with its file kept under a size: checked before every write."""
-
-    def __init__(self, stream: TextIO, limit: int) -> None:
-        self._stream = stream
-        self._limit = limit
-
-    def write(self, text: str) -> int:
-        with contextlib.suppress(OSError, ValueError):
-            self._stream.flush()
-            cap_file(self._stream.fileno(), self._limit)
-        return self._stream.write(text)
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self._stream, name)
-
-
-def cap_streams(limit: int) -> None:
-    """launchd.log: the bridge's stdout and stderr (uncaught errors, Python's warnings) go there, outside bridge.log.
-    Emptied now when over `limit`, and before any write that finds it over."""
-    for name in ("stdout", "stderr"):
-        stream = getattr(sys, name)
-        try:
-            fd = stream.fileno()
-        except (OSError, ValueError, AttributeError):
-            continue
-        if stat.S_ISREG(os.fstat(fd).st_mode):
-            cap_file(fd, limit)
-            setattr(sys, name, CappedStream(stream, limit))
-
-
-def setup_logging(
-    log_dir: Path,
-    *,
-    foreground: bool,
-    bridge_cap: int = BRIDGE_LOG_BYTES,
-    stream_cap: int = STREAM_LOG_BYTES,
-) -> None:
-    """bridge.log rotated in-process (10 MB x 5 older files), launchd.log capped in-process: nothing outside the bridge
-    (no newsyslog, no root) touches its logs. Every file it makes is private (umask 077, as the daemon's Umask)."""
-    os.umask(0o077)
-    log_dir.mkdir(parents=True, exist_ok=True)
-    log_dir.chmod(0o700)
-    cap_streams(stream_cap)
-    formatter = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
-    handler = logging.handlers.RotatingFileHandler(
-        log_dir / "bridge.log", maxBytes=bridge_cap, backupCount=BRIDGE_LOG_FILES, encoding="utf-8"
-    )
-    with contextlib.suppress(OSError):
-        (log_dir / "bridge.log").chmod(0o600)  # one made before the umask (an older install)
-    handler.setFormatter(formatter)
-    root = logging.getLogger()
-    root.setLevel(logging.INFO)
-    root.addHandler(handler)
-    if foreground:
-        stream = logging.StreamHandler()
-        stream.setFormatter(formatter)
-        root.addHandler(stream)
-
-
-def signal_client(cfg: Config) -> SignalClient:
-    """signal-cli as configured: with [calls] the JVM build (Homebrew's native one cannot place calls) with Java,
-    IPv4 and the call helper in its environment, subscribed to call events."""
-    if not cfg.calls_enabled:
-        return SignalClient(
-            signal_cli_command(cfg.signal_cli, cfg.bot_number, config_dir=signal_data()), cfg.allowed_acis
-        )
-    cfg.call_socket_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    java_home = cfg.java_home or find_java_home()
-    if java_home is None:
-        log.warning("calls: no Java found with /usr/libexec/java_home; set java_home in [calls] if signal-cli fails")
-    env = call_env(java_home=java_home, tunnel=cfg.call_tunnel, socket_dir=cfg.call_socket_dir, home=Path.home())
-    command = signal_cli_command(str(cfg.call_signal_cli), cfg.bot_number, jvm=True, config_dir=signal_data())
-    return SignalClient(command, cfg.allowed_acis, env=env, calls=True)
-
-
-async def _serve(app: App) -> None:
-    loop = asyncio.get_running_loop()
-    task = asyncio.current_task()
-    if task is not None:
-        for signum in (os_signal.SIGTERM, os_signal.SIGINT):
-            loop.add_signal_handler(signum, task.cancel)
-    try:
-        await app.run()
-    except asyncio.CancelledError:
-        log.info("stopping")
-    finally:
-        if app.calls:
-            await app.calls.hangup()  # before signal-cli stops, so the caller hears the call end
-        await app.signal.stop()
-
-
-def model_pin(cfg: Config, gemma: OllamaGemma) -> ModelPin:
-    """Always: Ollama's own entry for the alias is read at the start, every 5 minutes and before every chat; once a
-    read sees a cloud model, no message goes to it; with model_digest, any other digest pauses answers too."""
-    return ModelPin(gemma.model_entry, cfg.model_digest)
-
-
-def main(argv: list[str] | None = None) -> None:
-    parser = argparse.ArgumentParser(prog="local-assistant", description="Private Signal assistant on the local Gemma")
-    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH)
-    parser.add_argument("--foreground", action="store_true", help="also log to the terminal")
-    parser.add_argument(
-        "--mail-login", metavar="ADDRESS", help="sign in one configured mailbox (device code), then exit"
-    )
-    parser.add_argument(
-        "--mail-only",
-        action="store_true",
-        help="with --mail-login: sign in mail alone, without the mailbox's calendar (Calendars.Read)",
-    )
-    parser.add_argument(
-        "--spotify-login", action="store_true", help="sign in to Spotify (paste the address), then exit"
-    )
-    args = parser.parse_args(argv)
-    if args.mail_only and not args.mail_login:
-        parser.error("--mail-only goes with --mail-login <address>")
-    try:
-        cfg = load_config(args.config)
-    except ConfigError as exc:
-        print(f"local-assistant: {exc}", file=sys.stderr)
-        raise SystemExit(2) from exc
-    if args.mail_login:
-        try:
-            signed_in = asyncio.run(
-                device_login(cfg, args.mail_login, TokenStore(cfg.mail_token_path), mail_only=args.mail_only)
-            )
-        except MailAuthError as exc:
-            print(f"local-assistant: {exc}", file=sys.stderr)
-            raise SystemExit(1) from exc
-        print(f"signed in: {signed_in} (the bridge picks the new sign-in up by itself)")
-        return
-    if args.spotify_login:
-        if not cfg.spotify_enabled:
-            print("local-assistant: add [spotify] with your app's client_id to the config first", file=sys.stderr)
-            raise SystemExit(2)
-        try:
-            tokens = SpotifyTokens(cfg.spotify_token_path, cfg.spotify_client_id)
-            asyncio.run(login(tokens, read=spotify_auth.read_answer, name=cfg.name))
-        except SpotifyAuthError as exc:
-            print(f"local-assistant: {exc}", file=sys.stderr)
-            raise SystemExit(1) from exc
-        return
-    setup_logging(cfg.log_dir, foreground=args.foreground)
-    store = Store.open(cfg.db_path)
-    signal = signal_client(cfg)
-    gemma = OllamaGemma(
-        cfg.ollama_base_url,
-        cfg.model,
-        unreachable_seconds=cfg.gemma_unreachable_seconds,
-        request_timeout=cfg.gemma_request_timeout,
-    )
-    pin = model_pin(cfg, gemma)
-    log.info(
-        "starting: model %s (%s), %d allowed account(s)",
-        cfg.model,
-        "pinned" if cfg.model_digest else "not pinned",
-        len(cfg.allowed_acis),
-    )
-    try:
-        asyncio.run(_serve(App(cfg, store, signal, gemma, Fetcher(), model_pin=pin)))
-    finally:
-        store.close()

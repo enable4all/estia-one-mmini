@@ -1,6 +1,7 @@
 """Her voice in a language while jane's model of it downloads (owner, 25 Oct: "why use supersonic
-while downloading pocket? lets make it clear via a msg, that language is downloading, we need 3 minutes"): no
-Supertonic-3 stand-in for that language's lines, code's notes say so, and one says when the voice is ready."""
+while downloading pocket? lets make it clear via a msg, that language is downloading, we need 3 minutes"): nothing in
+that language is spoken meanwhile (owner, 3 Nov 2026: no other voice says a line), code's notes say so, and one says
+when the voice is ready."""
 
 from __future__ import annotations
 
@@ -13,7 +14,7 @@ import pytest
 from local_assistant import prompts
 from local_assistant import voice_download as download_module
 from local_assistant.language import CODES
-from local_assistant.voice import POCKET_LANGUAGE_FILES, SpokenClip
+from local_assistant.voice import POCKET_LANGUAGE_FILES, VoiceNotSaidError
 from local_assistant.voice_download import LanguageDownload
 from tests.conftest import ME
 from tests.conftest import STRANGER as OTHER  # a second account, as a test name: never one she answers here
@@ -37,11 +38,10 @@ class FakeVoice:
     async def health_when_up(self) -> dict[str, Any] | None:
         return await self.health()
 
-    async def speak(self, text: str, *, language: str | None = None, context: str = "") -> SpokenClip:
+    async def speak(self, text: str, *, language: str | None = None, context: str = "") -> bytes:
         self.spoken.append((text, language))
-        clip = SpokenClip(b"RIFF")
-        clip.stand_in = "F1"  # her model is not ready: Supertonic-3 says the warm-up line, thrown away
-        return clip
+        # her model is not ready: the voice service refuses the warm-up line (409), and no other voice says it
+        raise VoiceNotSaidError("Pocket TTS could not say it")
 
 
 class Clock:
@@ -64,7 +64,6 @@ def follower(
     tmp_path: Path,
     voice: FakeVoice | None,
     *,
-    language_voice: str = "jane",
     in_use: set[str] | None = None,
     locked: list[bool] | None = None,
 ) -> tuple[LanguageDownload, Notes, Clock]:
@@ -79,7 +78,6 @@ def follower(
         voice,
         tmp_path / "voice-models",
         notes,
-        language_voice=language_voice,
         in_use=lambda code: code in used,
         locked=lambda: lock[0],
         clock=clock,
@@ -117,8 +115,7 @@ def test_the_owners_copy() -> None:
         '"Her German voice is ready."'
     )
     assert prompts.VOICE_DOWNLOAD_FAILED.format(language="German") == (
-        "Her German voice could not be downloaded. Voice notes and calls in German use Supertonic-3's voice until a "
-        "later try works."
+        "Her German voice could not be downloaded. Until a later try works, her answers in German come as text."
     )
 
 
@@ -130,7 +127,7 @@ async def test_a_language_whose_model_is_missing_downloads_and_the_reply_says_so
     assert reply == "German is on. " + DOWNLOADING
     assert found.downloading("de")
     await settled(found)
-    # its one warm-up line starts the voice service's fetch; Supertonic-3 said it, and it was thrown away
+    # its one warm-up line starts the voice service's fetch; it is not said (no other voice says it)
     assert voice.spoken == [(prompts.CALL_SPOKEN["de"].now_speaking, "de")]
     assert notes.sent == []
 
@@ -147,24 +144,31 @@ async def test_a_model_already_there_is_no_download(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
-    ("language", "pocket", "language_voice"),
+    ("language", "pocket"),
     [
-        ("ko", "idle", "jane"),  # Korean: Supertonic-3's alone, nothing to download
-        ("de", None, "jane"),  # a voice service without jane's German model: Supertonic-3's F1 as before
-        ("de", "idle", ""),  # [voice] language_voice = "": F1 in the six languages
-        ("de", "ready", "jane"),  # the voice service has it ready (its own folder)
-        ("de", "unavailable", "jane"),  # a try that failed minutes ago: F1 until its next try
+        ("ko", "idle"),  # Korean: no voice at all (owner, 3 Nov 2026), nothing to download
+        ("de", None),  # a voice service without jane's German model: nothing to wait for
+        ("de", "ready"),  # the voice service has it ready (its own folder)
+        ("de", "unavailable"),  # a try that failed minutes ago: no voice in German until its next try
     ],
 )
-async def test_no_download_without_one_to_wait_for(
-    tmp_path: Path, language: str, pocket: str | None, language_voice: str
-) -> None:
+async def test_no_download_without_one_to_wait_for(tmp_path: Path, language: str, pocket: str | None) -> None:
     voice = FakeVoice(pocket, language=language)
-    found, _, _ = follower(tmp_path, voice, language_voice=language_voice, in_use={language})
+    found, _, _ = follower(tmp_path, voice, in_use={language})
     found.warm_up(language)
     assert await found.reply(language, ME) == ""
     assert not found.downloading(language)
     await settled(found)
+
+
+@pytest.mark.parametrize("language", ["ko", "pl", "ru", "ja"])
+async def test_a_language_her_voice_does_not_speak_has_no_warm_up(tmp_path: Path, language: str) -> None:
+    """Owner, 3 Nov 2026: Korean, Polish, Russian and Japanese have no voice: nothing is asked in them."""
+    voice = FakeVoice("idle", language=language)
+    found, notes, _ = follower(tmp_path, voice, in_use={language})
+    found.warm_up(language)
+    await settled(found)
+    assert voice.spoken == [] and voice.reads == 0 and notes.sent == []
 
 
 async def test_english_has_no_warm_up_and_no_download(tmp_path: Path) -> None:
@@ -248,7 +252,7 @@ async def test_nobody_told_gets_no_ready_note(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("state", ["unavailable", "refused", None])
-async def test_a_failed_download_says_so_then_supertonic_speaks_until_a_later_try_works(
+async def test_a_failed_download_says_so_then_her_answers_come_as_text_until_a_later_try_works(
     tmp_path: Path, state: str | None
 ) -> None:
     voice = FakeVoice("loading")
@@ -263,7 +267,8 @@ async def test_a_failed_download_says_so_then_supertonic_speaks_until_a_later_tr
     await found.check()
     failed = prompts.VOICE_DOWNLOAD_FAILED.format(language="German")
     assert notes.sent == [(ME, failed)]
-    # Supertonic-3's F1 speaks German again: voice notes are spoken, calls picked up
+    # no voice in German until a later try works (no other voice says a line): her answers come as text, with no more
+    # download notes; a call is picked up and Pocket TTS is tried at every line
     assert not found.downloading("de") and found.voice_note(ME, "de") == "" and found.call_note(ME, "de") == ""
     await found.check()
     assert notes.sent == [(ME, failed)]  # said once
@@ -306,6 +311,62 @@ async def test_a_voice_service_that_started_again_is_asked_for_a_line_again(tmp_
     await found.check()
     assert voice.spoken == [(prompts.CALL_SPOKEN["de"].now_speaking, "de")] * 2
     assert found.downloading("de")
+
+
+async def test_a_call_wakes_an_idle_model_before_it_is_picked_up(tmp_path: Path) -> None:
+    """The review of 4 Nov: after the voice service restarted on its own, jane's model of the language in use is idle
+    and nothing warmed it up again, so a German call was picked up and its first answer went as text. A ring wakes it:
+    the warm-up's line at once (it loads while the call rings); files missing make a download, and the call rings out
+    with its note."""
+    voice = FakeVoice("idle")
+    fetched(tmp_path, "de")
+    found, _, _ = follower(tmp_path, voice)
+    await found.wake("de", dict(voice.state))
+    await settled(found)
+    assert voice.spoken == [(prompts.CALL_SPOKEN["de"].now_speaking, "de")] and not found.downloading("de")
+    missing = FakeVoice("idle")
+    other, _, _ = follower(tmp_path / "other", missing)
+    await other.wake("de", dict(missing.state))
+    assert other.downloading("de") and other.call_note(ME, "de").startswith("Her German voice is downloading")
+    await settled(other)
+    for language, state in (("de", "ready"), ("de", "loading"), ("en", "idle"), ("ko", "idle")):
+        quiet = FakeVoice(state, language=language)
+        nothing, _, _ = follower(tmp_path / f"{language}-{state}", quiet, in_use={language})
+        await nothing.wake(language, dict(quiet.state))
+        await settled(nothing)
+        assert quiet.spoken == [], (language, state)
+    await found.wake("de", None)  # the voice service did not answer: nothing asked
+    await settled(found)
+    assert len(voice.spoken) == 1
+
+
+async def test_an_idle_model_of_the_language_in_use_is_warmed_up_again(tmp_path: Path) -> None:
+    """The review of 4 Nov: a voice note after the voice service restarted on its own (or after a language model
+    rested after failed runs) found jane's model idle, and its answer went as text. The follower reads the health at
+    most once a minute while one of the six languages is in use with no download under way, and warms an idle model
+    up; a minute after its start at the earliest (the bridge's start warms it up itself)."""
+    voice = FakeVoice("idle")
+    fetched(tmp_path, "de")
+    found, _, clock = follower(tmp_path, voice)
+    await found.check()
+    assert voice.reads == 0 and voice.spoken == []
+    clock.now += download_module.IDLE_POLL_SECONDS
+    await found.check()
+    await settled(found)
+    assert voice.spoken == [(prompts.CALL_SPOKEN["de"].now_speaking, "de")] and not found.downloading("de")
+    reads = voice.reads
+    await found.check()
+    assert voice.reads == reads  # once a minute at most
+    voice.state["pocket_de"] = "ready"
+    clock.now += download_module.IDLE_POLL_SECONDS
+    await found.check()
+    await settled(found)
+    assert len(voice.spoken) == 1
+    english = FakeVoice("idle", language="en")
+    none, _, english_clock = follower(tmp_path / "en", english, in_use={"en"})
+    english_clock.now += download_module.IDLE_POLL_SECONDS
+    await none.check()
+    assert english.reads == 0  # English and the four languages without a voice: no read at all
 
 
 async def test_notes_wait_while_locked(tmp_path: Path) -> None:

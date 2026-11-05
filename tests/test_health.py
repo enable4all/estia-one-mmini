@@ -393,6 +393,13 @@ async def test_the_voice_service_has_a_line_when_voice_is_on(store: Store, logs:
     assert "- Voice: loading its models\n" in await health.report()
     mini.http["http://127.0.0.1:8150/health"] = '{"stt": "ready", "tts": "failed"}'
     assert await health.check() == [Problem("voice", "Voice", "speaking failed to load")]
+    # the review of 4 Nov: a rest after failed or late runs is no failure to load (tried again on its own), and a
+    # voice her ready model leaves out (heart's file missing) is one
+    mini.http["http://127.0.0.1:8150/health"] = '{"stt": "ready", "tts": "resting"}'
+    assert await health.check() == []
+    assert "- Voice: speaking rests after failed runs (tried again on its own)\n" in await health.report()
+    mini.http["http://127.0.0.1:8150/health"] = '{"stt": "ready", "tts": "ready", "voices_left_out": ["heart"]}'
+    assert await health.check() == [Problem("voice", "Voice", "heart cannot speak (an update puts it right)")]
     mini.http["http://127.0.0.1:8150/health"] = ConnectionRefusedError()
     assert await health.check() == [Problem("voice", "Voice", "not answering")]
 

@@ -1474,7 +1474,7 @@ def test_the_deploy_and_doctor_look_for_heart_in_the_same_places() -> None:
 def test_a_build_without_the_commits_heart_file_stops_the_deploy(tmp_path: Path, built: str) -> None:
     """The review of 27 Oct (swift-voice-1): a commit with heart's file whose voice service's build has none in its
     bundle (in neither place), or other bytes than the commit's, stops the deploy before anything goes live: never a
-    release whose heart is Kokoro's with nothing said; each of its files (owner, 29 Oct: the 18M's too), named. A
+    release whose heart is unsaid with nothing said; each of its files (owner, 29 Oct: the 18M's too), named. A
     commit from before heart (no such file) is not asked."""
     root, repo, clock = tmp_path / "root", checkout(tmp_path), Clock()
     installed_plists(root, voice=True)
@@ -1560,11 +1560,10 @@ def test_a_live_release_without_pocket_tts_s_program_gets_it_with_the_same_voice
 
 
 @pytest.mark.skipif(not Path("/usr/bin/plutil").exists(), reason="plutil is macOS only")
-def test_a_failed_pocket_fetch_leaves_eve_to_af_heart_and_the_deploy_goes_on(tmp_path: Path) -> None:
+def test_a_failed_pocket_fetch_leaves_her_answers_as_text_and_the_deploy_goes_on(tmp_path: Path) -> None:
     """Pocket TTS is an extra: a fetch that fails (offline, GitHub down, other bytes) leaves its program out and says
-    so; Kokoro says her lines meanwhile (af_heart, or am_michael for alba and michael: the review of 26 Oct named
-    af_heart alone and eve, her voice before jane), on a call one line each time she answers (owner, 28 Oct, words-04).
-    A commit without Pocket TTS asks for none."""
+    so; her answers come as text meanwhile (owner, 3 Nov 2026: no other voice says a line; until then Kokoro did). A
+    commit without Pocket TTS asks for none."""
     root, repo, clock = tmp_path / "root", checkout(tmp_path), Clock()
     installed_plists(root, voice=True)
     assert deployment(root, repo, FakeMac(root), clock).run() == 0
@@ -1577,10 +1576,7 @@ def test_a_failed_pocket_fetch_leaves_eve_to_af_heart_and_the_deploy_goes_on(tmp
     assert not (release / POCKET).exists() and (release / "tools/voice/.build/release/voice-service").is_file()
     assert any(line.startswith("! Pocket TTS's program was not fetched: ") for line in said)
     assert any(
-        line.endswith(
-            ". Kokoro says her lines meanwhile (on a call, one line each time she answers; the rest comes as a Signal"
-            " text); the next update fetches it again (doctor names it)."
-        )
+        line.endswith(". Her answers come as text meanwhile; the next update fetches it again (doctor names it).")
         for line in said
     )
 
@@ -1721,6 +1717,35 @@ def test_a_deploy_with_a_new_voice_binary_says_when_calls_work(tmp_path: Path) -
     new.voice_health = lambda: {"stt": "ready", "tts": "ready"}
     assert new.run() == 0
     assert said[-1] == "voice: ready"
+
+
+@pytest.mark.skipif(not Path("/usr/bin/plutil").exists(), reason="plutil is macOS only")
+def test_a_deploy_whose_voice_cannot_speak_says_so_and_waits_for_nothing(tmp_path: Path) -> None:
+    """Review of 5 Nov (mac-deploy-voice-end-line-pocket-failed): Pocket TTS is her only voice, so a `--fetch-pocket`
+    that failed leaves it "failed" at every update, and a rest after failed runs is tried again on its own. The end
+    line said loading, checked for 150 s and promised a text that is never sent; it names the state at once."""
+    root, repo, clock = tmp_path / "root", checkout(tmp_path), Clock()
+    installed_plists(root, voice=True)
+    said: list[str] = []
+    for index, (state, line) in enumerate(
+        (
+            ("failed", ownuser.VOICE_FAILED.format(doctor=f"{ownuser.ESTIA} doctor")),
+            ("resting", ownuser.VOICE_RESTING.format(check=f"{ownuser.ESTIA} check (log: {ownuser.ESTIA} logs voice)")),
+        )
+    ):
+        commit(repo, "tools/voice/Sources/voice-service/main.swift", f"// {index}\n", f"voice {index}")
+        said.clear()
+        update = deployment(root, repo, FakeMac(root), clock, said=said)
+
+        def health(state: str = state) -> ownuser.VoiceHealth:
+            return {"stt": "ready", "tts": state}
+
+        update.voice_health = health
+        update.her_calls = lambda: True
+        assert update.run() == 0
+        assert said[-1] == line, state
+        assert ownuser.VOICE_LOADING not in said and ownuser.VOICE_WAITING not in said, state  # no checking again
+        clock.now += 60
 
 
 def test_an_update_reads_her_voice_as_her(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

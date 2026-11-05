@@ -64,7 +64,13 @@ class FakeVoiceService:
         self.transcript = "Turn off the lamp."
         self.duration = 2.4
         self.speech = wav()
-        self.stand_in = ""  # X-Voice-Stand-In on speech once set: another voice said it in the asked one's place
+        # Pocket TTS cannot say the line (owner, 3 Nov 2026: no other voice does): speech is refused, 409 "not_said"
+        self.unsaid = False
+        # a voice service from before 3 Nov 2026, with Kokoro and Supertonic-3: once set, X-Voice-Stand-In on speech
+        # (another voice said it in Pocket TTS's place), except an English line asked with "kokoro": false (409), unless
+        # `stands_in_always` (Supertonic-3's F1 in another language never read the field)
+        self.stand_in = ""
+        self.stands_in_always = False
         self.health: dict[str, object] = {"stt": "ready", "tts": "ready"}
         self.languages: list[str] | None = None  # in the health once set (a service that can do languages)
         self.vad: str | None = None  # the detector's state in the health once set ("ready", "loading", ...)
@@ -141,8 +147,11 @@ class FakeVoiceService:
                 elif path == "/v1/audio/speech":
                     time.sleep(service.speech_delay)
                     stand_in = {"X-Voice-Stand-In": service.stand_in} if service.stand_in else {}
-                    if stand_in and language == "en" and json.loads(body).get("kokoro") is False:
-                        self._answer(409, b'{"error":"no_stand_in"}')  # Kokoro not asked: nothing said (calls-03)
+                    no_kokoro = language == "en" and json.loads(body).get("kokoro") is False
+                    if service.unsaid:
+                        self._answer(409, b'{"error":"not_said"}')  # Pocket TTS could not say it: nobody does
+                    elif stand_in and no_kokoro and not service.stands_in_always:
+                        self._answer(409, b'{"error":"no_stand_in"}')  # an older service: Kokoro not asked
                     else:
                         self._answer(200, service.speech, "audio/wav", stand_in)
                 else:

@@ -28,6 +28,7 @@ from datetime import time as day_time
 from zoneinfo import ZoneInfo
 
 from local_assistant import prompts
+from local_assistant.config import has_voice
 from local_assistant.gemma import GemmaClient, GemmaError
 from local_assistant.initiative import in_quiet_hours
 from local_assistant.language import LANGUAGES, negations
@@ -443,7 +444,8 @@ def recap_other(code: str, level: str, line: str) -> str:
 def listing_lines(last: tuple[str, str] | None) -> str:
     """The offered languages ("• Nederlands, Dutch (nl)", the last one marked), then those not offered yet."""
     lines = [
-        f"• {prompts.language_label(code)} ({code}){prompts.BABBLE_LAST if last and last[0] == code else ''}"
+        f"• {prompts.language_label(code)} ({code}){'' if has_voice(code) else prompts.NO_VOICE_MARK}"
+        f"{prompts.BABBLE_LAST if last and last[0] == code else ''}"
         for code in OFFERED
     ]
     lines += [prompts.BABBLE_NOT_YET_LINE.format(name=prompts.language_label(code), code=code) for code in NOT_YET]

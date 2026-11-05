@@ -119,37 +119,28 @@ def test_the_voice_line_names_calls_only_with_calls() -> None:
     # voice without [calls] is a valid install (calls need voice, voice does not need calls): every line true there
     alone = prompts.inventory(offered(TOOL_SCHEMAS), voice=True).helpers[0]
     assert alone == (
-        "• Voice service: voice notes turned into text (WhisperKit) and answers spoken (Pocket TTS, with Kokoro and "
-        "Supertonic-3 for what it cannot say), all on the Mac"
+        "• Voice service: voice notes turned into text (WhisperKit) and answers spoken (Pocket TTS, in English,"
+        " Spanish, Italian, Portuguese, Dutch, German and French only), all on the Mac"
     )
     with_calls = prompts.inventory(offered(TOOL_SCHEMAS), voice=True, calls=True).helpers[0]
     assert with_calls.startswith("• Voice service: voice notes and calls turned into text (WhisperKit)")
+    assert len(with_calls) <= 190  # the languages named (3 Nov 2026), one Signal line on a phone's width or two
 
 
-@pytest.mark.parametrize(
-    ("english", "languages", "spoken"),
-    [
-        ("heart", "jane", "Pocket TTS, with Kokoro and Supertonic-3 for what it cannot say"),
-        ("eve-full", "jane", "Pocket TTS, with Kokoro and Supertonic-3 for what it cannot say"),  # eve's other name
-        ("alba", "", "Pocket TTS and Kokoro in English, Supertonic-3 in the other languages"),
-        ("af_bella", "jane", "Kokoro in English, Pocket TTS and Supertonic-3 in the other languages"),
-        ("am_michael", "", "Kokoro in English, Supertonic-3 in the other languages"),
-    ],
-)
-def test_the_voice_line_names_who_speaks_from_the_voices_in_use(english: str, languages: str, spoken: str) -> None:
-    """Review of 0.9.8, guards-6: the line named Kokoro and Supertonic-3 only, while Pocket TTS speaks heart and jane,
-    the default voices, and her rules treat a program not listed as absent. Pocket TTS for its English voices and for
-    six languages in jane (`[voice] language_voice`), Kokoro for an English line Pocket TTS cannot say and for its own
-    voices, Supertonic-3 for the other languages."""
-    line = prompts.inventory(offered(TOOL_SCHEMAS), voice=True, english_voice=english, language_voice=languages)
-    assert line.helpers[0] == (
-        f"• Voice service: voice notes turned into text (WhisperKit) and answers spoken ({spoken}), all on the Mac"
-    )
-    assert len(line.helpers[0]) <= 170
+def test_the_voice_line_names_only_pocket_and_the_languages_it_speaks() -> None:
+    """Review of 0.9.8, guards-6: the line names the engine that speaks, as her rules treat a program not listed as
+    absent. Owner, 3 Nov 2026: Pocket TTS is her only voice (Kokoro and Supertonic-3 removed), in English and the six
+    languages of its own models: Korean, Polish, Russian and Japanese are not named, so she never claims a voice in
+    them."""
+    line = prompts.inventory(offered(TOOL_SCHEMAS), voice=True).helpers[0]
+    assert "Kokoro" not in line and "Supertonic" not in line
+    assert not any(name in line for name in ("Korean", "Polish", "Russian", "Japanese"))
 
 
-async def test_a_voice_chosen_with_voice_is_named_in_her_list(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """/voice af_bella moves her answers to Kokoro: her rules and /tools follow from the next answer."""
+async def test_a_voice_chosen_with_voice_leaves_her_list_as_it_is(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """/voice michael changes her English voice, never who speaks: her rules and /tools keep the Pocket TTS line."""
     from tests.fakes.fake_voice import FakeVoiceService
     from tests.test_app import T0 as NOW  # the app's own tests' time: a message from conftest's T0 is missed
     from tests.test_app import deliver, her_rules, sent, start, stop, until
@@ -157,13 +148,13 @@ async def test_a_voice_chosen_with_voice_is_named_in_her_list(tmp_path: Path, mo
     with FakeVoiceService() as service:
         harness = await start(tmp_path, monkeypatch, FakeGemma(), voice_url=service.url)
         try:
-            pocket = "answers spoken (Pocket TTS, with Kokoro and Supertonic-3 for what it cannot say)"
+            pocket = (
+                "answers spoken (Pocket TTS, in English, Spanish, Italian, Portuguese, Dutch, German and French only)"
+            )
             assert pocket in her_rules(harness.app)
-            deliver(harness.folder, "/voice af_bella", NOW)
-            await until(lambda: any(line.startswith("af_bella is on") for line in sent(harness.folder)))
-            kokoro = "answers spoken (Kokoro in English, Pocket TTS and Supertonic-3 in the other languages)"
-            assert kokoro in her_rules(harness.app) and pocket not in her_rules(harness.app)
-            assert kokoro in harness.app.status_host.inventory_text()
+            deliver(harness.folder, "/voice michael", NOW)
+            await until(lambda: any(line.startswith("Michael is on") for line in sent(harness.folder)))
+            assert pocket in her_rules(harness.app) and pocket in harness.app.status_host.inventory_text()
         finally:
             await stop(harness)
 
@@ -184,7 +175,10 @@ def test_the_page_line_says_a_pages_text_is_kept() -> None:
     # read_link keeps a page's text in her database for later searches (Tools._read_link)
     line = prompts.TOOL_LINES["read_link"]
     assert "nothing saved" not in line
-    assert line == "a page or a YouTube video you send, summarised; a page's text kept for later searches"
+    assert line == (
+        "a page or a YouTube video you send, or one I found after you type YES, summarised; a page's text kept for "
+        "later searches"
+    )
     pages = "earlier conversations and the pages you sent, searched by words or names"
     assert prompts.TOOL_LINES["search_history"] == pages
 
@@ -205,6 +199,26 @@ def test_no_line_names_captions() -> None:
 def test_she_can_call_the_user_says_the_reminder_line() -> None:
     # main, 24 Oct: asked "can you call me?" she said "I can't initiate a call" 4 of 4 times, while wake-up calls are on
     assert prompts.TOOL_LINES["set_reminder"].startswith("a call to you or a text at the time you ask for")
+
+
+@pytest.mark.parametrize("code", ["ko", "pl", "ru", "ja"])
+def test_in_a_language_with_no_voice_her_tools_name_no_wake_up_call(code: str) -> None:
+    """Review of 4 Nov, DLG-0983-06: her tools' list still said a reminder is "a call to you or a text" in the four
+    languages her voice does not speak, where her call for a reminder is refused (`can_place`: no_voice): there a
+    "call me" reminder is a text, as without wake-up calls."""
+    voiced = prompts.inventory(offered(REMINDER_SCHEMAS), calls=True, wake_calls=True)
+    assert "a call to you or a text" in "\n".join(voiced.tools)
+    silent = prompts.inventory(offered(REMINDER_SCHEMAS), calls=True, wake_calls=True, language=code)
+    assert silent == prompts.inventory(offered(REMINDER_SCHEMAS), calls=True)
+    assert "wake-up" not in "\n".join([*silent.tools, *silent.helpers])
+
+
+@pytest.mark.parametrize("code", ["en", "es", "it", "pt", "nl", "de", "fr"])
+def test_in_a_language_with_a_voice_her_tools_are_listed_as_they_were(code: str) -> None:
+    schemas = offered(REMINDER_SCHEMAS)
+    assert prompts.inventory(schemas, calls=True, wake_calls=True, language=code) == prompts.inventory(
+        schemas, calls=True, wake_calls=True
+    )
 
 
 def test_without_wake_up_calls_the_reminder_lines_name_no_call() -> None:

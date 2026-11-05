@@ -12,6 +12,7 @@ from local_assistant.babble import OFFERED
 from local_assistant.brain import Brain
 from local_assistant.context import ContextBuilder
 from local_assistant.documents import shown_folder
+from local_assistant.language import LANGUAGES
 from local_assistant.profile import Profile
 from local_assistant.store import Store
 from local_assistant.tools import Tools
@@ -132,6 +133,37 @@ def test_with_wake_up_calls_the_calls_line_says_she_calls_too() -> None:
         )
 
 
+NO_VOICE = ["ko", "pl", "ru", "ja"]  # her voice speaks English and the six of Pocket TTS only (config.has_voice)
+
+
+@pytest.mark.parametrize("code", NO_VOICE)
+def test_in_a_language_with_no_voice_the_list_offers_no_call_and_names_the_welcomes_line(code: str) -> None:
+    """Review of 4 Nov, DLG-0983-06: /help and her rules, which carry this list word for word, still said "call me on
+    Signal" and offered wake-up calls in Korean, Polish, Russian and Japanese, where every call rings out and her own
+    call for a reminder is refused. The calls line is the welcome's (the same fact, the same words); the reminders are
+    texts; nothing else of the list moves."""
+    english = LANGUAGES[code].english
+    lines = prompts.capabilities(**EVERYTHING, language=code)
+    silent = f"• Calls: {prompts.VOICE_NO_LANGUAGE.format(language=english)}"
+    welcome = prompts.welcome(name="Estia", calls=True, language=code)
+    assert silent.removeprefix("• ") in [line.removeprefix("• ") for line in welcome.splitlines()]  # the same words
+    assert not any("wake-up" in line or "call me" in line.lower() or "Interrupt:" in line for line in lines), lines
+    # the list of an install without wake-up calls, its calls line the welcome's: nothing else moves
+    without_wake_up = prompts.capabilities(**{**EVERYTHING, "wake_calls": False})
+    assert lines == [silent if line.startswith("• Calls: ") else line for line in without_wake_up]
+
+
+@pytest.mark.parametrize("code", ["en", "es", "it", "pt", "nl", "de", "fr"])
+def test_in_a_language_with_a_voice_the_list_is_byte_for_byte_as_it_was(code: str) -> None:
+    assert prompts.capabilities(**EVERYTHING, language=code) == prompts.capabilities(**EVERYTHING)
+
+
+def test_without_calls_set_up_a_language_with_no_voice_adds_no_calls_line() -> None:
+    lines = prompts.capabilities(reminders=True, wake_calls=True, language="ja")
+    assert not any(line.startswith("• Calls") for line in lines)
+    assert not any("wake-up" in line for line in lines)  # wake_calls alone never names one there
+
+
 def test_wake_up_calls_and_the_digest_follow_what_is_set_up() -> None:
     only_texts = prompts.capabilities(reminders=True)
     assert any(line.startswith("• Reminders: ") for line in only_texts)
@@ -222,7 +254,9 @@ def test_mail_says_every_change_it_never_makes() -> None:
 def test_without_calls_the_security_line_names_no_call() -> None:
     """Off parts are never named: /lock's line says what it stops without naming calls."""
     security = prompts.capabilities(security="hardened")[-1]
-    assert security.startswith("• Security: /lock stops everything at once, until /unlock from the same device.")
+    assert security.startswith(
+        "• Security: /lock stops everything at once, until /unlock from the same device or your phone."
+    )  # owner, 3 Nov: the phone ends any lock of its account
     assert "call" not in security
 
 

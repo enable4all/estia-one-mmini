@@ -904,6 +904,8 @@ def test_the_firewall_question_names_what_would_stop_answering(tmp_path: Path) -
     run.run()
     question = next(q for q in run.questions if "Turn on the firewall?" in q)
     assert "node on port 8170" in question and "doctor" in question.casefold()
+    assert "Your programs listening for other machines now: node on port 8170." in question
+    assert harden.OTHERS_NOT_LISTED in question  # fix review 9: lsof as you lists only your own
     node = "/opt/homebrew/Cellar/node/24.1.0/bin/node"
     assert (SUDO, "-n", SOCKETFILTERFW, "--add", node) in host.asked
     assert (SUDO, "-n", SOCKETFILTERFW, "--unblockapp", node) in host.asked
@@ -915,6 +917,10 @@ def test_the_firewall_question_without_listeners_says_doctor_names_them_later(tm
     run.run()
     question = next(q for q in run.questions if "Turn on the firewall?" in q)
     assert "doctor" in question.casefold()
+    # fix review 9: "Nothing listens" claimed more than lsof as you can see
+    assert "Nothing listens" not in question and "No program of yours listens for other machines now" in question
+    assert harden.OTHERS_NOT_LISTED == "other accounts' listening programs are not listed here"
+    assert harden.OTHERS_NOT_LISTED in question
 
 
 def test_a_listener_whose_program_is_unknown_is_named_with_the_way_to_allow_it(tmp_path: Path) -> None:
@@ -1518,5 +1524,7 @@ def test_in_the_window_the_removal_is_checked_by_roots_listing_of_your_rules(tmp
     said: list[object] = []
     windowed(after, home, said, ask=lambda question, default: "zz-rule" in question).run()
     assert any(argv[:3] == (SUDO, "-n", hostsec.RM) for argv in after.asked)
-    asks, check = "✓ sudo asks for your password now.", "! sudo: check it in a new terminal."
+    asks = "✓ sudo asks for your password now."
+    check = "! sudo: not confirmed. In a new Terminal window, /usr/bin/sudo -v should ask for your Mac password."
     assert (asks in said, check in said) == ((True, False) if left else (False, True))
+    assert "! sudo: check it in a new terminal." not in said  # W18: the line names the command to type

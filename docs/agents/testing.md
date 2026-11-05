@@ -12,7 +12,7 @@ paths:
 ## Commands
 
 - Hermetic suite: `env -u LANG uv run pytest -q` and `LANG=C uv run pytest -q` pass as the plain run does (`tests/test_hermetic.py` runs the helper-environment tests under both, and greps the code for system paths read outside `Host.path()`)
-- Before every commit: `scripts/verify.sh` (in AGENTS.md, Commands). Its voice step runs `tools/voice`'s own-account and offline Pocket suites, and its other offline suites that hold a promise (call audio only in memory, the 27.0.x warning, a request's "kokoro": false), only when `tools/voice` differs from main (the voice package's first build fetches WhisperKit and FluidAudio); the whole `cd tools/voice && swift test` stays a step by hand (`docs/agents/calls.md`).
+- Before every commit: `scripts/verify.sh` (in AGENTS.md, Commands). Its voice step runs `tools/voice`'s own-account and offline Pocket suites, and its other offline suites that hold a promise (call audio only in memory, and until the voice service's step of 3 Nov 2026 the 27.0.x warning and a request's "kokoro": false), only when `tools/voice` differs from main (the voice package's first build fetches WhisperKit and FluidAudio); the whole `cd tools/voice && swift test` stays a step by hand (`docs/agents/calls.md`).
 
 ## Gotchas
 

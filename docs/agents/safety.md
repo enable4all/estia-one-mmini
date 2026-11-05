@@ -6,7 +6,7 @@ These hold in every area and load at every start; each area's rule file has the 
 
 - Only ACIs in `allowed_acis` reach Gemma or receive anything; `SignalClient` refuses other recipients in code.
 - Calls: only allowed ACIs are answered; anyone else is ignored, never rejected (a rejection sends them something). Details: `calls.md`.
-- A message from a device of the user's not known yet is held at envelope time: not stored, not read, no receipt. `/lock` stops everything until `/unlock` from the same device. Details: `core.md`.
+- A message from a device of the user's not known yet is held at envelope time: not stored, not read, no receipt. Only the phone (device 1) allows or forgets a device. `/lock` stops everything until `/unlock` from the same device or that account's phone. Details: `core.md`.
 
 ## Outside text
 
@@ -37,4 +37,4 @@ These hold in every area and load at every start; each area's rule file has the 
 - The model always runs on the Mac: a cloud model is a config error; the alias is checked against Ollama's own entry before every chat. Ollama's official build, or the app if the person chooses it; never Homebrew's or one someone other than its owner may control. Details: `core.md`, `own-user-deploy.md`.
 - In her own user, her services run only from /usr/local/estia as `_estia`, never from the checkout; on a new install her Ollama too (/usr/local/estia/ollama, 127.0.0.1:8151). Details: `own-user-deploy.md`.
 - Never run sudo yourself, and never type, see or ask for the Mac password: admin rights come only from the person, in macOS's own password box or their own Terminal. Root-touching code takes `--dry-run` and `ESTIA_ROOT`. Details: `own-user-deploy.md`.
-- Tests never read Estia's own system paths or installed tools: a system path goes through `Host.path()`, a fixed tool path under `ESTIA_TEST_ROOT`; what is still read as the Mac has it: AGENTS.md (Conventions). Details: `testing.md`.
+- Tests never read Estia's system paths or installed tools: how, and what is still read as the Mac has it: AGENTS.md (Conventions). Details: `testing.md`.

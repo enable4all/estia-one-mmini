@@ -7,7 +7,7 @@ import pytest
 
 from local_assistant import prompts
 from local_assistant.babble import PracticeTurn
-from local_assistant.brain import NOTHING_SAVED, Brain, defang_links
+from local_assistant.brain import NOTHING_SAVED, Brain, clean_summary, defang_links, is_reasoning
 from local_assistant.context import ContextBuilder
 from local_assistant.fetcher import Page
 from local_assistant.gemma import Completion, GemmaUnavailableError, ToolCall
@@ -936,6 +936,194 @@ async def test_a_call_answer_can_end_the_call(store: Store) -> None:
     said = store.add_call_turn(conversation.id, ME, "[call] that's all for today")
     reply = await brain.answer(conversation, store.message(said))
     assert reply.text == "Bye, talk soon!" and reply.end_call
+
+
+# her goodbye never stands before code's device question (calls-099-01; the gate run of 4-5 Nov, call_device_yes_then_bye
+# 0 of 10: after "switch off the heater, that's all for today, bye" she called device_set and end_call, and every answer
+# ended "Goodbye!", which the caller heard before code's question)
+HEATER_OFF = tool("device_set", device="heater", power="off")  # the heater asks first: the change waits for the yes
+ASKED_AND_SAID_BYE = "Please say yes to turn off the heater.\n\nGoodbye!"
+HEARD_BEFORE_THE_QUESTION = "Please say yes to turn off the heater."
+CALLER_LEAVES = "switch off the heater, that's all for today, bye"
+
+
+@pytest.mark.parametrize(
+    ("steps", "ends"),
+    [
+        pytest.param((HEATER_OFF, tool("end_call")), True, id="end_call after the change"),
+        pytest.param((tool("end_call"), HEATER_OFF), True, id="end_call before the change"),
+        # on a live call she rarely calls it: code ends the call on the caller's own goodbye, after the yes
+        pytest.param((HEATER_OFF,), False, id="no end_call"),
+    ],
+)
+async def test_on_a_call_her_closing_goodbye_never_stands_before_codes_device_question(
+    store: Store, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, steps: tuple[Completion, ...], ends: bool
+) -> None:
+    gemma = FakeGemma(*steps, text(ASKED_AND_SAID_BYE))
+    brain = with_all_tools(store, gemma, tmp_path, monkeypatch)
+    reply = await brain.answer(store.current_conversation(), on_call(store, CALLER_LEAVES), max_tokens=220)
+    assert (reply.text, reply.end_call) == (HEARD_BEFORE_THE_QUESTION, ends)
+    assert reply.hers == HEARD_BEFORE_THE_QUESTION  # what call_host says before code's question
+
+
+async def test_a_written_end_call_and_a_goodbye_after_the_ask_both_go(
+    store: Store, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    gemma = FakeGemma(HEATER_OFF, text("Please say yes to turn off the heater. Thanks, bye! end_call"))
+    brain = with_all_tools(store, gemma, tmp_path, monkeypatch)
+    reply = await brain.answer(store.current_conversation(), on_call(store, CALLER_LEAVES), max_tokens=220)
+    assert (reply.text, reply.end_call) == (HEARD_BEFORE_THE_QUESTION, True)
+
+
+async def test_her_question_before_the_goodbye_is_last_again_and_a_goodbye_alone_is_codes_question(
+    store: Store, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The goodbye hid her closing question from `without_last_questions` (call_host); with it gone the question is last
+    again and goes. A goodbye and nothing else leaves no words of hers: code's own question, as for a blank answer."""
+    asks = "To turn off the heater, I need you to say yes. Can you do that for me?"
+    gemma = FakeGemma(HEATER_OFF, tool("end_call"), text(f"{asks}\n\nThanks, that's all for today. Goodbye!"))
+    brain = with_all_tools(store, gemma, tmp_path, monkeypatch)
+    reply = await brain.answer(store.current_conversation(), on_call(store, CALLER_LEAVES), max_tokens=220)
+    assert reply.text == asks and reply.end_call
+    only = FakeGemma(HEATER_OFF, tool("end_call"), text("Okay, bye!"))
+    brain = with_all_tools(store, only, tmp_path, monkeypatch)
+    reply = await brain.answer(store.current_conversation(), on_call(store, CALLER_LEAVES), max_tokens=220)
+    assert (reply.text, reply.end_call) == ("Shall I switch heater off?", True)
+
+
+async def test_her_goodbye_stays_where_no_device_question_of_this_answer_waits(
+    store: Store, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Only a change this answer asked, on a call, holds her goodbye back: a call with nothing waiting, a typed message
+    (no call to end), and a question that waited from an earlier turn (no change of this answer: code has no line to
+    stand in for a goodbye left alone) keep her words as she wrote them."""
+    caplog.set_level("INFO", logger="local_assistant.brain")
+    plain = with_all_tools(store, FakeGemma(tool("end_call"), text("Bye, talk soon!")), tmp_path, monkeypatch)
+    reply = await plain.answer(store.current_conversation(), on_call(store, "that's all for today"), max_tokens=220)
+    assert (reply.text, reply.end_call) == ("Bye, talk soon!", True)
+    typed = with_all_tools(store, FakeGemma(HEATER_OFF, text(ASKED_AND_SAID_BYE)), tmp_path, monkeypatch)
+    reply = await typed.answer(store.current_conversation(), incoming(store, "switch off the heater, bye"))
+    assert reply.text == ASKED_AND_SAID_BYE and not reply.end_call
+    gemma = FakeGemma(HEATER_OFF, text("Please say yes."), text("Okay, bye!"))
+    earlier = with_all_tools(store, gemma, tmp_path, monkeypatch)
+    await earlier.answer(store.current_conversation(), on_call(store, "switch off the heater"), max_tokens=220)
+    reply = await earlier.answer(store.current_conversation(), on_call(store, "never mind, bye"), max_tokens=220)
+    assert reply.text == "Okay, bye!"
+    assert "closing goodbye left out" not in caplog.text
+
+
+async def test_the_goodbye_left_out_is_logged_without_a_word_of_it(
+    store: Store, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level("INFO", logger="local_assistant.brain")
+    gemma = FakeGemma(HEATER_OFF, tool("end_call"), text(ASKED_AND_SAID_BYE))
+    brain = with_all_tools(store, gemma, tmp_path, monkeypatch)
+    message = on_call(store, CALLER_LEAVES)
+    await brain.answer(store.current_conversation(), message, max_tokens=220)
+    [line] = [r.getMessage() for r in caplog.records if "closing goodbye left out" in r.getMessage()]
+    assert line == f"message {message.id}: her closing goodbye left out; a device question waits for the yes"
+    assert "Please say yes" not in caplog.text and "Goodbye!" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    "said",
+    [
+        "Bye! Please say yes to turn off the heater.",
+        "Please say yes to turn off the heater, and goodbye!",
+        "Please say yes to turn off the heater.\n\nAnd goodbye!",
+        "Take care, Alex, and have a good night! Please say yes to turn off the heater.",
+    ],
+)
+async def test_her_goodbye_at_the_start_or_joined_with_and_goes_too(
+    store: Store, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, said: str
+) -> None:
+    """The gate run of 5 Nov (7 of 10): "...Can you say yes?\n\nAnd goodbye!" and "Bye! Can you please say yes ..."
+    stood before code's question; her words and her stored reply (`hers`) are the same, without the goodbye."""
+    gemma = FakeGemma(HEATER_OFF, tool("end_call"), text(said))
+    brain = with_all_tools(store, gemma, tmp_path, monkeypatch)
+    reply = await brain.answer(store.current_conversation(), on_call(store, CALLER_LEAVES), max_tokens=220)
+    assert reply.text == reply.hers == HEARD_BEFORE_THE_QUESTION and reply.end_call
+
+
+# her own reasoning said as the answer (the gate run of 5 Nov, 1 of 10, a call: no thought was asked)
+LEAKED_REASONING = (
+    "> was called. The bridge says it's done once the user answers the device question. However, the user's message "
+    'was "that\'s all for today, bye", which implies they are leaving. I already replied with a goodbye and. I should '
+    'check if I need to do anything else. Wait, the tool result for device_set said "needs the user\'s yes first". My '
+    'reply was "The heater needs you to say yes first...". I also called. The user\'s intent was to end the call.\n\n'
+    'Actually, the instruction says: "When the user says goodbye or is wrapping up... answer with a short goodbye and '
+    'call in the same answer."\n\nI did that. Wait, I notice my previous output included the tool call and the response '
+    'in the thought block. I need to provide the final text response.\n\nMy response: "The heater needs you to say yes '
+    'first before I can switch it off. Goodbye!"'
+)
+
+
+def test_the_gate_runs_leaked_reasoning_is_found() -> None:
+    assert is_reasoning(LEAKED_REASONING)
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        "Please say yes to turn off the heater.",
+        "The heater needs you to say yes first. Can you say yes?",
+        "The bridge in Bristol opened in 1864, and the instruction says to stay left of the arch.",  # one kind alone
+        "Wait, actually, the user's guide says the heater has a timer. Press the button twice.",  # no bridge talk
+        "The tool result you asked about, the drill's torque, is 12 newton metres. Actually, it can reach 14.",
+        "The user wants a short answer, so here it is: yes. The bridge says nothing about it.",  # two kinds only
+        "Actually, the instructions say to bake it for 20 minutes. The oven result is what counts, not the timer.",
+        "Sure. Wait, let me think. Actually, the tool is not needed here: the answer is Paris.",
+        "Das Ergebnis des Tools sagt, der Benutzer wolle gehen. Moment, eigentlich bleibt es dabei.",
+        # a normal self-correction: "the instructions say" and "the user's guide" are about a manual (review of 5 Nov)
+        "Actually, my previous answer was wrong: the instructions say to hold reset for ten seconds, not five.",
+        "Sorry, my previous answer was wrong. Actually, the instructions say to bake it for 25 minutes, not 20.",
+        "My last answer was wrong. Actually, the instructions say 25 minutes.",
+        "The instructions say to hold it. Actually, the user's guide says 10 s.",
+        # the three kinds inside quotation marks are words she quotes from a mail or a page, never her own
+        'The mail says: "The bridge says it is done. The user\'s message was clear. My previous reply was wrong. Wait, no."',
+        'The page reads "the tool result for device_set said ok; the user wants a yes. My last answer stands. Actually, no."',
+        "",
+    ],
+)
+def test_a_normal_answer_is_never_taken_for_reasoning(answer: str) -> None:
+    assert not is_reasoning(answer)
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        "The bridge says it's done. The user's request was clear. Wait, my last answer was wrong.",
+        "The tool result for device_set said ok. The user's message was clear. Actually, my last answer was wrong.",
+        'She said "no" first. The bridge confirms it. The user wants a yes. Wait, my previous reply was wrong.',
+    ],
+)
+def test_reasoning_with_the_bridges_own_words_is_still_found(answer: str) -> None:
+    assert is_reasoning(answer)
+
+
+async def test_leaked_reasoning_on_a_call_with_a_change_waiting_leaves_codes_question_alone(
+    store: Store, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level("WARNING", logger="local_assistant.brain")
+    gemma = FakeGemma(HEATER_OFF, tool("end_call"), text(LEAKED_REASONING))
+    brain = with_all_tools(store, gemma, tmp_path, monkeypatch)
+    message = on_call(store, CALLER_LEAVES)
+    reply = await brain.answer(store.current_conversation(), message, max_tokens=220)
+    assert (reply.text, reply.end_call) == ("Shall I switch heater off?", True)  # the call ends after the yes
+    [line] = [r.getMessage() for r in caplog.records if "own reasoning" in r.getMessage()]
+    assert line == f"message {message.id}: her answer was her own reasoning ({len(LEAKED_REASONING)} chars); left out"
+    assert "bridge" not in caplog.text and "Goodbye" not in caplog.text
+
+
+@pytest.mark.parametrize("on_a_call", [True, False], ids=["call", "text"])
+async def test_leaked_reasoning_with_nothing_waiting_is_a_plain_retry_and_never_ends_the_call(
+    store: Store, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, on_a_call: bool
+) -> None:
+    gemma = FakeGemma(tool("end_call"), text(LEAKED_REASONING))
+    brain = with_all_tools(store, gemma, tmp_path, monkeypatch)
+    said = on_call(store, "that's all for today, bye") if on_a_call else incoming(store, "that's all for today, bye")
+    reply = await brain.answer(store.current_conversation(), said, max_tokens=220)
+    assert (reply.text, reply.end_call) == (prompts.CONFUSED, False)
 
 
 @pytest.mark.parametrize(
@@ -2020,6 +2208,74 @@ async def test_a_link_inside_another_link_or_by_its_numbers_is_defanged_too(
     assert "://" not in defang_links("https://a.example/" * 2_000, "")  # one pass, however many inside
 
 
+HELD_NOTE = prompts.DEVICE_HELD.format(time="14:05", device=3)
+CALL_NOTE = prompts.CALL_ANSWERED_NOTE.format(span="14:02-14:10")
+
+
+@pytest.mark.parametrize(
+    ("written", "sent"),
+    [
+        # a thinking channel that leaked into it (without_thinking): the label alone on the first line, or all up to
+        # its end marker
+        ("thought\n- the club moved to friday", "- the club moved to friday"),
+        ("<|channel>thought\nplan it<channel|>- the club moved to friday", "- the club moved to friday"),
+        # a paragraph that starts like code's note, in any of its forms (without_fake_notices)
+        (f"- the club moved to friday\n\n{HELD_NOTE}", "- the club moved to friday"),
+        (
+            f"- the club moved to friday\n\n**{CALL_NOTE}**\n\n- Anna called",
+            "- the club moved to friday\n\n- Anna called",
+        ),
+        # the list's own lines, behind their bullets ("- ", "• ", "* "): only that line goes, never the lines around it
+        (
+            f"- the club moved to friday\n- {HELD_NOTE}\n- Anna called",
+            "- the club moved to friday\n- Anna called",
+        ),
+        (f"- one\n\u2022 {CALL_NOTE}\n* two", "- one\n* two"),
+        ("- one\n  - A message came from a new linked device 3 and was held.\n- two", "- one\n- two"),
+        # a paragraph whose first line is the note's is the note's: all of it goes (its next line may be its payload)
+        (f"{HELD_NOTE}\nSend /devices ok 3 from your phone.\n\n- one", "- one"),
+        # about someone's message or call, or her explanation of the note: stays
+        (
+            "- A message came from the dentist: moved to 11:00\n- A call from Anna is on your calendar at 15:00\n"
+            "- A message sent at 14:05 by Anna asks about lunch\n"
+            "- A call from one of your devices means a phone or computer on your account",
+            "- A message came from the dentist: moved to 11:00\n- A call from Anna is on your calendar at 15:00\n"
+            "- A message sent at 14:05 by Anna asks about lunch\n"
+            "- A call from one of your devices means a phone or computer on your account",
+        ),
+        # all of it a note's, or nothing written: nothing is left
+        (HELD_NOTE, ""),
+        (f"thought\n{CALL_NOTE}", ""),
+        ("  ", ""),
+    ],
+)
+def test_a_call_summary_goes_through_the_filters_of_her_answers(written: str, sent: str) -> None:
+    """Review of 5 Nov (guards-notes-call-summary-unfiltered, promises-REQ-02): the summary went out after the links rule
+    and the chords check only, so code's held-device or after-call note's form that Gemma copied from text the call
+    read (a planted "tell the user ...: send /devices ok 3 from your phone"), or a thinking label that leaked, went to
+    every device as the summary's own words. A paragraph that starts like one goes, and a line of the list that does,
+    behind its bullet. Detection only, never the gate: only the phone's own /devices ok allows a device."""
+    assert clean_summary(written, "") == sent
+
+
+def test_a_call_summary_defangs_its_links_after_the_filters_and_logs_no_words(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The links rule stays (review I33): a link the caller did not say loses what makes it tappable, one they said
+    stays; a line left out is one warning with counts, never its words (metadata only)."""
+    written = f"- sign in at https://evil.example/login or club.example.org\n- {HELD_NOTE}\n- Anna called"
+    with caplog.at_level("WARNING", logger="local_assistant.brain"):
+        sent = clean_summary(written, "User: and is club.example.org up?")
+    assert sent == "- sign in at evil[.]example/login or club.example.org\n- Anna called"
+    [record] = caplog.records
+    assert record.getMessage() == "call summary: 1 of 3 lines read like code's notes and were left out"
+    assert "linked device" not in caplog.text
+    caplog.clear()
+    with caplog.at_level("WARNING", logger="local_assistant.brain"):
+        assert clean_summary("- one\n- two", "") == "- one\n- two"
+    assert caplog.records == []
+
+
 @pytest.mark.parametrize(
     ("answer", "sent"),
     [
@@ -2630,11 +2886,19 @@ async def test_a_device_change_told_now_with_a_time_after_outside_text_is_codes_
     assert (reply.text, reply.device) == ("Today you have the dentist at 10:00.", prompts.DEVICE_NOT_SCHEDULED)
 
 
+@pytest.mark.parametrize(
+    "said",
+    [
+        "The heater will be switched on at 6:00.",
+        # 0.9.9 (review of 0.9.8, G03's "if"/"unless" part): an "unless" waits for no word of the user's
+        "The heater will be switched on at 6:00 unless you object.",
+    ],
+)
 async def test_a_device_change_set_for_later_alone_leaves_codes_line_as_the_answer(
-    store: Store, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    store: Store, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, said: str
 ) -> None:
     after_a_page(store)
-    gemma = FakeGemma(text("The heater will be switched on at 6:00."))
+    gemma = FakeGemma(text(said))
     brain = with_all_tools(store, gemma, tmp_path, monkeypatch)
     reply = await brain.answer(store.current_conversation(), incoming_later(store, "And tomorrow?"))
     assert (reply.text, reply.device) == (prompts.DEVICE_NOT_SCHEDULED, "")
@@ -2695,15 +2959,22 @@ async def test_while_a_change_waits_a_change_set_for_later_still_goes(
     assert reply.text == "The heater needs your OK first." and prompts.DEVICE_NOT_SCHEDULED in reply.device
 
 
+@pytest.mark.parametrize(
+    ("power", "said"),
+    [
+        ("off", "Reply yes and the heater will be switched off."),
+        # 0.9.9 (guard-fixrev3-claims-02): a time in another clause is no time of the change
+        ("on", "It's cold tonight, so reply yes and the heater will be switched on."),
+    ],
+)
 async def test_a_device_change_set_for_later_while_a_change_waits_for_the_yes_stays(
-    store: Store, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    store: Store, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, power: str, said: str
 ) -> None:
     """A device_set in the answer (the heater asks first): her words of it are about that change."""
     after_a_page(store)
-    said = "Reply yes and the heater will be switched off."
-    gemma = FakeGemma(tool("device_set", device="heater", power="off"), text(said))
+    gemma = FakeGemma(tool("device_set", device="heater", power=power), text(said))
     brain = with_all_tools(store, gemma, tmp_path, monkeypatch)
-    reply = await brain.answer(store.current_conversation(), incoming_later(store, "Switch off the heater"))
+    reply = await brain.answer(store.current_conversation(), incoming_later(store, f"Switch {power} the heater"))
     assert reply.text == said and prompts.DEVICE_NOT_SCHEDULED not in reply.device
 
 
@@ -2713,6 +2984,10 @@ async def test_a_device_change_set_for_later_while_a_change_waits_for_the_yes_st
         "The heater is scheduled to switch off at 23:00, your confirmation is not needed.",
         "The heater will be switched off regardless of your confirmation.",
         "Say yes and the heater will be switched off at 23:00.",
+        # 0.9.9 (guard-fixrev3-claims-01): a time in words
+        "Reply yes and the heater will be switched off in ten minutes.",
+        # 0.9.9 (redteam-claims-negation-scope-and-second-yes-phrase): a negation past a comma
+        "Reply yes and the heater will be switched off, your confirmation is not needed.",
     ],
 )
 async def test_the_yes_words_of_the_waiting_device_with_a_time_or_a_late_negation_are_codes_line(

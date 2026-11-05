@@ -76,15 +76,8 @@ public func pcm16WAV(_ samples: [Float], sampleRate: Int) -> Data {
     return Data(header) + pcm.withUnsafeBytes { Data($0) }
 }
 
-/// What the bridge gets from every voice: Kokoro's own format, 24 kHz mono 16-bit WAV.
+/// What the bridge gets from her voice: 24 kHz mono 16-bit WAV, Pocket TTS's own (`PocketWAV`; Kokoro's format too,
+/// before 3 Nov 2026).
 public enum SpeechAudio {
     public static let sampleRate = 24_000
-
-    /// Float samples (Supertonic-3: 44.1 kHz) in that format, resampled, at their own level (non-finite samples
-    /// become silence). Not peak-normalised as FluidAudio's CLI and OpenWhisperer do: measured here, Supertonic-3
-    /// and Kokoro both speak at about -26 dBFS RMS, and normalising made Supertonic 5-9 dB louder, varying by
-    /// sentence (a call mixes both voices, sentence by sentence).
-    public static func wav(_ samples: [Float], sampleRate: Int) -> Data {
-        pcm16WAV(resample(samples.map { $0.isFinite ? $0 : 0 }, from: sampleRate, to: Self.sampleRate), sampleRate: Self.sampleRate)
-    }
 }

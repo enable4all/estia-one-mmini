@@ -47,6 +47,8 @@ TRUST = ("--trust-new-identities", "on-first-use")  # the identity rule the brid
 IPV4 = "-Djava.net.preferIPv4Stack=true"  # signal_io.IPV4: one network path, as the bridge uses
 PLIST = ownuser.DAEMONS / f"{ownuser.BRIDGE}.plist"
 NOT_LOADED = "Could not find service"  # launchctl print's answer for a service launchd does not have (estia stop)
+# the firewall question's listeners come from lsof as you (`hostsec.listeners`): your own only (fix review 9, 3 Nov)
+OTHERS_NOT_LISTED = "other accounts' listening programs are not listed here"
 QUESTIONS = {
     "firewall": "Turn on the firewall?",
     "stealth": "Turn on stealth mode? The Mac then no longer answers ping or probes of closed ports.",
@@ -140,6 +142,8 @@ HER_NOT_CHECKED = "! Her files and Registration Lock: not checked, as admin righ
 PASSWORD_ONCE_MORE = (
     "Your Mac password once more (nothing shows while you type): to check that admin rights now ask for it."
 )
+# the window's read-back after the rule's removal could not confirm it: the command is typed, so it stays exact (W18)
+SUDO_NOT_CONFIRMED = f"! sudo: not confirmed. In a new Terminal window, {SUDO} -v should ask for your Mac password."
 SSH_DONE = (
     "✓ SSH: keys only from the next login on. Test a new login from your laptop before you close this one; if it\n"
     "  fails, type this here to take it back: {undo}"
@@ -511,16 +515,20 @@ class Harden:
 
     @staticmethod
     def question(check: Check, listening: Sequence[tuple[str, str, str]]) -> str:
-        """The yes/no question; the firewall's names what would stop answering other machines (on a Mac without a
-        screen nobody can click "Allow"), and that doctor names a new one later."""
+        """The yes/no question; the firewall's names what of yours would stop answering other machines (on a Mac
+        without a screen nobody can click "Allow"), says other accounts' are not listed, and that doctor names a new
+        one later."""
         if check.key != "firewall":
             return QUESTIONS[check.key]
         if not listening:
-            return f"{QUESTIONS['firewall']} Nothing listens for other machines now; doctor names any program that does later."
+            return (
+                f"{QUESTIONS['firewall']} No program of yours listens for other machines now ({OTHERS_NOT_LISTED}); "
+                "doctor names any program that does later."
+            )
         named = ", ".join(f"{name} on port {port}" for name, port, _program in listening)
         return (
-            f"{QUESTIONS['firewall']} Listening for other machines now: {named}. Each may stop answering them unless "
-            "you keep it (asked next); doctor names any new one later."
+            f"{QUESTIONS['firewall']} Your programs listening for other machines now: {named}. Each may stop answering "
+            f"them unless you keep it (asked next); {OTHERS_NOT_LISTED}; doctor names any new one later."
         )
 
     def keep_listening(self, listening: Sequence[tuple[str, str, str]]) -> None:
@@ -643,7 +651,7 @@ class Harden:
             # (review ADM-10)
             code, left = self.host.run([SUDO, "-n", "-l"], read_only=True)
             asks = hostsec.owner_sudo(self.host).status == "ok" and code == 0 and with_password(left)
-            self.say("✓ sudo asks for your password now." if asks else "! sudo: check it in a new terminal.")
+            self.say("✓ sudo asks for your password now." if asks else SUDO_NOT_CONFIRMED)
             return
         self.host.run([SUDO, "-k"])
         self.say(PASSWORD_ONCE_MORE)

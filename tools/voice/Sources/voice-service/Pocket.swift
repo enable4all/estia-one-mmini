@@ -6,18 +6,18 @@
 // never fetches or changes it. The model's files are fetched once, each at its commit (Hugging Face's repository
 // without voice cloning: no account), into voice-models/pocket-tts (heart's, one a model, which ship with the voice
 // service, copied there from its own bundle beside its program, private to her: never fetched; a shipped file that is
-// not there or not the pinned one leaves only its own voice to Kokoro, as only an update puts it right), and checked
-// file by file against their sha256
+// not there or not the pinned one leaves only its own voice unsaid, as only an update puts it right, and so does one
+// that fails its first run at load, until the next check), and checked file by file against their sha256
 // with Whisper's rules (`prepareModel`: a changed or added file or a link is never run; that folder is set aside and
 // fetched fresh once; changed again, refused). Every checked file is checked again whenever its size, times or inode
 // change, each stamp taken from the bytes checked. Each line is one run of the program under sandbox-exec
 // (`PocketRun`: no network, no other program, no signal to another, no macOS service, nothing written, her home closed
 // but Pocket's folder), one thread, int8, from a config naming only those files. Whatever it cannot say (no program,
-// not fetched yet, refused, a run that fails or is late) Kokoro says (am_michael for alba and michael, af_heart for the
-// others; in another language Supertonic-3's F1); three failed runs in a row rest it until its next try (1, 5 and 30
-// minutes, then every 30; a language's model only once a line is asked in it after that wait), except for a call's
-// lines, each of which runs it again (the review of 28 Oct, calls-03: Kokoro can crash the service and the call). Never
-// text or audio in the log.
+// not fetched yet, refused, a run that fails or is late) no other voice says (owner, 3 Nov 2026: Kokoro and
+// Supertonic-3 removed; the voice service refuses the line, `PocketLine`); three failed runs in a row rest it until
+// its next try (1, 5 and 30 minutes, then every 30; a language's model only once a line is asked in it after that
+// wait), except for a call's lines, each of which runs it again (the review of 28 Oct, calls-03). Never text or audio
+// in the log.
 import Foundation
 import VoiceCore
 
@@ -219,7 +219,7 @@ func fetchPocket(
         return true
     } catch {
         try? FileManager.default.removeItem(at: release.location(in: programs))
-        log("Pocket TTS: its program was not fetched (\(error is PocketFailure ? SpeechFallback.reason(error) : downloadFailure(error)))")
+        log("Pocket TTS: its program was not fetched (\(error is PocketFailure ? PocketLine.reason(error) : downloadFailure(error)))")
         return false
     }
 }
@@ -227,9 +227,9 @@ func fetchPocket(
 actor PocketSpeaker {
     enum State: String {
         /// A language's model, at every start and after a failure's wait: nothing checked, fetched or run until a line
-        /// is asked in it (Supertonic-3 says that line in that language, and the check and fetch start).
+        /// is asked in it (that line is not said; the check and fetch start).
         case idle
-        /// Its files are being checked or fetched (Kokoro speaks meanwhile).
+        /// Its files are being checked or fetched (its lines are not said meanwhile).
         case loading
         case ready
         /// Its program is not beside the voice service, its model could not be fetched, or its runs failed: tried
@@ -270,7 +270,8 @@ actor PocketSpeaker {
     private var stamps: [URL: FileStamp] = [:]
     private var failures = 0
     /// Unavailable because `PocketTTS.failuresBeforeRest` runs failed in a row (its files and program checked): a call's
-    /// line still runs (`speak(call:)`), as resting left every line of a call to Kokoro for 1 to 30 minutes.
+    /// line still runs (`speak(call:)`), as resting left every line of a call to Kokoro for 1 to 30 minutes (now
+    /// unsaid).
     private var restingAfterRuns = false
     /// Resting after a run past its time limit: when a call's line last tried it (its rest's start, else that line's
     /// run), so a call's next try waits `PocketTTS.callRetrySeconds`; nil after a run that failed fast (each call line
@@ -281,10 +282,17 @@ actor PocketSpeaker {
     /// and a rest after that waited it out, up to 30 minutes, where a fresh rest waits one).
     private var restGeneration = 0
     /// Its shipped voices (`PocketVoice.bundled`: heart's) whose file was not beside the voice service, or not the
-    /// pinned one there, at the last check, by voice, with why ("missing", "not the pinned one"). The review of 27 Oct
-    /// (swift-voice-2): only an update puts such a file right, so the model is ready without it, only that voice's
-    /// lines are Kokoro's (`speak`: never a failed run, never a rest) and no timer tries it again.
+    /// pinned one there, at the last check, or that failed its first run at load (`firstRuns`), by voice, with why
+    /// ("missing", "not the pinned one", "failed its first run (exit 1)"). The review of 27 Oct (swift-voice-2): only an
+    /// update puts such a file right, so the model is ready without it, only that voice's lines are not said (`speak`:
+    /// never a failed run, never a rest) and no timer tries it again; the next check tries it again.
     private var missingShipped: [String: String] = [:]
+
+    /// Unavailable after failed or late runs, its files and program checked (`/health`'s `tts` "resting": tried again on
+    /// its own and by a call's lines), never for a missing program or files (`tts` "failed").
+    var resting: Bool { state == .unavailable && restingAfterRuns }
+    /// The shipped voices a ready model leaves out (`missingShipped`), by name: `/health`'s `voices_left_out`.
+    var leftOut: [String] { state == .ready ? missingShipped.keys.sorted() : [] }
 
     /// `models`: the voice service's models folder; `her`: her home, which a run cannot read but Pocket's folder;
     /// `programs`: the folder of the voice service's own program, where the release program is (root's, in her
@@ -322,8 +330,6 @@ actor PocketSpeaker {
     }
 
     private var folder: URL { models.appendingPathComponent(PocketTTS.folder) }
-    /// Who says its lines meanwhile, for the log: Kokoro in English, Supertonic-3 in a language.
-    private var instead: String { askedOnly ? "Supertonic-3" : "Kokoro" }
     /// When the log says a failure is tried again: an English model on its own after the wait, a language's only at
     /// the next line asked in it after the wait (`retry`; the review of 25 Oct).
     static func retried(askedOnly: Bool) -> String {
@@ -335,8 +341,8 @@ actor PocketSpeaker {
     private func file(_ pin: HubPin) -> URL { pin.location(in: models).appendingPathComponent(pin.sha256.keys.sorted()[0]) }
 
     /// Checks the program and every model file (fetching what of the model is missing), writes the config and says
-    /// one word (its first run). Never throws: what fails is logged and leaves it unavailable (`retried`) or
-    /// refused. A language's stays idle until a line is asked in it.
+    /// one word (its first run, then once in each shipped voice: `firstRuns`). Never throws: what fails is logged and
+    /// leaves it unavailable (`retried`) or refused. A language's stays idle until a line is asked in it.
     func load() async {
         guard asked else {  // a language's: never at a start, only once a line is asked in it
             state = .idle
@@ -356,11 +362,11 @@ actor PocketSpeaker {
             break
         case .missing:
             state = .unavailable
-            log("Pocket TTS (\(name)) unavailable: its program is not beside the voice service (an update puts it there: estia-deploy); \(instead) speaks, \(retried)")
+            log("Pocket TTS (\(name)) unavailable: its program is not beside the voice service (an update puts it there: estia-deploy); no other voice speaks, \(retried)")
             return
         case .changed:
             state = .refused
-            log("Pocket TTS (\(name)) refused: its program beside the voice service is not the pinned one (never run; an update puts the pinned one there: estia-deploy); \(instead) speaks")
+            log("Pocket TTS (\(name)) refused: its program beside the voice service is not the pinned one (never run; an update puts the pinned one there: estia-deploy); no other voice speaks")
             return
         }
         switch await prepare() {
@@ -368,29 +374,32 @@ actor PocketSpeaker {
             break
         case .missing:
             state = .unavailable
-            log("Pocket TTS (\(name)) unavailable: files still missing after the download; \(instead) speaks, \(retried)")
+            log("Pocket TTS (\(name)) unavailable: files still missing after the download; no other voice speaks, \(retried)")
             return
         case .changed:
             state = .refused
-            log("Pocket TTS (\(name)) refused: its files are not the pinned ones even after a fresh download, or could not be set aside (\(PocketTTS.folder) in voice-models; never run); \(instead) speaks")
+            log("Pocket TTS (\(name)) refused: its files are not the pinned ones even after a fresh download, or could not be set aside (\(PocketTTS.folder) in voice-models; never run); no other voice speaks")
             return
         }
         guard stampChecked() else {
             state = .unavailable
-            log("Pocket TTS (\(name)) unavailable: a file changed or went right after its check (never run); \(instead) speaks, \(retried)")
+            log("Pocket TTS (\(name)) unavailable: a file changed or went right after its check (never run); no other voice speaks, \(retried)")
             return
         }
         do {
             try writeConfig()
         } catch {
             state = .unavailable
-            log("Pocket TTS (\(name)) unavailable: its config could not be written and checked (\(SpeechFallback.reason(error))); \(instead) speaks, \(retried)")
+            log("Pocket TTS (\(name)) unavailable: its config could not be written and checked (\(PocketLine.reason(error))); no other voice speaks, \(retried)")
             return
         }
         do {
+            // the model's first run: its first fetched voice by name (a shipped one only when it has none)
             let names = model.voices.keys.sorted()
-            let voice = names.first { missingShipped[$0] == nil } ?? names[0]  // the first by name it has
+            let shipped = names.filter { model.voices[$0]?.bundled == true }
+            let voice = names.first { !shipped.contains($0) } ?? names.first { missingShipped[$0] == nil } ?? names[0]
             _ = try await firstRun { try await self.say("Ready.", voice: voice) }  // on Pocket's queue, as a line
+            await firstRuns(of: shipped.filter { $0 != voice && missingShipped[$0] == nil })
             state = .ready
             failures = 0
             rests = 0
@@ -401,14 +410,40 @@ actor PocketSpeaker {
             // a first run past its time limit: a call's line tries it a minute on, as after a late line (the second
             // deep scan of 0.9.8, swift-1: the next call line ran it to its full limit again, in silence)
             lateSince = error as? PocketFailure == .timeout ? now() : nil
-            log("Pocket TTS (\(name)) unavailable: its first run failed (\(SpeechFallback.reason(error))); \(instead) speaks, \(retried)")
+            log("Pocket TTS (\(name)) unavailable: its first run failed (\(PocketLine.reason(error))); no other voice speaks, \(retried)")
+        }
+    }
+
+    /// Each shipped voice says "Ready." once, on Pocket's queue as a line (the release review of 0.9.8, V01: heart, the
+    /// default voice, never ran at load, so a file with its pinned bytes that fails every run left load ready, and its
+    /// first three lines rested the whole model). One that fails for its file (an exit, a signal, too much audio, no
+    /// WAV) is set aside as a missing one is (`missingShipped`: its lines not said, never run, no rest) until the next
+    /// check; one past its time limit (a busy Mac, not a broken file) or whose files changed is not: its next line runs.
+    private func firstRuns(of voices: [String]) async {
+        for voice in voices {
+            do {
+                _ = try await firstRun { try await self.say("Ready.", voice: voice) }
+            } catch {
+                let why = PocketLine.reason(error)
+                switch error as? PocketFailure {
+                case .exit?, .signal?, .tooLarge?:
+                    break
+                case nil where error is PocketWAV.Invalid:
+                    break
+                default:
+                    log("Pocket TTS (\(name)): \(voice)'s first run failed (\(why)), not set aside: its next line runs it")
+                    continue
+                }
+                missingShipped[voice] = "failed its first run (\(why))"
+                log("Pocket TTS (\(name)): \(voice)'s voice failed its first run (\(why)); no other voice says \(voice)'s lines until its next check (the next start or an update)")
+            }
         }
     }
 
     /// Every model file against its pin, each fetched when missing (a bundled voice's copied from the voice service's
     /// own resources, never fetched). A fetch that fails is logged; `.missing` then. A bundled voice's file comes last
     /// and never stops the model: one that is not beside the voice service, or not the pinned one, is logged once and
-    /// kept in `missingShipped` (its lines Kokoro's until an update puts it there).
+    /// kept in `missingShipped` (its lines not said until an update puts it there).
     private func prepare() async -> ModelFiles {
         let (models, download, name) = (self.models, self.download, self.name)
         let resources = self.resources ?? PocketTTS.resources(beside: programs)
@@ -454,10 +489,10 @@ actor PocketSpeaker {
                 continue
             case .missing:
                 missingShipped[voice] = "missing"
-                log("Pocket TTS (\(name)): \(voice)'s voice file is not beside the voice service (\(pin.path)\(why); an update puts it there: estia-deploy); \(instead) says \(voice)'s lines")
+                log("Pocket TTS (\(name)): \(voice)'s voice file is not beside the voice service (\(pin.path)\(why); an update puts it there: estia-deploy); no other voice says \(voice)'s lines")
             case .changed:
                 missingShipped[voice] = "not the pinned one"
-                log("Pocket TTS (\(name)): \(voice)'s voice file beside the voice service is not the pinned one (\(pin.path)\(why); never run; an update puts the pinned one there: estia-deploy); \(instead) says \(voice)'s lines")
+                log("Pocket TTS (\(name)): \(voice)'s voice file beside the voice service is not the pinned one (\(pin.path)\(why); never run; an update puts the pinned one there: estia-deploy); no other voice says \(voice)'s lines")
             }
         }
         return .ok
@@ -494,13 +529,13 @@ actor PocketSpeaker {
         stamps[config] = stamp
     }
 
-    /// `text` (already as Pocket reads it) in `voice`, as Kokoro's own WAV format at the voice's gain. Throws when it
-    /// cannot (`PocketFailure`, `PocketWAV.Invalid`): Kokoro says that line. `call`: a call's line, which runs while it
-    /// rests after failed runs (the review of 28 Oct, calls-03: an Apple bug can crash Kokoro, the voice service and
-    /// the call with it, so a call tries Pocket again at each line); a run that works makes it ready again, one that
-    /// fails leaves it resting and counts no further.
+    /// `text` (already as Pocket reads it) in `voice`, as the bridge gets every line (`SpeechAudio`) at the voice's
+    /// gain. Throws when it cannot (`PocketFailure`, `PocketWAV.Invalid`): no other voice says that line (`PocketLine`).
+    /// `call`: a call's line, which runs while it rests after failed runs (the review of 28 Oct, calls-03: a call tries
+    /// Pocket again at each line); a run that works makes it ready again, one that fails leaves it resting and counts
+    /// no further.
     func speak(_ text: String, voice: String, call: Bool = false) async throws -> Data {
-        if state == .idle {  // the first line asked in it: its check and fetch start, its stand-in says this one
+        if state == .idle {  // the first line asked in it: its check and fetch start, this one is not said
             asked = true
             state = .loading
             log("Pocket TTS (\(name)): first asked; checking its files, fetching any missing")
@@ -510,7 +545,7 @@ actor PocketSpeaker {
         let due = lateSince.map { now().timeIntervalSince($0) >= PocketTTS.callRetrySeconds } ?? true
         let again = call && state == .unavailable && restingAfterRuns && due
         guard state == .ready || again else { throw PocketFailure.notReady(state.rawValue) }
-        // a shipped voice whose file an update has to put right: Kokoro says its line, never a failed run (no rest)
+        // a shipped voice whose file an update has to put right: its line not said, never a failed run (no rest)
         if let why = missingShipped[voice] { throw PocketFailure.notReady("shipped voice \(voice) \(why)") }
         do {
             let wav = try await say(text, voice: voice)
@@ -529,7 +564,7 @@ actor PocketSpeaker {
             throw PocketFailure.changed
         } catch {
             let late = error as? PocketFailure == .timeout
-            // still resting: its stand-in says this line, the call's next one tries (after a late run, a minute on)
+            // still resting: this line not said, the call's next one tries (after a late run, a minute on)
             guard !again else {
                 lateSince = late ? now() : nil
                 throw error
@@ -539,7 +574,7 @@ actor PocketSpeaker {
                 state = .unavailable
                 restingAfterRuns = true
                 lateSince = late ? now() : nil
-                log("Pocket TTS (\(name)) unavailable: \(failures) runs failed in a row; \(instead) speaks, \(retried); a call's lines try it \(late ? "once a minute" : "at once")")
+                log("Pocket TTS (\(name)) unavailable: \(failures) runs failed in a row; no other voice speaks, \(retried); a call's lines try it \(late ? "once a minute" : "at once")")
                 rest()
             }
             throw error

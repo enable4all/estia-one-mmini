@@ -94,13 +94,20 @@ The full threat model is in [setup_assistant.md, section 8](setup_assistant.md#8
   Doctor names tools that are not the live release's, and such a file in either Python.
 - Only messages from the devices you allowed are answered: your phone (Signal's device 1) from the start; a new linked
   device (Signal Desktop, a tablet) is held, not answered and not read, until your phone sends `/devices ok N`. A note
-  says so. A held device cannot command her, but it still receives what she sends to your account, as Signal delivers
-  each message to every device of an account: remove a device you do not know in Signal, Linked devices. Signal
-  gives a new linked device the number of a removed one: an allowed device silent for 14 days is held again, and
-  `/devices forget N` removes one you unlinked at once.
-- `/lock` from a device she answers stops every answer and call at once, until `/unlock` comes from the same device, 10
-  minutes later at the earliest. Language practice stops too: a practice recap that falls due meanwhile is written and
-  sent only after `/unlock`. The lock survives a restart and needs no admin rights.
+  says so and names the time. The time is when Signal received the message, by Signal's own clock, never the device's.
+  A device linked to your account gets a copy of every message you send, so it can send one in the same minute: a
+  matching time alone does not show the device is yours. A held device's texts cannot command her. A call names no
+  device, so a call from it is answered like one from your phone, and a text after it gives its start and end time on
+  all your devices. A held device still receives what she sends to your account, as Signal delivers each message to
+  every device of an account: remove a device you do not know in Signal, Linked devices. Signal gives a new linked
+  device the number of a removed one: an allowed device silent for 14 days is held again, and `/devices forget N`
+  removes one you unlinked at once.
+  `/devices ok N` and `/devices forget N` work only from your phone: a linked device, even an allowed one, never lets
+  another in.
+- `/lock` from a device she answers stops every answer and call at once, until `/unlock` from the same device or your
+  phone, 10 minutes later at the earliest; no other device ends it. Language practice stops too: a practice recap that
+  falls due meanwhile is written and sent only after `/unlock`. The lock survives a restart and needs no admin rights;
+  with neither device at hand, `/usr/bin/sudo /usr/local/estia/bin/estia unlock` on the Mac ends it.
 - A changed safety number is never trusted by itself (`--trust-new-identities on-first-use`, pinned in code): messages
   from that number are dropped, and doctor and `/status` show it with the steps to compare, then trust. Doctor also
   counts the devices on her own Signal account (only the Mac's).
@@ -144,10 +151,10 @@ The full threat model is in [setup_assistant.md, section 8](setup_assistant.md#8
   service for it. Each sentence is one run of the program under macOS's sandbox (`sandbox-exec`): no network, no other
   program started, none of her other programs stopped or signalled (her bridge, her voice service), no request to
   macOS's own services (tested with its notification and preferences services), nothing written, her home closed except
-  Pocket's own folder, and a time limit that grows with the text. Whatever a Pocket TTS voice cannot say in English,
-  Kokoro says: af_heart for heart, jane, eve and vera, am_michael for alba and michael; in jane's six other languages,
-  Supertonic-3's F1. On a call Kokoro says at most one line each time she answers: the rest of that answer comes as a
-  Signal text.
+  Pocket's own folder, and a time limit that grows with the text. Pocket TTS is her only voice: a line it cannot say is
+  said by no other voice, so a voice note's answer comes as text alone, and on a call the rest of that answer comes as
+  a Signal text. Korean, Polish, Russian and Japanese have no voice: her answers in them come as text, and calls in
+  them are not picked up.
 - Ollama is only its official build: setup downloads one fixed version (0.40.4) from GitHub and checks its fingerprint
   (sha256), every program's signature (Apple's Developer ID certificate for Ollama's team, 3MU9H2V9Y9, not only the
   team's name, which anyone can put in a signature) and Apple's notarization before anything is installed; one failed
@@ -261,7 +268,8 @@ The full threat model is in [setup_assistant.md, section 8](setup_assistant.md#8
   text: its checks after outside text stay on.
 - The model has no shell. With Projects on, its project tools read only files git tracks, at the level chosen
   (summary, docs or code), never secret-like file names, binaries or files over 200 KB, and never through symlinks.
-  A file's text is read on demand and never stored: the tool log keeps a stub.
+  A file's text is read on demand and never stored: the tool log keeps a stub. A folder is listed by names only, at
+  every level: only names git tracks, secret-like names never, nothing opened.
 - An answer that reads mail, a project, a document or the chat history (her earlier answers, from every conversation)
   sends nothing to a search engine or a map: it runs no web search and no map request (refused in code).
   An answer that reads the calendar runs no web search; of the calendar's words, only an event's place may go to
@@ -329,8 +337,15 @@ The full threat model is in [setup_assistant.md, section 8](setup_assistant.md#8
   answers reaches you defanged. A web search, map or Spotify request never takes its words from mail, calendar
   or document text in a note (an event's place read from the calendar in that answer may go to a map); the check
   compares words, so a paraphrase or a translation is not caught (a known gap).
-- YouTube: only a video link in the user's current message is read, and only its 11-character video ID reaches the
-  YouTube helper, never the link; a video found by a web search is never read. The helper asks only
+- YouTube: only a video link in the user's current message is read, or the one link of a video she found after the
+  user's typed YES, and only its 11-character video ID reaches the YouTube helper, never the link; a video named in
+  a web search result is never read. A video she finds (`find_video`) is searched and ranked by code, which texts one
+  match with its link; it is read only after the user's next typed message in that chat is a YES (the whole message,
+  within 2 minutes; a voice note or a call never counts; anything else ends the match; the list lasts 10 minutes, in
+  memory only). Its title and channel are outside text: cleaned, at most 80 characters, shown in code's message; after
+  a typed `another`, they reach her only as code's note, marked as outside text. Her tool result never holds them, and
+  the first match's message does not reach her, unless her answer to that request failed. Its search words go out as a
+  web search's do (Brave, or Ollama as the backup), with the same guards. The helper asks only
   https://www.youtube.com (every request and redirect checked, at most 3 redirects), with no proxy settings, no
   cookie file, no account and no key of its own (it uses the public key YouTube puts in the video's page); cookies
   YouTube sets last only for that one run. It stops itself after 20 s, and the bridge stops it at 30 s. YouTube sees
@@ -383,12 +398,14 @@ The full threat model is in [setup_assistant.md, section 8](setup_assistant.md#8
   not published. The release on GitHub runs the same scan over its own version first, and a known hole stops it there.
   The Mac's scan names the day of its copy of the database, and says so when that copy is over 3 days old. GitHub
   pauses the weekly scan after 60 days without a change to the repository.
+- Her Python's own OpenSSL encrypts her connections to mail, calendars, maps and the web. The scan does not cover it:
+  before each release, the OpenSSL of the Python a deploy installs then is compared by hand with the newest release
+  of its series on OpenSSL's site, openssl-library.org. Doctor names her Python's version and its OpenSSL's.
 - Model files are checked by fingerprint before they load: Whisper's, the speech detector's and the turn detector's,
   at every start. With `model_digest` set, Gemma's model is checked against its pin before every chat.
 - Not covered: holes nobody has reported yet; the Swift packages, checked by hand at each release; Python itself,
   Ollama, signal-cli's build for calls and the call helper; Homebrew's programs, kept current by Homebrew
-  (`brew upgrade`); the speaking voices (Kokoro, Supertonic-3), downloaded as published with no check of their files
-  (Known accepted gaps).
+  (`brew upgrade`).
 
 ## If the Mac is compromised
 
@@ -426,7 +443,8 @@ it was copied: whoever
    the Mac. She stays stopped after it: it starts her again only when she was running before it (then it stops her for
    the PIN and starts her after).
 8. Check your own phone: Signal, Linked devices; remove any device you do not know, then send her
-   `/devices forget N` for it. Check hers: `/usr/bin/sudo /usr/local/estia/bin/estia signal listDevices` (only the Mac).
+   `/devices forget N` for it from your phone. Check hers:
+   `/usr/bin/sudo /usr/local/estia/bin/estia signal listDevices` (only the Mac).
    She stays stopped after it: it starts her again only when she was running before it. Then start her:
    `/usr/bin/sudo /usr/local/estia/bin/estia start`.
 
@@ -473,14 +491,22 @@ it was copied: whoever
   refuses facts from an audio file and still makes
   a device change wait for your yes after an audio file, for an `ask first` device and in a message that is not about
   devices, but 32 GB with Gemma 26B is the tested setup.
+- **Deep Thinking acts on planted text more often.** In tests with Deep Thinking on, she tried to set a reminder from
+  words planted in a photo in 9 of 10 tries, and to switch a device or set a reminder from lines planted in mail and
+  calendar in 9 of 20, against none of 20 without it. Code refused or held every one. Deep Thinking passed its safety
+  tests in one run, on the 26B model only. On Macs with 24 GB, Deep Thinking runs Gemma 4 12B, which has not been
+  tested with it.
 - One user per Mac is assumed. Ollama, reachable only from the Mac itself (127.0.0.1:11434; her own Ollama:
   127.0.0.1:8151), is a trusted local service; on a Mac shared with other accounts, another user could start a
   look-alike service at the same address first. Setup refuses an Ollama that an account other than yours (for her own
-  Ollama: hers) runs, also one beside it on the same port, and doctor shows either with a ✗; the bridge itself does
-  not check before each request: while her own Ollama restarts, another program could take its address first. Where
-  macOS's list of network connections (`netstat`) shows none, as in some AI tools' command shells, setup and doctor
-  find her own Ollama through its background service and cannot see a program another account runs beside it on the
-  same port. The voice service (127.0.0.1:8150) runs as her: the bridge sends it audio and text only over a connection
+  Ollama: hers) runs, also one beside it on the same port, and doctor shows either with a ✗ where it can list the
+  program; the bridge itself does not check before each request: while her own Ollama restarts, another program could
+  take its address first. Where macOS's list of network connections (`netstat`) shows none (seen on macOS 27.0.1 on 3
+  Nov), setup finds her own Ollama through its background service (doctor, as her, with `lsof`), and neither can see
+  a program another account runs beside it on the same port. Doctor's Ollama line then says that other accounts'
+  programs on its port could not be listed, or, where it finds no program at all, that its program and account could
+  not be read. The voice
+  service (127.0.0.1:8150) runs as her: the bridge sends it audio and text only over a connection
   that a program of her own account took, checked after the connection is made and before anything is sent (macOS's
   `lsof`, run as her, lists only her own programs). A program of yours, or of another account, that takes that
   address while her voice service is not running gets nothing, and its words never count as yours; her voice notes
@@ -500,23 +526,29 @@ it was copied: whoever
 - On a call, every voice the phone picks up counts as the caller's: a TV or another person in the room can set a
   reminder, save or forget a fact, or switch a `normal` device by name, and their yes counts as yours for an `ask
   first` one. Code cannot tell voices apart.
-- The speaking models (Kokoro for English in its own voices and for any line Pocket TTS cannot say, Supertonic-3 for
-  Korean, Polish, Japanese and Russian and for any line jane cannot say in her six other languages) come from Hugging
-  Face as published: no fixed version, no check of their files. By FluidAudio 0.15.8's code they are fetched only when
-  a file is missing; that was not tested with the network off.
+- On a call, her own voice from a loud speaker next to the microphone (a laptop on Signal Desktop) is told apart from
+  the caller's by its words (setup_assistant.md, Her own voice). Her own voice that is not told apart counts as the
+  caller's words, as another voice in the room does: when she reads a mail or a page aloud, its words can set a
+  reminder, save or forget a fact, or switch a `normal` device by name; untested on Signal Desktop with speakers
+  (docs/e2e-checklist.md, 52a).
+- Kokoro's and Supertonic-3's files from an install before 3 Nov 2026 (downloaded as published, with no check of their
+  files) stay in her home until deleted by hand (setup_assistant.md, section 3, Voice notes); nothing loads them.
 - Pocket TTS's sandbox (every Pocket voice and language) closes her home, the network, writing, other programs and
   macOS's own services, never reading elsewhere: a flaw in Pocket TTS's program that any text sent to her voice service could reach would
   still read what her account reads outside her home (the projects folder and `~/Estia-KB` when shared, her logs in
   `/var/log/estia`). `sandbox-exec` is deprecated in its man page, and still shipped with macOS.
 - If Kyutai removes the v4.0.1 release from GitHub, an update cannot download Pocket TTS's program: it says so and
-  goes on, and Kokoro speaks (on a call, one line each time she answers; the rest comes as a Signal text). If the
-  model's version is removed from Hugging Face, a new install cannot download it: Kokoro speaks (on a call, one line
-  each time she answers; the rest comes as a Signal text), and the voice service tries the download again every 30
-  minutes. A language's model is tried again only when she next speaks that language after the wait (1, 5 or 30
-  minutes); Supertonic-3's F1 speaks meanwhile.
+  goes on, and her answers come as text. If the model's version is removed from Hugging Face, a new install cannot
+  download it: her answers come as text, and the voice service tries the download again every 30 minutes. A
+  language's model is tried again only when she next speaks that language after the wait (1, 5 or 30 minutes); her
+  answers in it come as text meanwhile.
 - The Pocket TTS voices need an update whose root-run tools fetch their program: with tools from before it, an update
-  goes live without the program and Kokoro speaks (on a call, one line each time she answers; the rest comes as a
-  Signal text), until `--update-tools` and one more update.
+  goes live without the program and her answers come as text, until `--update-tools` and one more update.
+- While Pocket TTS loads, a call is not picked up: it rings out, and a text says her voice is still loading. While it
+  rests after failed runs or cannot run, and speech recognition is ready, a call is answered and each of her answers
+  comes as a Signal text in the same chat until the call ends; with speech recognition not ready too, the call rings
+  out, and a text says her voice is not working. During a call, a line Pocket TTS cannot say is left unsaid, and the
+  rest of that answer comes as a Signal text in the same chat.
 - Health checks (`[health] extra_checks`) follow redirects; list only services you run.
 - CalDAV is untested live with iCloud, Fastmail and Nextcloud (recorded answers only). A server that sends the
   calendar helper on to another host (iCloud's own aside) is not followed: its final address goes in the config.
@@ -553,15 +585,24 @@ it was copied: whoever
   its time is approximate.
 - The home area's house number is told apart from a postcode by its place and its length. After the first comma, a
   number of 4 or 5 digits reads as a postcode: it goes to OpenStreetMap and gets no advice, unless a flat's or a
-  building's word comes right before it ("Suite 1200", "Bldg 1234"), the part right before its part is only a flat's, a
-  building's or a floor's word with its number, a letter label or a digit ordinal ("Apt 4B", "Building B", "3rd Floor",
-  "#4"), or an English street word follows it ("1234 Main St", "1234-B Main St"). In "Town, 1234 Example Loop", "Second
-  Floor, 1234 Example Loop" and "Apt 4B, Example Tower, 1234 Example Loop", 1234 goes. After the first comma, a number
-  joined to the letters before it goes too, with or without a dash ("Unit A-12", "B-7", "No12").
+  building's word comes right before it ("Suite 1200", "Bldg 1234", "Rm 1203"), the part right before its part is only
+  a flat's, a building's or a floor's word with its number, a letter label or an ordinal ("Apt 4B", "Building B", "3rd
+  Floor", "Second Floor", "Level 2", "#4"), or an English street word follows it ("1234 Main St", "1234-B Main St";
+  "St." or "Ter" right before a town's name does not count: "9000 St. Gallen", "9561 TA Ter Apel"). In "Town, 1234
+  Example Loop" and "Apt 4B, Example Tower, 1234 Example Loop", 1234 goes. After the first comma, a number joined to
+  the letters before it goes too, with or without a dash ("B-7", "No12"), unless a flat's or a building's word comes
+  right before it ("Unit A-12").
 - FOSSGIS's routing servers and Transitous are for non-commercial use: a commercial install needs other servers. How
   long FOSSGIS keeps its server log was not checked (its privacy policy is in German, and its site refused automated
   reads).
 - Calls name no device: a call from a new linked device rings like one from your phone (texts from it are held).
+  Such a call is answered too. A text after each call she answers gives its start and end time, on all your
+  devices; a device linked to your account can delete that text, and Signal then deletes it on every device. A
+  wake-up or reminder call she places rings every device on your account: whichever picks it up hears the
+  reminder and can talk with her, and only the summary, after two or more turns, gives its time.
+- Whoever has your unlocked phone ends any lock of your account, one sent from your laptop too, 10 minutes later at the
+  earliest. With your phone gone, stop her on the Mac: `/usr/bin/sudo /usr/local/estia/bin/estia stop` (she starts
+  again at the next restart of the Mac).
 - The TP-Link login goes to a configured device's address over the login that device asks for: KLAP, or AES login
   v2 (a hash of the password, never the password itself; AES login v1 is refused, and listing devices sends no login).
   A machine that takes a device's address (a guest's laptop, after the router gives that address away) and asks for
@@ -645,6 +686,14 @@ it was copied: whoever
   checks the record, and once the security step has set SSH to keys only, its drop-in also denies the account. The
   first real move ran on 13 Oct; that macOS 27's `sysadminctl -roleAccount` leaves nothing else to log in with is
   still untested beyond doctor's record check (docs/e2e-checklist.md, 113).
+- On macOS 26 and later, with FileVault and remote login (SSH) on, macOS answers remote login after a restart, before
+  the disk is unlocked, and takes an account name and its password there to unlock it. The security step's keys-only
+  setting is kept on that still-locked disk and does not apply then. Until the disk is unlocked, remote login takes
+  passwords: anyone who reaches the Mac can try them. A right password there unlocks the disk but opens no session:
+  macOS ends that connection, and the keys-only setting applies again. For a planned restart,
+  `/usr/bin/sudo /usr/bin/fdesetup authrestart` unlocks the disk as the Mac starts, so remote login takes no passwords
+  after that restart; after a power cut it still does. Read from macOS's own manual pages
+  (`man apple_ssh_and_filevault`, `man fdesetup`), not tested on a live Mac.
 - launchd opens her services' output files (`launchd.log`, `voice.log`, her own Ollama's `ollama.log`) as her
   account, never as root: with the file missing, launchd did not start a test service run as her account (measured on
   30 Oct, macOS 27.0.1). Each is made hers, 0600, before her service starts, in `/var/log/estia`, a folder only root

@@ -10,9 +10,11 @@ import shutil
 import tempfile
 import time
 import wave
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -31,14 +33,29 @@ from local_assistant.calls import (
     says_goodbye,
     wants_hang_up,
 )
-from local_assistant.config import DEFAULT_NAME, POCKET_LANGUAGES, Config
+from local_assistant.config import DEFAULT_NAME, POCKET_LANGUAGES, Config, has_voice
 from local_assistant.language import LANGUAGES
-from local_assistant.voice import SpokenClip, Transcript, VoiceNoStandInError, VoiceUnavailableError, sentences
+from local_assistant.voice import Transcript, VoiceNotSaidError, VoiceUnavailableError, sentences
 from tests.conftest import ME, STRANGER
 from tests.fakes.fake_voice import speech_probability
 from tests.test_call_audio import typing
 
 CALL = -7  # signal-cli's call ids are signed
+
+
+def voiced(cases: list[Any]) -> list[Any]:
+    """A call test's cases, those in a language her voice does not speak skipped: such a call rings out (owner, 3 Nov
+    2026: Korean, Polish, Russian and Japanese have no voice), so its cases wait for a Pocket TTS model of it. A case
+    is its language code, or a tuple that starts with it."""
+    no_voice = pytest.mark.skip(reason="no voice in this language: a call in it rings out (owner, 3 Nov 2026)")
+    return [
+        case
+        if has_voice(case if isinstance(case, str) else case[0])
+        else pytest.param(*([case] if isinstance(case, str) else case), marks=no_voice)
+        for case in cases
+    ]
+
+
 NAME = DEFAULT_NAME  # her name in these calls
 GREETING = prompts.call_greetings(NAME)[0]  # the one known greeting the harness gives her
 
@@ -88,12 +105,9 @@ class FakeVoice:
         self.windows: list[int] = []  # the bytes of each window Smart Turn was asked about
         self.spoken: list[str] = []
         self.voice = "eve"  # her voice (/voice <voice> sets the clients')
-        self.language_voice = "jane"  # the voice of the six languages Pocket TTS speaks (`[voice] language_voice`)
         self.voices: list[str] = []  # the voice each spoken text was asked in
-        self.stand_in: set[str] = set()  # texts another voice says in hers' place (Pocket TTS not ready)
-        # whether Kokoro may stand in for each spoken text (`kokoro=False`: no Kokoro asked for, `_KokoroTurn`)
-        self.kokoro_flags: list[bool] = []
-        self.ignores_kokoro = False  # an older voice service: Kokoro stands in whatever the request says
+        # texts Pocket TTS cannot say (not ready, resting, a failed run): no other voice says them (owner, 3 Nov 2026)
+        self.unsaid: set[str] = set()
         self.contexts: list[str] = []  # what she said before each spoken text ("" for none)
         self.spoken_on_calls: list[bool] = []  # whether each spoken text was asked as a call's line (`call=True`)
         self.hints: list[str] = []  # the hint of each transcription ("" for none)
@@ -106,6 +120,7 @@ class FakeVoice:
         self.broken: set[str] = set()
         self.slow: dict[str, asyncio.Event] = {}  # a text whose speech is made only once its event is set
         self.health_gate: asyncio.Event | None = None  # when set, a health read waits for it (a slow voice service)
+        self.state: dict[str, object] = {}  # more health keys, or ones that replace the ready ones (tts "resting")
 
     async def transcribe(
         self, audio: bytes, *, language: str | None = None, hint: str = "", call: bool = False
@@ -121,36 +136,31 @@ class FakeVoice:
         # as the real voice service: without the call flag a bare thanks or bye is erased (VoiceCore cleanTranscript)
         return Transcript("" if not call and text.lower() in SERVICE_ERASES else text, 1.0)
 
-    async def speak(
-        self, text: str, *, language: str | None = None, context: str = "", call: bool = False, kokoro: bool = True
-    ) -> bytes:
+    async def speak(self, text: str, *, language: str | None = None, context: str = "", call: bool = False) -> bytes:
         self.spoken.append(text)
         self.spoken_on_calls.append(call)
-        self.kokoro_flags.append(kokoro)
         self.voices.append(self.voice_for(language or "en"))
         self.languages.append(language)
         self.contexts.append(context)
         await asyncio.sleep(0)  # a request to the voice service: other tasks (the answer) run meanwhile
         if text in self.slow:
             await self.slow[text].wait()
-        english = (language or "en") == "en"
-        if text in self.stand_in and english and not kokoro and not self.ignores_kokoro:
-            raise VoiceNoStandInError(
-                "Pocket TTS did not say it, and Kokoro was not asked"
-            )  # as the voice service's 409
+        if text in self.unsaid:
+            raise VoiceNotSaidError("Pocket TTS could not say it")  # as the voice service's 409
         if text in self.broken:
             return b"not a wav at all"
-        clip = SpokenClip(wav24(min(0.03 * len(text), 8.0)))
-        clip.stand_in = ("af_heart" if (language or "en") == "en" else "F1") if text in self.stand_in else ""
-        return clip
+        return wav24(min(0.03 * len(text), 8.0))
 
-    def voice_for(self, language: str) -> str:  # as VoiceClient's: "" for none, her English voice everywhere
-        return self.language_voice if self.language_voice and language in POCKET_LANGUAGES else self.voice
+    def voice_for(self, language: str) -> str:  # as VoiceClient's: jane in the six languages, else her English voice
+        return "jane" if language in POCKET_LANGUAGES else self.voice
 
-    async def health(self) -> dict[str, str] | None:
+    async def health(self) -> dict[str, object] | None:
         if self.health_gate is not None:
             await self.health_gate.wait()
-        health = {"stt": "ready", "tts": "ready"} if self.ready else {"stt": "loading", "tts": "loading"}
+        health: dict[str, object] = (
+            {"stt": "ready", "tts": "ready"} if self.ready else {"stt": "loading", "tts": "loading"}
+        )
+        health |= self.state
         health |= {"vad": self.detector} if self.detector is not None else {}
         return health | ({"turn": self.turn_detector} if self.turn_detector is not None else {})
 
@@ -173,12 +183,24 @@ class FakeHost:
         self.turns: list[str] = []
         self.notes: list[str] = []
         self.texts: list[tuple[str, str, int | None, bool]] = []  # code's texts on a call: aci, text, reply, outside
-        self.summaries: list[tuple[list[str], int]] = []
+        self.text_only_turns: list[bool] = []  # per turn: whether the call said it is text-only
+        self.reply_sent = True  # False: the answer's text could not be sent
+        self.on_reply: Callable[[], Awaitable[None]] | None = None  # runs inside the answer's send
+        self.note_error: Exception | None = None  # when set, the call's notes raise it
+        self.text_practice: list[bool] = []  # per code text: whether the call said it is a practice call
+        self.reply_texts: list[tuple[str, int]] = []  # a text-only call's answers sent whole as texts: aci, reply
+        self.summaries: list[tuple[list[str], str]] = []  # per summary asked: the call's lines and its span
+        self.summary_sent = True  # False: the summary did not go out (Gemma failed, or wrote nothing)
+        self.summary_error: Exception | None = None  # when set, the summary raises it
+        self.on_summary: Callable[[], None] | None = None  # when set, called inside the summary (a lock that lands)
+        self.chords_error: Exception | None = None  # when set, the chords message raises it
+        self.chords_gate: asyncio.Event | None = None  # when set, the chords message waits for it (notes still to go)
         self.interruptions: list[tuple[int, str]] = []
         self.started: list[str] = []
         self.started_practice: list[bool] = []  # per call: whether it started as a practice call
         self.ended = 0
         self.dropped_waiting = 0
+        self.unheard_questions = 0  # dropped because her voice could not ask the question (code's note says so)
         self.standbys: list[str] = []  # standby started (the caller quiet): a waiting yes and her offer dropped
         self.cancelled_turns = 0
         self.gate: asyncio.Event | None = None  # when set, an answer also waits for it
@@ -219,8 +241,10 @@ class FakeHost:
         *,
         practice: bool = False,
         on_retry: Callable[[], None] | None = None,
+        text_only: bool = False,
     ) -> Turn:
         self.turns.append(text)
+        self.text_only_turns.append(text_only)
         self.practice_turns.append(practice)
         if self.use_tools:
             on_tools()
@@ -238,8 +262,9 @@ class FakeHost:
             raise
         return self.answers.pop(0) if self.answers else Turn("Okay.")
 
-    async def call_drop_waiting(self, aci: str) -> None:
+    async def call_drop_waiting(self, aci: str, *, unheard: bool = False) -> None:
         self.dropped_waiting += 1
+        self.unheard_questions += unheard
 
     async def call_standby(self, aci: str) -> None:
         self.standbys.append(aci)
@@ -248,16 +273,37 @@ class FakeHost:
         self.interruptions.append((reply_id, heard))
 
     async def call_note(self, aci: str, text: str) -> None:
+        if self.note_error is not None:
+            raise self.note_error
         self.notes.append(text)
 
-    async def call_text(self, aci: str, text: str, *, reply_id: int | None, outside: bool) -> None:
+    async def call_text(
+        self, aci: str, text: str, *, reply_id: int | None, outside: bool, practice: bool = False
+    ) -> None:
         self.texts.append((aci, text, reply_id, outside))
+        self.text_practice.append(practice)
 
-    async def call_summary(self, aci: str, lines: list[str], minutes: int) -> None:
-        self.summaries.append((lines, minutes))
-        self.notes.append("(summary)")  # in order with the notes
+    async def call_reply_text(self, aci: str, reply_id: int) -> bool:
+        self.reply_texts.append((aci, reply_id))
+        if self.on_reply is not None:
+            await self.on_reply()  # the send takes a while: the caller may speak meanwhile
+        return self.reply_sent
+
+    async def call_summary(self, aci: str, lines: list[str], span: str) -> bool:
+        self.summaries.append((lines, span))
+        if self.on_summary is not None:
+            self.on_summary()
+        if self.summary_error is not None:
+            raise self.summary_error
+        if self.summary_sent:
+            self.notes.append("(summary)")  # in order with the notes
+        return self.summary_sent
 
     async def call_chords(self, aci: str) -> None:
+        if self.chords_gate is not None:
+            await self.chords_gate.wait()
+        if self.chords_error is not None:
+            raise self.chords_error
         self.notes.append("(chords)")
 
     async def practice_call_ended(self, aci: str) -> None:
@@ -334,6 +380,7 @@ class FakeSignal:
         self.hung_up: list[tuple[str, int]] = []
         self.started: list[str] = []
         self.start_error: Exception | None = None
+        self.accept_error: Exception | None = None  # when set, her accepting a call raises it
         self.helper: FakeHelper | None = None
         self.hangup_fails: list[Exception | None] = []  # per hang-up: an error, or None for one with no ENDED after it
 
@@ -369,6 +416,8 @@ class FakeSignal:
 
     async def accept_call(self, aci: str, call_id: int) -> dict[str, Any]:
         self.accepted.append((aci, call_id))
+        if self.accept_error is not None:
+            raise self.accept_error
         path = self.folder / f"signal-call-{call_id & 0xFFFFFFFFFFFFFFFF}.sock"
         self.helper = FakeHelper(path)
         await self.helper.start()
@@ -407,6 +456,8 @@ class Harness:
         language: str = "en",
         rng: random.Random | None = None,
         clock: Callable[[], float] = time.monotonic,
+        wall: Callable[[], float] = time.time,
+        tz: ZoneInfo | None = None,
         name: str = NAME,
         practice: Callable[[str], str | None] | None = None,
         locked: Callable[[], bool] = lambda: False,
@@ -447,6 +498,8 @@ class Harness:
             language=language,
             rng=rng,
             clock=clock,
+            wall=wall,
+            tz=tz,
             name=name,
             practice=practice or (lambda aci: None),
             locked=locked,
@@ -504,8 +557,7 @@ async def test_the_owners_call_is_answered_greeted_and_a_turn_is_spoken() -> Non
 
 async def test_every_line_of_a_call_is_asked_as_a_calls() -> None:
     """The review of 28 Oct (calls-03): the voice service tries a Pocket TTS voice that rests after failed runs again
-    for a call's line, so Kokoro, which an Apple bug can crash with the call, says fewer lines. Her canned lines and
-    her answer's sentences go as a call's."""
+    for a call's line. Her canned lines and her answer's sentences go as a call's."""
     async with Harness(["what's on tomorrow"], [Turn("Two meetings. One at nine.", reply_id=7)]) as h:
         await h.connected()
         await h.quiet_after(GREETING)
@@ -534,107 +586,87 @@ async def test_each_sentence_of_her_answer_goes_with_the_ones_she_said_before_it
         h.signal.remote_hangup()
 
 
-async def test_a_canned_line_is_kept_in_its_voice_and_never_a_stand_ins() -> None:
-    """The review of 24 Oct: canned lines were kept by (language, text) alone, so after `/voice af_heart` the greeting
-    stayed eve's until the bridge restarted, and one Kokoro said in eve's place (Pocket TTS still fetching after a
-    deploy, or resting) stayed af_heart's on every later call. A line is kept in its voice, and one the voice service
-    marks as said by another voice (X-Voice-Stand-In) is never kept."""
+async def test_a_canned_line_is_kept_in_its_voice_and_one_pocket_could_not_say_is_asked_again() -> None:
+    """The review of 24 Oct: canned lines were kept by (language, text) alone, so after /voice the greeting stayed in
+    the voice before until the bridge restarted. A line is kept in its voice; one Pocket TTS could not say (not ready
+    yet, resting) is left unsaid, by no other voice (owner, 3 Nov 2026), and the next call asks for it again."""
 
-    async def one_call(number: int) -> None:
+    async def one_call(number: int, said: int) -> None:
         h.signal.ring(call_id=CALL - number)
-        await h.until(lambda: h.manager.said.count(GREETING) == number)
+        await h.until(lambda: len(h.signal.accepted) == number and h.manager.said.count(GREETING) == said)
+        await h.until(lambda: GREETING in h.voice.spoken and h.manager.saying == "")
         h.signal.remote_hangup(call_id=CALL - number)
         await h.until(lambda: h.host.ended == number)
 
     async with Harness() as h:
-        h.voice.stand_in = {GREETING}  # Pocket TTS not ready yet: Kokoro's af_heart says it
-        await one_call(1)
-        h.voice.stand_in = set()
-        await one_call(2)  # eve's own, asked again
-        await one_call(3)  # and kept
-        h.voice.voice = "af_heart"  # /voice af_heart: at once
-        await one_call(4)
-        await one_call(5)
+        h.voice.unsaid = {GREETING}  # Pocket TTS not ready yet: nobody says it
+        await one_call(1, 0)
+        h.voice.unsaid = set()
+        await one_call(2, 1)  # eve's own, asked again
+        await one_call(3, 2)  # and kept
+        h.voice.voice = "michael"  # /voice michael: at once
+        await one_call(4, 3)
+        await one_call(5, 4)
     asked = [voice for text, voice in zip(h.voice.spoken, h.voice.voices, strict=True) if text == GREETING]
-    assert asked == ["eve", "eve", "af_heart"]
+    assert asked == ["eve", "eve", "michael"]
 
 
-async def test_a_canned_line_in_janes_language_is_kept_in_hers_and_never_f1s() -> None:
+async def test_a_canned_line_in_janes_language_is_kept_in_hers() -> None:
     """Owner, 25 Oct: German is jane's (Pocket TTS's German model). A German canned line is kept in the voice that says
-    it, jane's, so `/voice af_heart` (the English voice) keeps it; one Supertonic-3's F1 said in her place (her German
-    model still fetching: X-Voice-Stand-In) is never kept, so the next call asks again."""
+    it, jane's, so `/voice michael` (the English voice) keeps it; one Pocket TTS could not say (her German model not
+    ready) is said by no other voice, so the next call asks again."""
 
     greeting = prompts.call_lines("de", name=NAME).greetings[0]
 
-    async def one_call(number: int) -> None:
+    async def one_call(number: int, said: int) -> None:
         h.signal.ring(call_id=CALL - number)
-        await h.until(lambda: h.manager.said.count(greeting) == number)
+        await h.until(lambda: len(h.signal.accepted) == number and h.manager.said.count(greeting) == said)
+        await h.until(lambda: greeting in h.voice.spoken and h.manager.saying == "")
         h.signal.remote_hangup(call_id=CALL - number)
         await h.until(lambda: h.host.ended == number)
 
     async with Harness(language="de") as h:
-        h.voice.stand_in = {greeting}  # jane's German model not fetched yet: F1 says it
-        await one_call(1)
-        h.voice.stand_in = set()
-        await one_call(2)  # jane's own, asked again
-        await one_call(3)  # and kept
-        h.voice.voice = "af_heart"  # /voice af_heart: the English voice only
-        await one_call(4)  # still jane's German line, kept
+        h.voice.unsaid = {greeting}
+        await one_call(1, 0)
+        h.voice.unsaid = set()
+        await one_call(2, 1)  # jane's own, asked again
+        await one_call(3, 2)  # and kept
+        h.voice.voice = "michael"  # /voice michael: the English voice only
+        await one_call(4, 3)  # still jane's German line, kept
     asked = [voice for text, voice in zip(h.voice.spoken, h.voice.voices, strict=True) if text == greeting]
     assert asked == ["jane", "jane"]
 
 
-# ------------------------------------------------------------------ Kokoro's one line a turn (owner, 28 Oct, calls-03)
+# ------------------------------------------- a line Pocket TTS cannot say (owner, 3 Nov 2026: no other voice says it)
 
 LEAD = prompts.CALL_VOICE_STOPPED  # "My voice stopped working on this call. The rest of my answer:"
 
 
-async def test_a_turns_second_kokoro_line_is_never_said_and_the_rest_goes_as_a_text() -> None:
-    """Owner, 28 Oct ("great stuff, do it"; the review of 28 Oct, calls-03: Kokoro, the English stand-in for a Pocket
-    voice that failed or rests, can crash the voice service and the call with it): on a call Kokoro says at most one
-    line of a turn. Its first is said; each later line of the turn asks for no Kokoro ("kokoro": false), and the first
-    Pocket TTS cannot say either stops her for the rest of the turn: the rest of her answer, whole, goes to the caller
-    as a text, led by code's line. Her stored reply keeps what was heard; the call stays up."""
+async def test_a_part_pocket_cannot_say_stops_her_voice_and_the_rest_goes_as_a_text() -> None:
+    """Owner, 3 Nov 2026: Kokoro and Supertonic-3 were removed and nothing replaces them. A part of her answer Pocket
+    TTS cannot say is never said: nothing more of the turn is asked, and the rest of her answer, whole, goes to the
+    caller as a text, led by code's line. Her stored reply keeps what was heard; the call stays up."""
     async with Harness(["tell me three things"], [Turn("First point. Second point. Third point.", reply_id=7)]) as h:
-        h.voice.stand_in = {"First point.", "Second point.", "Third point."}  # Pocket TTS resting: Kokoro says each
+        h.voice.unsaid = {"Second point."}
         await h.connected()
         await h.quiet_after(GREETING)
         h.helper.caller_says(speech(1.0))
         await h.until(lambda: bool(h.host.texts))
         assert h.host.texts == [(ME, f"{LEAD}\nSecond point. Third point.", 7, False)]  # the caller's only
         assert "First point." in h.manager.said and "Second point." not in h.manager.said
-        asked = dict(zip(h.voice.spoken, h.voice.kokoro_flags, strict=True))
-        assert asked == {GREETING: True, "First point.": True, "Second point.": False}  # the third never asked
+        assert "Third point." not in h.voice.spoken  # nothing more of the turn is asked
         assert h.host.interruptions == [(7, "First point.")]  # her stored reply: what was heard
         await asyncio.sleep(0.3)
         assert h.signal.hung_up == [] and h.manager.in_call and not h.host.dropped_waiting  # the call stays up
+        assert h.host.notes == []  # no "the call dropped" note
         h.signal.remote_hangup()
 
 
-async def test_one_kokoro_line_in_a_turn_is_said_and_nothing_goes_as_a_text() -> None:
-    """A turn's one Kokoro line is said, first or later in it; the lines Pocket TTS says count for nothing, also when
-    they are asked with no Kokoro after it."""
-    turns = [Turn("Only this.", reply_id=7), Turn("Pocket first. Kokoro then. Pocket again.", reply_id=8)]
-    async with Harness(["one", "two"], turns) as h:
-        h.voice.stand_in = {"Only this.", "Kokoro then."}
-        await h.connected()
-        await h.quiet_after(GREETING)
-        h.helper.caller_says(speech(1.0))
-        await h.quiet_after("Only this.")
-        h.helper.caller_says(speech(1.0))
-        await h.quiet_after("Pocket again.")
-        assert h.host.texts == [] and h.host.interruptions == []
-        asked = dict(zip(h.voice.spoken, h.voice.kokoro_flags, strict=True))
-        assert asked["Kokoro then."] is True and asked["Pocket again."] is False
-        h.signal.remote_hangup()
-
-
-async def test_after_a_turn_whose_voice_stopped_the_next_turn_tries_pocket_and_kokoro_again() -> None:
-    """The cap is a turn's: the next turn asks its lines as before (Pocket TTS is tried at every line), and Kokoro may
-    say one line of it again."""
+async def test_after_a_turn_whose_voice_stopped_the_next_turn_tries_pocket_again() -> None:
+    """The stop is a turn's: the next turn asks its lines as before (Pocket TTS is tried at every line)."""
     turns = [Turn("One. Two.", reply_id=7), Turn("Three. Four.", reply_id=8)]
     async with Harness(["first", "second"], turns) as h:
-        h.voice.stand_in = {"One.", "Two.", "Three."}
+        h.voice.unsaid = {"Two."}
         await h.connected()
         await h.quiet_after(GREETING)
         h.helper.caller_says(speech(1.0))
@@ -642,24 +674,6 @@ async def test_after_a_turn_whose_voice_stopped_the_next_turn_tries_pocket_and_k
         h.helper.caller_says(speech(1.0))
         await h.quiet_after("Four.")
         assert "Three." in h.manager.said and h.host.texts == [(ME, f"{LEAD}\nTwo.", 7, False)]
-        asked = dict(zip(h.voice.spoken, h.voice.kokoro_flags, strict=True))
-        assert asked["Three."] is True and asked["Four."] is False
-        h.signal.remote_hangup()
-
-
-async def test_with_a_voice_service_that_ignores_the_ask_a_second_kokoro_line_is_still_never_said() -> None:
-    """An older voice service reads no "kokoro" field and Kokoro says the line all the same (X-Voice-Stand-In): it is
-    never played, nothing more of the turn is asked, and the rest goes as a text, that line too."""
-    async with Harness(["go on"], [Turn("Alpha. Beta. Gamma.", reply_id=7)]) as h:
-        h.voice.stand_in = {"Alpha.", "Beta.", "Gamma."}
-        h.voice.ignores_kokoro = True
-        await h.connected()
-        await h.quiet_after(GREETING)
-        h.helper.caller_says(speech(1.0))
-        await h.until(lambda: bool(h.host.texts))
-        assert h.host.texts == [(ME, f"{LEAD}\nBeta. Gamma.", 7, False)]
-        assert "Beta." not in h.manager.said and "Gamma." not in h.voice.spoken
-        assert h.host.interruptions == [(7, "Alpha.")]
         h.signal.remote_hangup()
 
 
@@ -674,7 +688,7 @@ async def test_the_text_holds_what_was_not_said_once_never_a_line_texted_on_its_
         also_texted=("Reminder set for 17:00.",),
     )
     async with Harness(["remind me at five"], [turn]) as h:
-        h.voice.stand_in = {"Sure.", "It is cold today.", "Reminder set for 17:00."}
+        h.voice.unsaid = {"It is cold today.", "Reminder set for 17:00."}
         await h.connected()
         await h.quiet_after(GREETING)
         h.helper.caller_says(speech(1.0))
@@ -701,23 +715,20 @@ def device_turn() -> Turn:
     )
 
 
-async def test_a_device_question_keeps_the_turns_kokoro_line_and_its_yes_counts() -> None:
-    """The review of 28 Oct (words-01, pipeline-04): a device question goes unheard when her first sentence spends the
-    turn's one Kokoro line, and the yes is dropped; while Pocket TTS stays down, asking again goes the same way. So on
-    a turn that waits for a yes her words ask for no Kokoro: the first Pocket TTS cannot say sends her words as the
-    text, and code's question is the turn's one Kokoro line. The question is heard, kept in her reply, never texted,
-    and the caller's yes reaches the waiting device."""
+async def test_a_device_question_is_still_tried_when_her_words_before_it_go_as_a_text() -> None:
+    """The review of 28 Oct (words-01, pipeline-04): a device question that goes unheard drops its yes. So on a turn
+    that waits for a yes, her words go as the text from the first part Pocket TTS cannot say, and code's question,
+    last, is still tried: heard, kept in her reply, never texted, and the caller's yes reaches the waiting device."""
     turns = [device_turn(), Turn("", code_text="Devices: heater on.")]
     async with Harness(["remind me and warm it up", "yes"], turns) as h:
-        h.voice.stand_in = {"Sure.", "It is cold today.", "Reminder set for 17:00.", DEVICE_QUESTION}
+        h.voice.unsaid = {"Sure.", "It is cold today."}
         await h.connected()
         await h.quiet_after(GREETING)
         h.helper.caller_says(speech(1.0))
         await h.quiet_after(DEVICE_QUESTION)
         assert h.host.texts == [(ME, f"{LEAD}\nSure. It is cold today.", 7, False)]
         assert "Sure." not in h.manager.said
-        asked = list(zip(h.voice.spoken, h.voice.kokoro_flags, strict=True))[1:]  # the greeting apart
-        assert asked == [("Sure.", False), (DEVICE_QUESTION, True)]  # one Kokoro line: the question
+        assert h.voice.spoken[1:] == ["Sure.", DEVICE_QUESTION]  # the greeting apart: nothing between is asked
         assert h.host.interruptions == [(7, DEVICE_QUESTION)]  # her stored reply: what was heard
         assert h.host.dropped_waiting == 0
         h.helper.caller_says(speech(0.4))
@@ -726,14 +737,58 @@ async def test_a_device_question_keeps_the_turns_kokoro_line_and_its_yes_counts(
         h.signal.remote_hangup()
 
 
+async def test_codes_own_line_left_unsaid_before_a_device_question_goes_as_itself() -> None:
+    """The review of 5 Nov (CALLS-0983-02): the parts a turn texts before a device question went through `_text_rest`
+    with its lead, so code's own line left unsaid (the not-set line, which her reply keeps) came as "My voice stopped
+    working on this call. The rest of my answer: ...", code's words presented as her answer; the review of 4 Nov fixed
+    that for `_texted_rest` only. Her own words before the question still carry the lead (the test above)."""
+    not_set = "Reminder not set: I need a time."
+    turn = Turn(
+        "Sure.",
+        reply_id=7,
+        asks_yes=True,
+        code_text=f"{not_set} {DEVICE_QUESTION}",
+        kept_code=(not_set, DEVICE_QUESTION),
+    )
+    async with Harness(["remind me and warm it up"], [turn]) as h:
+        h.voice.unsaid = {not_set}
+        await h.connected()
+        await h.quiet_after(GREETING)
+        h.helper.caller_says(speech(1.0))
+        await h.quiet_after(DEVICE_QUESTION)
+        assert h.host.texts == [(ME, not_set, 7, False)]  # that line alone, as itself
+        assert "Sure." in h.manager.said and not_set not in h.manager.said
+        assert h.voice.spoken[1:] == ["Sure.", not_set, DEVICE_QUESTION]  # the question is still tried
+        assert h.host.interruptions == [(7, f"Sure. {DEVICE_QUESTION}")] and h.host.dropped_waiting == 0
+        h.signal.remote_hangup()
+
+
+async def test_her_words_and_codes_line_before_a_device_question_still_go_with_the_lead() -> None:
+    """Her own words among the parts texted before the question keep the lead: it names her answer's rest, and code's
+    line left unsaid beside them goes in the same text."""
+    not_set = "Reminder not set: I need a time."
+    turn = Turn(
+        "Sure. It is cold today.",
+        reply_id=7,
+        asks_yes=True,
+        code_text=f"{not_set} {DEVICE_QUESTION}",
+        kept_code=(not_set, DEVICE_QUESTION),
+    )
+    async with Harness(["remind me and warm it up"], [turn]) as h:
+        h.voice.unsaid = {"It is cold today.", not_set}
+        await h.connected()
+        await h.quiet_after(GREETING)
+        h.helper.caller_says(speech(1.0))
+        await h.quiet_after(DEVICE_QUESTION)
+        assert h.host.texts == [(ME, f"{LEAD}\nIt is cold today. {not_set}", 7, False)]
+        h.signal.remote_hangup()
+
+
 async def test_a_device_question_her_voice_cannot_say_is_never_texted_and_its_yes_is_dropped() -> None:
-    """An older voice service (no "kokoro" field read): Kokoro said her "Got it.", so the question would need it a
-    second time and is not said. Its yes is dropped (never heard: no yes may act on it), and the text never holds the
-    question: a yes to it could switch nothing."""
-    said = "remind me at five and warm up the room"
-    async with Harness([said], [device_turn()], acknowledge=True) as h:
-        h.voice.stand_in = set(prompts.CALL_ACK_LINES) | {"Sure.", "It is cold today.", DEVICE_QUESTION}
-        h.voice.ignores_kokoro = True
+    """Pocket TTS cannot say the question either: it is not said, its yes is dropped (never heard: no yes may act on
+    it), and no text holds the question: a yes to it could switch nothing."""
+    async with Harness(["remind me and warm it up"], [device_turn()]) as h:
+        h.voice.unsaid = {"Sure.", "It is cold today.", DEVICE_QUESTION}
         await h.connected()
         await h.quiet_after(GREETING)
         h.helper.caller_says(speech(1.0))
@@ -741,65 +796,39 @@ async def test_a_device_question_her_voice_cannot_say_is_never_texted_and_its_ye
         assert h.host.texts == [(ME, f"{LEAD}\nSure. It is cold today.", 7, False)]
         assert DEVICE_QUESTION not in h.manager.said
         assert h.host.interruptions[-1] == (7, "…")
-        h.signal.remote_hangup()
-
-
-async def test_a_line_before_the_answer_never_spends_the_turns_kokoro_line() -> None:
-    """The review of 28 Oct (pipeline-01): her "Got it.", thinking, checking, wake and retry lines ask for no Kokoro, so
-    while Pocket TTS is down the turn's one Kokoro line is her answer's first sentence, never "Got it." followed by
-    the whole answer as a text. Pocket TTS down from the start: "Got it." is left unsaid, her first sentence is heard,
-    the rest is texted, and the turn asks for Kokoro once."""
-    said = "what is on my calendar for tomorrow please"
-    async with Harness([said], [Turn("Two meetings. One at nine.", reply_id=7)], acknowledge=True) as h:
-        h.voice.stand_in = set(prompts.CALL_ACK_LINES) | {"Two meetings.", "One at nine."}
-        await h.connected()
-        await h.quiet_after(GREETING)
-        h.helper.caller_says(speech(1.0))
-        await h.until(lambda: bool(h.host.texts))
-        assert h.host.texts == [(ME, f"{LEAD}\nOne at nine.", 7, False)]
-        assert "Two meetings." in h.manager.said
-        assert not any(line in h.manager.said for line in prompts.CALL_ACK_LINES)
-        asked = list(zip(h.voice.spoken, h.voice.kokoro_flags, strict=True))[1:]  # the greeting apart
-        assert any(text in prompts.CALL_ACK_LINES and not kokoro for text, kokoro in asked)
-        assert [text for text, kokoro in asked if kokoro] == ["Two meetings."]
-        assert h.host.interruptions == [(7, "Two meetings.")]
+        # the review of 4 Nov: dropped with its reason, so code's note says the device was not switched and why
+        assert h.host.unheard_questions == 1
         h.signal.remote_hangup()
 
 
 async def test_lines_before_the_answer_pocket_cannot_say_are_left_out_and_the_answer_is_said() -> None:
-    """Her "Got it." and a thinking line Pocket TTS cannot say are left unsaid; her voice goes on, and an answer Pocket
-    TTS says is said whole, nothing texted."""
+    """Her "Got it." and a thinking line Pocket TTS cannot say are left unsaid; her voice goes on (the review of 28 Oct,
+    pipeline-01: never the whole answer as a text for a line before it), and an answer Pocket TTS says is said whole,
+    nothing texted."""
     said = "what is on my calendar for tomorrow please"
     async with Harness([said], [Turn("Two meetings. One at nine.", reply_id=7)], acknowledge=True, delay=1.5) as h:
-        h.voice.stand_in = set(prompts.CALL_ACK_LINES) | set(prompts.CALL_THINKING_LINES)
+        h.voice.unsaid = set(prompts.CALL_ACK_LINES) | set(prompts.CALL_THINKING_LINES)
         await h.connected()
         await h.quiet_after(GREETING)
         h.helper.caller_says(speech(1.0))
         await h.quiet_after("One at nine.")
-        assert any(line in h.voice.spoken for line in prompts.CALL_THINKING_LINES)  # asked with no Kokoro: refused
+        assert any(line in h.voice.spoken for line in prompts.CALL_THINKING_LINES)  # asked, not said
         assert not any(line in h.manager.said for line in [*prompts.CALL_ACK_LINES, *prompts.CALL_THINKING_LINES])
         assert h.host.texts == [] and h.host.interruptions == []
         h.signal.remote_hangup()
 
 
-async def test_a_second_kokoro_line_before_the_answer_stops_her_voice_for_the_whole_turn() -> None:
-    """An older voice service (no "kokoro" field read): Kokoro said her "Got it.", then a thinking line: that line is
-    not said, nothing of her answer is asked, and the whole answer goes as a text. Her wait is still logged: no word
-    of her answer came (pipeline-06)."""
-    said = "what is on my calendar for tomorrow please"
-    async with Harness([said], [Turn("Two meetings. One at nine.", reply_id=7)], acknowledge=True, delay=1.5) as h:
-        h.voice.stand_in = set(prompts.CALL_ACK_LINES) | set(prompts.CALL_THINKING_LINES)
-        h.voice.ignores_kokoro = True
-        await h.connected()
-        await h.quiet_after(GREETING)
+async def test_a_greeting_pocket_cannot_say_is_left_unsaid_and_the_call_goes_on() -> None:
+    """Owner, 3 Nov 2026: a line Pocket TTS cannot say outside a turn (her greeting, a check-in, her goodbye) is left
+    unsaid too, never a dropped call: the caller's words are answered as ever."""
+    async with Harness(["hello?"], [Turn("Hi, I'm here.", reply_id=7)]) as h:
+        h.voice.unsaid = {GREETING}
+        h.signal.ring()
+        await h.until(lambda: GREETING in h.voice.spoken and h.manager.saying == "")
+        assert GREETING not in h.manager.said and h.manager.in_call
         h.helper.caller_says(speech(1.0))
-        await h.until(lambda: bool(h.host.texts))
-        assert h.host.texts == [(ME, f"{LEAD}\nTwo meetings. One at nine.", 7, False)]
-        assert any(line in h.manager.said for line in prompts.CALL_ACK_LINES)
-        assert any(line in h.voice.spoken for line in prompts.CALL_THINKING_LINES)
-        assert not any(line in h.manager.said for line in prompts.CALL_THINKING_LINES)
-        assert "Two meetings." not in h.voice.spoken
-        assert h.host.interruptions == [(7, "…")]
+        await h.quiet_after("Hi, I'm here.")
+        assert h.host.notes == [] and h.host.texts == [] and h.signal.hung_up == []
         h.signal.remote_hangup()
 
 
@@ -816,14 +845,14 @@ async def test_a_turn_whose_voice_stopped_before_its_answer_still_logs_its_wait(
     so the end line left out the turns in which the caller heard nothing of her answer. Now one line says how long
     after the end of the turn her voice stopped (metadata only), and the end line counts those turns."""
     caplog.set_level(logging.INFO, logger="local_assistant.calls")
-    said = "what is on my calendar for tomorrow please"
-    async with Harness([said], [Turn("Two meetings. One at nine.", reply_id=7)], acknowledge=True, delay=1.5) as h:
-        h.voice.stand_in = set(prompts.CALL_ACK_LINES) | set(prompts.CALL_THINKING_LINES)
-        h.voice.ignores_kokoro = True
+    async with Harness(["what is on my calendar"], [Turn("Two meetings. One at nine.", reply_id=7)]) as h:
+        h.voice.unsaid = {"Two meetings."}
         await h.connected()
         await h.quiet_after(GREETING)
         h.helper.caller_says(speech(1.0))
         await h.until(lambda: bool(h.host.texts))
+        assert h.host.texts == [(ME, f"{LEAD}\nTwo meetings. One at nine.", 7, False)]
+        assert h.host.interruptions == [(7, "…")]
         h.signal.remote_hangup()
         await h.until(lambda: h.host.ended == 1)
     [found] = [m for record in caplog.records if (m := STOPPED_LINE.fullmatch(record.getMessage()))]
@@ -833,60 +862,101 @@ async def test_a_turn_whose_voice_stopped_before_its_answer_still_logs_its_wait(
     assert end.endswith("; her voice stopped before her answer's first words: 1 turn"), end
 
 
-async def test_a_practice_call_follows_the_same_rule_and_supertonics_lines_never_count() -> None:
-    """A practice call (/babble) in Dutch: her Dutch lines Supertonic-3's F1 says in jane's place never count (only
-    Kokoro, the English stand-in, does); code's English lines after them follow the same rule."""
+async def test_a_practice_call_follows_the_same_rule() -> None:
+    """A practice call (/babble) in Dutch: her Dutch lines and code's English lines after them follow the same rule."""
     turn = Turn("Heel goed. Nog een keer.", reply_id=7, code_text="Not set. Say the time again. Then I set it.")
     async with Harness(["Ik woon in Utrecht."], [turn], practice=lambda aci: "nl" if aci == ME else None) as h:
-        h.voice.stand_in = {"Heel goed.", "Nog een keer.", "Not set.", "Say the time again.", "Then I set it."}
+        h.voice.unsaid = {"Nog een keer."}
         await h.connected()
         await h.quiet_after(prompts.spoken("nl", name=NAME).greeting)
         h.helper.caller_says(speech(1.0))
         await h.until(lambda: bool(h.host.texts))
-        assert {"Heel goed.", "Nog een keer.", "Not set."} <= set(h.manager.said)
-        assert h.host.texts == [(ME, f"{LEAD}\nSay the time again. Then I set it.", 7, False)]
-        assert h.host.practice_turns == [True] and h.host.interruptions == [(7, "Heel goed. Nog een keer.")]
+        assert "Heel goed." in h.manager.said
+        assert h.host.texts == [(ME, f"{LEAD}\nNog een keer. Not set. Say the time again. Then I set it.", 7, False)]
+        assert h.host.practice_turns == [True] and h.host.interruptions == [(7, "Heel goed.")]
         h.signal.remote_hangup()
 
 
-async def test_a_wake_up_call_follows_the_same_rule_its_opening_apart() -> None:
-    """A wake-up call she placed: its opening, said by Kokoro before any turn, is no turn's line; each turn after it
-    follows the same rule."""
+async def test_a_wake_up_call_follows_the_same_rule() -> None:
+    """A wake-up call she placed: an opening Pocket TTS cannot say is left unsaid, and each turn after it follows the
+    same rule."""
     async with Harness(["what's the weather"], [Turn("Sunny today. Warm later.", reply_id=7)]) as h:
         opening = "Good morning! It's 7:00. wake up"
-        h.voice.stand_in = {opening, "Sunny today.", "Warm later."}
+        h.voice.unsaid = {opening, "Warm later."}
         task = await placing(h)
         await h.signal.pick_up()
         assert await task == "answered"
-        await h.quiet_after(opening)
+        await h.until(lambda: opening in h.voice.spoken and h.manager.saying == "")
         h.helper.caller_says(speech(1.0))
         await h.until(lambda: bool(h.host.texts))
         assert "Sunny today." in h.manager.said and h.host.texts == [(ME, f"{LEAD}\nWarm later.", 7, False)]
         h.signal.remote_hangup(call_id=OUT)
 
 
-async def test_a_cut_in_over_her_kokoro_line_sends_no_text() -> None:
-    """The caller talking over her one Kokoro line takes over as ever: the rest of an answer talked over is dropped,
-    never texted."""
-    first = "This first sentence is quite a long one, so there is time to talk over it."
-    turns = [Turn(f"{first} Second one.", reply_id=7), Turn("Okay.", reply_id=8)]
-    async with Harness(["tell me", "wait, one more thing"], turns) as h:
-        h.voice.stand_in = {first, "Second one."}
+async def test_a_turn_whose_only_unsaid_line_went_as_a_text_of_its_own_ends_the_call_as_ever() -> None:
+    """The review of 4 Nov: a turn counted as stopped when the only line not said was code's line that goes as a text
+    of its own anyway: nothing new was texted, yet the call stayed up and the open line answered the room for 90 s.
+    Such a turn ends the call as a turn said whole does."""
+    line = "Reminder set for 17:00."
+    turn = Turn("Sure, bye!", end_call=True, code_text=line, also_texted=(line,))
+    async with Harness(["remind me at five to call mum, bye"], [turn]) as h:
+        h.voice.unsaid = {line}
         await h.connected()
         await h.quiet_after(GREETING)
         h.helper.caller_says(speech(1.0))
-        await h.until(lambda: h.manager.saying == first)
-        h.helper.caller_says_when(lambda: h.helper.her_frames() > 30, speech(1.0))
-        await h.quiet_after("Okay.")
-        assert h.host.texts == [] and h.host.interruptions[0][0] == 7
+        await h.until(lambda: bool(h.signal.hung_up))
+        assert h.host.texts == []
+
+
+async def test_codes_own_line_left_unsaid_is_texted_as_itself_and_a_failed_turns_never() -> None:
+    """The review of 4 Nov: code's line Pocket TTS could not say went as "My voice stopped working on this call. The
+    rest of my answer: …", code's words presented as her answer. Code's lines go as themselves, without that lead; a
+    failed turn's line ("lost my train of thought") goes as no text at all: the caller says it again."""
+    line = "Reminder set for 17:00."
+    async with Harness(["remind me at five"], [Turn("Sure.", code_text=line)]) as h:
+        h.voice.unsaid = {line}
+        await h.connected()
+        await h.quiet_after(GREETING)
+        h.helper.caller_says(speech(1.0))
+        await h.until(lambda: bool(h.host.texts))
+        assert h.host.texts == [(ME, line, None, False)]
         h.signal.remote_hangup()
+    lost = prompts.call_lines("en", name=NAME).lost
+    first = sentences(lost)[0]  # "Sorry, I lost my train of thought."
+    async with Harness(["what time is it"], [Turn(lost, failed=True)]) as h:
+        h.voice.unsaid = {first}
+        await h.connected()
+        await h.quiet_after(GREETING)
+        h.helper.caller_says(speech(1.0))
+        await h.until(lambda: first in h.voice.spoken)
+        await asyncio.sleep(0.3)
+        assert h.host.texts == [] and h.manager.in_call
+        h.signal.remote_hangup()
+
+
+async def test_a_got_it_her_voice_cannot_say_lets_the_next_request_have_one() -> None:
+    """The review of 4 Nov: an unsaid "Got it." still counted as said, so the next long request got none (never two in
+    a row). Only one the caller heard counts."""
+    said = ["what is on my calendar tomorrow", "and what about the day after"]
+    answers = ["Two meetings.", "Nothing."]
+    async with Harness(said, [Turn(a) for a in answers], acknowledge=True) as h:
+        h.voice.unsaid = set(prompts.CALL_ACK_LINES)
+        await h.connected()
+        await h.quiet_after(GREETING)
+        h.helper.caller_says(speech(1.2))
+        await h.quiet_after("Two meetings.")
+        h.voice.unsaid = set()
+        h.helper.caller_says(speech(1.2))
+        await h.quiet_after("Nothing.")
+    spoken = h.manager.said[1:]
+    assert spoken[0] == "Two meetings." and spoken[1] in prompts.CALL_ACK_LINES and spoken[2] == "Nothing."
 
 
 async def test_a_turn_whose_voice_stopped_never_ends_the_call() -> None:
     """The call stays up: her end_call ends nothing when the rest of her answer went as a text; the caller reads it
     and goes on or hangs up."""
     async with Harness(["that's all for now"], [Turn("Glad to help. Talk soon!", reply_id=7, end_call=True)]) as h:
-        h.voice.stand_in = {"Glad to help.", "Talk soon!"}
+        h.voice.unsaid = {"Talk soon!"}
         await h.connected()
         await h.quiet_after(GREETING)
         h.helper.caller_says(speech(1.0))
@@ -896,28 +966,57 @@ async def test_a_turn_whose_voice_stopped_never_ends_the_call() -> None:
         h.signal.remote_hangup()
 
 
-async def test_without_a_language_voice_a_german_line_names_her_english_voice() -> None:
-    """`[voice] language_voice = ""` (the review of 25 Oct: the way back to Supertonic-3's F1 for the six, as before
-    jane): a German canned line names her English voice, which the voice service speaks in F1 in German, and is kept
-    under it, so `/voice af_heart` asks it again in that voice."""
+@pytest.mark.parametrize("code", ["ko", "pl", "ru", "ja"])
+async def test_a_call_in_a_language_her_voice_does_not_speak_rings_out_with_a_text(code: str) -> None:
+    """Owner, 3 Nov 2026: Korean, Polish, Russian and Japanese have no voice (Pocket TTS has no model for them, nothing
+    replaces Supertonic-3). A call while one is in use rings out (never rejected) with code's text saying so, in plain
+    English as code's notes are; nothing is asked of the voice service; and no call is placed for a reminder."""
+    async with Harness(language=code) as h:
+        h.signal.ring()
+        await h.until(lambda: bool(h.host.notes))
+        await asyncio.sleep(0.1)
+        english = LANGUAGES[code].english
+        assert h.signal.accepted == [] and h.voice.spoken == []
+        assert h.host.notes == [prompts.CALL_NO_VOICE.format(language=english)]
+        # the review of 4 Nov: one fact, one wording: /language's reply word for word (VOICE_NO_LANGUAGE)
+        assert (
+            h.host.notes[0]
+            == prompts.VOICE_NO_LANGUAGE.format(language=english)
+            == (f"I have no voice in {english}: my answers come as text, and calls in {english} are not picked up.")
+        )
+        assert await h.manager.can_place(ME) == "no_voice"
+        assert await h.manager.place(ME, wake=True, time="7:00", text="x") == "call_failed"
+        assert h.signal.started == []
 
-    greeting = prompts.call_lines("de", name=NAME).greetings[0]
 
-    async def one_call(number: int) -> None:
-        h.signal.ring(call_id=CALL - number)
-        await h.until(lambda: h.manager.said.count(greeting) == number)
-        h.signal.remote_hangup(call_id=CALL - number)
-        await h.until(lambda: h.host.ended == number)
+async def test_a_practice_call_in_japanese_rings_out_too() -> None:
+    """A practice call takes the practised language: in Japanese (no voice) it rings out, and the text names the cause
+    and the way out (the review of 4 Nov: the plain no-voice text left a user in practice with no working call and no
+    word why); her own call for a reminder is in her own language, English, and is placed."""
+    async with Harness(practice=lambda aci: "ja") as h:
+        h.signal.ring()
+        await h.until(lambda: bool(h.host.notes))
+        assert h.signal.accepted == [] and h.host.notes == [prompts.CALL_NO_VOICE_PRACTICE.format(language="Japanese")]
+        assert h.host.notes[0] == (
+            "Practice in Japanese is text only: I have no voice in it, so calls are not picked up until /babble off."
+        )
+        assert await h.manager.can_place(ME) == ""
 
-    async with Harness(language="de") as h:
-        h.voice.language_voice = ""
-        await one_call(1)
-        await one_call(2)  # kept under eve
-        h.voice.voice = "af_heart"
-        await one_call(3)  # another voice: asked again
-        await one_call(4)
-    asked = [voice for text, voice in zip(h.voice.spoken, h.voice.voices, strict=True) if text == greeting]
-    assert asked == ["eve", "af_heart"]
+
+async def test_a_ring_in_a_language_with_no_voice_gets_its_text_at_most_every_10_minutes() -> None:
+    """The review of 4 Nov: every ring sent the same no-voice text at once (three rings, three texts), while the
+    not-ready note waits 10 minutes between sends. Now the same hold, per account."""
+    now = [1000.0]
+    async with Harness(language="ko", clock=lambda: now[0]) as h:
+        h.signal.ring()
+        await h.until(lambda: bool(h.host.notes))
+        now[0] += 30
+        h.signal.ring(call_id=8)
+        await asyncio.sleep(0.2)
+        assert h.host.notes == [prompts.CALL_NO_VOICE.format(language="Korean")] and h.signal.accepted == []
+        now[0] += calls.NOT_READY_NOTE_SECONDS
+        h.signal.ring(call_id=9)
+        await h.until(lambda: len(h.host.notes) == 2)
 
 
 async def test_codes_own_words_after_her_answer_go_without_hers() -> None:
@@ -943,19 +1042,25 @@ async def test_codes_own_words_after_her_answer_go_without_hers() -> None:
         h.signal.remote_hangup()
 
 
-async def test_after_a_longer_call_the_user_gets_a_summary() -> None:
-    async with Harness(["first idea", "second idea"], [Turn("Nice."), Turn("Good one.")]) as h:
+async def test_after_a_longer_call_the_user_gets_a_summary_with_its_start_and_end() -> None:
+    now = [at("14:02:10")]
+    async with Harness(
+        ["first idea", "second idea"], [Turn("Nice."), Turn("Good one.")], wall=lambda: now[0], tz=ZONE
+    ) as h:
         await h.connected()
         await h.quiet_after(GREETING)
         h.helper.caller_says(speech(1.0))
         await h.quiet_after("Nice.")
         h.helper.caller_says(speech(1.0))
         await h.quiet_after("Good one.")
+        now[0] = at("14:10:40")
         h.signal.remote_hangup()
         await h.until(lambda: bool(h.host.summaries))
-        lines, minutes = h.host.summaries[0]
+        lines, span = h.host.summaries[0]
         assert lines == ["User: first idea", "Estia: Nice.", "User: second idea", "Estia: Good one."]
-        assert minutes >= 1
+        assert span == "14:02-14:10"  # the summary names the call's start and end: no second note
+        await asyncio.sleep(0.1)
+        assert h.host.notes == ["(chords)", "(summary)"]
 
 
 async def test_after_a_call_codes_chords_message_comes_before_the_summary() -> None:
@@ -973,6 +1078,52 @@ async def test_after_a_call_codes_chords_message_comes_before_the_summary() -> N
         assert h.host.notes == ["(chords)", "(summary)"]
 
 
+async def test_after_notes_waits_for_the_notes_after_a_call_and_never_longer_than_its_limit() -> None:
+    """Review of 4 Nov, calls-4: the app's worker, released by the call's end, waits for the notes after it while Deep
+    Thinking answers (else its answer holds Ollama's one slot and the summary waits behind it). The notes are owed from
+    the first line of `_after`, with no wait after the app is told the call is over; none owed: at once; held: only up to
+    the limit."""
+    async with Harness(["first idea", "second idea"], [Turn("Nice."), Turn("Good one.")]) as h:
+        async with asyncio.timeout(1):
+            await h.manager.after_notes(60.0)  # no call yet, no notes owed: at once
+        h.host.chords_gate = asyncio.Event()  # the notes after the call are held here
+        await h.connected()
+        await h.quiet_after(GREETING)
+        h.helper.caller_says(speech(1.0))
+        await h.quiet_after("Nice.")
+        h.helper.caller_says(speech(1.0))
+        await h.quiet_after("Good one.")
+        h.signal.remote_hangup()
+        await h.until(lambda: h.host.ended == 1)  # the app is told first: its texts go on
+        began = time.monotonic()
+        await h.manager.after_notes(0.2)  # the notes are still owed: it gives up at its limit
+        assert 0.15 <= time.monotonic() - began < 2.0 and h.host.notes == []
+        waiting = asyncio.create_task(h.manager.after_notes(30.0))
+        await asyncio.sleep(0.1)
+        assert not waiting.done()
+        h.host.chords_gate.set()
+        async with asyncio.timeout(5):
+            await waiting  # the notes have gone out
+        assert h.host.notes == ["(chords)", "(summary)"]
+        async with asyncio.timeout(1):
+            await h.manager.after_notes(60.0)  # nothing is owed any more
+
+
+async def test_after_notes_is_done_also_when_the_notes_fail() -> None:
+    async with Harness(["first idea", "second idea"], [Turn("Nice."), Turn("Good one.")]) as h:
+        h.host.summary_error = RuntimeError("summary")
+        await h.connected()
+        await h.quiet_after(GREETING)
+        h.helper.caller_says(speech(1.0))
+        await h.quiet_after("Nice.")
+        h.helper.caller_says(speech(1.0))
+        await h.quiet_after("Good one.")
+        h.signal.remote_hangup()
+        await h.until(lambda: len(h.host.summaries) == 1)
+        async with asyncio.timeout(5):
+            await h.manager.after_notes(60.0)  # not held for the whole limit by a note that raised
+
+
 async def test_a_dropped_call_gets_its_chords_message_too() -> None:
     async with Harness() as h:
         await h.connected()
@@ -983,6 +1134,181 @@ async def test_a_dropped_call_gets_its_chords_message_too() -> None:
         h.helper.caller_says(speech(0.6))
         await h.until(lambda: "(chords)" in h.host.notes)
         assert h.host.notes.index(prompts.CALL_DROPPED) < h.host.notes.index("(chords)")
+
+
+# the after-call note (laptop path, Phase 0, owner 3 Nov): a call names no device, so a call from a newly linked one
+# rings and is answered like the phone's. Every call she answered shows on all the caller's devices, with its start and
+# end: in the summary's header when the summary goes out, else in code's own note, never both
+
+
+ZONE = ZoneInfo("UTC")  # the config's time zone in these calls
+
+
+def at(clock: str, day: str = "2026-11-03") -> float:
+    """A wall-clock time on the harness's clock (UTC): "14:02:10"."""
+    return datetime.fromisoformat(f"{day}T{clock}").replace(tzinfo=UTC).timestamp()
+
+
+def test_a_calls_span_is_its_start_and_end_on_the_users_clock() -> None:
+    assert calls.call_span(at("14:02:10"), at("14:10:40"), ZONE) == "14:02-14:10"
+    assert calls.call_span(at("14:02:10"), at("14:02:50"), ZONE) == "14:02"  # within one minute: one time
+    assert calls.call_span(at("23:58:00"), at("00:04:00", "2026-11-04"), ZONE) == "23:58-00:04"
+    athens = ZoneInfo("Europe/Athens")  # the config's time zone, not the Mac's (UTC+2 on 3 Nov)
+    assert calls.call_span(at("14:02:10"), at("14:10:40"), athens) == "16:02-16:10"
+
+
+async def test_after_a_call_she_answered_codes_note_gives_its_start_and_end() -> None:
+    now = [at("14:02:10")]
+    async with Harness(["what's on tomorrow"], [Turn("Two meetings tomorrow.")], wall=lambda: now[0], tz=ZONE) as h:
+        await h.connected()
+        await h.quiet_after(GREETING)
+        h.helper.caller_says(speech(1.0))
+        await h.quiet_after("Two meetings tomorrow.")
+        now[0] = at("14:10:40")
+        h.signal.remote_hangup()
+        await h.until(lambda: len(h.host.notes) == 2)
+        assert h.host.summaries == []  # one turn: no summary, so code's note says when the call was
+        assert h.host.notes == ["(chords)", "A call from one of your devices, 14:02-14:10."]
+        assert h.host.notes[1] == prompts.CALL_ANSWERED_NOTE.format(span="14:02-14:10")
+
+
+async def test_a_call_with_no_turn_gets_codes_note_too() -> None:
+    """A call that only heard her greeting (a device that called and listened) shows as well."""
+    now = [at("09:30:00")]
+    async with Harness(wall=lambda: now[0], tz=ZONE) as h:
+        await h.connected()
+        await h.quiet_after(GREETING)
+        now[0] = at("09:30:20")
+        h.signal.remote_hangup()
+        await h.until(lambda: len(h.host.notes) == 2)
+        assert h.host.notes == ["(chords)", "A call from one of your devices, 09:30."]
+
+
+async def test_when_the_summary_does_not_go_out_codes_note_does() -> None:
+    now = [at("14:02:10")]
+    async with Harness(
+        ["first idea", "second idea"], [Turn("Nice."), Turn("Good one.")], wall=lambda: now[0], tz=ZONE
+    ) as h:
+        h.host.summary_sent = False  # Gemma failed, or wrote nothing
+        await h.connected()
+        await h.quiet_after(GREETING)
+        h.helper.caller_says(speech(1.0))
+        await h.quiet_after("Nice.")
+        h.helper.caller_says(speech(1.0))
+        await h.quiet_after("Good one.")
+        now[0] = at("14:10:40")
+        h.signal.remote_hangup()
+        await h.until(lambda: len(h.host.notes) == 2)
+        assert len(h.host.summaries) == 1
+        assert h.host.notes == ["(chords)", "A call from one of your devices, 14:02-14:10."]
+
+
+async def test_with_the_summary_off_codes_note_still_goes() -> None:
+    async with Harness(["first idea", "second idea"], [Turn("Nice."), Turn("Good one.")], summary=False) as h:
+        await h.connected()
+        await h.quiet_after(GREETING)
+        h.helper.caller_says(speech(1.0))
+        await h.quiet_after("Nice.")
+        h.helper.caller_says(speech(1.0))
+        await h.quiet_after("Good one.")
+        h.signal.remote_hangup()
+        await h.until(lambda: len(h.host.notes) == 2)
+        assert h.host.summaries == [] and h.host.notes[1].startswith("A call from one of your devices, ")
+
+
+async def test_codes_note_comes_last_after_the_calls_other_notes() -> None:
+    """The order after a call stays: the dropped or unfinished note, the chords message, then the summary's place,
+    which code's note takes when no summary goes out."""
+    async with Harness() as h:
+        await h.connected()
+        await h.quiet_after(GREETING)
+        h.voice.fail_transcribe = True
+        h.helper.caller_says(speech(0.6))
+        await h.quiet_after(prompts.CALL_HEARING)
+        h.helper.caller_says(speech(0.6))
+        await h.until(lambda: len(h.host.notes) == 3)
+        assert h.host.notes[:2] == [prompts.CALL_DROPPED, "(chords)"]
+        assert h.host.notes[2].startswith("A call from one of your devices, ")
+
+
+@pytest.mark.parametrize("failing", ["chords", "summary"])
+async def test_codes_note_goes_when_a_note_before_it_fails(failing: str) -> None:
+    """The note has its own try: the chords message or the summary raising before it never skips it."""
+    async with Harness(["first idea", "second idea"], [Turn("Nice."), Turn("Good one.")]) as h:
+        if failing == "chords":
+            h.host.chords_error = RuntimeError("chords")
+        else:
+            h.host.summary_error = RuntimeError("summary")
+        await h.connected()
+        await h.quiet_after(GREETING)
+        h.helper.caller_says(speech(1.0))
+        await h.quiet_after("Nice.")
+        h.helper.caller_says(speech(1.0))
+        await h.quiet_after("Good one.")
+        h.signal.remote_hangup()
+        await h.until(lambda: any(note.startswith("A call from one of your devices, ") for note in h.host.notes))
+        assert h.host.notes[-1].startswith("A call from one of your devices, ")
+        assert "(summary)" not in h.host.notes
+
+
+async def test_a_lock_that_lands_while_the_summary_fails_sends_no_note() -> None:
+    """/lock between the summary that did not go out and code's note: nothing goes out once locked, the note too."""
+    locked = [False]
+    async with Harness(
+        ["first idea", "second idea"], [Turn("Nice."), Turn("Good one.")], locked=lambda: locked[0]
+    ) as h:
+        h.host.summary_sent = False
+        h.host.on_summary = lambda: locked.__setitem__(0, True)
+        await h.connected()
+        await h.quiet_after(GREETING)
+        h.helper.caller_says(speech(1.0))
+        await h.quiet_after("Nice.")
+        h.helper.caller_says(speech(1.0))
+        await h.quiet_after("Good one.")
+        h.signal.remote_hangup()
+        await h.until(lambda: len(h.host.summaries) == 1)
+        await asyncio.sleep(0.2)
+        assert h.host.notes == ["(chords)"]
+
+
+async def test_a_call_that_only_rang_gets_no_note() -> None:
+    async with Harness(answer_after_s=0.4) as h:
+        h.signal.ring()
+        await asyncio.sleep(0.1)
+        h.signal.remote_hangup()
+        await h.until(lambda: h.host.ended == 1)
+        await asyncio.sleep(0.2)
+        assert h.signal.accepted == [] and not any(note.startswith("A call from") for note in h.host.notes)
+
+
+async def test_a_call_she_placed_gets_no_note_from_one_of_your_devices() -> None:
+    """Her call for a reminder or a wake-up came from her, not from a device of the user's: no such note (its summary,
+    after two or more turns, still names its start and end)."""
+    async with Harness(["thanks, I'm up"], [Turn("Great, have a good day!")]) as h:
+        task = await placing(h)
+        await h.signal.pick_up()
+        assert await task == "answered"
+        h.helper.caller_says(speech(1.0))
+        await h.quiet_after("Great, have a good day!")
+        h.signal.remote_hangup(call_id=OUT)
+        await h.until(lambda: h.host.ended == 1)
+        await h.until(lambda: "(chords)" in h.host.notes)
+        await asyncio.sleep(0.2)
+        assert h.host.notes == ["(chords)"]
+
+
+async def test_a_practice_call_gets_codes_note_after_its_recap() -> None:
+    said = ["Ik woon in Utrecht.", "Ik werk bij een bank."]
+    async with Harness(said, [Turn("Waar werk je?"), Turn("Wat leuk!")], practice=lambda aci: "nl") as h:
+        await h.connected()
+        await h.quiet_after(prompts.spoken("nl", name=NAME).greeting)
+        for answer in ("Waar werk je?", "Wat leuk!"):
+            h.helper.caller_says(speech(1.0))
+            await h.quiet_after(answer)
+        h.signal.remote_hangup()
+        await h.until(lambda: len(h.host.notes) == 2)
+        assert h.host.notes[0] == "(practice ended)" and h.host.summaries == []
+        assert h.host.notes[1].startswith("A call from one of your devices, ")  # code's words: English
 
 
 async def test_a_call_never_speaks_markup() -> None:
@@ -1117,7 +1443,8 @@ async def test_a_call_the_lock_ends_asks_the_model_for_no_summary() -> None:
         await h.manager.hangup()
         await h.until(lambda: h.host.ended == 1)
         await h.until(lambda: "(chords)" in h.host.notes)  # code's own lines come as ever (held back by the lock)
-        assert h.host.summaries == []
+        await asyncio.sleep(0.1)
+        assert h.host.summaries == [] and h.host.notes == ["(chords)"]  # nor code's note: nothing goes out while locked
 
 
 async def test_a_second_call_during_a_call_is_ignored() -> None:
@@ -1143,6 +1470,10 @@ class Downloads:
     def __init__(self, languages: set[str]) -> None:
         self.languages = languages
         self.told: list[tuple[str, str]] = []
+        self.woken: list[tuple[str, object]] = []  # (language, its Pocket state in the health) before a call
+
+    async def wake(self, language: str, health: Mapping[str, object] | None) -> None:
+        self.woken.append((language, (health or {}).get(f"pocket_{language}")))
 
     def downloading(self, language: str) -> bool:
         return language in self.languages
@@ -1155,7 +1486,7 @@ class Downloads:
 
 
 async def test_a_call_while_janes_model_of_its_language_downloads_rings_out_with_a_text() -> None:
-    """Owner, 25 Oct: no Supertonic-3 stand-in while her model of the language downloads: the call rings out (never
+    """Owner, 25 Oct: nothing in the language is spoken while her model of it downloads: the call rings out (never
     rejected), the caller gets code's text saying when to call again, and no call is placed for a wake-up meanwhile."""
     downloads = Downloads({"de"})
     async with Harness(language="de", downloads=downloads) as h:
@@ -1183,6 +1514,440 @@ async def test_a_practice_call_follows_the_practised_languages_download() -> Non
     async with Harness(practice=lambda aci: "nl", downloads=downloads) as h:  # practice in Dutch, German downloads
         await h.connected()
         assert downloads.told == []
+
+
+async def test_a_call_wakes_its_languages_idle_model_before_it_is_picked_up() -> None:
+    """The review of 4 Nov: after the voice service restarted on its own, jane's model of each language is idle, so a
+    German call was picked up and its first answer went as text while the model only then loaded. Now the ring wakes
+    it (voice_download.LanguageDownload.wake: the warm-up's line, a download claimed when files are missing) before
+    the call is picked up; a practice call wakes the practised language."""
+    downloads = Downloads(set())
+    async with Harness(language="de", downloads=downloads) as h:
+        h.voice.state = {"pocket_de": "idle"}
+        await h.connected()
+        assert downloads.woken == [("de", "idle")]
+    downloads = Downloads(set())
+    async with Harness(practice=lambda aci: "nl", downloads=downloads) as h:
+        await h.connected()
+        assert downloads.woken == [("nl", None)]
+
+
+@pytest.mark.parametrize("tts", ["resting", "failed"])
+async def test_a_call_with_no_ears_and_her_voice_not_working_rings_out_with_the_true_reason(tts: str) -> None:
+    """The review of 4 Nov: with Pocket TTS her only voice, /health's tts is her English Pocket model's: "resting"
+    after failed or late runs, "failed" with its program missing or its files refused. The caller was told her voice
+    was still loading (up to 15 minutes), a promise never kept after a refusal. Now the text gives the true reason,
+    with the same hold, and the voice-ready note follows (a missed call, promised)."""
+    missed: list[tuple[str, bool]] = []
+    async with Harness(ready=False, missed=lambda aci, promised: missed.append((aci, promised))) as h:
+        h.voice.state = {"tts": tts}  # speech recognition still loading too: a call with no ears rings out (4 Nov)
+        h.signal.ring()
+        await h.until(lambda: bool(h.host.notes))
+        h.signal.ring(call_id=8)
+        await h.until(lambda: len(missed) == 2)
+        assert h.signal.accepted == [] and h.signal.hung_up == [] and h.voice.spoken == []
+        assert h.host.notes == [prompts.CALL_VOICE_FAILED]
+        assert missed == [(ME, True), (ME, False)]
+
+
+async def test_a_call_in_a_voice_her_model_leaves_out_rings_out_with_no_ears() -> None:
+    """The review of 4 Nov: heart's shipped file missing (or not the pinned one, or failing its first run) leaves the
+    model ready, and every call was picked up into silence. /health lists such a voice (`voices_left_out`): a call in
+    it rings out with the not-working text; a call in another voice is picked up. Never a stand-in voice (owner,
+    3 Nov 2026)."""
+    async with Harness(ready=False) as h:
+        h.voice.voice = "heart"
+        h.voice.state = {"voices_left_out": ["heart"]}
+        h.signal.ring()
+        await h.until(lambda: bool(h.host.notes))
+        assert h.signal.accepted == [] and h.voice.spoken == [] and h.host.notes == [prompts.CALL_VOICE_FAILED]
+        assert await h.manager.can_place(ME) == "not_ready"
+    async with Harness() as h:
+        h.voice.voice = "michael"
+        h.voice.state = {"voices_left_out": ["heart"]}
+        await h.connected()
+
+
+TEXT_ONLY_STATES: list[dict[str, object]] = [
+    {"tts": "resting"},
+    {"tts": "failed"},
+    {"voices_left_out": ["eve"]},
+]
+
+
+async def text_only_call(h: "Harness") -> None:
+    """Ring and wait until the call is answered and its note went out (no greeting is spoken on such a call)."""
+    h.signal.ring()
+    await h.until(lambda: h.signal.helper is not None and bool(h.host.notes))
+
+
+@pytest.mark.parametrize("state", TEXT_ONLY_STATES)
+async def test_a_call_while_her_voice_is_not_working_is_answered_as_a_text_only_call(state: dict[str, object]) -> None:
+    """Owner, 4 Nov 2026 ("reply by text"): the ears work, the voice rests, cannot run or is left out: the call is
+    answered after its rings, code's note says so and promises a text, and no speech is asked for at all. Her answer
+    goes whole as a text in the turn's chat (stored reply `reply_id`), never spoken, never cut, no prefix, and the
+    voice-ready note follows (a missed call, promised); a connected call owes none otherwise, but this one does."""
+    missed: list[tuple[str, bool]] = []
+    reached: list[str] = []
+    turns = [Turn("Two meetings tomorrow. Then lunch.", reply_id=7)]
+    async with Harness(
+        ["what's on tomorrow"],
+        turns,
+        missed=lambda aci, promised: missed.append((aci, promised)),
+        reached=reached.append,
+    ) as h:
+        h.voice.state = state
+        await text_only_call(h)
+        assert h.signal.accepted == [(ME, CALL)] and h.host.started == [ME]
+        assert h.host.notes == [prompts.CALL_TEXT_ONLY]
+        assert missed == [(ME, True)] and reached == []
+        h.helper.caller_says(speech(1.0))
+        await h.until(lambda: bool(h.host.reply_texts))
+        assert h.host.reply_texts == [(ME, 7)]
+        assert h.host.turns == ["what's on tomorrow"]
+        h.signal.remote_hangup()
+        await h.until(lambda: h.host.ended == 1)
+        assert h.voice.spoken == [] and h.host.interruptions == [] and h.host.texts == []
+        assert h.host.standbys == []
+
+
+async def test_a_text_only_call_asks_for_no_speech_not_even_a_wait_line() -> None:
+    """No greeting, no "Got it.", no thinking or checking line, no text-waits line, no check-in or standby, no
+    still-here line: every turn is answered, and no name is needed. Even a slow answer with tools and a caller's text
+    that waits are not spoken."""
+    turns = [Turn("Rain.", reply_id=3), Turn("Sun.", reply_id=4)]
+    async with Harness(
+        ["what will the weather be like tomorrow please", "and the day after that"],
+        turns,
+        delay=1.0,
+        use_tools=True,
+        acknowledge=True,
+        idle_prompt_s=0.5,
+    ) as h:
+        h.voice.state = {"tts": "resting"}
+        await text_only_call(h)
+        h.helper.caller_says(speech(1.0))
+        await h.until(lambda: bool(h.host.reply_texts))
+        assert h.manager.text_waits(ME)  # the chat line goes as today; her say-so on the call does not
+        await asyncio.sleep(2.0)  # longer than the idle prompt: no check-in, no standby
+        h.helper.caller_says(speech(1.0))  # no name said: answered all the same
+        await h.until(lambda: len(h.host.reply_texts) == 2)
+        assert h.voice.spoken == [] and h.host.standbys == [] and not h.voice.spoken_on_calls
+        h.signal.remote_hangup()
+
+
+async def test_a_text_only_call_stays_text_only_when_the_voice_comes_back() -> None:
+    async with Harness(["one", "two"], [Turn("A.", reply_id=1), Turn("B.", reply_id=2)]) as h:
+        h.voice.state = {"tts": "resting"}
+        await text_only_call(h)
+        h.helper.caller_says(speech(1.0))
+        await h.until(lambda: len(h.host.reply_texts) == 1)
+        h.voice.state = {}  # her voice is back
+        h.helper.caller_says(speech(1.0))
+        await h.until(lambda: len(h.host.reply_texts) == 2)
+        assert h.voice.spoken == []
+        h.signal.remote_hangup()
+
+
+async def test_a_practice_call_while_her_voice_is_not_working_is_text_only_too() -> None:
+    async with Harness(["bonjour"], [Turn("Salut.", reply_id=5)], practice=lambda aci: "fr") as h:
+        h.voice.state = {"tts": "failed"}
+        await text_only_call(h)
+        assert h.host.started_practice == [True]
+        h.helper.caller_says(speech(1.0))
+        await h.until(lambda: bool(h.host.reply_texts))
+        assert h.voice.spoken == []
+        h.signal.remote_hangup()
+
+
+@pytest.mark.parametrize("practice", [False, True])
+async def test_a_text_only_calls_code_line_with_no_reply_goes_to_the_conversation_of_its_call(practice: bool) -> None:
+    """The review of 5 Nov (CALLS-0983-03): `_text_rest` named no practice call, so a practice call's code line that has
+    no reply of hers (the model-paused line: `practice_call_turn` gives `Turn("", code_text=...)`) was stored in the
+    chat conversation. It goes to the practice conversation on a practice call, to the chat on any other."""
+    paused = prompts.MODEL_PAUSED_SPOKEN
+    async with Harness(
+        ["bonjour"], [Turn("", code_text=paused)], practice=(lambda aci: "fr") if practice else None
+    ) as h:
+        h.voice.state = {"tts": "failed"}
+        await text_only_call(h)
+        assert h.host.started_practice == [practice]
+        h.helper.caller_says(speech(1.0))
+        await h.until(lambda: bool(h.host.texts))
+        assert h.host.texts == [(ME, paused, None, False)] and h.host.text_practice == [practice]
+        assert h.voice.spoken == []
+        h.signal.remote_hangup()
+
+
+async def test_a_spoken_practice_calls_code_line_with_no_reply_goes_to_the_practice_conversation() -> None:
+    """The same on a spoken practice call (the gap since 0.9.8): code's line her voice could not say goes as a text."""
+    paused = prompts.MODEL_PAUSED_SPOKEN
+    async with Harness(["Ik woon in Utrecht."], [Turn("", code_text=paused)], practice=lambda aci: "nl") as h:
+        h.voice.unsaid = {sentences(paused)[0]}  # her voice stops at the first sentence: all of it goes as one text
+        await h.connected()
+        await h.quiet_after(prompts.spoken("nl", name=NAME).greeting)
+        h.helper.caller_says(speech(1.0))
+        await h.until(lambda: bool(h.host.texts))
+        assert h.host.texts == [(ME, paused, None, False)] and h.host.text_practice == [True]
+        h.signal.remote_hangup()
+
+
+async def test_the_text_only_answer_leaves_out_the_lines_that_go_as_texts_of_their_own() -> None:
+    """The stored reply (her words and `kept_code`, the device question last) is the answer; code's other lines go as
+    one note of their own, but those in `also_texted`, which have texts of their own, never come twice."""
+    turn = Turn(
+        "Sure.",
+        reply_id=9,
+        asks_yes=True,
+        code_text="Lights are on. Set it? Shall I switch the lamp on?",
+        kept_code=("Shall I switch the lamp on?",),
+        also_texted=("Lights are on.",),
+    )
+    async with Harness(["lamp"], [turn]) as h:
+        h.voice.state = {"tts": "resting"}
+        await text_only_call(h)
+        h.helper.caller_says(speech(1.0))
+        await h.until(lambda: bool(h.host.reply_texts))
+        await h.until(lambda: bool(h.host.texts))
+        assert h.host.reply_texts == [(ME, 9)]
+        assert h.host.texts == [(ME, "Set it?", 9, False)]  # not hers: no "my voice stopped" line, no repeat
+        assert h.voice.spoken == []
+        h.signal.remote_hangup()
+
+
+async def test_a_failed_turn_on_a_text_only_call_is_a_text_too() -> None:
+    async with Harness(["something long"], [Turn(prompts.call_lines("en", name=NAME).lost, failed=True)]) as h:
+        h.voice.state = {"tts": "resting"}
+        await text_only_call(h)
+        h.helper.caller_says(speech(1.0))
+        await h.until(lambda: bool(h.host.texts))
+        assert h.host.texts == [(ME, prompts.call_lines("en", name=NAME).lost, None, False)]
+        assert h.voice.spoken == [] and h.host.reply_texts == []
+        h.signal.remote_hangup()
+
+
+@pytest.mark.parametrize(
+    "heard, turn",
+    [
+        ("goodbye", Turn("Bye.", reply_id=2)),
+        ("thanks, that's all for now", Turn("You're welcome.", reply_id=2, end_call=True)),
+        ("thanks, please hang up now", Turn("Okay.", reply_id=2)),
+    ],
+)
+async def test_a_text_only_call_ends_by_the_normal_rules_with_no_texted_goodbye(heard: str, turn: Turn) -> None:
+    async with Harness([heard], [turn]) as h:
+        h.voice.state = {"tts": "resting"}
+        await text_only_call(h)
+        h.helper.caller_says(speech(1.0))
+        await h.until(lambda: h.host.ended == 1, limit=10.0)
+        assert h.voice.spoken == [] and h.host.texts == []
+        assert not h.manager.in_call
+
+
+async def test_a_text_only_calls_time_cap_ends_it_with_its_bye_as_a_text() -> None:
+    async with Harness([], [], max_s=1.0) as h:
+        h.voice.state = {"tts": "resting"}
+        await text_only_call(h)
+        await h.until(lambda: h.host.ended == 1, limit=10.0)
+        assert h.host.texts == [(ME, prompts.call_lines("en", name=NAME).max_bye, None, False)]
+        assert h.voice.spoken == []
+
+
+async def test_a_text_only_call_that_hears_wrong_texts_the_hearing_line() -> None:
+    async with Harness(["x"], []) as h:
+        h.voice.state = {"tts": "resting"}
+        await text_only_call(h)
+        h.voice.fail_transcribe = True
+        h.helper.caller_says(speech(1.0))
+        await h.until(lambda: bool(h.host.texts))
+        assert h.host.texts == [(ME, prompts.call_lines("en", name=NAME).hearing, None, False)]
+        h.signal.remote_hangup()
+
+
+async def test_a_yes_said_before_the_answers_text_went_out_is_never_heard() -> None:
+    """Review, 4 Nov: a whole "Okay." into the silence while she worked sat in the listen backlog and confirmed the
+    device question texted after it. `_write` awaits the send, then drops the backlog (like a spoken answer's fresh
+    drain)."""
+    async with Harness(["lamp", "yes"], [Turn("Sure.", reply_id=9, asks_yes=True, kept_code=("Switch it?",))]) as h:
+        h.voice.state = {"tts": "resting"}
+
+        async def yes_meanwhile() -> None:
+            h.helper.caller_says(speech(1.0))
+            await asyncio.sleep(1.0)  # the yes is in the backlog before the send returns
+
+        h.host.on_reply = yes_meanwhile
+        await text_only_call(h)
+        h.helper.caller_says(speech(1.0))
+        await h.until(lambda: bool(h.host.reply_texts))
+        await asyncio.sleep(1.5)
+        assert h.host.turns == ["lamp"] and h.voice.heard == 1  # the early yes was dropped, never transcribed
+        h.signal.remote_hangup()
+
+
+async def test_a_yes_said_after_the_answers_text_went_out_is_a_turn() -> None:
+    async with Harness(["lamp", "yes"], [Turn("Sure.", reply_id=9, asks_yes=True, kept_code=("Switch it?",))]) as h:
+        h.voice.state = {"tts": "resting"}
+        await text_only_call(h)
+        h.helper.caller_says(speech(1.0))
+        await h.until(lambda: bool(h.host.reply_texts))
+        await asyncio.sleep(0.3)
+        h.helper.caller_says(speech(1.0))
+        await h.until(lambda: h.host.turns == ["lamp", "yes"])
+        h.signal.remote_hangup()
+
+
+@pytest.mark.parametrize("asks_yes", [True, False])
+async def test_an_answer_whose_text_could_not_be_sent_drops_the_waiting_question(asks_yes: bool) -> None:
+    turn = Turn("Sure.", reply_id=9, asks_yes=asks_yes, kept_code=("Switch it?",) if asks_yes else ())
+    async with Harness(["lamp"], [turn]) as h:
+        h.voice.state = {"tts": "resting"}
+        h.host.reply_sent = False
+        await text_only_call(h)
+        h.helper.caller_says(speech(1.0))
+        await h.until(lambda: bool(h.host.reply_texts))
+        await asyncio.sleep(0.3)
+        assert (h.host.dropped_waiting, h.host.unheard_questions) == ((1, 1) if asks_yes else (0, 0))
+        h.signal.remote_hangup()
+        await h.until(lambda: h.host.ended == 1)
+    assert not any(line.startswith(f"{NAME}: Sure.") for lines in h.host.summaries for line in lines[0])
+
+
+async def test_her_goodbye_on_a_text_only_call_does_not_end_it() -> None:
+    """Review F2: the 3 s quiet after her goodbye started when the text was queued and hung up before it could be read.
+    The call ends only on the caller's own closing, her end_call, the time cap or a hang-up."""
+    answers = [Turn("Sorry to hear that. Take care!", reply_id=2), Turn("Rest well.", reply_id=3)]
+    async with Harness(["I have a bad cold today.", "thanks, I will"], answers) as h:
+        h.voice.state = {"tts": "resting"}
+        await text_only_call(h)
+        h.helper.caller_says(speech(1.0))
+        await h.until(lambda: len(h.host.reply_texts) == 1)
+        h.helper.caller_says_after(lambda: len(h.host.reply_texts) == 1, 250, speech(1.0))  # 5 s later
+        await h.until(lambda: len(h.host.reply_texts) == 2)  # still up: those words are the next turn
+        assert h.host.turns == ["I have a bad cold today.", "thanks, I will"] and h.host.ended == 0
+        h.signal.remote_hangup()
+
+
+async def test_a_caller_who_hangs_up_during_the_rings_of_a_text_only_call_gets_the_ring_out_note() -> None:
+    missed: list[tuple[str, bool]] = []
+    async with Harness(answer_after_s=1.0, missed=lambda aci, promised: missed.append((aci, promised))) as h:
+        h.voice.state = {"tts": "resting"}
+        h.signal.ring()
+        await h.until(lambda: bool(h.host.started))
+        h.signal.remote_hangup()
+        await h.until(lambda: h.host.ended == 1)
+        notes = [note for note in h.host.notes if note != "(chords)"]
+        assert notes == [prompts.CALL_VOICE_FAILED] and missed == [(ME, True)] and h.signal.accepted == []
+        h.signal.ring(call_id=8)  # the ten-minute hold applies as before
+        await h.until(lambda: len(h.host.started) == 2)
+        h.signal.remote_hangup(call_id=8)
+        await h.until(lambda: h.host.ended == 2)
+        notes = [note for note in h.host.notes if note != "(chords)"]
+        assert notes == [prompts.CALL_VOICE_FAILED] and missed == [(ME, True), (ME, False)]
+
+
+async def test_the_ready_promise_is_recorded_only_after_the_text_only_note_went_out() -> None:
+    missed: list[tuple[str, bool]] = []
+    async with Harness(missed=lambda aci, promised: missed.append((aci, promised))) as h:
+        h.voice.state = {"tts": "resting"}
+        h.host.note_error = RuntimeError("could not be stored")
+        h.signal.ring()
+        await h.until(lambda: h.host.started == [ME] and h.signal.helper is not None)
+        await asyncio.sleep(0.3)
+        assert missed == [] and h.host.notes == []  # nothing was promised
+        h.signal.remote_hangup()
+
+
+async def test_a_text_only_call_that_could_not_be_accepted_promises_nothing() -> None:
+    missed: list[tuple[str, bool]] = []
+    async with Harness(missed=lambda aci, promised: missed.append((aci, promised))) as h:
+        h.voice.state = {"tts": "resting"}
+        h.signal.accept_error = RuntimeError("signal-cli refused")
+        h.signal.ring()
+        await h.until(lambda: h.host.ended == 1)
+        assert missed == [] and prompts.CALL_TEXT_ONLY not in h.host.notes
+
+
+async def test_a_text_only_call_keeps_the_end_lines_honest(caplog: pytest.LogCaptureFixture) -> None:
+    """Review F6: a bump (too little voice) and noise are no turn for the early end's lines, they log as the spoken path
+    does, and each texted answer logs its wait (metadata)."""
+    calls_logs(caplog)
+    async with Harness(["*music*", "what time is it"], [Turn("Four.", reply_id=1)], **EARLY) as h:
+        h.voice.detector = h.voice.turn_detector = "ready"
+        h.voice.state = {"tts": "resting"}
+        h.voice.turn_p = [0.95] * 4
+        await text_only_call(h)
+        h.helper.caller_says(speech(0.11))
+        await h.until(lambda: any(line.startswith("calls: noise (voiced") for line in log_lines(caplog)))
+        h.helper.caller_says(speech(1.0))  # heard as noise
+        await h.until(lambda: h.voice.heard == 1)
+        h.helper.caller_says(speech(1.0))
+        await h.until(lambda: bool(h.host.reply_texts))
+        h.signal.remote_hangup()
+        await h.until(lambda: h.host.ended == 1)
+    lines = log_lines(caplog)
+    assert "calls: noise heard as words; listening on" in lines
+    assert any(re.fullmatch(r"calls: texted \d+ ms after the end of the turn", line) for line in lines)
+    assert end_line(caplog).startswith("calls: early end on (short pause 0.60 s, full 2.30 s): 1 turn, 1 ended early")
+
+
+async def test_a_text_only_call_logs_its_silence(caplog: pytest.LogCaptureFixture) -> None:
+    calls_logs(caplog)
+    async with Harness([], [], idle_prompt_s=0.5) as h:
+        h.voice.state = {"tts": "resting"}
+        await text_only_call(h)
+        await h.until(lambda: any(line.startswith("calls: no speech in") for line in log_lines(caplog)))
+        assert h.voice.spoken == []
+        h.signal.remote_hangup()
+
+
+async def test_a_ring_that_text_only_does_not_cover_rings_out_as_before() -> None:
+    """Still loading, ears not ready, a language with no voice, a language downloading, a call she places: all as
+    before (owner, 4 Nov 2026: only a ring from an allowed account with ready ears and a voice that is not working)."""
+    async with Harness(ready=False) as h:  # still loading: stt and tts
+        h.signal.ring()
+        await h.until(lambda: bool(h.host.notes))
+        assert h.host.notes == [prompts.CALL_NOT_READY] and h.signal.accepted == []
+    async with Harness() as h:  # ears loading, voice resting
+        h.voice.state = {"stt": "loading", "tts": "resting"}
+        h.signal.ring()
+        await h.until(lambda: bool(h.host.notes))
+        assert h.host.notes == [prompts.CALL_VOICE_FAILED] and h.signal.accepted == []
+    downloads = Downloads({"de"})
+    async with Harness(language="de", downloads=downloads) as h:  # German downloading, voice resting
+        h.voice.state = {"tts": "resting"}
+        h.signal.ring()
+        await h.until(lambda: bool(h.host.notes))
+        assert h.host.notes == ["Her de voice is downloading."] and h.signal.accepted == []
+    async with Harness() as h:  # a call she places
+        h.voice.state = {"tts": "resting"}
+        assert await h.manager.can_place(ME) == "not_ready"
+
+
+def test_the_text_only_note_says_so_and_that_she_texts_when_it_works() -> None:
+    assert prompts.CALL_TEXT_ONLY == (
+        "My voice is not working right now: I'm listening, and my answers come as text. I'll text you when it works "
+        "again."
+    )
+
+
+def test_the_voice_failed_note_says_so_and_that_she_texts_when_it_works() -> None:
+    assert prompts.CALL_VOICE_FAILED == (
+        "I can't take calls right now: my voice is not working. My answers come as text. I'll text you when it works "
+        "again."
+    )
+
+
+async def test_her_call_keeps_the_language_it_was_placed_in() -> None:
+    """The review of 4 Nov: the language was checked before dialling and read again once picked up, up to ring_wait_s
+    later: a /language ko meanwhile put a reminder call in Korean, where every line is refused. The call keeps the
+    language it was placed in."""
+    async with Harness() as h:
+        task = await placing(h)
+        h.manager.language = "ko"
+        await h.signal.pick_up()
+        assert await task == "answered"
+        await h.until(lambda: bool(h.voice.spoken))
+        assert "ko" not in h.voice.languages and h.voice.languages[0] in (None, "en")
 
 
 def test_the_not_ready_note_says_why_and_that_she_texts_when_ready() -> None:
@@ -1283,6 +2048,20 @@ def test_the_check_in_names_her_and_the_still_here_line_is_short() -> None:
     """Owner, 18 Oct: the check-in tells the caller her name, the word that ends standby."""
     assert f"Take your time, I'm here. Say {NAME} when you need me." == CHECK_IN
     assert prompts.call_lines("en", name=NAME).still_here == "I'm still here."
+
+
+async def test_a_check_in_her_voice_cannot_say_starts_no_standby() -> None:
+    """The review of 4 Nov: standby started before the check-in was tried, so a check-in Pocket TTS could not say left
+    the caller in standby without its rule ("Say <name> when you need me.") ever heard, and every turn without her
+    name was dropped in silence. Standby starts only once the check-in is said: the next turn is answered as ever."""
+    async with Harness(["what's the weather tomorrow"], [Turn("Sunny.")], idle_prompt_s=0.5) as h:
+        h.voice.unsaid = {CHECK_IN}
+        await h.connected()
+        await h.until(lambda: CHECK_IN in h.voice.spoken)
+        h.helper.caller_says(speech(1.0))
+        await h.quiet_after("Sunny.")
+        assert h.host.turns == ["what's the weather tomorrow"] and h.host.standbys == []
+        h.signal.remote_hangup()
 
 
 async def test_after_the_check_in_only_a_turn_with_her_name_is_answered(caplog: pytest.LogCaptureFixture) -> None:
@@ -1794,6 +2573,100 @@ async def test_after_her_greeting_which_asks_the_line_waits_for_her_answer() -> 
         h.helper.caller_says(speech(1.0))
         await h.quiet_after(TEXT_LINE)
         assert h.manager.said[-2:] == ["Noon.", TEXT_LINE] and h.host.turns == ["what's the time"]
+
+
+async def test_a_text_the_call_stopped_is_told_right_after_the_greeting_never_behind_its_question() -> None:
+    """The review of 5 Nov (DLG-0983-05): a Deep Thinking text that a call stopped is out of her window for the whole
+    call, and every greeting asks something, so her line about it waited for her answer to the caller's first turn:
+    "Did you get my question about the visa?" was answered as if there were none, and before code's line. As the
+    greeting ends, before the first listen, she says it (once a call); the caller's first turn comes after it."""
+    asked = "did you get my question about the visa"
+    async with Harness([asked], [Turn("Noon.")]) as h:
+        made = asyncio.Event()
+        h.voice.slow[GREETING] = made  # still being made while the call's text is stopped: it is owed as she greets
+        h.signal.ring()
+        await h.until(lambda: GREETING in h.voice.spoken)
+        assert h.manager.text_waits(ME, stopped=True) is True
+        assert h.manager.text_waits(ME, stopped=True) is False  # once a call
+        made.set()
+        await h.quiet_after(TEXT_LINE)
+        assert h.manager.said[-2:] == [GREETING, TEXT_LINE] and h.host.turns == []  # said before any turn
+        h.helper.caller_says(speech(1.0))
+        await h.quiet_after("Noon.")
+        assert h.manager.said[-3:] == [GREETING, TEXT_LINE, "Noon."] and h.host.turns == [asked]
+        await call_time(h, 3.0)
+        assert h.manager.said.count(TEXT_LINE) == 1 and overlaps(h) == []  # once, over no word of the caller
+
+
+async def test_a_text_stopped_while_the_call_rings_has_its_line_made_while_she_greets() -> None:
+    """Its speech is asked as she starts to greet (as the line that waits for a quiet moment is made ahead: `_text_due`),
+    so no gap follows the greeting in which the caller's first words would be thrown away."""
+    async with Harness(["what's the time"], [Turn("Noon.")], answer_after_s=0.4) as h:
+        gate = asyncio.Event()
+        h.voice.slow[GREETING] = gate  # she is greeting: its speech is not made yet
+        h.signal.ring()
+        await h.until(lambda: h.manager.in_call)
+        assert h.manager.text_waits(ME, stopped=True)  # while it rings
+        await h.until(lambda: GREETING in h.voice.spoken)
+        await h.until(lambda: TEXT_LINE in h.voice.spoken, limit=2.0)  # asked now, not after the greeting
+        gate.set()
+        await h.quiet_after(TEXT_LINE)
+        assert h.manager.said[-2:] == [GREETING, TEXT_LINE] and h.host.turns == []
+        assert h.voice.spoken.count(TEXT_LINE) == 1  # made once
+        h.helper.caller_says(speech(1.0))
+        await h.quiet_after("Noon.")
+
+
+async def test_the_callers_words_over_the_greeting_come_first_and_the_line_waits_as_before() -> None:
+    """The caller who speaks over the greeting is a cut-in: those words are the first turn, as ever; her line follows
+    her answer (the next quiet moment that is not behind a question of hers)."""
+    long_greeting = "Hello there, this is Estia, glad you called. What can I do for you on this fine morning?"
+    async with Harness(["did you get my message"], [Turn("Noon.")], greetings=(long_greeting,)) as h:
+        made = asyncio.Event()
+        h.voice.slow[long_greeting] = made
+        h.signal.ring()
+        await h.until(lambda: long_greeting in h.voice.spoken)
+        assert h.manager.text_waits(ME, stopped=True)
+        h.helper.caller_says_when(lambda: h.manager.saying == long_greeting, speech(1.0))
+        made.set()
+        await h.quiet_after(TEXT_LINE)
+        assert h.manager.said[-2:] == ["Noon.", TEXT_LINE]
+        assert h.host.turns == [f"{prompts.CUTTING_IN} did you get my message"]
+
+
+async def test_a_text_typed_during_the_call_still_waits_behind_the_greetings_question() -> None:
+    """Only a stopped text goes first: one typed while she greets keeps the rule of 23 Oct (the reply comes first)."""
+    async with Harness(["what's the time"], [Turn("Noon.")]) as h:
+        made = asyncio.Event()
+        h.voice.slow[GREETING] = made
+        h.signal.ring()
+        await h.until(lambda: GREETING in h.voice.spoken)
+        assert h.manager.text_waits(ME)
+        made.set()
+        await h.quiet_after(GREETING)
+        await call_time(h, 3.0)
+        assert TEXT_LINE not in h.manager.said
+        h.helper.caller_says(speech(1.0))
+        await h.quiet_after(TEXT_LINE)
+        assert h.manager.said[-2:] == ["Noon.", TEXT_LINE]
+
+
+async def test_a_stopped_texts_line_whose_speech_fails_is_dropped_and_the_call_goes_on() -> None:
+    """As for the line that waits for a quiet moment (`_text_due`): a failed speech drops the line, never the call."""
+    async with Harness(["what's the time"], [Turn("Noon.")]) as h:
+        h.voice.broken.add(TEXT_LINE)  # the voice service's answer is no WAV
+        made = asyncio.Event()
+        h.voice.slow[GREETING] = made
+        h.signal.ring()
+        await h.until(lambda: GREETING in h.voice.spoken)
+        assert h.manager.text_waits(ME, stopped=True)
+        made.set()
+        await h.until(lambda: TEXT_LINE in h.voice.spoken)
+        h.helper.caller_says(speech(1.0))
+        await h.quiet_after("Noon.")
+        assert TEXT_LINE not in h.manager.said and h.voice.spoken.count(TEXT_LINE) == 1
+        assert h.host.turns == ["what's the time"] and h.manager.in_call and h.host.ended == 0
+        h.signal.remote_hangup()
 
 
 async def test_after_her_question_with_no_reply_the_line_follows_the_check_in() -> None:
@@ -2480,6 +3353,7 @@ async def test_a_retry_a_search_and_a_long_answer_over_the_turn_limit_lose_the_a
             *,
             practice: bool = False,
             on_retry: Callable[[], None] | None = None,
+            text_only: bool = False,
         ) -> Turn:
             self.turns.append(text)
             try:
@@ -2539,8 +3413,9 @@ async def test_a_call_that_ends_after_a_timed_out_answer_says_it_was_not_done() 
         await h.quiet_after(prompts.CALL_LOST.split(". ")[-1])
         h.signal.remote_hangup()
         await h.until(lambda: h.host.ended == 1)
-        await h.until(lambda: len(h.host.notes) == 2)
-    assert h.host.notes == [prompts.CALL_TOO_LONG_NOTE, "(chords)"]
+        await h.until(lambda: len(h.host.notes) == 3)
+    assert h.host.notes[:2] == [prompts.CALL_TOO_LONG_NOTE, "(chords)"]
+    assert h.host.notes[2].startswith("A call from one of your devices, ")  # one turn: code's note, last
     assert prompts.CALL_TOO_LONG_NOTE == (
         "Your last request on the call took too long, so I stopped working on it. Ask me again by text if you still "
         "want it."
@@ -2796,6 +3671,10 @@ async def test_a_wrap_up_answered_with_a_device_question_keeps_the_call() -> Non
         ("That's all right.", False),
         ("That's all good, thanks.", False),
         ("All right, that's it.", True),
+        # voice-calls-fixrev3-04: "that is enough" was no wrap-up, though "that's enough" was
+        ("That is enough for today.", True),
+        ("That is enough, thanks.", True),
+        ("That is enough sugar.", False),
     ],
 )
 def test_what_counts_as_wrapping_up(said: str, wraps_up: bool) -> None:
@@ -2913,6 +3792,19 @@ CALLERS_CLOSINGS = [
     ("Всё, пока!", "ru"),
     ("Ну, пока!", "ru"),
     ("All right, that's it.", "en"),  # third fix review of 0.9.8, voice-calls-fixrev3-02
+    ("That is enough, thanks.", "en"),  # voice-calls-fixrev3-04
+    ("Gracias, buenas noches.", "es"),  # "good evening" too: only after a thanks
+    # dialogue-F4: a "for now" goodbye after "well then" ("じゃあ", "cześć"), with or without a comma
+    ("じゃあ、またあとで", "ja"),
+    ("じゃあまたあとで", "ja"),
+    ("Cześć, na razie!", "pl"),
+    # dialogue-F4: a "for now" goodbye with only a thanks after it
+    ("Na razie, dzięki!", "pl"),
+    ("またあとで、ありがとう", "ja"),
+    # dialogue-F5: the call language's soft word beside "пока" or "pa" in its part, with no comma
+    ("Ну пока!", "ru"),
+    ("Ладно пока!", "ru"),
+    ("No pa!", "pl"),
 ]
 NO_CLOSINGS = [
     # an acknowledgement or a thanks alone, a question, more after the goodbye
@@ -2938,6 +3830,7 @@ NO_CLOSINGS = [
     ("Ciao, bene grazie!", "it"),
     ("안녕!", "ko"),
     ("Boa noite!", "pt"),
+    ("¡Buenas noches!", "es"),
     ("Dag!", "nl"),
     ("Cześć!", "pl"),
     ("Servus!", "de"),
@@ -2970,6 +3863,16 @@ NO_CLOSINGS = [
     ("Na razie dobrze.", "pl"),
     ("Na razie tak.", "pl"),
     ("うん、またあとで。天気を教えて", "ja"),
+    ("Cześć, na razie dobrze.", "pl"),  # dialogue-F4: "hi, so far fine"
+    ("Na razie dobrze, dzięki.", "pl"),  # "fine so far, thanks"
+    ("Na razie nie, dzięki.", "pl"),  # "not for now, thanks"
+    ("Na razie, dzięki?", "pl"),  # asked
+    # dialogue-F5: "всё" and "хорошо" beside "пока" are "so far" (language.SO_FAR); an acknowledgement before the
+    # goodbye stays refused until a native speaker's check
+    ("Ну, пока всё.", "ru"),
+    ("Пока всё понятно.", "ru"),
+    ("Dobra pa", "pl"),
+    ("Oké dag dag", "nl"),
 ]
 
 
@@ -3768,21 +4671,24 @@ async def test_a_goodbye_said_back_after_hers_ends_the_call_without_another_answ
 
 @pytest.mark.parametrize(
     ("code", "hers", "said"),
-    [
-        ("en", "Have fun! Bye!", "Thank you."),  # a voiced thanks, kept since 0.9.7's I23 fix
-        ("en", "Have fun! Bye!", "Okay, thanks, bye."),
-        ("nl", "Fijne avond! Doei!", "Doei!"),
-        ("nl", "Fijne avond! Doei!", "Dag!"),  # also "hello": a goodbye only after hers
-        ("de", "Schönen Abend! Tschüss!", "Tschüss!"),
-        ("it", "Buona serata! A presto!", "Ciao!"),
-        ("ru", "Хорошего вечера! До связи!", "Пока!"),
-        ("fr", "Bonne soirée ! À bientôt !", "Merci, salut !"),
-        ("ja", "またね。", "またね"),
-        ("es", "¡Que lo pases bien! ¡Adiós!", "¡Adiós!"),
-        ("ko", "좋은 저녁 보내세요! 안녕히 계세요!", "안녕히 계세요."),
-        ("pt", "Boa noite! Tchau!", "Tchau tchau!"),
-        ("pl", "Miłego wieczoru! Pa pa!", "Cześć!"),
-    ],
+    voiced(
+        [
+            ("en", "Have fun! Bye!", "Thank you."),  # a voiced thanks, kept since 0.9.7's I23 fix
+            ("en", "Have fun! Bye!", "Okay, thanks, bye."),
+            ("nl", "Fijne avond! Doei!", "Doei!"),
+            ("nl", "Fijne avond! Doei!", "Dag!"),  # also "hello": a goodbye only after hers
+            ("de", "Schönen Abend! Tschüss!", "Tschüss!"),
+            ("it", "Buona serata! A presto!", "Ciao!"),
+            ("ru", "Хорошего вечера! До связи!", "Пока!"),
+            ("fr", "Bonne soirée ! À bientôt !", "Merci, salut !"),
+            ("ja", "またね。", "またね"),
+            ("es", "¡Que lo pases bien! ¡Adiós!", "¡Adiós!"),
+            ("es", "¡Que descanses! ¡Adiós!", "Buenas noches."),  # also "good evening": a goodbye only after hers
+            ("ko", "좋은 저녁 보내세요! 안녕히 계세요!", "안녕히 계세요."),
+            ("pt", "Boa noite! Tchau!", "Tchau tchau!"),
+            ("pl", "Miłego wieczoru! Pa pa!", "Cześć!"),
+        ]
+    ),
 )
 async def test_the_callers_goodbye_in_any_language_after_hers_ends_the_call(code: str, hers: str, said: str) -> None:
     """Review of 0.9.7 (C6): after her goodbye only an English goodbye ended the call; "Doei!", "Tschüss!", "Ciao!",
@@ -4564,8 +5470,9 @@ async def test_a_call_that_ends_during_an_answer_leaves_a_note_that_it_was_not_d
         await h.until(lambda: h.host.turns == ["switch the lights off"])
         h.signal.remote_hangup()
         await h.until(lambda: h.host.ended == 1)
-        await h.until(lambda: len(h.host.notes) == 2)
-        assert h.host.notes == [prompts.CALL_UNFINISHED, "(chords)"]  # then code's chords message (none, here)
+        await h.until(lambda: len(h.host.notes) == 3)
+        assert h.host.notes[:2] == [prompts.CALL_UNFINISHED, "(chords)"]  # then code's chords message (none, here)
+        assert h.host.notes[2].startswith("A call from one of your devices, ")  # and code's note on the call, last
 
 
 def test_no_spoken_line_is_a_hum_the_voice_garbles() -> None:
@@ -4727,7 +5634,7 @@ async def test_words_over_the_wake_line_answer_it_so_a_silence_after_gets_the_ch
         assert not any(line in h.manager.said for line in prompts.CALL_BYE_LINES)
 
 
-@pytest.mark.parametrize("hello", ["Hello?", "Hallo?", "Hey, hello.", f"Hello, {NAME}?"])
+@pytest.mark.parametrize("hello", ["Hello?", "Hallo?", "Hey, hello.", f"Hello, {NAME}?", "Yes, hello?"])
 async def test_a_callees_hello_over_the_opening_resumes_it(hello: str, caplog: pytest.LogCaptureFixture) -> None:
     """The second deep scan (calls-hello-over-opening): on a call she places, the callee's "Hello?" over its opening
     counted as one word asked back and took over, so the time and the reminder were never said on the call. Greeting
@@ -4758,6 +5665,19 @@ async def test_a_callees_hello_over_the_opening_resumes_it(hello: str, caplog: p
         ("Tiffany?", "en", False),  # her name alone calls no one over the opening
         ("Hello? Who is this?", "en", False),
         ("Wait.", "en", False),
+        # review of 0.9.8, V02: a yes or a pickup word ("Pronto?", "¿Diga?") over her opening took the turn
+        ("Ja, hallo?", "de", True),
+        ("Ja, hallo.", "de", True),
+        ("Yes, hello?", "en", True),
+        ("Oui, allô ?", "fr", True),
+        ("Sì, pronto?", "it", True),
+        ("Pronto?", "it", True),
+        ("¿Sí, dígame?", "es", True),
+        ("¿Diga?", "es", True),
+        ("Да, алло?", "ru", True),
+        ("Halo, słucham?", "pl", True),
+        ("Hello, who is this?", "en", False),
+        ("Ja?", "de", False),  # a yes word alone stays a turn until a native speaker's check
     ],
 )
 def test_only_greeting_or_calling_words(said: str, code: str, greeting: bool) -> None:
@@ -5135,8 +6055,42 @@ async def test_a_practice_call_ends_practice_before_its_notes() -> None:
         h.helper.caller_says(speech(0.8))
         await h.until(lambda: h.host.turns == ["Ik ben moe."])
         h.signal.remote_hangup()
-        await h.until(lambda: len(h.host.notes) == 2)
-        assert h.host.notes == ["(practice ended)", prompts.CALL_UNFINISHED]
+        await h.until(lambda: len(h.host.notes) == 3)
+        assert h.host.notes[:2] == ["(practice ended)", prompts.CALL_UNFINISHED]
+        assert h.host.notes[2].startswith("A call from one of your devices, ")
+
+
+async def test_a_practice_calls_drain_is_not_held_by_the_notes_that_wait_for_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Review of 4 Nov, calls-2: the drain (the texts typed during the call, answered as practice, then the recap) waits
+    for the app's worker, and a worker that holds such a text waits, while Deep Thinking answers, for the notes after the
+    call (`after_notes`): so none are owed while the drain runs, and they are owed again for the rest of the notes."""
+    async with Harness(["Ik ben moe."], delay=30.0, practice=lambda aci: "nl") as h:
+        owed: list[tuple[str, bool]] = []  # per step: its name and whether the notes were owed as it began
+        drain, note = h.host.practice_call_ended, h.host.call_note
+
+        async def draining(aci: str) -> None:
+            owed.append(("drain", not h.manager._after_done.is_set()))
+            await drain(aci)
+
+        async def noting(aci: str, text: str) -> None:
+            owed.append((text, not h.manager._after_done.is_set()))
+            await note(aci, text)
+
+        monkeypatch.setattr(h.host, "practice_call_ended", draining)
+        monkeypatch.setattr(h.host, "call_note", noting)
+        await h.connected()
+        await h.quiet_after(prompts.spoken("nl", name=NAME).greeting)
+        h.helper.caller_says(speech(0.8))
+        await h.until(lambda: h.host.turns == ["Ik ben moe."])
+        h.signal.remote_hangup()
+        await h.until(lambda: len(h.host.notes) == 3)
+        assert owed[0] == ("drain", False)  # the worker that holds a typed text may answer it: nothing is owed
+        assert [was_owed for _, was_owed in owed[1:]] == [True, True]  # the rest of the notes are owed, as ever
+        assert owed[1][0] == prompts.CALL_UNFINISHED and owed[2][0].startswith("A call from one of your devices")
+        async with asyncio.timeout(1):
+            await h.manager.after_notes(60.0)  # and nothing is owed once they have gone out
 
 
 async def test_without_practice_a_call_keeps_its_language_and_summary() -> None:
@@ -5178,7 +6132,7 @@ async def test_a_call_she_places_during_practice_is_an_ordinary_call() -> None:
 # on; anything more, a "but", or an answer to her question takes over.
 @pytest.mark.parametrize(
     ("code", "asked", "first", "second", "heard", "carries_on"),
-    [
+    voiced([
         ("en", "how is the weather", "It is sunny.", "The whole week stays dry and warm, with a light wind from the west.",
          "Yeah.", True),
         ("en", "how is the weather", "It is sunny.", "The whole week stays dry and warm, with a light wind from the west.",
@@ -5207,7 +6161,7 @@ async def test_a_call_she_places_during_practice_is_an_ordinary_call() -> None:
          "でも", False),
         ("ja", "天気はどう", "晴れです。", "今週はずっと乾燥していて暖かく、西からの穏やかな風が吹き、とても過ごしやすい一週間になりそうです。",
          "はい、明日は？", False),
-    ],
+    ]),
 )  # fmt: skip
 async def test_over_her_answer_an_acknowledgement_carries_on_and_anything_more_takes_over(
     code: str, asked: str, first: str, second: str, heard: str, carries_on: bool
@@ -5269,7 +6223,7 @@ RHETORICAL = {
 }
 
 
-@pytest.mark.parametrize("code", ["ja", "ko", "en"])
+@pytest.mark.parametrize("code", voiced(["ja", "ko", "en"]))
 async def test_call_backchannel_after_rhetorical(code: str, caplog: pytest.LogCaptureFixture) -> None:
     """A question at part 3 of 6 that she talks on from is rhetorical: an acknowledgement over part 4 carries on, all
     six parts are said, and the caller's turn is no turn of the host's (call_backchannel_after_rhetorical_ja/_ko/_en)."""
@@ -6248,3 +7202,195 @@ def test_a_closing_question_stays_when_what_is_left_would_end_the_call() -> None
     answer = FULL_ANSWER + " Bye for now! Or is there anything else?"
     assert calls.ends_with_goodbye(FULL_ANSWER + " Bye for now!", name=DEFAULT_NAME)
     assert calls.without_closing_questions(answer, name=DEFAULT_NAME) == answer
+
+
+# her goodbye never stands before code's device question (calls-099-01; the gate run of 4-5 Nov, call_device_yes_then_bye:
+# after "switch off the heater, that's all for today, bye" all ten answers ended "Goodbye!", ahead of code's question)
+RUN_ONE_ASKS = [
+    # her ten answers' words in that run (the fifth is lost from the log), each with the ending as it was
+    (
+        "The heater needs you to say yes first. Please say yes to switch it off.\n\nGoodbye!",
+        "The heater needs you to say yes first. Please say yes to switch it off.",
+    ),
+    ("Please say yes to turn off the heater.\n\nGoodbye!", "Please say yes to turn off the heater."),
+    (
+        "To turn off the heater, I need you to say yes. Can you do that for me?\n\nGoodbye!",
+        "To turn off the heater, I need you to say yes. Can you do that for me?",
+    ),
+    (
+        "The heater needs you to say yes first before I can switch it off. Can you say yes?\n\n"
+        "Thanks, that's all for today. Goodbye!",
+        "The heater needs you to say yes first before I can switch it off. Can you say yes?",
+    ),
+    ("Please say yes to switch off the heater.\n\nGoodbye!", "Please say yes to switch off the heater."),
+    (
+        "I've asked to turn off the heater, but I need you to say yes first. Once you do, I'll switch it off for you."
+        "\n\nGoodbye!",
+        "I've asked to turn off the heater, but I need you to say yes first. Once you do, I'll switch it off for you.",
+    ),
+    ("Could you say yes to turn off the heater?\n\nGoodbye!", "Could you say yes to turn off the heater?"),
+    ("Please say yes so I can switch off the heater. \n\nGoodbye!", "Please say yes so I can switch off the heater."),
+]
+
+
+@pytest.mark.parametrize(("answer", "kept"), RUN_ONE_ASKS)
+def test_her_closing_goodbye_goes_from_what_she_asked_in_the_gate_run(answer: str, kept: str) -> None:
+    assert calls.without_goodbye_parts(answer, name=DEFAULT_NAME) == kept
+
+
+@pytest.mark.parametrize(
+    ("answer", "kept"),
+    [
+        ("Shall I switch off the heater? Bye for now!", "Shall I switch off the heater?"),
+        ("Okay, bye!", ""),  # only a goodbye: nothing of hers is left
+        ("Please say yes to switch off the heater. Bye, Alex!", "Please say yes to switch off the heater."),
+        ("Please say yes to switch off the heater. Thanks, bye!", "Please say yes to switch off the heater."),
+        ("Please say yes to switch off the heater. Have a great day!", "Please say yes to switch off the heater."),
+        ("Please say yes to switch off the heater. Take care! Goodbye!", "Please say yes to switch off the heater."),
+        ("Please say yes to switch off the heater. Goodbye! 👋", "Please say yes to switch off the heater."),
+        ("Please say yes to switch off the heater. **Goodbye!**", "Please say yes to switch off the heater."),
+        ("Please say yes. That's all for today.", "Please say yes."),  # a wrap-up she says back
+        ("Zeg alsjeblieft ja. Doei!", "Zeg alsjeblieft ja."),  # the call's language (a Dutch call)
+    ],
+)
+def test_her_closing_goodbyes_and_wrap_ups_go_and_nothing_else(answer: str, kept: str) -> None:
+    code = "nl" if "alsjeblieft" in answer else "en"
+    assert calls.without_goodbye_parts(answer, name=DEFAULT_NAME, language=code) == kept
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        "Please say yes to switch off the heater.",
+        "Please say yes to switch off the heater. The call ends once you answer.",
+        "Please say yes to switch off the heater. Bye, though.",  # only a goodbye with a name or soft words is one
+        "Shall I switch off the heater? Or shall I say bye first?",  # a question
+        "Goodbye is a word I do not say before your yes",  # no mark: no sentence of its own
+        "",
+    ],
+)
+def test_an_answer_that_does_not_end_with_a_goodbye_is_kept_whole(answer: str) -> None:
+    assert calls.without_goodbye_parts(answer, name=DEFAULT_NAME) == answer
+
+
+# the gate run of 5 Nov (call_device_yes_then_bye, 7 of 10 on the real model): the three misses, two of them goodbyes
+# the end-only peel of 4 Nov did not reach: one joined with "And" after a blank line, one at the start
+RUN_TWO_GOODBYES = [
+    (
+        "The heater needs you to say yes first. Can you say yes?\n\nAnd goodbye!",
+        "The heater needs you to say yes first. Can you say yes?",
+    ),
+    (
+        "Bye! Can you please say yes so I can turn off the heater for you?",
+        "Can you please say yes so I can turn off the heater for you?",
+    ),
+]
+
+
+@pytest.mark.parametrize(("answer", "kept"), RUN_TWO_GOODBYES)
+def test_a_goodbye_joined_with_and_or_at_the_start_goes_from_what_she_asked_in_the_second_run(
+    answer: str, kept: str
+) -> None:
+    assert calls.without_goodbye_parts(answer, name=DEFAULT_NAME) == kept
+
+
+@pytest.mark.parametrize(
+    ("answer", "kept"),
+    [
+        # at the start, as a sentence or as a part of one; a name after it, soft words before it
+        ("Take care! Do you want me to turn off the heater?", "Do you want me to turn off the heater?"),
+        ("Bye, can you say yes?", "Can you say yes?"),
+        ("Okay, bye, Alex! Please say yes.", "Please say yes."),
+        ("Goodbye for now, please say yes to turn off the heater.", "Please say yes to turn off the heater."),
+        # in the middle
+        ("Please say yes, bye, and I will switch it off.", "Please say yes, and I will switch it off."),
+        ("Please say yes.\n\nBye!\n\nThen I will switch it off.", "Please say yes.\n\nThen I will switch it off."),
+        # joined with "and", with a comma, a line break or neither; in the call's language
+        ("Please say yes, and goodbye!", "Please say yes."),
+        ("Please say yes and goodbye!", "Please say yes."),
+        ("Please say yes.\n\nAnd goodbye, Alex!", "Please say yes."),
+        ("Please say yes, and have a great day!", "Please say yes."),
+        ("Please say yes and have a good night.", "Please say yes."),
+        ("Take care and have a good night! Please say yes.", "Please say yes."),
+        # a name after it, between the parts of a closing too
+        ("Please say yes. Take care, Alex, and have a good night!", "Please say yes."),
+        ("Please say yes. Bye, Alex Example!", "Please say yes."),
+        # an emoji or a stage mark belongs to its part; a line of only a goodbye goes with its break
+        ("Please say yes 😊\n\nGoodbye!", "Please say yes 😊"),
+        ("👋 Bye!\nPlease say yes.", "Please say yes."),
+        # an offer to wait goes from a closing sentence
+        ("Please say yes. I'll be here whenever you're ready.", "Please say yes."),
+        ("Say yes. Thanks, that's all for today. Take care! Bye!", "Say yes."),
+        # a name after a part cut at its "and" goes with it (review of 5 Nov, voice-F5), her own name too
+        ("Please say yes and goodbye, Alex!", "Please say yes."),
+        (f"Please say yes and goodbye, {DEFAULT_NAME}!", "Please say yes."),
+        # a clause that only led to the wish goes with it: "Once it's off." would be a broken clause (voice-F2)
+        ("Please say yes to switch it off. Once it's off, sleep well!", "Please say yes to switch it off."),
+        ("Please say yes. Before you go, sleep well!", "Please say yes."),
+        ("Please say yes. When you wake up, have a great day!", "Please say yes."),
+        ("Before you go, sleep well!", ""),
+    ],
+)
+def test_her_goodbye_goes_wherever_it_stands(answer: str, kept: str) -> None:
+    assert calls.without_goodbye_parts(answer, name=DEFAULT_NAME) == kept
+
+
+@pytest.mark.parametrize(
+    ("answer", "code", "kept"),
+    [
+        ("Zeg ja, en doei!", "nl", "Zeg ja."),
+        ("Doei! Zeg alsjeblieft ja.", "nl", "Zeg alsjeblieft ja."),
+        ("Okay, Schönen Abend! Bitte sag ja.", "de", "Bitte sag ja."),  # a wish, never a name after "Okay"
+        ("Bitte sag ja. Auf Wiedersehen!", "de", "Bitte sag ja."),
+        ("Dis oui. Au revoir, et bonne soirée !", "fr", "Dis oui."),
+        ("Di que sí, y hasta luego.", "es", "Di que sí."),
+        ("Dì di sì. Buona serata e arrivederci!", "it", "Dì di sì."),
+        ("Diga sim, e até logo.", "pt", "Diga sim."),
+        ("Powiedz tak. Do widzenia!", "pl", "Powiedz tak."),
+        ("Скажи да. До свидания!", "ru", "Скажи да."),
+        ("はいと言ってください。さようなら！", "ja", "はいと言ってください。"),
+        ("네라고 말해 주세요. 안녕히 계세요!", "ko", "네라고 말해 주세요."),
+    ],
+)
+def test_her_goodbye_goes_in_each_language_a_call_has(answer: str, code: str, kept: str) -> None:
+    assert calls.without_goodbye_parts(answer, name=DEFAULT_NAME, language=code) == kept
+
+
+@pytest.mark.parametrize(
+    ("answer", "code"),
+    [
+        ("Скажи да. Пока!", "ru"),  # "пока" is also "so far", "ciao" and "dag" are also "hello": no plain goodbye
+        ("Di sì. Ciao!", "it"),
+        ("Zeg ja. Dag!", "nl"),
+        ("Es bleibt bewölkt, bis morgen.", "de"),  # the weather, not a goodbye (language.GOODBYES_UNTIL)
+        ("Hace sol hasta luego, y luego llueve.", "es"),
+        ("Hasta mañana, seguirá lloviendo.", "es"),  # an until-goodbye that leads content keeps the time (voice-F4)
+        ("Bis morgen, dann wird es sonnig.", "de"),
+    ],
+)
+def test_a_word_that_is_also_hello_or_until_a_time_stays(answer: str, code: str) -> None:
+    assert calls.without_goodbye_parts(answer, name=DEFAULT_NAME, language=code) == answer
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        "Do you want me to turn off the heater? Or shall I say bye first?",
+        'Alex wrote, "See you soon!" Please say yes.',  # quoted speech: inside quotation marks
+        'Please say yes. Alex ended it with "Take care, bye!" and nothing else.',
+        "Tell Alex: take care. Please say yes.",  # after a colon
+        "Please say yes to switch off the heater. Bye, though.",  # one word or soft words after it: none
+        "Please say yes to switch off the heater. Take care, okay.",
+        "Please say yes. Bye?",  # asks
+        "Say yes. Say the word and I will do it, and take the rest as it comes.",  # an offer inside an answer
+        "Take care of the heater cable and say yes.",  # words that start like a goodbye
+        "Please say yes. The goodbye comes after the yes.",
+        "Say yes if you want a good night.",
+        "I will switch it off, and then we are done.",
+        # a wish is no part to cut from inside a sentence of content (voice-F3)
+        "Have a light meal, drink water. Please say yes.",
+        "Have a light meal, drink water, and arrive two hours early.",
+    ],
+)
+def test_words_that_are_no_goodbye_of_hers_stay_where_they_stand(answer: str) -> None:
+    assert calls.without_goodbye_parts(answer, name=DEFAULT_NAME) == answer

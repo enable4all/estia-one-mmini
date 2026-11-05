@@ -1,6 +1,7 @@
 import Foundation
 
-/// Text in the ten Supertonic-3 languages as Supertonic-3 is to read it (the 0.9.3 plan; English is `SpokenEnglish`):
+/// Text in the ten other languages as a voice is to read it (the 0.9.3 plan, for Supertonic-3, removed on 3 Nov 2026;
+/// jane reads the six Pocket TTS speaks so, then its guard: `PocketText`; English is `SpokenEnglish`):
 /// one list of passes in one run order, as in English, with each language's words, tables and context lists in its
 /// pack (`Pack_<code>.swift`). A pass that runs early owns its text: chords their letters, times their colon, dates
 /// their numbers, phones their groups, amounts their unit; whatever number is left is read last (es, it, pt, fr, nl,
@@ -17,7 +18,7 @@ public enum SpokenLanguage {
     /// The passes' names in their run order for `language` (none for a language without a pack).
     public static func order(_ language: String) -> [String] { readers[language]?.passes.map(\.name) ?? [] }
 
-    /// `text` as Supertonic-3 is to read it in `language`; a language without a pack keeps its text.
+    /// `text` as a voice is to read it in `language`; a language without a pack keeps its text.
     public static func spoken(_ text: String, language: String) -> String {
         guard let reader = readers[language] else { return text }
         return reader.passes.reduce(text) { text, pass in pass.run(text, "") }

@@ -176,7 +176,7 @@ async def test_a_second_change_of_the_same_device_replaces_the_first_question(ho
 )
 async def test_every_clear_yes_counts(home: Home, answer: str) -> None:
     devices = home.make()
-    await devices.set("heater", power="off")
+    await devices.set("heater", power="off", spoken=answer.startswith("[call]"))  # a call's yes answers a said question
     assert await devices.confirm(answer) == "Devices: heater off"
 
 
@@ -421,6 +421,50 @@ async def test_a_spoken_question_is_dropped_from_the_note_by_a_cancel_or_an_answ
     assert devices.take_note() == ""
 
 
+@pytest.mark.parametrize("answer", ["[call] Yes.", "  [call] okay", "[call] ja", "[call] (cutting in) yes"])
+async def test_a_yes_said_on_a_call_never_answers_a_question_that_went_as_a_text(home: Home, answer: str) -> None:
+    """Review of 4 Nov, calls-1: an answer that finished while a call was on asked its question as a text, and the caller's
+    first "Okay." confirmed a device question that was never asked on the call (`calls.md`: a yes never confirms
+    something the caller did not hear). Only a yes said on a call answers a question asked on one; code's next note says
+    why nothing switched."""
+    devices = home.make()
+    await devices.set("heater", power="off", aci=ME)  # asked in a text: "reply yes within 2 minutes"
+    home.clock += 30
+    assert await devices.confirm(answer, ME) is None
+    assert home.sets() == [] and not devices.pending
+    assert devices.take_note() == (
+        "Devices: heater not switched off: the question went as a text, never asked on the call"
+    )  # and not "reply yes within 2 minutes": that question is gone
+    assert devices.take_note() == ""
+    assert await devices.confirm("yes", ME) is None and home.sets() == []  # and a later yes finds nothing
+
+
+async def test_a_text_question_that_lapsed_by_itself_leaves_no_line_for_a_late_yes_on_a_call(home: Home) -> None:
+    devices = home.make()
+    await devices.set("heater", power="off", aci=ME)
+    home.clock += 121  # the two minutes ran out: it lapsed by itself, as every unanswered question does
+    assert await devices.confirm("[call] Yes.", ME) is None
+    assert devices.take_note() == "" and home.sets() == []
+
+
+async def test_another_call_turn_drops_a_text_question_with_the_same_line(home: Home) -> None:
+    devices = home.make()
+    await devices.set("heater", power="off", aci=ME)
+    assert await devices.confirm("[call] what's the weather?", ME) is None
+    assert devices.take_note() == (
+        "Devices: heater not switched off: the question went as a text, never asked on the call"
+    )
+    assert home.sets() == []
+
+
+async def test_another_persons_call_turn_drops_a_text_question_without_a_line(home: Home) -> None:
+    """The line goes to the person who was asked: another account's call drops the question and says nothing of it."""
+    devices = home.make()
+    await devices.set("heater", power="off", aci=ME)
+    assert await devices.confirm("[call] Yes.", "11111111-2222-4333-8444-555555555555") is None
+    assert devices.take_note() == "" and home.sets() == [] and not devices.pending
+
+
 @pytest.mark.parametrize(
     ("text", "about"),
     [
@@ -564,7 +608,7 @@ async def test_when_no_device_answers_the_worst_reason_is_recorded(home: Home, t
 )
 async def test_the_yes_words_of_every_language_count(home: Home, answer: str) -> None:
     devices = home.make()
-    await devices.set("heater", power="off")
+    await devices.set("heater", power="off", spoken=answer.startswith("[call]"))  # a call's yes answers a said question
     assert await devices.confirm(answer) == "Devices: heater off"
 
 

@@ -16,18 +16,13 @@ PATH="/usr/bin:/bin:/usr/sbin:/sbin:$PATH"  # the Mac's own tools first, then yo
 repo="$(cd "$(dirname "$0")/.." && pwd)"
 [[ "$(id -u)" != 0 ]] || { echo "run as your normal user, not root (the script calls sudo itself)" >&2; exit 1; }
 source "$(dirname "$0")/own-user.sh"  # moved, and her commands' fixed paths ($estia, $estia_deploy)
-# the Mac's own sw_vers by its full path (under a test's fake tree, its stub)
-case "$("$estia_root/usr/bin/sw_vers" -productVersion 2>/dev/null)" in  # macOS 27 or later only (setup.sh)
-  27.0|27.0.*)  # Kokoro's crash seen on 27.0.1 (docs/agents/calls.md, Gotchas): warned until measured otherwise
-    echo "warning: an Apple bug that can crash English speech (Kokoro) and the voice service with it, in the middle" >&2
-    echo "of a call, was seen on macOS 27.0.1; no fix yet: the voice service starts again by itself" >&2 ;;
-esac
 moved || { echo "her own macOS account comes first: scripts/install-daemon.sh" >&2; exit 1; }
 "$sudo" "$estia_deploy" --voice "$repo"
 echo "waiting for the models (first start: download and Neural Engine compile, up to ~15 minutes)"
 # her voice service answers only programs running as her own macOS account: the wait reads its health as her, in one
 # admin command (after a long build sudo may ask for your Mac password again), with her PATH of root-owned folders;
-# one line, as setup's window runs it too (ownuser.VOICE_WAIT_AS_HER: a test keeps the two the same)
+# one line; setup's window runs it with its input read between looks in the place of the sleep
+# (ownuser.VOICE_WAIT_AS_HER_WINDOW, review W19; a test keeps the rest the same)
 # shellcheck disable=SC2016  # expanded by her shell, not this one
 wait_as_her='state=""; for _ in $(seq 1 240); do state="$(curl -q -s --max-time 2 --max-filesize 10000 http://127.0.0.1:8150/health || true)"; if [[ "$state" == *"\"stt\":\"ready\""* && "$state" == *"\"tts\":\"ready\""* || "$state" == *failed* ]]; then break; fi; sleep 5; done; printf "%s" "$state"'
 # the wait always ends with its printf: a failure is the admin command's own (a wrong password three times)
@@ -41,6 +36,13 @@ if [[ "$state" == *'"stt":"ready"'* && "$state" == *'"tts":"ready"'* ]]; then ec
 if [[ "$state" == *failed* ]]; then
   echo "voice: failed (${state}); see its log: /usr/bin/sudo /usr/local/estia/bin/estia logs voice" >&2
   exit 1
+fi
+# Pocket TTS resting after failed or late runs (a busy Mac) is tried again on its own: no failure, exit 3 as loading
+# (prompts.SETUP_VOICE_RESTING, the same words; the review of 4 Nov)
+if [[ "$state" == *'"tts":"resting"'* ]]; then
+  echo "voice: resting after failed runs (${state}). It is tried again on its own, and calls work once her voice speaks." >&2
+  echo "Check later: /usr/bin/sudo /usr/local/estia/bin/estia check (log: /usr/bin/sudo /usr/local/estia/bin/estia logs voice)" >&2
+  exit 3
 fi
 # still loading is no fault (a slow line, a slow Mac): exit 3, so setup's calls step goes on with the call builds
 echo "voice: still loading after 20 minutes (${state:-no answer}). On a slow line the first download takes longer:" >&2

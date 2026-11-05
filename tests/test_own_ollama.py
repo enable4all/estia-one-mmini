@@ -350,11 +350,16 @@ def no_sockets(launchd: str | None, program: str = HER_RUNNING) -> NoSocketsHost
 def test_her_ollama_is_named_by_her_service_when_no_socket_can_be_seen() -> None:
     host = no_sockets(launchd_print("7101"))
     heard = ollama_build.Tools(Path("/"), host=host).listener(8151)
-    assert heard == ollama_build.Listener(HER_RUNNING, ("127.0.0.1.8151",), HER_UID)
+    # no socket listed at all: another account's program beside hers could not be listed (3 Nov report)
+    assert heard == ollama_build.Listener(HER_RUNNING, ("127.0.0.1.8151",), HER_UID, others_unread=True)
     assert (LAUNCHCTL, "print", f"system/{ollama_build.LABEL}") in host.asked
     # where her service file says she listens is checked as a socket would be: every address names other machines
     wide = ollama_build.Tools(Path("/"), host=no_sockets(launchd_print("7101", "0.0.0.0:8151"))).listener(8151)
     assert wide.addresses == ("*.8151",) and ollama_build.other_machines(wide.addresses, 8151) == ["*.8151"]
+
+
+# no socket listed at all and none found: nothing named, and other accounts' listeners unread (fix review 1, 3 Nov)
+NONE_SEEN = ollama_build.Listener("", others_unread=True)
 
 
 @pytest.mark.parametrize(
@@ -363,18 +368,18 @@ def test_her_ollama_is_named_by_her_service_when_no_socket_can_be_seen() -> None
     ids=["no-job", "not-running", "another-port", "no-address"],
 )
 def test_without_a_socket_nothing_but_her_running_service_on_her_address_counts(launchd: str | None) -> None:
-    assert ollama_build.Tools(Path("/"), host=no_sockets(launchd)).listener(8151) == ollama_build.Listener("")
+    assert ollama_build.Tools(Path("/"), host=no_sockets(launchd)).listener(8151) == NONE_SEEN
 
 
 def test_without_a_socket_a_job_outside_roots_copy_or_on_another_port_is_never_named() -> None:
     elsewhere = no_sockets(launchd_print("7101"), program="/Users/alex/opt/ollama/v0.40.4/ollama")
-    assert ollama_build.Tools(Path("/"), host=elsewhere).listener(8151) == ollama_build.Listener("")
+    assert ollama_build.Tools(Path("/"), host=elsewhere).listener(8151) == NONE_SEEN
     host = no_sockets(launchd_print("7101"))
-    assert ollama_build.Tools(Path("/"), host=host).listener(11434) == ollama_build.Listener("")
+    assert ollama_build.Tools(Path("/"), host=host).listener(11434) == NONE_SEEN
     assert not any(argv[0] == LAUNCHCTL for argv in host.asked)  # today's 11434 is yours: lsof names it
     # only an Ollama that answered is named by its service: on her address without an answer, a socket is the proof
     quiet = no_sockets(launchd_print("7101"))
-    assert ollama_build.Tools(Path("/"), host=quiet).listener(8151, by_service=False) == ollama_build.Listener("")
+    assert ollama_build.Tools(Path("/"), host=quiet).listener(8151, by_service=False) == NONE_SEEN
     assert not any(argv[0] == LAUNCHCTL for argv in quiet.asked)
 
 

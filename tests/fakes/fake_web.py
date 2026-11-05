@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from local_assistant.web_search import WebResult, WebResults, WebSearchError
+from local_assistant.web_search import VideoResult, VideoResults, WebResult, WebResults, WebSearchError
 
 
 class FakeWeb:
@@ -11,6 +11,8 @@ class FakeWeb:
         self.queries: list[str] = []
         self.quick: list[bool] = []  # per search: on a call
         self.down = False
+        self.videos: list[VideoResult] = []  # what a video search finds, whatever its words
+        self.video_queries: list[str] = []
 
     async def search(self, query: str, *, quick: bool = False) -> WebResults:
         self.queries.append(query)
@@ -21,3 +23,9 @@ class FakeWeb:
             if word.lower() in query.lower():
                 return WebResults("Brave", tuple(found))
         return WebResults("Brave", ())
+
+    async def search_videos(self, query: str) -> VideoResults:
+        self.video_queries.append(query)
+        if self.down:
+            raise WebSearchError("web search is not available right now")
+        return VideoResults("Brave", tuple(self.videos))

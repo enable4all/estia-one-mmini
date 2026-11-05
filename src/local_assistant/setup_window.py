@@ -80,6 +80,8 @@ ADMIN_SECONDS = 86_400  # an admin command's time limit at most (AdminCore.maxSe
 # a one-shot admin command with input, without a limit of its own: Host.run's default (review W08: one whose input
 # was never opened, the window gone, waited for a writer until the Mac restarted)
 PIPED_SECONDS = 600.0
+# a command that ends with its input (`ends_on_stop`): how often a Ctrl-C noted in Terminal is looked for meanwhile
+STOP_LOOK_SECONDS = 0.25
 KINDS = frozenset({*get_args(Kind), "kept"})  # the question list's kinds, and the window's own list of kept answers
 _HTTPS = re.compile(r"^https://[^\s/?#]+[^\s]*$")
 _TOKEN = re.compile(r"^[a-z0-9]{1,16}$")
@@ -889,6 +891,11 @@ class WindowFace:
                 self.ai.stop(text, said)
             raise KeyboardInterrupt
 
+    @property
+    def holding(self) -> bool:
+        """Inside `stops_held` now (harden's: her stop, her PIN, her start)."""
+        return self._holding > 0
+
     def _stopping(self) -> str:
         """What a stop says now: the held section's line, or that the command finishes first."""
         return self._held_line if self._holding else prompts.SETUP_WINDOW_FINISHES_FIRST
@@ -969,6 +976,7 @@ class WindowFace:
         why: str = "",
         answer: Callable[[str, list[str]], str | None] | None = None,
         seconds: float | None = None,
+        ends_on_stop: bool = False,
     ) -> Ran | None:
         """A command in today's sudo form, run as root by the window (`setup_admin.as_root`): macOS's own box asks
         (`why` is its line), each line of its output in Terminal and the window's log (kept, not said, with
@@ -979,7 +987,9 @@ class WindowFace:
         when the window closed before it ran, its box could not ask (setup goes on in Terminal: review ADM-4), or for
         a form the window does not run (`as_root` refuses it): Terminal runs it with sudo, never a traceback (ADM-1). Once the window closed, every form is
         Terminal's, `sudo -n -v` and `sudo -k` too: they ask nothing of the window, but Terminal's sudo answers them
-        (review ADM-2)."""
+        (review ADM-2). `ends_on_stop`: a command that ends soon after its input ends (the wait for her voice, review
+        W19): its stdin open, nothing written there, and Stop here or a Ctrl-C ends it at once, said at once, then
+        setup stops after its end."""
         if self.terminal_face is not None:
             return None
         if self.ai is not None and (self.closed or self._held_stop):  # in a held section, once it cannot go on
@@ -996,7 +1006,9 @@ class WindowFace:
         if root is None:
             return Ran(0, "")
         while True:
-            ran = self._admin(root, input=input, quiet=capture, why=why, answer=answer, seconds=seconds)
+            ran = self._admin(
+                root, input=input, quiet=capture, why=why, answer=answer, seconds=seconds, ends_on_stop=ends_on_stop
+            )
             if ran is None or not ran.refused:
                 return ran
             # a stop held for the section's end: Not now, never a screen the page drops after "Stopped" (review W21),
@@ -1013,6 +1025,7 @@ class WindowFace:
         why: str,
         answer: Callable[[str, list[str]], str | None] | None,
         seconds: float | None = None,
+        ends_on_stop: bool = False,
     ) -> Ran | None:
         self.heard()  # a Stop here while setup worked: never a box after it (review FRIEND-4)
         if self.terminal_face is not None:
@@ -1031,7 +1044,7 @@ class WindowFace:
                     prompts.SETUP_AI_ADMIN.format(why=why_line if why_line in ADMIN_LINES else prompts.ADMIN_WHY)
                 )
         request: dict[str, object] = {"t": "admin", "id": aid, "argv": root, "input": input,
-                                      "open": answer is not None, "why": why_line}  # fmt: skip
+                                      "open": answer is not None or ends_on_stop, "why": why_line}  # fmt: skip
         if seconds is None and input is not None and answer is None:  # never one whose question is a screen
             seconds = PIPED_SECONDS
         if seconds is not None:
@@ -1045,9 +1058,17 @@ class WindowFace:
         lines: list[str] = []  # as said and shown: cleaned (setup_admin.shown)
         raw: list[str] = []  # as the command printed them: what a caller reads back, as Host.run gives it (ADM-6)
         stopped = False
+        ended = False  # `ends_on_stop`: its input ended
         with _ctrl_c_held() as pressed:
             while True:
-                message = self.held.pop(0) if self.held else self._next()
+                if ends_on_stop and (stopped or pressed) and not ended:  # its end now, never after its last look
+                    if not stopped and not self._stop_held:  # a Ctrl-C: said as a stop is
+                        self.say(self._stopping())
+                    stopped = ended = True
+                    self.window.send({"t": "admin_end", "id": aid})
+                message = self.held.pop(0) if self.held else self._next(STOP_LOOK_SECONDS if ends_on_stop else None)
+                if message is None and ends_on_stop and not self.window.ended:
+                    continue  # nothing yet: a Ctrl-C noted meanwhile is looked for
                 if message is None or message["t"] == "closed":  # it went on as root, its end unread
                     if self.ai is not None:
                         self.closed = True
@@ -1081,7 +1102,7 @@ class WindowFace:
                         self.say(lines[-1])
                 elif message["t"] == "admin_done" and message["id"] == aid:
                     break
-        if answer is not None:
+        if answer is not None or (ends_on_stop and not ended):
             self.window.send({"t": "admin_end", "id": aid})  # never read again: harmless after its end
         code = message.get("code")
         if stopped or pressed:

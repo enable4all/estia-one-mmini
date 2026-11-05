@@ -41,6 +41,7 @@ import re
 import shlex
 import shutil
 import sqlite3
+import ssl
 import stat
 import subprocess
 import sys
@@ -53,7 +54,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Literal
 
-from local_assistant import babble, hostsec, ollama_build, ownuser, prompts, share, voice
+from local_assistant import babble, deploy, hostsec, ollama_build, ownuser, prompts, share, voice
 from local_assistant.commands import VOICE_NAME_KEY, voices_here
 from local_assistant.config import (
     CODE_ROOT,
@@ -70,11 +71,11 @@ from local_assistant.config import (
     CalendarSource,
     Config,
     ConfigError,
-    canonical_voice,
     find_java_home,
+    has_voice,
     is_estia_kb,
-    kokoro_stand_in,
     load_config,
+    pocket_voice,
     read_avatar,
     signal_cli_series,
     tunnel_stamp_differs,
@@ -119,6 +120,8 @@ ALIVE_SECONDS = 180  # a sign of life older than this (three missed beats) means
 SIGNAL_DOWN_SECONDS = 180  # signal-cli not connected this long is a ✗ (shorter: a restart in progress)
 LAUNCHCTL = "/bin/launchctl"
 PMSET = "/usr/bin/pmset"  # read only: `pmset -g`
+SW_VERS = "/usr/bin/sw_vers"  # read only: `sw_vers -productVersion`
+MACOS_FIRST = 27  # scripts/setup.sh refuses an older macOS (owner, 29 Oct)
 HUE_CHECK_SECONDS = 20  # doctor's limit for the device helper's run (its own 12 s are checked between requests)
 _LAUNCHD_STATE = re.compile(r"^\s*state = (.+?)\s*$", re.MULTILINE)  # the first is the service's own
 _LAUNCHD_EXIT = re.compile(r"^\s*last exit code = (-?\d+)\b", re.MULTILINE)
@@ -147,6 +150,22 @@ class Probe:
 
     def platform(self) -> tuple[str, str]:
         return sys.platform, platform.machine()
+
+    def python_versions(self) -> tuple[str, str]:
+        """The version of the Python doctor runs on (hers: her release's as her, the checkout's before the move) and of
+        its own OpenSSL, read from itself: no network, no tool run."""
+        return platform.python_version(), ssl.OPENSSL_VERSION
+
+    def macos_version(self) -> str | None:
+        """`sw_vers -productVersion` ("27.0.1"), as scripts/setup.sh reads it (read-only, fixed argv, no shell); None
+        when it cannot be read: never under a test's root."""
+        if hostsec.estia_root() != Path("/"):
+            return None
+        try:
+            done = subprocess.run([SW_VERS, "-productVersion"], capture_output=True, text=True, timeout=5, check=False)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return done.stdout.strip() if done.returncode == 0 else None
 
     def java_home(self) -> Path | None:
         """Where the JVM signal-cli finds Java when [calls] java_home is not set."""
@@ -337,7 +356,7 @@ def run(config_path: Path, probe: Probe) -> list[Finding]:
         if not config_path.exists() and probe.moved():  # her config is hers: readable only as her user
             fix = prompts.DOCTOR_OWN_USER_CONFIG
         return [_mac(probe, DEFAULT_NAME), _tools(probe), Finding("fail", "Config", str(exc), fix)]
-    findings = [_mac(probe, cfg.name), _tools(probe)]
+    findings = [_mac(probe, cfg.name), _tools(probe), _python(probe)]
     placeholders = [
         key
         for key, used in (
@@ -637,11 +656,33 @@ def _history(cfg: Config, now: float) -> Finding:
 
 
 def _mac(probe: Probe, name: str) -> Finding:
+    """Apple silicon (✗ otherwise), and macOS 27 or later: an older one (an install made before setup refused it) is a
+    warning in setup's words; a version that cannot be read keeps the ✓ (no guess)."""
     system, machine = probe.platform()
     if system == "darwin" and machine == "arm64":
+        version = probe.macos_version() or ""
+        major = version.split(".", 1)[0]  # as scripts/setup.sh reads it
+        if re.fullmatch(r"[0-9]+", major) and int(major) < MACOS_FIRST:
+            return Finding(
+                "warn", "Mac", prompts.DOCTOR_MACOS_OLD.format(version=version, name=name), prompts.DOCTOR_MACOS_OLD_FIX
+            )
         return Finding("ok", "Mac", "macOS on Apple silicon")
     return Finding(
         "fail", "Mac", f"this is {system} on {machine}", f"{name} needs a Mac with Apple silicon (M1 or later)"
+    )
+
+
+def _python(probe: Probe) -> Finding:
+    """Her Python and its OpenSSL, which encrypts her connections to the web: a fact (○). The release scan reads only
+    the lockfiles, so each release compares this OpenSSL by hand; doctor looks nothing up online. The fix says how a
+    newer one comes: a newer uv, then a deploy for hers (as her), `uv python upgrade` for the checkout's."""
+    python, openssl = probe.python_versions()
+    then = ownuser.DEPLOY_CMD if probe.her_user() else f"uv python upgrade {deploy.PYTHON_SERIES}"
+    return Finding(
+        "untested",
+        "Python",
+        prompts.DOCTOR_PYTHON.format(python=python, openssl=openssl),
+        prompts.DOCTOR_PYTHON_FIX.format(then=then),
     )
 
 
@@ -723,7 +764,9 @@ def _ollama_build(cfg: Config, probe: Probe) -> Finding | None:
     (setup's own service: updated in place by scripts/install-ollama.sh); the official one with its library ✓.
     Read-only: its program and addresses from netstat and proc_pidpath, its account from ps, its folder's files; no
     line when the program cannot be seen (as her, your folders may be closed to her account) and the version says
-    nothing."""
+    nothing, unless netstat listed no socket (seen on macOS 27.0.1, 3 Nov): then no program found may be another
+    account's, and a ○ (or the end of the "!") says its program and account could not be read (fix review 1). The ✓
+    names what it could not list then too. Each line fits the owner's terminal (`hostsec.terminal_text`)."""
     base = _ollama(cfg)
     try:
         answer = probe.get_json(f"{base}/api/version")
@@ -733,6 +776,8 @@ def _ollama_build(cfg: Config, probe: Probe) -> Finding | None:
     port = urllib.parse.urlsplit(base).port or ollama_build.PORT
     heard = probe.ollama_listener(port)
     program = heard.program
+    unread = prompts.DOCTOR_OLLAMA_OTHERS_UNREAD if heard.others_unread else ""  # never "alone on its port" unread
+    unseen = f"; {prompts.DOCTOR_OLLAMA_UNSEEN}" if heard.others_unread else ""  # no program found: maybe another's
     pin = ollama_build.RELEASE.version
     untested = (
         Finding(
@@ -748,8 +793,13 @@ def _ollama_build(cfg: Config, probe: Probe) -> Finding | None:
         parsed = ollama_build.parse_version(version) if version else None
         if parsed is not None and parsed < ollama_build.MIN_VERSION:
             text = prompts.DOCTOR_OLLAMA_OLD.format(version=version, needed=ollama_build.MIN_TEXT)
-            return Finding("warn", "Ollama", text, prompts.OLLAMA_OTHER_FIX)
-        return untested
+            return Finding("warn", "Ollama", _fitted(text + unseen), prompts.OLLAMA_OTHER_FIX)
+        if untested is not None:
+            return replace(untested, text=_fitted(untested.text + unseen))
+        if not unseen or not version:
+            return None
+        fix = prompts.DOCTOR_OLLAMA_UNSEEN_FIX.format(port=port)
+        return Finding("untested", "Ollama", _fitted(f"{version} answers{unseen}"), fix)
     found = ollama_build.Found(program, version or None, addresses=heard.addresses, uid=heard.uid, others=heard.others)
     owner = probe.owner_uid()
     chosen = cfg.ollama == "app"  # the Ollama app the person chose at setup (owner, 29 Oct)
@@ -764,15 +814,20 @@ def _ollama_build(cfg: Config, probe: Probe) -> Finding | None:
         if untested is not None:
             return replace(untested, fix=prompts.OLLAMA_HER_UNTESTED_FIX)
         text = prompts.DOCTOR_OLLAMA_HERS_OK.format(version=version, program=program, user=ownuser.ROLE_USER)
-        return Finding("ok", "Ollama", text) if version else None
+        return Finding("ok", "Ollama", _fitted(text + unread)) if version else None
     if chosen and version and ollama_build.app_of(Path(program)) is not None:  # it updates itself: no pin to name
         return Finding("warn", "Ollama", prompts.DOCTOR_OLLAMA_APP.format(version=version, program=program))
     if untested is not None:
         return untested
-    _missing, unread = ollama_build.missing_libraries(program)
-    if unread or not version:
+    _missing, libraries_unread = ollama_build.missing_libraries(program)
+    if libraries_unread or not version:
         return None
-    return Finding("ok", "Ollama", prompts.DOCTOR_OLLAMA_OK.format(version=version, program=program))
+    return Finding("ok", "Ollama", _fitted(prompts.DOCTOR_OLLAMA_OK.format(version=version, program=program) + unread))
+
+
+def _fitted(text: str) -> str:
+    """An Ollama line split to fit the owner's terminal after its mark and part ("✓ Ollama: "): render never wraps."""
+    return hostsec.terminal_text(text, len("✓ Ollama: "))
 
 
 def _ollama_service() -> Finding | None:
@@ -1258,31 +1313,29 @@ def _pocket(cfg: Config, probe: Probe) -> Finding:
     beside the voice service in her release (root's: an update puts it there), and the Mac's model's heart file in the
     voice service's own bundle there (owner, 27 Oct: the 100M's; 29 Oct: the 18M's), the Mac's model in the voice
     service's models folder (owner, 26 Oct: the 100M beside Gemma 4 26B, the 18M beside 12B: `voice.pocket_standard`);
-    and Pocket's state in its health. Whatever stops them, Kokoro says her lines meanwhile, in the voice the line names
-    (`config.kokoro_stand_in`: am_michael for alba and michael, af_heart for the others); heart's file stops only heart
-    (the review of 27 Oct, swift-voice-2: its lines af_heart's). The voice judged is the one that speaks
-    (`_voice_in_use`): vera on a Mac with the 18M, which has none, is told (heart, the default, speaks there)."""
+    and Pocket's state in its health. Whatever stops them, her answers come as text meanwhile (owner, 3 Nov 2026: no
+    other voice says a line); heart's file stops only heart (the review of 27 Oct, swift-voice-2). The voice judged is
+    the one that speaks (`_voice_in_use`): vera on a Mac with the 18M, which has none, is told (heart, the default,
+    speaks there)."""
     part = "Pocket TTS voices"
     standard = voice.pocket_standard()
     in_use = _voice_in_use(cfg, standard)
-    kokoro = {"stand_in": kokoro_stand_in(in_use)}
     models = probe.home / "Library" / "Application Support" / "local-assistant" / "voice-models"
     files = voice.pocket_files(models, voice.pocket_english_files(standard))
     release = hostsec.estia_root() / ownuser.CURRENT.relative_to("/")
     program = voice.pocket_files(release, voice.POCKET_PROGRAM)
     # heart's file for the Mac's model, shipped in the voice service's own bundle in her release: the source of its
-    # copy, in either layout of the bundle (the review of 27 Oct, swift-voice-1); without it only heart's lines are
-    # Kokoro's
+    # copy, in either layout of the bundle (the review of 27 Oct, swift-voice-1); without it only heart is not said
     pins = voice.pocket_shipped(release, standard)
     shipped = voice.pocket_files(release, pins)
-    hearts = {"stand_in": kokoro_stand_in("heart"), "file": next(iter(pins)).rsplit("/", 1)[-1]}
+    hearts = {"file": next(iter(pins)).rsplit("/", 1)[-1]}
     log = _voice_log(probe)
-    lead = len(f"{MARKS['warn']} {part}: ")  # the lines with Kokoro's limit on a call, split to fit the terminal
+    lead = len(f"{MARKS['warn']} {part}: ")  # the longer lines, split to fit the terminal
     update = prompts.DOCTOR_POCKET_PROGRAM_FIX.format(deploy=ownuser.DEPLOY_CMD)
     if program == "changed":
-        return Finding("fail", part, prompts.DOCTOR_POCKET_PROGRAM_CHANGED.format(**kokoro), update)
+        return Finding("fail", part, prompts.DOCTOR_POCKET_PROGRAM_CHANGED, update)
     if program == "missing":
-        return Finding("warn", part, prompts.DOCTOR_POCKET_NO_PROGRAM.format(**kokoro), update)
+        return Finding("warn", part, prompts.DOCTOR_POCKET_NO_PROGRAM, update)
     if shipped == "changed":
         return Finding("fail", part, prompts.DOCTOR_POCKET_SHIPPED_CHANGED.format(**hearts), update)
     if shipped == "missing":
@@ -1298,10 +1351,10 @@ def _pocket(cfg: Config, probe: Probe) -> Finding:
     state = health.get("pocket") if isinstance(health, dict) else None
     if files == "changed" or state == "refused":
         fix = _unavailable_fix(probe, prompts.DOCTOR_POCKET_CHANGED_FIX, "pocket-tts")
-        return Finding("fail", part, prompts.DOCTOR_POCKET_CHANGED.format(**kokoro), fix)
+        return Finding("fail", part, prompts.DOCTOR_POCKET_CHANGED, fix)
     if files == "missing":
         size = 250 if standard else 130
-        text = hostsec.terminal_text(prompts.DOCTOR_POCKET_MISSING.format(size=size, **kokoro), lead)
+        text = hostsec.terminal_text(prompts.DOCTOR_POCKET_MISSING.format(size=size), lead)
         return Finding("warn", part, text, prompts.DOCTOR_POCKET_MISSING_FIX.format(log=log))
     # vera beside the 18M is told (heart, the default, speaks there)
     if not standard and in_use in STANDARD_ONLY:
@@ -1311,9 +1364,9 @@ def _pocket(cfg: Config, probe: Probe) -> Finding:
         size_name = "100M" if standard else "18M"
         return Finding("ok", part, prompts.DOCTOR_POCKET_ENGLISH_OK.format(size=size_name, voices=voices))
     if isinstance(health, dict) and "pocket" not in health:
-        return Finding("warn", part, prompts.DOCTOR_POCKET_OLD.format(**kokoro), prompts.DOCTOR_VOICE_REINSTALL)
+        return Finding("warn", part, prompts.DOCTOR_POCKET_OLD, prompts.DOCTOR_VOICE_REINSTALL)
     text = prompts.DOCTOR_POCKET_LOADING if state == "loading" else prompts.DOCTOR_POCKET_UNAVAILABLE
-    shown = hostsec.terminal_text(text.format(**kokoro), lead)
+    shown = hostsec.terminal_text(text, lead)
     return Finding("warn", part, shown, prompts.DOCTOR_POCKET_LOG_FIX.format(log=log))
 
 
@@ -1326,7 +1379,7 @@ def _voice_in_use(cfg: Config, standard: bool) -> str:
             row = conn.execute("SELECT value FROM state WHERE key = ?", (VOICE_NAME_KEY,)).fetchone()
     except sqlite3.Error:
         return cfg.voice_name
-    chosen = canonical_voice(row[0]) if row is not None and isinstance(row[0], str) else ""
+    chosen = pocket_voice(row[0]) if row is not None and isinstance(row[0], str) else ""  # a Kokoro id: its Pocket one
     return chosen if chosen in voices_here(standard) else cfg.voice_name
 
 
@@ -1343,9 +1396,7 @@ def _practice_language(cfg: Config) -> str | None:
 def _spoken_languages(cfg: Config) -> list[str]:
     """The languages jane speaks in Pocket TTS now (owner, 25 Oct): the one in use (set with /language, else the
     config's) and a running practice's (/babble, which fetches and runs its model too; the review of 25 Oct), each
-    one of the six; none with `[voice] language_voice = ""` (Supertonic-3's F1 speaks them)."""
-    if not cfg.voice_language_voice:
-        return []
+    one of the six."""
     found = [_current_language(cfg), _practice_language(cfg)]
     return [code for at, code in enumerate(found) if code in voice.POCKET_LANGUAGE_FILES and code not in found[:at]]
 
@@ -1508,6 +1559,13 @@ def _optional_parts(cfg: Config, folder: Path, probe: Probe, states: _States) ->
         )
         found.append(_pocket(cfg, probe))
         found.extend(_pocket_language(cfg, probe, language) for language in _spoken_languages(cfg))
+        if not has_voice(language := _current_language(cfg)):  # Korean, Polish, Russian, Japanese (owner, 3 Nov 2026)
+            name = LANGUAGES[language].english
+            found.append(Finding("ok", f"Voice ({name})", prompts.DOCTOR_NO_VOICE_LANGUAGE.format(language=name)))
+        practised = _practice_language(cfg)  # every call of the user's is a practice call: the review of 4 Nov
+        if practised is not None and practised != language and not has_voice(practised):
+            name = LANGUAGES[practised].english
+            found.append(Finding("ok", f"Voice ({name})", prompts.DOCTOR_NO_VOICE_PRACTICE.format(language=name)))
     if cfg.calls_enabled:
         missing = [path.name for path in (cfg.call_signal_cli, cfg.call_tunnel) if not path.exists()]
         java = cfg.java_home or probe.java_home()

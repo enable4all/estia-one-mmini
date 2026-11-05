@@ -35,9 +35,10 @@ __all__ = [
     "SETUP_WINDOW_LOGIN_AGAIN_TITLE", "SETUP_WINDOW_LOGIN_NO_TIME", "SETUP_WINDOW_LOGIN_UNTIL", "SETUP_WINDOW_NOT_BUILT", "SETUP_WINDOW_NOT_NOW", "SETUP_WINDOW_NOT_OPENED",
     "SETUP_WINDOW_NO_BOX", "SETUP_WINDOW_NO_BOX_TERMINAL", "SETUP_WINDOW_NO_PROGRAM", "SETUP_WINDOW_NO_TOOLS",
     "SETUP_WINDOW_OFFER_LEAD", "SETUP_WINDOW_OFFER_TITLE", "SETUP_WINDOW_OPEN", "SETUP_WINDOW_OPENING",
-    "SETUP_WINDOW_PAGE_UNREAD", "SETUP_WINDOW_RUN_IT", "SETUP_WINDOW_SECURITY_YES", "SETUP_WINDOW_SHARE_CLOSE_MORE",
+    "SETUP_WINDOW_PAGE_UNREAD", "SETUP_WINDOW_RELEASE_OLD", "SETUP_WINDOW_RELEASE_OLD_WHAT", "SETUP_WINDOW_RUN_IT",
+    "SETUP_WINDOW_SECURITY_YES", "SETUP_WINDOW_SHARE_CLOSE_MORE",
     "SETUP_WINDOW_SHARE_CLOSE_NO", "SETUP_WINDOW_SHARE_CLOSE_TITLE", "SETUP_WINDOW_SHARE_CLOSE_YES",
-    "SETUP_WINDOW_SKIP", "SETUP_WINDOW_SPOTIFY_OLD", "SETUP_WINDOW_STOPPED_HERE", "SETUP_WINDOW_STOP_AGAIN",
+    "SETUP_WINDOW_SKIP", "SETUP_WINDOW_STOPPED_HERE", "SETUP_WINDOW_STOP_AGAIN",
     "SETUP_WINDOW_STOP_AGAIN_AI", "SETUP_WINDOW_STOP_HERE", "SETUP_WINDOW_TRY_AGAIN", "SETUP_WINDOW_WORD_ASK",
 ]
 # fmt: on
@@ -159,11 +160,17 @@ SETUP_WINDOW_DEPLOY_OLD = (
     "Her root-run tools ask only in Terminal (an update of them brings the window's way). Run this there, then "
     "scripts/setup.sh again:\n$ {command}"
 )
-# her release from before the window's Spotify sign-in (its address asked with no line end): Terminal only
-SETUP_WINDOW_SPOTIFY_OLD = (
-    "Her release asks for Spotify's address only in Terminal (an update brings the window's way). Run this there "
-    "after setup:\n$ {command}"
+# her release from before the window's way of one of her commands: Terminal only. Spotify: its address asked with no
+# line end; Hue: the button's prompt held until the pairing's end, after its 60 seconds; mail: Microsoft's code held
+# until the sign-in's end, up to 15 minutes later (W22)
+SETUP_WINDOW_RELEASE_OLD = (
+    "Her release {what} only in Terminal (an update brings the window's way). Run this there after setup:\n$ {command}"
 )
+SETUP_WINDOW_RELEASE_OLD_WHAT = {
+    "spotify-login": "asks for Spotify's address",
+    "hue-pair": "says when to press the Hue Bridge's button",
+    "mail-login": "shows Microsoft's sign-in code",
+}
 # the share's close question (share.py's CLOSE_ASK and its kin, the screen's lead); what closing changes, in its fold
 SETUP_WINDOW_SHARE_CLOSE_TITLE = "Folders in your home every account may open"
 SETUP_WINDOW_SHARE_CLOSE_YES = "Close them"

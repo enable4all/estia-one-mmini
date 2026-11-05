@@ -1827,13 +1827,16 @@ def test_without_shellcheck_verify_says_so_and_goes_on(tmp_path: Path) -> None:
 # her voice service's own-account suites, and (the review of 26 Oct, R2-F6) the offline Pocket ones: the sandbox behind
 # SECURITY.md's promise (PocketPrograms) and the pins (PocketPins) passed verify.sh weakened; RealPocket needs the network.
 # The second deep scan of 0.9.8 (swift-3): the other offline suites that hold a promise too: the six languages' pins,
-# call audio only in memory (hard rule 7), the 27.0.x warning, a request's "kokoro": false and the service's arguments
-# (`\.Speech/`: VoiceCoreTests' Speech suite alone, never SpeechDetection's real model)
+# call audio only in memory (hard rule 7), a request's "kokoro" and the service's arguments (`\.Speech/`: VoiceCoreTests'
+# Speech suite alone, never SpeechDetection's real model); owner, 3 Nov 2026: Pocket TTS her only voice, a line it cannot
+# say refused whatever the request asks (PocketOnly; the 27.0.x warning went with Kokoro); the review of 4 Nov: the
+# health's speaking state, which decides whether a call is picked up (`\.LanguageChoice/`), and the refusals' status and
+# code (`\.Errors/`)
 VOICE_FILTER = (
     "PeerChecking|PeerLookup|RefusalLogging|OnlyItsOwnAccount"
     "|PocketPins|PocketRunning|PocketPrograms|PocketRouting|PocketAudio|PocketPacing|PocketSpeaking"
-    "|PocketLanguageRouting|PocketLanguagePins|PocketLanguagePacing|CallAudioInMemory|KokoroOnThisMac"
-    "|TranscriptionRequests|HTTPParsing|ServiceArgumentsParsing|\\.Speech/"
+    "|PocketLanguageRouting|PocketLanguagePins|PocketLanguagePacing|CallAudioInMemory|PocketOnly"
+    "|TranscriptionRequests|HTTPParsing|ServiceArgumentsParsing|\\.Speech/|\\.LanguageChoice/|\\.Errors/"
 )
 VOICE_SUITES = f"(cd tools/voice && swift test --quiet --filter '{VOICE_FILTER}')"
 
@@ -1911,8 +1914,12 @@ def test_every_suite_verify_runs_in_the_voice_service_is_one_of_its_tests() -> N
     [
         ("VoiceCoreTests.PocketLanguagePins/eachLanguageIsPinned()", True),
         ("VoiceServiceTests.CallAudioInMemory/aCallsTurnNeverTouchesTheDisk()", True),
-        ("VoiceCoreTests.KokoroOnThisMac/theWarningNamesTheFixOrThatThereIsNoneYet()", True),
-        ("VoiceCoreTests.Speech/aCallsLineMayAskForNoKokoro()", True),
+        ("VoiceServiceTests.PocketOnly/aLinePocketCannotSayIsRefusedWhateverTheRequestAsks()", True),
+        ("VoiceServiceTests.PocketOnly/aLanguageWithNoVoiceIsRefused()", True),
+        ("VoiceCoreTests.LanguageChoice/speakingIsHerEnglishPocketModels()", True),  # whether a call is picked up
+        ("VoiceCoreTests.Errors/eachErrorHasItsStatusAndCode()", True),  # not_said and no_voice
+        ("VoiceCoreTests.SpeakingErrors/anything()", False),  # only the suite named Errors
+        ("VoiceCoreTests.Speech/theKokoroFieldIsTakenAndIgnored()", True),
         ("VoiceCoreTests.ServiceArgumentsParsing/aTypoIsRefused()", True),
         ("VoiceServiceTests.SpeechDetection/thePinnedModelDownloadsLoadsAndAnswers()", False),  # the real model
         ("VoiceServiceTests.WhisperStart/whisperLoadsOnlyFromItsCheckedFoldersAndNeverDownloads()", False),
@@ -1923,8 +1930,9 @@ def test_every_suite_verify_runs_in_the_voice_service_is_one_of_its_tests() -> N
 def test_verify_runs_the_voice_suites_that_hold_promises(test: str, run: bool) -> None:
     """The second deep scan of 0.9.8 (swift-3): a change to the six languages' pins, to call audio staying in memory
     (hard rule 7), to a request's "kokoro": false or to the 27.0.x warning passed verify.sh, whose filter named only the
-    own-account and Pocket suites. Matched as `swift test --filter` matches a test's name; the suites that need a real
-    model or the network stay out."""
+    own-account and Pocket suites; owner, 3 Nov 2026: Pocket TTS her only voice, so the service's refusal of a line it
+    cannot say holds a promise too (PocketOnly; the warning went with Kokoro). Matched as `swift test --filter` matches
+    a test's name; the suites that need a real model or the network stay out."""
     assert (re.search(VOICE_FILTER, test) is not None) is run
 
 

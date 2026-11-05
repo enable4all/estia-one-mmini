@@ -225,6 +225,26 @@ def test_notes_during_an_answer_never_split_her_turn(store: Store) -> None:
     assert [result.split("\n")[-1] for result in results(built)] == ["Reminder: tea.", "Devices: lamp on."]
 
 
+def test_a_note_about_an_answer_stays_out_when_a_trim_left_only_the_answer_in_the_window(store: Store) -> None:
+    """The window can start between a request and her answer (a trim to the model's context): the note sent while she
+    answered (the first found video's match, quoting outside text) is still about that answer, so it never reaches her
+    next request (SECURITY.md: "the first match's message does not reach her"); a note about no request still does."""
+    _, context = make(store)
+    conv = store.current_conversation()
+    asked = say(store, conv, "find me a video of Ivan on Tech", T0)
+    note(store, conv, "Episode 212: last week · Ivan on Tech", T0 + 5_000, asked, outside=True)
+    note(store, conv, "Reminder: tea.", T0 + 6_000)
+    reply(store, conv, "That is the one above.", asked, T0 + 30_000)
+    store.move_window_start(conv.id, store.message(asked.id).seq or 0)  # the request leaves, her answer stays
+    later = say(store, conv, "what time is it", T0 + 60_000)
+    conv = store.current_conversation()
+    assert [message.text for message in context.window(conv)] == ["That is the one above.", "what time is it"]
+    built = context.build(conv)
+    assert [result.split("\n")[-1] for result in results(built)] == ["Reminder: tea."]
+    assert context.outside_notes(conv, later.id) == []
+    assert not context.after_outside(conv, later.id)
+
+
 def test_a_request_ends_with_the_message_being_answered(store: Store) -> None:
     """A note stored after the message being answered (its voice echo, its document's note) belongs to this answer:
     never in its own request, so the request ends with the user's message."""

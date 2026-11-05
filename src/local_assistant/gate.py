@@ -79,6 +79,19 @@ _UNSUPPORTED_DATA = ("sticker", "contacts", "pollCreate", "payment")
 # what stands for a part the user's app hid until tapped (Signal's spoiler): text the user may never have seen, as in a
 # forwarded message, is never their own words (second review of 0.9.8, redteam-01)
 HIDDEN_MARK = "(hidden part left out)"
+# the characters no app shows: Unicode's Default_Ignorable_Code_Point (DerivedCoreProperties.txt), among them the
+# zero-width space, the left-to-right and right-to-left marks, the word joiner, the soft hyphen, the byte order mark,
+# the Hangul fillers and the variation selectors
+_INVISIBLE = (
+    r"\u00ad\u034f\u061c\u115f\u1160\u17b4\u17b5\u180b-\u180f\u200b-\u200f\u202a-\u202e\u2060-\u206f\u3164"
+    r"\ufe00-\ufe0f\ufeff\uffa0\ufff0-\ufff8\U0001bca0-\U0001bca3\U0001d173-\U0001d17a\U000e0000-\U000e0fff"
+)
+# a typed text's leading bracketed groups, an empty one too, with the spaces and invisible characters before and between
+# them: code's marks look like them ("[call]", "[voice]", "[audio file]", "[photo]", "[document]", and the time stamp
+# before each of the user's messages in her input), so each such "[" gets a backslash ("[call] yes" -> "\[call] yes"):
+# code never takes the user's typed words for its own mark, and Gemma sees the backslash (owner's plan, 3 Nov; a
+# leading zero-width space hid the mark until the review of 3 Nov)
+_LEADING_GROUPS = re.compile(rf"^[\s{_INVISIBLE}]*(?:\[[^\]\n]*\][\s{_INVISIBLE}]*)+")
 _BIDI_CONTROLS = frozenset({*range(0x202A, 0x202F), *range(0x2066, 0x206A)})  # overrides, embeddings and isolates
 _TAGS = range(0xE0000, 0xE0080)  # Unicode tag characters: no app shows them, a model may read them
 _CANCEL_TAG = 0xE007F
@@ -146,6 +159,14 @@ def shown_words(text: str, styles: object) -> str:
     length in UTF-16 code units) replaced by HIDDEN_MARK, and the characters no app shows that could carry words
     removed: tag characters (an emoji flag's own kept) and bidi overrides, embeddings and isolates."""
     return _without_hidden_characters(_without_spoilers(text, styles))
+
+
+def escape_marks(text: str) -> str:
+    """The user's typed words as stored: each "[" of the text's leading bracketed groups with a backslash before it
+    ("[call] yes" -> "\\[call] yes", "[Mon 3 Nov 09:41] [call] yes" -> "\\[Mon 3 Nov 09:41] \\[call] yes"), an empty
+    group and one after invisible characters too ("\\u200b[call] yes" -> "\\u200b\\[call] yes"), so a typed text never
+    starts with a mark code writes (_LEADING_GROUPS); any other text as it is."""
+    return _LEADING_GROUPS.sub(lambda found: found.group().replace("[", "\\["), text, count=1)
 
 
 def _spoiler_ranges(styles: object, total: int) -> list[tuple[int, int]]:
@@ -240,7 +261,7 @@ def _classify(envelope: Mapping[str, Any], allowed: frozenset[str]) -> Decision:
         others = tuple(ref for ref in refs if ref.content_type not in IMAGE_TYPES)
         caption = data.get("message")
         styles = data.get("textStyles")  # the user's own words with the file, as their app showed them
-        caption = shown_words(caption, styles).strip() if isinstance(caption, str) else ""
+        caption = escape_marks(shown_words(caption, styles).strip()) if isinstance(caption, str) else ""
         if not photos:
             voice = next((ref for ref in refs if ref.content_type.startswith("audio/")), None)
             documents = tuple(ref for ref in refs if document_suffix(ref.content_type, ref.filename))
@@ -264,4 +285,4 @@ def _classify(envelope: Mapping[str, Any], allowed: frozenset[str]) -> Decision:
     text = shown_words(text, data.get("textStyles")).strip()
     if text.startswith("/"):
         return Decision(Kind.COMMAND, text=text, discard=long_texts)
-    return Decision(Kind.TEXT, text=text, discard=long_texts)
+    return Decision(Kind.TEXT, text=escape_marks(text), discard=long_texts)

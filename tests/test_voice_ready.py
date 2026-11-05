@@ -7,6 +7,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from local_assistant import prompts
+from local_assistant.config import has_voice
 from local_assistant.voice_ready import LONG_LOAD_SECONDS, ReadyNote
 
 TZ = ZoneInfo("Europe/Athens")
@@ -48,6 +49,8 @@ class Harness:
         self.voice = Voice(ready)
         self.sent: list[tuple[str, str]] = []
         self.locked = False
+        self.busy: set[str] = set()  # accounts with a call on
+        self.language = {ALEX: "en", SAM: "en"}  # each account's call language (the practised one, else the one in use)
         self.note = ReadyNote(
             self.voice,
             self.send,
@@ -55,7 +58,9 @@ class Harness:
             tz=TZ,
             quiet_hours=quiet,
             locked=lambda: self.locked,
+            busy=lambda aci: aci in self.busy,
             clock=self.clock,
+            speaks=lambda aci: has_voice(self.language[aci]),
         )
 
     async def send(self, aci: str, text: str) -> None:
@@ -83,6 +88,27 @@ async def test_after_a_long_load_every_allowed_account_gets_the_note_once() -> N
     await h.after(15)
     await h.after(3600)
     assert len(h.sent) == 2  # at most once per bridge start
+
+
+@pytest.mark.parametrize("language", ["ko", "pl", "ru", "ja"])
+async def test_after_a_long_load_no_call_invite_goes_where_calls_ring_out(language: str) -> None:
+    """The review of 4 Nov: "My voice is ready: you can call me now." went to every allowed account, also one whose
+    call language has no voice (in use, or practised), whose next call rings out with the no-voice text. That account
+    gets no long-load note; one in Spanish still does."""
+    h = Harness(at(10))
+    h.language[SAM] = language
+    await h.after(0)
+    await h.after(LONG_LOAD_SECONDS + 5)
+    h.voice.ready = True
+    await h.after(15)
+    assert h.sent == [(ALEX, prompts.VOICE_READY)]
+    h = Harness(at(10))
+    h.language[SAM] = "es"
+    await h.after(0)
+    await h.after(LONG_LOAD_SECONDS + 5)
+    h.voice.ready = True
+    await h.after(15)
+    assert h.to() == [ALEX, SAM]
 
 
 async def test_a_short_load_sends_nothing_and_stops_reading_the_voice() -> None:
@@ -114,6 +140,24 @@ async def test_a_call_that_rang_while_not_ready_gets_the_note_at_once_and_only_t
     h.voice.ready = True
     await h.after(15)
     assert h.sent == [(ALEX, prompts.VOICE_READY)]  # the other account did not call: nothing for it
+
+
+async def test_the_note_waits_for_the_end_of_a_call_with_that_account() -> None:
+    """Review 4 Nov: "My voice is ready" arrived in the middle of a text-only call. It is held while a call with that
+    account is on, and sent after it ends."""
+    h = Harness(at(10), ready=True)
+    await h.after(0)
+    h.voice.ready = False
+    h.note.missed(ALEX, True)
+    await h.after(15)
+    h.voice.ready = True
+    h.busy.add(ALEX)
+    await h.after(15)
+    await h.after(15)
+    assert h.sent == []
+    h.busy.clear()
+    await h.after(15)
+    assert h.sent == [(ALEX, prompts.VOICE_READY)]
 
 
 async def test_in_quiet_hours_the_long_load_note_waits_until_morning_but_a_caller_gets_it_at_once() -> None:

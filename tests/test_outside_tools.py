@@ -85,6 +85,7 @@ ARGS = {
     "read_document": {"document": "letter"},
     "calendar_search": {"words": "bank"},
     "web_search": {"query": "bank"},
+    "find_video": {"what": "bank"},
     "places_search": {"what": "bank"},
     "route": {"to": "bank", "mode": "walk"},
 }

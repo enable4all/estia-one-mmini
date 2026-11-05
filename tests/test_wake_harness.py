@@ -1,5 +1,6 @@
 """The offline wake harness (evals/wake_harness.py): its phrases, sounds and scoring, and its talk with the voice
-service, on a stand-in; never the real Whisper or Kokoro here (the harness itself is run by hand, alone on the GPU)."""
+service, on a stand-in; never the real Whisper or Pocket TTS here (the harness itself is run by hand, alone on the
+GPU)."""
 
 import array
 import dataclasses
@@ -99,7 +100,7 @@ def test_line_noise_is_mixed_in_without_clipping_and_keeps_the_length() -> None:
 
 @pytest.mark.parametrize("count", [27, 49, 101, RATE + 27, 3 * RATE + 1])
 def test_line_noise_fits_a_clip_of_any_length(count: int) -> None:
-    """A Kokoro clip of any sample count gets noise of exactly its length (22 Oct: int(RATE * seconds) dropped a sample
+    """A spoken clip of any sample count gets noise of exactly its length (22 Oct: int(RATE * seconds) dropped a sample
     for 27 samples, 49, ..., and the mix stopped on the first room item)."""
     speech = array.array("h", [1_000] * count).tobytes()
     for noise in NOISES:
@@ -138,7 +139,7 @@ class Scripted:
 
 def test_a_run_counts_wakes_and_false_wakes_for_each_arm_in_turn() -> None:
     service = Scripted("Tiffany")
-    items = run(service, "Tiffany", voices=("af_heart", "am_michael"), noises=("clean", "room"))
+    items = run(service, "Tiffany", voices=("heart", "michael"), noises=("clean", "room"))
     listed = phrases("Tiffany")
     named = len([phrase for phrase in listed if phrase.named])
     each = len(listed) * 2 * 2 + len(sounds())  # phrases by voice and noise; the sounds once
@@ -150,20 +151,20 @@ def test_a_run_counts_wakes_and_false_wakes_for_each_arm_in_turn() -> None:
     assert {key: plain["unnamed"][key] for key in ("items", "woke")} == {"items": each - named * 4, "woke": 0}
     assert hinted["unnamed"]["woke"] == each - named * 4  # every false wake shows
     assert plain["by kind"]["near"]["woke"] == 0 and hinted["by kind"]["silence"]["woke"] == 1
-    assert {voice for _, voice in service.spoken} == {"af_heart", "am_michael"}
+    assert {voice for _, voice in service.spoken} == {"heart", "michael"}
 
 
 def test_the_client_sends_her_name_as_the_hint_and_the_calls_16k_audio() -> None:
     with FakeVoiceService() as fake:
         fake.transcript = "Tiffany, are you there?"
         service = VoiceService(fake.url)
-        spoken = service.speak("Tiffany, are you there?", "bf_emma")
+        spoken = service.speak("Tiffany, are you there?", "eve")
         assert spoken.startswith(b"RIFF")
         assert service.transcribe(wav(0.5), "Tiffany") == "Tiffany, are you there?"
         assert service.transcribe(wav(0.5), "") == "Tiffany, are you there?"
         # call=1, as a call's audio goes since 0.9.7 (the service keeps a bare "Bye."; review E4)
         assert fake.paths()[-2:] == ["/v1/audio/transcriptions?hint=Tiffany&call=1", "/v1/audio/transcriptions?call=1"]
-        assert json.loads(fake.requests[0][3]) == {"input": "Tiffany, are you there?", "voice": "bf_emma", "speed": 1.0}
+        assert json.loads(fake.requests[0][3]) == {"input": "Tiffany, are you there?", "voice": "eve"}
 
 
 def test_the_harness_runs_and_keeps_counts_only_never_audio(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -171,7 +172,7 @@ def test_the_harness_runs_and_keeps_counts_only_never_audio(tmp_path: Path, caps
         fake.health["hints"] = True
         fake.transcript = "Thank you."
         # --force: never this Mac's own process table (another job's evals may run beside the tests)
-        args = ["--url", fake.url, "--name", "Tiffany", "--voices", "af_heart", "--noises", "clean", "--force"]
+        args = ["--url", fake.url, "--name", "Tiffany", "--voices", "heart", "--noises", "clean", "--force"]
         code = wake_harness.main([*args, "--out", str(tmp_path)])
     assert code == 0
     [written] = list(tmp_path.iterdir())
@@ -186,7 +187,7 @@ def test_the_harness_refuses_a_voice_service_without_the_hint(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     with FakeVoiceService() as fake:  # an older service: its health has no "hints"
-        code = wake_harness.main(["--url", fake.url, "--voices", "af_heart", "--out", str(tmp_path), "--force"])
+        code = wake_harness.main(["--url", fake.url, "--voices", "heart", "--out", str(tmp_path), "--force"])
     assert code == 2 and list(tmp_path.iterdir()) == []
     assert "hint" in capsys.readouterr().err
 
@@ -198,7 +199,7 @@ def test_a_voice_service_of_another_account_is_named_with_the_way_to_run_one_of_
     run as you, says how to run this branch's voice service as you on another port."""
     with FakeVoiceService() as fake:
         fake.status["/health"] = 403
-        code = wake_harness.main(["--url", fake.url, "--voices", "af_heart", "--out", str(tmp_path), "--force"])
+        code = wake_harness.main(["--url", fake.url, "--voices", "heart", "--out", str(tmp_path), "--force"])
     assert code == 2 and list(tmp_path.iterdir()) == []
     err = capsys.readouterr().err
     assert "answers only programs of its own macOS account" in err
@@ -253,7 +254,7 @@ def test_a_run_waits_while_a_call_is_on_and_goes_on_after_it() -> None:
     items = run(
         service,
         "Tiffany",
-        voices=("af_heart",),
+        voices=("heart",),
         noises=("clean",),
         busy=lambda: next(calls_on, False),
         wait=waits.append,
@@ -267,7 +268,7 @@ def test_the_harness_refuses_to_start_during_a_call(
     monkeypatch.setattr(wake_harness, "_listing", lambda pattern: CALL_HELPER)
     with FakeVoiceService() as fake:
         fake.health["hints"] = True
-        code = wake_harness.main(["--url", fake.url, "--voices", "af_heart", "--out", str(tmp_path)])
+        code = wake_harness.main(["--url", fake.url, "--voices", "heart", "--out", str(tmp_path)])
     assert code == 3 and list(tmp_path.iterdir()) == [] and fake.requests == []
     assert "call" in capsys.readouterr().err
 
@@ -315,8 +316,8 @@ def test_the_owners_phrases_pause_after_the_first_part_longer_than_the_short_pau
     }
     whole = {spoken.parts for spoken in listed if spoken.kind == "owner"}
     assert ("Hello. Tiffany.",) in whole or ("Hello Tiffany.",) in whole
-    brisk = [spoken for spoken in listed if spoken.kind == "alone brisk"]
-    assert len({spoken.speed for spoken in brisk}) >= 3 and all(spoken.parts == ("Tiffany.",) for spoken in brisk)
+    # her name alone, once, at Pocket TTS's own pace (it has no speed: the brisk ones went with Kokoro, 3 Nov 2026)
+    assert [spoken.parts for spoken in listed if spoken.kind == "alone once"] == [("Tiffany.",)]
     assert all(says_name(" ".join(spoken.parts), "Tiffany") == spoken.named for spoken in listed)
     assert len({spoken.id for spoken in listed}) == len(listed)
 
@@ -364,16 +365,14 @@ class Line:
         self.name, self.short = name, short
         self.levels: dict[int, str] = {}
         self.hints: list[str] = []
-        self.speeds: list[float] = []
 
     def health(self) -> dict[str, object]:
         return {"stt": "ready", "tts": "ready", "turn": "ready", "hints": True}
 
-    def speak(self, text: str, voice: str, speed: float = 1.0) -> bytes:
-        self.speeds.append(speed)
+    def speak(self, text: str, voice: str) -> bytes:
         level = next((lv for lv, said in self.levels.items() if said == text), LEVELS[len(self.levels)])
         self.levels[level] = text
-        count = round(24_000 * 0.3 * max(1, len(text.split())) / speed)
+        count = round(24_000 * 0.3 * max(1, len(text.split())))
         samples = array.array("h", (level if (i // 12) % 2 else -level for i in range(count)))
         out = io.BytesIO()
         with wave.open(out, "wb") as file:
@@ -405,7 +404,7 @@ class Line:
 
 def test_a_call_run_misses_her_name_in_short_clips_and_the_full_pause_or_the_fixed_service_hears_it() -> None:
     service = Line("Tiffany")
-    items = run_call(service, "Tiffany", voices=("af_heart",), noises=("clean",), lines=("clean",))
+    items = run_call(service, "Tiffany", voices=("heart",), noises=("clean",), lines=("clean",))
     by = {(item.id, item.arm): item for item in items}
     hello = [key for key in by if key[0].startswith("owner-hello-") and not key[0].endswith("whole")]  # paused
     assert hello and all(not by[(id_, "early end")].woke for id_, arm in hello if arm == "early end")
@@ -415,8 +414,8 @@ def test_a_call_run_misses_her_name_in_short_clips_and_the_full_pause_or_the_fix
     assert all(turn.seconds < 1.0 for turn in chopped.turns)
     result = call_summary(items)
     assert result["early end"]["turns"]["no words"] > 0 and result["full pause"]["unnamed"]["woke"] == 0
-    assert set(service.hints) == {""} and {1.0, 1.3, 1.6} <= set(service.speeds)
-    fixed = run_call(Line("Tiffany", short=True), "Tiffany", voices=("af_heart",), noises=("clean",), lines=("clean",))
+    assert set(service.hints) == {""}
+    fixed = run_call(Line("Tiffany", short=True), "Tiffany", voices=("heart",), noises=("clean",), lines=("clean",))
     assert all(item.woke for item in fixed if item.named)
     assert not [item.id for item in fixed if item.woke and not item.named]
 
@@ -425,7 +424,7 @@ async def test_standby_holds_her_name_alone_and_joins_the_request_after_its_paus
     """As calls.py (review of 0.9.7, C2a): in standby an early end after her name alone waits out the full pause, and
     what the caller says in it is joined to the name: one turn, her name heard."""
     service = Line("Tiffany", short=True)
-    name, request = (wav_to_pcm48(service.speak(text, "af_heart")) for text in ("Tiffany", "what time is it"))
+    name, request = (wav_to_pcm48(service.speak(text, "heart")) for text in ("Tiffany", "what time is it"))
     turns = await standby_turns(service, stream([name, request], 0.8), "Tiffany", early=True, hint="")
     assert [(turn.heard, turn.woke) for turn in turns] == [("Tiffany what time is it", True)]
 
@@ -433,7 +432,7 @@ async def test_standby_holds_her_name_alone_and_joins_the_request_after_its_paus
 def test_a_call_run_with_the_hint_sends_her_name_only_in_its_hint_arms() -> None:
     service = Line("Tiffany", short=True)
     arms = (*CALL_ARMS, *HINT_ARMS)
-    items = run_call(service, "Tiffany", voices=("af_heart",), noises=("clean",), lines=("clean",), arms=arms)
+    items = run_call(service, "Tiffany", voices=("heart",), noises=("clean",), lines=("clean",), arms=arms)
     assert {item.arm for item in items} == {arm for arm, _, _ in arms}
     assert set(service.hints) == {"", "Tiffany"}
     hinted = [item for item in items if item.arm.endswith("hint")]
@@ -446,7 +445,7 @@ def test_the_call_harness_keeps_counts_and_synthetic_words_only(
     with FakeVoiceService() as fake:
         fake.turn = "ready"
         fake.transcript = "Tiffany."
-        args = ["--call", "--url", fake.url, "--name", "Tiffany", "--voices", "af_heart", "--noises", "clean"]
+        args = ["--call", "--url", fake.url, "--name", "Tiffany", "--voices", "heart", "--noises", "clean"]
         code = wake_harness.main([*args, "--lines", "clean", "--force", "--out", str(tmp_path)])
     assert code == 0
     [written] = list(tmp_path.iterdir())
@@ -460,9 +459,7 @@ def test_the_call_harness_keeps_counts_and_synthetic_words_only(
 
 def test_the_call_harness_needs_the_turn_detector(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     with FakeVoiceService() as fake:  # no "turn" in its health: no early end to measure
-        code = wake_harness.main(
-            ["--call", "--url", fake.url, "--voices", "af_heart", "--out", str(tmp_path), "--force"]
-        )
+        code = wake_harness.main(["--call", "--url", fake.url, "--voices", "heart", "--out", str(tmp_path), "--force"])
     assert code == 2 and list(tmp_path.iterdir()) == []
     assert "turn" in capsys.readouterr().err
 
@@ -477,7 +474,7 @@ def test_a_negative_the_text_check_wakes_on_is_kept_and_counted_apart(monkeypatc
     monkeypatch.setattr(wake_harness, "NEAR", near)
     [kept] = [phrase for phrase in phrases("Tiffany") if phrase.kind == "near"]
     assert kept.matched and not kept.named
-    items = run(Scripted("Tiffany"), "Tiffany", voices=("af_heart",), noises=("clean",))
+    items = run(Scripted("Tiffany"), "Tiffany", voices=("heart",), noises=("clean",))
     result = summary(items)["no hint"]
     assert result["matched"] == {"items": 1, "woke": 1}  # the text check's own false wake
     assert result["unnamed"]["woke"] == 0  # Whisper's false wakes: none
@@ -485,8 +482,8 @@ def test_a_negative_the_text_check_wakes_on_is_kept_and_counted_apart(monkeypatc
 
 def test_each_item_gets_its_own_noise_the_same_in_every_run() -> None:
     speech = array.array("h", [1_000] * RATE).tobytes()
-    one, two = item_seed("tv-news", "af_heart", "room"), item_seed("tv-goal", "af_heart", "room")
-    assert one != two and one == item_seed("tv-news", "af_heart", "room")
+    one, two = item_seed("tv-news", "heart", "room"), item_seed("tv-goal", "heart", "room")
+    assert one != two and one == item_seed("tv-news", "heart", "room")
     assert noisy(speech, "room", one) != noisy(speech, "room", two)
 
 
@@ -495,7 +492,7 @@ def test_false_wakes_are_given_per_hour_with_their_upper_bound() -> None:
     assert false_wake_bound(0, 3600) == pytest.approx(2.996, abs=0.01)
     assert false_wake_bound(0, 12 * 60) == pytest.approx(14.98, abs=0.05)
     assert false_wake_bound(2, 3600) == pytest.approx(6.296, abs=0.01)  # Poisson's exact 95 % bound for 2
-    items = run(Scripted("Tiffany"), "Tiffany", voices=("af_heart",), noises=("clean",))
+    items = run(Scripted("Tiffany"), "Tiffany", voices=("heart",), noises=("clean",))
     unnamed = summary(items)["no hint"]["unnamed"]
     assert unnamed["seconds"] > 0 and unnamed["per hour under"] == pytest.approx(3 * 3600 / unnamed["seconds"], 0.01)
     assert "an hour" in table(summary(items))
@@ -514,7 +511,7 @@ def test_the_arms_are_compared_item_by_item() -> None:
     the early end and 18 only with the full pause."""
 
     def item(id_: str, arm: str, woke: bool) -> CallItem:
-        return CallItem(id_, "start", True, "af_heart", "clean", "phone", arm, woke)
+        return CallItem(id_, "start", True, "heart", "clean", "phone", arm, woke)
 
     items = [item(f"a{n}", "early end", n < 4) for n in range(22)] + [
         item(f"a{n}", "full pause", n >= 4) for n in range(22)
@@ -529,10 +526,10 @@ def test_a_call_run_prints_whispers_share_of_her_wait_at_the_median_and_90th_per
     """Review of 26 Oct (eval-methods-6): the caller's wait before her first word starts with the end of the turn and
     Whisper's time on it; --call prints Whisper's time per turn at the median and the 90th percentile, per arm."""
     turns = [Turn(1.2, 3, "hello", False, heard_ms=ms) for ms in (100, 200, 300, 400, 900)]
-    items = [CallItem("a1", "start", True, "af_heart", "clean", "phone", "early end", False, turns=turns)]
+    items = [CallItem("a1", "start", True, "heart", "clean", "phone", "early end", False, turns=turns)]
     result = call_summary(items)
     assert result["early end"]["turns"]["whisper ms"] == {"p50": 300, "p90": 900}
     assert "whisper p50 300 ms, p90 900 ms" in call_table(result)
-    assert call_summary([CallItem("a2", "start", True, "af_heart", "clean", "phone", "full pause", False)])[
-        "full pause"
-    ]["turns"]["whisper ms"] == {"p50": 0, "p90": 0}
+    assert call_summary([CallItem("a2", "start", True, "heart", "clean", "phone", "full pause", False)])["full pause"][
+        "turns"
+    ]["whisper ms"] == {"p50": 0, "p90": 0}

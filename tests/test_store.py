@@ -76,6 +76,22 @@ def test_a_message_joins_the_conversation_when_it_is_answered(store: Store) -> N
     assert texts == ["first question", "first answer", "second question"]
 
 
+def test_a_message_taken_out_of_the_conversation_joins_it_again_when_it_is_answered(store: Store) -> None:
+    """A text a call stopped while she thought (Deep Thinking): it waits as a text does during a call, with no place in
+    the conversation, so the call's turns never see it unanswered; answered after the call, it joins at the end."""
+    conv = store.current_conversation()
+    asked = store.add_incoming(conv.id, ME, T0, "text", "a long question", defer_seq=True)
+    assert asked is not None
+    store.assign_seq(asked)
+    assert [m.id for m in store.window_messages(conv.id, 0)] == [asked]
+    store.unassign_seq(asked)
+    assert store.message(asked).seq is None and store.window_messages(conv.id, 0) == []
+    assert [m.id for m in store.unanswered_incoming()] == [asked]  # still waiting to be answered
+    call = store.add_call_turn(conv.id, ME, "[call] hi there")
+    store.assign_seq(asked)
+    assert [m.id for m in store.window_messages(conv.id, 0)] == [call, asked]  # after the call's turns
+
+
 def test_recovery_queries(store: Store) -> None:
     conv = store.current_conversation()
     waiting = store.add_incoming(conv.id, ME, T0, "text", "waiting")

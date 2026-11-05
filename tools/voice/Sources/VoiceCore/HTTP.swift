@@ -65,10 +65,8 @@ public enum HTTP {
         431: "Request Header Fields Too Large", 500: "Internal Server Error", 503: "Service Unavailable",
     ]
 
-    /// `headers`: extra ones, ours only (fixed names, values without line breaks: `SpokenLine.headers`).
-    public static func response(_ status: Int, contentType: String, body: Data, headers: [(String, String)] = []) -> Data {
-        let extra = headers.filter { !"\($0.0)\($0.1)".contains(where: \.isNewline) }.map { "\($0.0): \($0.1)\r\n" }.joined()
-        let head = "HTTP/1.1 \(status) \(reasons[status] ?? "Error")\r\nContent-Type: \(contentType)\r\n" + extra
+    public static func response(_ status: Int, contentType: String, body: Data) -> Data {
+        let head = "HTTP/1.1 \(status) \(reasons[status] ?? "Error")\r\nContent-Type: \(contentType)\r\n"
             + "Content-Length: \(body.count)\r\nConnection: close\r\n\r\n"
         return Data(head.utf8) + body
     }

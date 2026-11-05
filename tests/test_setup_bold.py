@@ -40,7 +40,7 @@ BOLD = {
     "ollama_app": ("Ollama app", "background build"),  # owner, 29 Oct: the two choices
     "smaller_model": ("steer her",),  # the owner's words, 29 Oct
     "name": ("(AI)",),
-    "voice": ("English voice", "one voice"),
+    "voice": ("English voice", "one voice", "no voice"),
     "signal_app": ("spare SIM", "without a number", "Your own Signal"),  # owner, 28 Oct: "yes to both" (words-06)
     "route": ("spare SIM's", "Without number"),  # the owner's own two
     "number": ("no Signal app", "logs out", "kept topped up"),

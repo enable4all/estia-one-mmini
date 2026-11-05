@@ -50,6 +50,23 @@ def service(store: Store, clock: Clock, **options: object) -> Reminders:
 # times
 
 
+@pytest.mark.parametrize("wake", [True, False])
+def test_a_call_reminder_while_a_language_with_no_voice_is_in_use_says_no_call_comes(store: Store, wake: bool) -> None:
+    """The review of 4 Nov: with Korean in use, "/remind call 07:00 wake up" was confirmed as a wake-up call that
+    can_place then refused, and a sleeper found out after the fact. Code's note says no call is placed while Korean is
+    in use, inside the note, as REMINDER_CALLS_OFF does; the reminder still fires as a text."""
+    language = ["ko"]
+    reminders = service(store, Clock(), language=lambda: language[0])
+    created = reminders.set(ME, at="2026-10-13 07:00" if wake else "2026-10-13 17:00", text="wake up", call=True)
+    suffix = prompts.REMINDER_NO_VOICE.format(language="Korean")
+    assert suffix == " · no call while Korean is in use: I have no voice in it"
+    assert suffix in created.note and "wake-up call" not in created.note and " · call ·" not in created.note
+    assert created.reminder.call  # a text when due, with why there is no call
+    language[0] = "es"
+    other = reminders.set(ME, at="2026-10-14 07:00", text="up again", call=True)
+    assert "no call while" not in other.note
+
+
 def test_a_time_in_the_spring_forward_gap_moves_an_hour_on_and_says_so() -> None:
     moment, shifted = resolve_local(datetime(2026, 3, 29, 2, 30), TZ)
     assert shifted and (moment.hour, moment.minute) == (3, 30) and moment.utcoffset() is not None
@@ -754,6 +771,8 @@ async def test_cancelling_during_the_wait_stops_the_retry(store: Store) -> None:
         ("in_call", "we were already on a call"),
         # owner, 25 Oct: no Supertonic-3 stand-in while jane's model of the language in use downloads
         ("downloading", "her voice in the language in use is still downloading"),
+        # owner, 3 Nov 2026: Korean, Polish, Russian, Japanese; the review of 4 Nov: named (the reminders' language)
+        ("no_voice", "I have no voice in English"),
     ],
 )
 async def test_no_call_when_it_cannot_be_placed_the_text_says_why(store: Store, ready: str, why: str) -> None:

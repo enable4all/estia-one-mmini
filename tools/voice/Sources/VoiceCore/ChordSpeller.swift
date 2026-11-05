@@ -1,15 +1,15 @@
 import Foundation
 
-/// Chord names said as music before Kokoro reads them (owner, 16 Oct, on a call: "chord progression still chinese ...
+/// Chord names said as music before Pocket TTS reads them (owner, 16 Oct, on a call: "chord progression still chinese ...
 /// # and flats have words"; the rules are the review's): "Em7" is "E minor seven", "D/F#" "D over F sharp",
 /// "Bb" "B flat". A chord that could be a word ("Am", "Ab", "A+", "A/B") is spelled only among other chords or in a
 /// sentence about music; "Am I", lower case and words that only start with A to G stay as written. A run of chords
-/// gets a comma between them (punctuation is Kokoro's only pause). A chart's marks are words among chords (the chord
+/// gets a comma between them (a pause; measured with Kokoro before 3 Nov 2026). A chart's marks are words among chords (the chord
 /// speech audit, 18 Oct): "N.C." is "no chord" (in a sentence about music too, where a chart puts it: `chartSpot`), "%" "repeat", and "x2" after chords, a
 /// section's name or a bracket "twice". Numbers are left to `NumberNormalizer`.
 public enum ChordSpeller {
 
-    /// Between the chords of a run: a comma, Kokoro's pause (owner, 16 Oct: "just use comma... for chords"; measured
+    /// Between the chords of a run: a comma, a pause (Kokoro's, as measured; owner, 16 Oct: "just use comma... for chords"; measured
     /// 0.12-0.24 s; a full stop gives 0.21-0.33 s, so a longer pause would need silence put in by the service).
     static let separator = ", "
 

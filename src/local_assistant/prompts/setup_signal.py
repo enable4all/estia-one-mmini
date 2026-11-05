@@ -10,6 +10,7 @@ __all__ = [
     "SETUP_CARD_DONE", "SETUP_CARD_KEPT", "SETUP_CARD_KEYS", "SETUP_CARD_LIMITED", "SETUP_CARD_LIMITED_UNTIL",
     "SETUP_CARD_NOT_ID", "SETUP_CARD_NOT_KEY", "SETUP_CARD_NO_ANSWER", "SETUP_CARD_PASTE_LONG", "SETUP_CARD_REFUSED",
     "SETUP_CARD_SHORT", "SETUP_CARD_SYMBOL", "SETUP_CARD_TITLE", "SETUP_CARD_TYPED_AGAIN", "SETUP_CODE_DIGITS",
+    "SETUP_CODE_EXPIRED",
     "SETUP_CODE_FAILED", "SETUP_CODE_NO_ANSWER", "SETUP_CODE_STOP", "SETUP_CODE_STOPPED", "SETUP_KEYCHAIN_ID_ITEM",
     "SETUP_KEYCHAIN_ID_LABEL", "SETUP_KEYCHAIN_KEEP_BOTH", "SETUP_KEYCHAIN_KEPT", "SETUP_KEYCHAIN_KEY_ITEM",
     "SETUP_KEYCHAIN_KEY_LABEL", "SETUP_KEYCHAIN_LOCKED", "SETUP_KEYCHAIN_NOT_KEPT", "SETUP_KEYCHAIN_ONE_KEPT",
@@ -113,6 +114,9 @@ SETUP_CODE_STOPPED = (  # q at the code or the old PIN, before a code was checke
     "  Signal limits how many codes it sends. A SIM that gets no SMS: scripts/setup.sh --redo signal,\n"
     "  for a Signal Account without a number."
 )
+# a code Signal takes no more (sms-code-expired: signal-cli's -3, "Verification code expired"): typed again it fails
+# the same way, so it stops, in either face, with the stop's register-again lines
+SETUP_CODE_EXPIRED = "The SMS code expired ({reason}).\n" + SETUP_CODE_STOPPED
 # a registration Signal refused (signal-register-errors-raw, round 1): by what happened, as route 2 says it, its
 # UTC time as the Mac's clock shows it (setup_signal.local_times); each a stop with its Fix
 SETUP_REGISTER_LIMITED = (

@@ -3,6 +3,7 @@ OpenStreetMap's words, list and results; the new cases' checks, on canned replie
 
 from __future__ import annotations
 
+import urllib.parse
 from pathlib import Path
 
 import pytest
@@ -10,8 +11,10 @@ import pytest
 from evals.gemma_suite import (
     CASES,
     HOME_CENTRE,
+    OSM_FIXTURE,
     Case,
     Harness,
+    OsmFixture,
     maps_google_fallback,
     maps_near_home,
     maps_osm_hours,
@@ -21,6 +24,7 @@ from evals.gemma_suite import (
 )
 from local_assistant import maps, osm
 from local_assistant.maps import HOME_WORDS
+from local_assistant.osm import NOMINATIM_URL
 from local_assistant.tools import MAPS_SCHEMAS, OSM_MAPS_SCHEMAS
 from tests.fakes.fake_gemma import FakeGemma, text, tool
 
@@ -120,10 +124,30 @@ async def test_the_unlisted_case_reads_the_ranking_osm_made(tmp_path: Path, what
     assert ok, detail
     assert harness.real_maps is not None and harness.real_maps.found
     assert all(place.unlisted == ("vegan",) for place in harness.real_maps.found)
+    # the fixture's own restaurants, ranked by osm.py: never a place made up of the kind's word (fix review of 0.9.8,
+    # evals-osm-fixture-invents-the-kind: "vegan food" found a cafe called "Food")
+    assert {place.name for place in harness.real_maps.found} <= {"Trattoria Uno", "Bistro Due", "Pizzeria Tre"}
     asked = [query.get("q") for query in harness.osm_http.nominatim()]
     kind = what.split()[-1]
     assert what in asked and kind in asked  # by the words, then by the kind
     assert detail.startswith(f"searched {asked} | found ")
+
+
+@pytest.mark.parametrize("words", ["nearby", "cinema", "vegan restaurants nearby", "Food Hall"])
+async def test_the_osm_fixture_invents_no_place(words: str) -> None:
+    """Words the fixture holds no answer for find no place, as Nominatim finds none for them: a place made up of the
+    words ("Nearby", a cafe 2 km north) reached the ranking as the kind's place (evals-osm-fixture-invents-the-kind)."""
+    fixture = OsmFixture(OSM_FIXTURE)
+    url = f"{NOMINATIM_URL}?{urllib.parse.urlencode({'q': words, 'format': 'jsonv2'})}"
+    answer = await fixture("GET", url, {}, None)
+    assert answer.status == 200 and answer.body == []
+
+
+@pytest.mark.parametrize("kind", ["restaurant", "restaurants", "food", "place", "places", "Restaurants"])
+async def test_the_osm_fixture_reads_each_kind_word_it_means_as_its_restaurants(kind: str) -> None:
+    fixture = OsmFixture(OSM_FIXTURE)
+    answer = await fixture("GET", f"{NOMINATIM_URL}?{urllib.parse.urlencode({'q': kind})}", {}, None)
+    assert [found["name"] for found in answer.body] == ["Trattoria Uno", "Bistro Due", "Pizzeria Tre"]
 
 
 async def test_the_unlisted_case_fails_when_the_ranking_drops_what_is_not_listed(

@@ -58,19 +58,25 @@ def test_chords_is_an_extra_off_without_its_section() -> None:
 # f605e5b2… and help 47fa63d5… before; call_rules unchanged. 28 Oct, review of 0.9.8 guards-6 (her list's voice line
 # names Pocket TTS, who speaks her voices): web_calls' rules 7e7103bd… before. 29 Oct, C4 (a call's deep question ends
 # with "the view you find strongest and why: "I think …"", owner: "put C4 back"; docs/agents/prompts-evals.md):
-# web_calls' rules da3520af… and call_rules 5e8f9b46… before.
+# web_calls' rules da3520af… and call_rules 5e8f9b46… before. 31 Oct, find_video (a video she finds, read after the
+# user's typed YES; docs/agents/web-maps-music-video.md): the tool in the web tools, one Web search rule, read_link's
+# and the web part's list lines: plain's rules 29715938… before; web_calls' rules 2ce3a320…, call_rules a80f224c…,
+# tools cfeb41ac… and help 2fa4d4e9… before. 3 Nov, the phone ends any lock of its account (owner; laptop P0, E1): the
+# security line's "or your phone": plain's rules 9b425c69… and help 2ff862f1…, web_calls' rules ffcd6409… and help
+# cdc02b4f… before; call_rules and the tools unchanged. 3 Nov, merge of Pocket TTS only (the
+# inventory's voice line: Pocket TTS only) with the line above: web_calls' rules 565f2890… before.
 BEFORE_CHORDS = {
     "plain": {
-        "rules": "29715938b5543548a70f07c55751680c80b02c0f5d8e80fd905f9093d77308a7",
+        "rules": "46c3f27fb1a1b265ec8ffd36743421a982f13e2c2533d6ceae91203f15273371",
         "call_rules": "79d1a4864fd97133a71541b87af8e7921b16d15b3be074a467a7e83e5fb6e20c",
         "tools": "9fa8044d05b59d5d2c1b75b2d63ae36dc244e03ec7f996e8dbc3cb473d50ea39",
-        "help": "2ff862f1c392f91a9a336338b2da1117a17086ef989bc46846de01ca0af1fd7d",
+        "help": "333c768d2470df3acac884679d2d2b4bf99244a189e3cf0d80999de79be00964",
     },
     "web_calls": {
-        "rules": "2ce3a320d943ce2cfe990dcd4257a714ce8d1511cd480da35e7dc711b6e9001c",
-        "call_rules": "a80f224c6a87487516dd654cdb82ba8125c22ad714e33f23deec27efb83fb3f4",
-        "tools": "cfeb41ac8a696bde3310c5c7cd93b1790e3a929b4402df0d9533898db05f393a",
-        "help": "2fa4d4e9c68770ba0c1884de5ea801898c89a4752f4ad2403c8efd36cf3f47a5",
+        "rules": "f21e1aef9949ced1cfcd069a441381b7c37d7556c122ec664a26e71078c0a6c2",
+        "call_rules": "e800160df60c9441e55b1a6acb74c7f35ea1f0ebf418e0ff6070183f13fc66f7",
+        "tools": "debaaf97152c35afebc556bf13b43fd19ab8e97dede3e252e576948e56665159",
+        "help": "c74bcc69519ce97b1d4bd4bca1ac8ac489848708a4a9b1cfcb6b1759930d0db4",
     },
 }
 SETUPS: dict[str, dict[str, Any]] = {
@@ -1402,6 +1408,28 @@ async def test_on_a_call_a_chords_line_the_message_after_it_leaves_out_stays_in_
         await stop(harness)
 
 
+async def test_a_chords_line_with_some_results_moved_is_texted_once_by_the_message_after_the_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review of the text-only call (F10): a turn with one result that moved and one that did not has its chords line
+    in the message after the call (sent because a transpose ran, with every result that worked), so it is also_texted:
+    never in a text now as well."""
+    gemma = FakeGemma(
+        tool("chords", **TRANSPOSE),
+        tool("chords", action="notes", chords="Bm"),
+        text("Done."),
+    )
+    harness = await chord_call(tmp_path, monkeypatch, gemma)
+    try:
+        app = harness.app
+        app.call_started(ME)
+        turn = await app.call_turn(ME, "transpose Am F C G up 2 and the notes of B minor", lambda: None)
+        assert "Bm: the notes B, D and F sharp." in turn.code_text
+        assert turn.also_texted == (turn.code_text,)
+    finally:
+        await stop(harness)
+
+
 async def test_without_the_page_the_turns_sources_are_the_source(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1435,7 +1463,7 @@ async def test_a_summary_line_with_another_chord_is_left_out(tmp_path: Path, mon
         await app.call_turn(ME, "thanks", lambda: None)
         app.call_ended()
         await app.call_chords(ME)
-        await app.call_summary(ME, ["User: transpose", "Estia: Done."], 2)
+        await app.call_summary(ME, ["User: transpose", "Estia: Done."], "14:02-14:04")
         await until(lambda: len(sent(harness.folder)) == 2)
         summary = sent(harness.folder)[1]
         assert "We moved Am F C G up a whole tone." in summary and "Then we said goodbye." in summary

@@ -138,7 +138,8 @@ setup's yet) it installs her own Ollama as above, and never makes her account; e
   account. Ollama has no login, so one that other machines reach (`OLLAMA_HOST=0.0.0.0`) stops it, with the setting
   that closes it; one that another account of this Mac runs stops it too (that account would control her answers),
   and so does another program or account that listens on its port too (the Mac itself has two addresses for that
-  port, so a second Ollama can sit beside yours); doctor shows either with a ✗.
+  port, so a second Ollama can sit beside yours); doctor shows either with a ✗ where it can list the program, and
+  says what it could not read where it cannot.
 - A kept Ollama of another version than 0.40.4 gets a "!": it works, but she is tested on 0.40.4. Setup's own service
   (below) is updated in place instead: the new version is downloaded and checked while the old one keeps answering,
   then `~/opt/ollama/current` points at it and the service starts again (a few seconds without answers); if the new
@@ -535,8 +536,7 @@ Edit the file:
    the voices ("heart, jane, eve, vera (female); alba, michael (male)", or "heart, jane, eve (female); alba, michael
    (male)" on a smaller Mac) and the Signal commands
    `/voices`, `/tools` and `/help`. Spanish, Italian, Portuguese, Dutch, German and French are spoken by
-   jane (Pocket TTS, the `[voice]` line `language_voice`); Korean, Polish, Japanese and Russian keep Supertonic's
-   voice F1.
+   jane (Pocket TTS); Korean, Polish, Japanese and Russian have no voice.
    `avatar`: her Signal profile picture, a PNG or JPEG of at most 5 MB (a full path, `~/` allowed). Left out, it is
    Estia's mark (`docs/brand/estia-avatar.png`), whatever her name; `avatar = ""` sends none, and Signal keeps the
    picture it has. Keep your own picture outside the repo folder; the move into her own macOS account copies it into
@@ -803,8 +803,13 @@ shows every step, `--voice` also installs the voice service. When the voice serv
 `--voice`), the deploy ends with "voice: ready"; while it still loads, with `[calls]` in her config (read as her, by
 her release's Python) "Calls work once her voice is ready (up to about 15 minutes); she texts you then." after up to
 150 s of checking (the bridge texts only when her voice still loads 2 minutes after it started), and without
-`[calls]` "voice: loading (up to about 15 minutes)" at once. A Ctrl-C during that wait ends only the wait. It prints
-only what happened and when, never message text.
+`[calls]` "voice: loading (up to about 15 minutes)" at once. While Pocket TTS rests after failed runs or cannot run
+(its program was not fetched, its files are missing or refused), it ends at once, with no wait and no promised text:
+"voice: resting after failed runs. It is tried again on its own, and calls work once her voice speaks." (without
+`[calls]`: the same without "and calls work once her voice speaks") and "Check later: /usr/bin/sudo
+/usr/local/estia/bin/estia check (log: /usr/bin/sudo /usr/local/estia/bin/estia logs voice)", or "voice: not working
+(doctor says why: /usr/bin/sudo /usr/local/estia/bin/estia doctor); her answers come as text". A Ctrl-C during that
+wait ends only the wait. It prints only what happened and when, never message text.
 
 When a release changes a root-run tool (`scripts/estia`, `scripts/estia-deploy`, `deploy.py`, `ownuser.py`,
 `hostsec.py`, a service template), the deploy says so and keeps the installed one. Read its diff and take it with
@@ -843,8 +848,8 @@ Her signal-cli by hand (one signal-cli per account): `/usr/bin/sudo /usr/local/e
 `… signal trust -v <safety number> <ACI>`, `… signal listDevices` or `… signal removeDevice -d N` stops the bridge and
 runs her own signal-cli as her from `/` with her flags; it starts her again only when she was running before it (after
 `/usr/bin/sudo /usr/local/estia/bin/estia stop` she stays stopped, and the last line says so).
-`/usr/bin/sudo /usr/local/estia/bin/estia unlock` ends a `/lock` from the Mac (when the device that locked her is gone),
-the same way.
+`/usr/bin/sudo /usr/local/estia/bin/estia unlock` ends a `/lock` from the Mac, the same way: the last resort, when
+neither the device that locked her nor your phone can send `/unlock`.
 
 Her own macOS account does not cover everything: Ollama and AgentJev run as you and see what she sends them, the move
 and each deploy trust your checkout and Homebrew at that moment, and with Projects on her own macOS account reads every file in your
@@ -982,7 +987,12 @@ cannot be found gets "may not be reachable" with the command that names it,
 program's path changes (a new version folder): run doctor again and let the new path through. Then check from your
 laptop. Known gaps: Untested as her on the live Mac until `/usr/bin/sudo /usr/local/estia/bin/estia doctor` shows the
 line (docs/e2e-checklist.md, 122). As her, `lsof` lists only her own processes, so your programs come from `netstat`
-alone; in one sandbox `netstat` listed no internet sockets, and then your programs are not named.
+alone. Where `netstat` lists none (seen on macOS 27.0.1 on 3 Nov, without admin rights), your programs are not named,
+and doctor never looks all clear: its last firewall line is "○ Firewall: other accounts' listening programs could not
+be listed without admin rights: only the account doctor runs as was checked", with
+`/usr/bin/sudo /usr/sbin/lsof -nP -iTCP -sTCP:LISTEN`, which lists every account's listening programs. When the
+firewall is on but its list cannot be read, no program is weighed and the line is "○ Firewall: its list could not be
+read: listening programs not checked".
 
 The phone checklist comes last:
 
@@ -994,8 +1004,10 @@ The phone checklist comes last:
   her carrier: a port-out or SIM-swap PIN; a prepaid number: a reminder to top it up before it lapses.
 
 What stays a risk: an unlocked phone or laptop with your Signal can talk to her (`/lock` stops her from the phone), and
-root on the Mac reads everything. Without the firewall (the nuclear option), a program of yours that listens for other
-machines can be reached from your network.
+root on the Mac reads everything. Whoever has your unlocked phone ends any lock of your account, one sent from your
+laptop too, 10 minutes later at the earliest. With your phone gone, stop her on the Mac:
+`/usr/bin/sudo /usr/local/estia/bin/estia stop` (she starts again at the next restart of the Mac). Without the firewall
+(the nuclear option), a program of yours that listens for other machines can be reached from your network.
 
 ## 3. Optional parts
 
@@ -1308,18 +1320,25 @@ her to switch a light on.
 
 ### Voice notes (once)
 
-**Before you start:** her own macOS account (2.7) first; on macOS 27.0.x a call may drop (below); the Command Line
-Tools with Swift 6.2; about 1.7 GB of disk for the models; admin rights twice: her update, then reading her voice as
+**Before you start:** her own macOS account (2.7) first; the Command Line
+Tools with Swift 6.2; about 1.6 GB of disk for the models; admin rights twice: her update, then reading her voice as
 her (your Mac password in Terminal; after a long build it may ask again); no account, no cost; up to about 20 minutes
 for the first start. With calls picked, `scripts/setup.sh` runs
 this step itself.
 
 **Steps:**
 
-Voice notes and spoken answers use a local service: WhisperKit for speech-to-text, and Kokoro (English) or Supertonic-3
-(the other ten languages) for text-to-speech, on the Neural Engine, beside Pocket TTS on the Mac's processor (English
-in heart, jane, eve, vera, alba and michael; Spanish, Italian, Portuguese, Dutch, German and French in jane). Whisper is told the language on every request. An Apple bug can crash Kokoro (the stand-in English voice) and the voice service with it, and it was seen on macOS 27.0.1: a call in progress drops, and the voice service starts again by itself. Kokoro still says a one-word check ("Ready.") at each start of the voice service, every English line a Pocket TTS voice cannot say (on a call at most one each time she answers: the rest of that answer comes as a Signal text), and every line in a Kokoro voice such as af_heart; lines in the other ten languages never go through it. The install
-script and the voice service's log warn on macOS 27.0.x. It also needs the Swift 6.2 toolchain from the Command Line Tools. Homebrew's installer
+Voice notes and spoken answers use a local service: WhisperKit for speech-to-text, on the Neural Engine, and Pocket TTS
+for text-to-speech, on the Mac's processor (English in heart, jane, eve, vera, alba and michael; Spanish, Italian,
+Portuguese, Dutch, German and French in jane). Whisper is told the language on every request. Pocket TTS is her only voice: a line it cannot say is said by no other voice, so a voice note's answer comes as text alone, and on a call the rest of that answer comes as a Signal text. Korean, Polish, Russian and Japanese have no voice: her answers in them come as text, and calls in them are not picked up.
+Kokoro and Supertonic-3, her other voices until 3 Nov 2026, were removed (Supertonic-3's makers ended its development
+in September 2026): a config that names a Kokoro voice still loads, in the closest Pocket TTS voice, and her log says
+so once at each start. Their files from an earlier install stay where they were downloaded (about 380 MB): nothing
+deletes them, and nothing loads them. To free the space, delete the folders `kokoro`, `kokoro-82m-coreml` and
+`supertonic-3` in `/var/estia/.cache/fluidaudio/Models` (with admin rights, in your own Terminal window:
+`/usr/bin/sudo /bin/rm -rf /var/estia/.cache/fluidaudio/Models/kokoro /var/estia/.cache/fluidaudio/Models/kokoro-82m-coreml /var/estia/.cache/fluidaudio/Models/supertonic-3`),
+and the same three in `~/.cache/fluidaudio/Models` in your own home when they are there (the move into her own macOS
+account left a copy). The voice service also needs the Swift 6.2 toolchain from the Command Line Tools. Homebrew's installer
 (2.1) installs the Command Line Tools. If `swift --version` is missing or older than 6.2, run `xcode-select --install`.
 
 1. Install the service: `cd <repo> && scripts/install-voice-daemon.sh`. The script runs
@@ -1327,7 +1346,7 @@ script and the voice service's log warn on macOS 27.0.x. It also needs the Swift
    sources with the exact versions in `Package.resolved`, puts it into her release and installs it as a background
    service that starts with the Mac (a LaunchDaemon), runs as her own macOS account `_estia` and is reachable only from
    the Mac itself (`127.0.0.1:8150`). It asks for your Mac password, because installing a service needs admin rights, as
-   for the bridge (2.7). The models (about 1.7 GB) download on the first start into
+   for the bridge (2.7). The models (about 1.6 GB) download on the first start into
    `/var/estia/Library/Application Support/local-assistant/voice-models` (the move into her own macOS account copies
    them when they are there). Whisper's files (the listening model and its word list) are fixed to one version on
    Hugging Face (one commit) and checked one by one against their fingerprints (sha256) at every start, in under a
@@ -1335,9 +1354,7 @@ script and the voice service's log warn on macOS 27.0.x. It also needs the Swift
    download's extra file too) is never loaded: it is set aside whole as `<folder>.refused-<time>` (only the latest such
    copy is kept) and that version is downloaded again into a fresh folder, with no step of yours;
    `/usr/bin/sudo /usr/local/estia/bin/estia logs voice` says so. Only when the fresh download is changed too does `stt`
-   say `failed` on the `voice:` line of `/usr/bin/sudo /usr/local/estia/bin/estia check`. The speaking voices (Kokoro for English at the first start,
-   Supertonic-3 for the other ten languages on first use) are downloaded as published: no fixed version and no check of
-   their files. By FluidAudio's code, they are fetched only when a file is missing. The voices heart, jane, eve, vera,
+   say `failed` on the `voice:` line of `/usr/bin/sudo /usr/local/estia/bin/estia check`. The voices heart, jane, eve, vera,
    alba and michael (Pocket TTS: its program from GitHub, its model and voices from Hugging Face, no account; heart's
    voice file from this repository) are fixed to one version and checked file by file against their sha256 values
    before the first sentence and whenever a file changes. One model speaks them all, chosen by the Mac's memory as
@@ -1346,11 +1363,11 @@ script and the voice service's log warn on macOS 27.0.x. It also needs the Swift
    beside the voice service; the voice service never downloads or changes it), and so do heart's voice files (one for
    each model, about 9 MB and 6 MB, in the voice service's own folder; never downloaded); its model and other voices
    come at the voice service's
-   first start; until all are there, Kokoro says her lines (on a call, one line each time she answers; the rest comes as a Signal text): `af_heart`, or `am_michael` for alba and michael. `eve-full` is another name for eve. jane's models for Spanish, Italian, Portuguese,
+   first start; until all are there, her answers come as text. `eve-full` is another name for eve. jane's models for Spanish, Italian, Portuguese,
    Dutch, German and French (Pocket TTS's own model of each, about 227 MB) are fixed and checked the same way, and a
    language's model is checked, and fetched when missing, only for the language in use: the first time she speaks it
-   after a start (the bridge asks at its start and right after `/language`); until then Supertonic-3's F1 says her
-   lines in it.
+   after a start (the bridge asks at its start and right after `/language`); until then her answers in it come as
+   text.
 2. The script waits up to about 20 minutes. If it says "voice: still loading after 20 minutes" after a slow first
    download, the service keeps loading.
    Check later with `/usr/bin/sudo /usr/local/estia/bin/estia check`: on its `voice:` line `stt` and `tts` both say `ready` when it is done.
@@ -1365,14 +1382,13 @@ script and the voice service's log warn on macOS 27.0.x. It also needs the Swift
 Languages other than English need a voice service that knows them: its health then lists `"languages"`. A service
 installed before the language feature speaks English only; the reply to `/language` says so. Run
 `scripts/install-voice-daemon.sh` again (it asks for your Mac password: run it yourself), and `scripts/doctor.sh` shows Language ✓ (it
-checks the language in use: the one chosen with `/language`, else the config's). The first use of such a language downloads Supertonic-3 (about
-265 MB, about a minute); the bridge does this in the background at start and right after `/language`. In Spanish,
-Italian, Portuguese, Dutch, German and French the same moment, or the start of practice in one (`/babble`), fetches
-jane's model of that language (about 227 MB, about half a minute here; her message says about 3 minutes), only for a
+checks the language in use: the one chosen with `/language`, else the config's). In Spanish, Italian, Portuguese,
+Dutch, German and French the first use of the language, in the background at start and right after `/language`, or
+the start of practice in one (`/babble`), fetches jane's model of that language (about 227 MB, about half a minute here; her message says about 3 minutes), only for a
 language in use; it stays on the Mac. While it downloads, nothing in that language is spoken: voice notes get text
 answers, calls ring out with a text saying when to call again, and "Her German voice is ready." follows. Doctor's
-"Voice jane" line checks it for the language in use and for a running practice's. `language_voice = ""` in `[voice]`
-gives the six back to Supertonic-3's F1.
+"Voice jane" line checks it for the language in use and for a running practice's. In Korean, Polish, Russian and
+Japanese nothing is downloaded: they have no voice.
 
 The first start after an install, a move into her own macOS account or a macOS update takes up to about 15 minutes while
 the Neural Engine compiles the models (its cache is per user and per macOS build). Until then, voice notes get "Voice
@@ -1484,10 +1500,13 @@ path too long for Unix sockets. A `socket_dir` you set must be short (under abou
 
 Undo: remove `[calls]` and restart. The bridge then uses Homebrew's signal-cli again, as before.
 
-**While her voice loads.** A call needs both speech parts ready (`stt` and `tts` in `/health`). Until then a call
-from an allowed account rings out, never rejected, and a note goes to the caller: "I can't take calls yet: my voice
-is still loading (up to 15 minutes after an install, a move or a macOS update). I'll text you when it's ready." That
-note goes at most once in 10 minutes, so a second call soon after gets none. Once her voice is ready, the code sends
+**While her voice loads.** A call needs both speech parts ready (`stt` and `tts` in `/health`). Until then, but for the case below
+where only her voice is not working, a call from an allowed account rings out, never rejected, and a note goes to the caller: "I can't take calls yet: my voice
+is still loading (up to 15 minutes after an install, a move or a macOS update). I'll text you when it's ready." While
+her voice rests after failed runs, cannot run or is one voice left out, and speech recognition (`stt`) is ready, the call
+is answered after its usual rings, and a note says: "My voice is not working right now: I'm listening, and my answers come as text. I'll text you when it works again." Each of her answers then comes as a Signal text, whole, until the call
+ends, also when her voice is back. With speech recognition not ready too, the call rings out and the note says: "I can't take calls right now: my voice is not working. My answers come as text. I'll text you when it works again."
+A note for a call that rang out goes at most once in 10 minutes, so a second call soon after gets none. Once her voice is ready, the code sends
 the note "My voice is ready: you can call me now." (in the model's history only as the bridge's note):
 
 - to a caller whose call rang meanwhile: at once, also in quiet hours;
@@ -1531,8 +1550,10 @@ up to the stop. It is her own voice when it has at least 3 of her content words 
 them. A stop, yes or no word she did not say ("wait", "yes", "no", "not") makes it the caller's: "the dentist at three"
 or "no, not Amsterdam" over her own sentence is the caller talking. All 11 languages; Japanese by characters (pairs of
 characters, and 6 in a row). She carries on, as after a cough. The first time in a call, a stop then needs 1.5 times
-the level that stopped her, for the rest of the call (both rules; raised once, never again). Her own words never reach
-the model. The log says `calls: her own voice heard; carrying on`.
+the level that stopped her, for the rest of the call (both rules; raised once, never again). What is told apart as
+her own voice never reaches the model. The log says `calls: her own voice heard; carrying on`. Her own voice that is
+not told apart counts as the caller's words, as another voice in the room does (SECURITY.md, known gaps); untested on
+Signal Desktop with speakers (docs/e2e-checklist.md, 52a).
 
 **A listener's "okay".** A listener's "okay", "yeah" or "mm-hm" alone, in the call's language, does not stop her either:
 she carries on, as after a cough, unless she just asked something. After a stop, a transcript of only acknowledgement
@@ -2351,14 +2372,15 @@ calls say only the words, never a crossed-out one.
 | `/soul` | The style file in use (`soul.md`, its text without the `#` lines; with `[chat]` and `[call]` lines, what texts get and what calls get), or why none is and the built-in style in use (hearth or playful) and the other; with the line added in code turned off (`calm_on_worry = false`), it says so |
 | `/language` · `/language <name or code>` | The 11 languages with the current one marked; switch with a code or a name in English or in the language itself (`/language nl`, `/language dutch`, `/language nederlands`) |
 | `/babble` · `/babble <name or code> [a2\|b1]` · `/babble off` | Language practice: start one (every language at A2; `b1` for B1), resume the last setting with a plain `/babble` (the first time: the list), or end it with a recap. Typed only; refused while another allowed account practises |
+| `/thinking on` · `/thinking off` · `/thinking` | Deep Thinking: her answers to texts and voice notes think first (a higher reasoning effort and room for 8,000 more tokens), off by itself after 30 minutes without a message from you; one switch per allowed account. Typed only (never a voice note, a call or Gemma); off until you turn it on; kept across a restart inside the 30 minutes; never on calls, practice or the messages she starts. Off on Macs with less than 24 GB of memory (model context under 32,768 tokens), and where her config has no `context_tokens` line (nothing says there is room) |
 | `/remind [call] [daily\|weekdays\|weekly] <when> <text>` | A reminder without the model: `<when>` is `17:00` (today, or tomorrow once passed), `2026-10-13 07:00`, `20m`, `2h` or `3d`; `call` adds a wake-up call. The same checks and confirmation as asking her |
 | `/reminders` · `/reminders cancel N\|cN\|all` | Your reminders, the check-ins she may send (`#cN`) and what was missed or failed in the last 7 days, with the reason; cancel one or all |
 | `/initiative on` · `/initiative off` · `/initiative` | Let her write first now and then (opt-in: off until you turn it on; wins over the config), stop it, or see which |
 | `/quiet` · `/quiet off` | Pause every message she starts herself, until `/quiet off`; reminders and wake-up calls still come |
 | `/evening on` · `/evening 20:30` · `/evening off` · `/evening` | The evening note: three short questions from the code each evening (opt-in: off until you turn it on; wins over the config; only to the account that typed it), its time, stop it, or see which |
-| `/lock` | An emergency stop, typed from a device she answers: no answers, no calls, nothing sent until `/unlock` from the same device, 10 minutes later at the earliest; it holds after a restart (`/usr/bin/sudo /usr/local/estia/bin/estia unlock` ends it from the Mac) |
-| `/unlock` | Ends `/lock`: only from the device that sent it, after the wait |
-| `/devices` · `/devices ok N` · `/devices forget N` | The devices she answers and the held ones; allow held device N (only from a device she already answers); take device N off the list after you unlink it (a linked device silent for 14 days is held again) |
+| `/lock` | An emergency stop, typed from a device she answers: no answers, no calls, nothing sent until `/unlock` from the same device or your phone, 10 minutes later at the earliest; it holds after a restart (`/usr/bin/sudo /usr/local/estia/bin/estia unlock` ends it from the Mac, the last resort) |
+| `/unlock` | Ends `/lock`: only from the device that sent it or your phone (never another linked device), after the wait |
+| `/devices` · `/devices ok N` · `/devices forget N` | The devices she answers and the held ones; allow held device N; take device N off the list after you unlink it (a linked device silent for 14 days is held again). Allowing and forgetting work only from your phone |
 | `/docs` · `/docs send N` | Your documents (with `[documents]`), newest first (30 at most, then a count), each with its number, place in the folder and pages, or why it cannot be read; the folder is looked at first. `/docs send N` sends that document back only to the account that asked; during a call it waits for the end. Without `[documents]`: how they are turned on |
 | `/help` | What she can do in this install, then the list above. The first part is the list her rules carry, word for word (see below) |
 
@@ -2399,7 +2421,8 @@ In normal messages:
 - A YouTube video link (`youtube.com/watch?v=…`, `youtu.be/…`, `/shorts/`, `/live/` and `/embed/` links, also on
   `m.youtube.com`, and `music.youtube.com/watch?v=…`), with or without a question → `read_link` reads the video's
   captions, not the page, through the YouTube helper (`tools/youtube`). Only a link in that same message is read, and
-  only the video's 11-character ID goes to the helper; a video named in a web search result is never read. Gemma
+  only the video's 11-character ID goes to the helper; a video named in a web search result is never read. The one
+  exception is a video she finds herself (the "A video she finds" item below). Gemma
   answers from the captions only, in at most about 300 words (her reply cap is 600 tokens, fixed in code), with
   the time of each main point, and says when YouTube generated the captions automatically (names and terms may be
   misheard). Hand-written captions come before automatic ones, each in the video's own language first: the automatic
@@ -2427,6 +2450,19 @@ In normal messages:
   video's captions and that the link is given for the full transcript: the link opens the video, so she never
   calls it the transcript. Without such a link, no line is added.
 - A video is never read on a call: a link cannot be spoken. The learn tool refuses a video link, as `/learn` does.
+- A video she finds: asked for a video by name ("the latest episode of Ivan on Tech, and summarise it"), she calls
+  `find_video` (offered with web search, on texts and calls). Code searches
+  (Brave first, Ollama as the backup, the words passing web search's own checks and guards), keeps only the links
+  `video.video_id` takes, rebuilt from the video's ID, ranks at most 3 (a title or channel naming the words first; with
+  "newest", the newest by the search's date first) and texts one match as a message of its own: title, channel, length,
+  date and link, "Reply YES to read it, or another for the next one." A video she finds is read only after your typed
+  YES: only your next typed message counts, the whole message, within 2 minutes (a voice note or a call never counts; a
+  text stored before the match's message is no answer). `another` shows the next match with 2 more minutes; the list
+  lasts 10 minutes, in memory only, per account and conversation; anything else ends the match. Her tool result holds no
+  title or channel. After the YES, that one link is read by `read_link` as if you had sent it, and code's line last in
+  her prompt gives it with your original request. On a call the match is texted at once and she says so; a YES typed
+  during the call waits for its end like any text, counts by its arrival and is answered in the chat. Logs hold codes,
+  counts and times, never the words searched, the video's ID or a title.
 - When a video cannot be read, she passes on the code's reason: "This video has no captions." (nothing is
   transcribed), a private or removed video or one not shown in this country, an age-restricted one (no account is used), YouTube
   refusing this Mac for now, YouTube not answering in time, YouTube not reachable just now, the YouTube helper not
@@ -2711,15 +2747,16 @@ Language practice (`/babble`):
   "Profile changes: none. Practice never saves a fact; ...". A claimed reminder, when your message or the one before
   asked for one, gets "No reminder was set: practice never sets one. Type /remind, or ask again after /babble off."
   (a roleplay line such as a shop's "I'll call you tomorrow" gets none).
-- Voice notes and calls are heard and spoken in the practised language. A call you make during practice is a practice
-  call: its greeting in that language, and when you said something, hanging up ends practice and the recap replaces
-  the call summary. Texts you typed during that call are answered first, as practice (for at most 2 minutes), so the
-  recap reads them. A call she places for a reminder or a wake-up is an ordinary call: your `/language`, her tools,
-  its summary, and practice keeps running. Goodbye words on a call are recognised in English only. Leave-taking as a
-  phrase of its own ("Okay, I have to go"), not inside a longer sentence ("I have to go to the dentist"), ends a call in
-  English and in the call's language once her reply is spoken ("I have to go", "ik moet gaan", "ich muss los", "je
-  dois y aller"), and so does asking her to end the call ("let's end the call", "laten we ophangen"); otherwise, in
-  another language, hang up yourself.
+- Voice notes and calls are heard and spoken in the practised language; in Japanese, which she has no voice for, a
+  voice note's answer comes as text and calls are not picked up until `/babble off`. A call you make during
+  practice, in a language with a voice, is a practice call: its greeting in that language, and when you said
+  something, hanging up ends practice and the recap replaces the call summary. Texts you typed during that call are
+  answered first, as practice (for at most 2 minutes), so the recap reads them. A call she places for a reminder or
+  a wake-up is an ordinary call: your `/language`, her tools, its summary, and practice keeps running. Goodbye words
+  on a call are recognised in English only. Leave-taking as a phrase of its own ("Okay, I have to go"), not inside a
+  longer sentence ("I have to go to the dentist"), ends a call in English and in the call's language once her reply
+  is spoken ("I have to go", "ik moet gaan", "ich muss los", "je dois y aller"), and so does asking her to end the
+  call ("let's end the call", "laten we ophangen"); otherwise, in another language, hang up yourself.
 - The recap: one structured call (JSON schema, temperature 0) over your practice turns (the latest 40, at most 12,000
   characters), at most 3 points {said, better, why}, the why in your `/language`. The code keeps a point only when
   "said" is verbatim in one of your turns, "better" differs by more than punctuation or capitals, the change is small
@@ -2731,7 +2768,8 @@ Language practice (`/babble`):
   ("'I goed' is correct" is dropped; "'went' is right" and "'Gekoopt' klopt niet" stay). English always, plus short
   lists in your language that need a native check. Dropped points are logged as counts per reason, never text. When
   the model named points and the checks kept none, the recap says "No mistakes to note." (without "well done"). For
-  Dutch, French, Russian, Japanese and Korean voice or call turns the recap says it is based on what was heard.
+  Dutch, French, Russian, Japanese and Korean voice notes, and for calls in Dutch and French, the recap says it is
+  based on what was heard.
 - The end: `/babble off` (the recap at once), a practice call (at once), or 30 minutes without a practice message: then
   the session ends and the recap says so; during the quiet hours (`[initiative] quiet_hours`, 22:00-08:00 by default)
   it is written and sent when they end, or at once when you write again first (before that message is answered, in
@@ -2757,7 +2795,7 @@ Voice notes (in the current language):
 - Send a voice note: the bridge fetches it, the voice service on the Mac transcribes it, and Gemma answers the transcript as
   if it were typed (the history keeps "[voice] what you said"). The audio is deleted afterwards.
 - The text answer comes first. Then the same answer comes as a Signal voice note (her English voice in English, jane
-  in Spanish, Italian, Portuguese, Dutch, German and French, Supertonic-3 otherwise; cleaned for speaking: no code,
+  in Spanish, Italian, Portuguese, Dutch, German and French; none in Korean, Polish, Russian and Japanese, and none for an answer Pocket TTS cannot say; cleaned for speaking: no code,
   links, lists, emoji or stage directions such as "(pause)"; a command such as /reminders is said as "slash
   reminders"), cut at a sentence after 1,500 characters ("The rest is in the text.").
   Notes are never spoken.
@@ -2917,7 +2955,7 @@ Notes you may see:
 | Messages she starts | `/status` shows "Initiative: on · last 4 weeks: N sent · N answered within a day · /quiet N times · improvised note: this week" and the last skip per kind with its reason; doctor shows the kinds that are on (and says when the calendar notes are off for lack of `[calendar]`) and warns when one could not be sent. `/usr/bin/sudo /usr/local/estia/bin/estia logs -n 5000 \| grep initiative` has kinds, ids and reasons, never text. `--draft` (section 4) prints one without sending |
 | Language practice | `/babble` in Signal says which session runs. `/usr/bin/sudo /usr/local/estia/bin/estia logs -n 5000 \| grep practice` (before her own macOS account, `grep practice ~/Library/Logs/local-assistant/bridge.log`): starts, ends with the reason (off, idle, call, switch), when the recap is due, and how many points were kept and dropped per reason; never text. A recap held for the morning, or while she is locked (`/lock`: it waits for `/unlock`), waits in `babble:session` and still goes out after a restart. The first start with practice moves the database to schema v8 (one column, `conversations.kind`), and the first start with the devices to v9 (`known_devices`, `messages.source_device`): copy `assistant.db` while the bridge is stopped before such a start |
 | The laptop cannot reach a program on the Mac (a page you open from your laptop, a file share) | The firewall is on (`scripts/harden.sh --nuclear`, an earlier security step, or your own choice) and does not let that program through (no screen to click "Allow"). `/usr/bin/sudo /usr/local/estia/bin/estia doctor` names it in a "! Firewall: … cannot be reached from other machines" line with the two `socketfilterfw` commands for a program you started, each with the program's full path (2.10). After a Homebrew update the path changes: run doctor again |
-| A new device is held | "A message came from a new linked device N and was held." Yours: send `/devices ok N` from your phone. Not yours: remove it in Signal → Settings → Linked devices, then turn on Registration Lock for your number |
+| A new device is held | "A message Signal received at 14:05 came from a new linked device (N) and was held." The time is when Signal received the message, by Signal's own clock, never the device's. A device linked to your account gets a copy of every message you send, so it can send one in the same minute: a matching time alone does not show the device is yours. Yours: send `/devices ok N` from your phone. Not yours, or you linked no device just now: remove it in Signal → Settings → Linked devices, then turn on Registration Lock for your number |
 | The move failed | Her old setup comes back (on a first install nothing is installed). Keep the ✗ line: it names what failed. Fix that, run `scripts/migrate-to-own-user.sh --dry-run` again, then `scripts/install-daemon.sh` |
 | YouTube | Nothing to set up: always on with `read_link`. `/usr/bin/sudo /usr/local/estia/bin/estia doctor` shows a YouTube line: its last read (working, set up but not tested yet, or failing with the fix), then youtube-transcript-api's version in brackets; `/status` shows the same line without the version. "refused by the service": YouTube blocks this Mac for a while after many requests or a bot check; wait. "unreadable answer": YouTube changed; a newer pinned version of `tools/youtube` may be needed. Every video said to have no captions or to be private or removed, while `/status` shows YouTube working: YouTube may have changed too (SECURITY.md, known gaps); try a video you know has captions. "! … the YouTube helper is not set up": before her own macOS account, run `cd tools/youtube && uv sync --frozen`. In her own macOS account, run `/usr/bin/sudo /usr/local/estia/bin/estia-deploy`; if it says the root-run tools differ, read the diff, run `/usr/bin/sudo /usr/local/estia/bin/estia-deploy --update-tools`, then run `/usr/bin/sudo /usr/local/estia/bin/estia-deploy` again. `/usr/bin/sudo /usr/local/estia/bin/estia logs -n 5000 \| grep youtube` has outcome codes, character counts and times, never the video or its title |
 | Documents | With `[documents]`, `/usr/bin/sudo /usr/local/estia/bin/estia doctor` shows a Documents line: the helper built, the folder shared and readable, then her last look (section 3, Documents); `/status` shows the last look. `/docs` lists what she has and why a document cannot be read. Share again: `scripts/share-documents.sh` as you (`--dry-run` first; no admin rights); take it back: `scripts/share-documents.sh --revoke`. "macOS refuses it (operation not permitted)": the folder is in Documents, Desktop or Downloads, which macOS guards; use `~/Estia-KB` (section 3, Documents). "the documents helper is not built": in her own macOS account `/usr/bin/sudo /usr/local/estia/bin/estia-deploy` (after `/usr/bin/sudo /usr/local/estia/bin/estia-deploy --update-tools` when it says the root-run tools differ); before, `cd tools/documents && swift build -c release`. A scan over about 190 full pages ends in a timeout: split it, and take the original out of the folder. "! … scanned pages not read (text recognition failed)": text pages are still read; restart her (`/usr/bin/sudo /usr/local/estia/bin/estia restart`), which tries text recognition again, and look for the warm-up in her log. `/usr/bin/sudo /usr/local/estia/bin/estia logs -n 5000 \| grep documents` has counts, codes and times, never a document's name or text |
@@ -2998,9 +3036,8 @@ This section is the threat model. [SECURITY.md](SECURITY.md) explains how to rep
   Whisper's model files and the speech detector's are fixed to one version on Hugging Face and checked against their
   fingerprints (sha256) at every start; a model with a changed or extra file is never loaded (Whisper's folder is
   then set aside as `<folder>.refused-<time>`, only the latest kept, and downloaded again at that version; changed
-  again, listening stays off), and Whisper starts with no network once downloaded. Kokoro's and Supertonic-3's speaking models are not fixed: they come from Hugging Face
-  as published. Pocket TTS's program, models and voices are fixed and checked by their sha256 (section 3, Voice
-  notes).
+  again, listening stays off), and Whisper starts with no network once downloaded. Pocket TTS, her only voice: its
+  program, models and voices are fixed and checked by their sha256 (section 3, Voice notes).
 - Calendar: a Google calendar's secret iCal address is a password. It is kept in `calendar.env` (mode 0600, one key per
   calendar) and read only by `tools/ical/helper.py`, which fetches only `https://calendar.google.com/calendar/ical/…`, follows
   no redirects and passes on only its own error codes. The bridge runs the helper with fixed arguments (the calendar's name
@@ -3063,7 +3100,7 @@ This section is the threat model. [SECURITY.md](SECURITY.md) explains how to rep
   links, stay in the chat history. Their links appear only in the Sources note. An answer that used them refuses
   `remember` and `forget`, and its device requests wait for your yes.
 - The only tools that open web pages are `learn_link` and `read_link`, both using the same guarded fetcher (a YouTube video link goes
-  to the YouTube helper instead, below): http(s) only, and the link must be in the user's current message. Hosts resolve to IPv4
+  to the YouTube helper instead, below): http(s) only, and the link must be in the user's current message (a video's link may also be the one a typed YES unlocked: see "A video she finds"). Hosts resolve to IPv4
   only (the home network's global IPv6 addresses would otherwise count as "public"). Every address must be public (no loopback, private, link-local, CGNAT or Tailscale, or multicast). The connection goes to
   the checked address, and redirects are checked again (at most 3). Limits: 2 MB, 15 s per step, 30 s in total, and a 45 s hard limit on
   the whole fetch. Login walls are reported, and chat control tokens are stripped from page text.

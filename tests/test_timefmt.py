@@ -1,3 +1,4 @@
+from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from local_assistant.timefmt import (
@@ -26,6 +27,11 @@ def test_hhmm_and_dates() -> None:
     assert local_hhmm(T0 / 1000, TZ) == "09:32"
     assert local_date("2026-10-08T07:32:23+00:00", TZ) == "8 Oct 2026"
     assert local_datetime("2026-10-08T07:32:23+00:00", TZ) == "8 Oct 2026 09:32"
+
+
+def test_hhmm_without_a_zone_is_the_macs_own() -> None:
+    """A call's times (calls.call_span, the status line) use this one clock format, the config's zone or none."""
+    assert local_hhmm(T0 / 1000, None) == datetime.fromtimestamp(T0 / 1000).strftime("%H:%M")
 
 
 def test_utc_now_round_trips() -> None:

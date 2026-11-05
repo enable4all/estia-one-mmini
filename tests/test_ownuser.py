@@ -2441,6 +2441,90 @@ def test_a_voice_not_read_as_her_says_so_at_once_and_never_says_loading() -> Non
     assert line.startswith("voice: not read as her") and said == [ownuser.VOICE_WAITING]
 
 
+FAILED_VOICE: ownuser.VoiceHealth = {"stt": "ready", "tts": "failed"}
+RESTING_VOICE: ownuser.VoiceHealth = {"stt": "ready", "tts": "resting"}
+DOCTOR = f"{ownuser.ESTIA} doctor"
+CHECK_LOG = f"{ownuser.ESTIA} check (log: {ownuser.ESTIA} logs voice)"
+
+
+@pytest.mark.parametrize("calls", [True, False])
+def test_a_voice_that_cannot_run_says_so_at_once_and_never_says_loading(calls: bool) -> None:
+    """Review of 5 Nov (mac-deploy-voice-end-line-pocket-failed): Pocket TTS is her only voice, so a program that was
+    not fetched leaves `tts` "failed" at every update. The end line said loading, waited 150 s with [calls] and
+    promised a text that ReadyNote never sends for a voice that does not turn ready."""
+    said: list[str] = []
+    voice = VoiceClock(ready_at=None)
+    line = ownuser.voice_end(lambda: FAILED_VOICE, calls=calls, clock=voice, sleep=voice.sleep, say=said.append)
+    assert line == ownuser.VOICE_FAILED.format(doctor=DOCTOR)
+    assert line == (
+        "voice: not working (doctor says why: /usr/bin/sudo /usr/local/estia/bin/estia doctor); her answers come as text"
+    )
+    assert "loading" not in line and "texts you" not in line and ownuser.voice_line(FAILED_VOICE) == line
+    assert said == [] and voice.now == 0.0  # no wait, no "checking again"
+    # before her own user the wrapper does not exist: the checkout's own doctor
+    before = ownuser.voice_end(
+        lambda: FAILED_VOICE, calls=calls, clock=voice, sleep=voice.sleep, say=said.append, moved=False
+    )
+    assert before == "voice: not working (doctor says why: scripts/doctor.sh); her answers come as text"
+
+
+@pytest.mark.parametrize("calls", [True, False])
+def test_a_voice_that_rests_says_so_in_the_voice_installs_words_and_never_says_loading(calls: bool) -> None:
+    """The same review: a voice resting after failed runs is tried again on its own (1, 5 and 30 minutes), not loading
+    for up to 15 minutes. Its words are the voice install's (`prompts.SETUP_VOICE_RESTING`, which setup's window says),
+    without the state dump; with no [calls] they leave out when calls work."""
+    from local_assistant import prompts
+
+    said: list[str] = []
+    voice = VoiceClock(ready_at=None)
+    line = ownuser.voice_end(lambda: RESTING_VOICE, calls=calls, clock=voice, sleep=voice.sleep, say=said.append)
+    install = prompts.SETUP_VOICE_RESTING.replace(" ({state})", "")
+    assert ownuser.VOICE_RESTING.format(check=CHECK_LOG) == install  # the same words as the voice install says
+    if calls:
+        assert line == install
+    else:
+        assert line == f"voice: resting after failed runs. It is tried again on its own.\nCheck later: {CHECK_LOG}"
+    assert "loading" not in line and "texts you" not in line
+    assert said == [] and voice.now == 0.0
+    before = ownuser.voice_end(
+        lambda: RESTING_VOICE, calls=calls, clock=voice, sleep=voice.sleep, say=said.append, moved=False
+    )
+    assert before == f"{line.splitlines()[0]}\nCheck later: scripts/check.sh"
+
+
+def test_a_voice_that_turns_failed_or_resting_during_the_wait_ends_it_there() -> None:
+    said: list[str] = []
+    expected = {
+        "failed": ownuser.VOICE_FAILED.format(doctor=DOCTOR),
+        "resting": ownuser.VOICE_RESTING.format(check=CHECK_LOG),
+    }
+    for state, line in expected.items():
+        voice = VoiceClock(ready_at=None)
+        reads: Iterator[ownuser.VoiceHealth] = iter(
+            [{"stt": "loading", "tts": "loading"}, {"stt": "ready", "tts": state}]
+        )
+
+        def health(reads: Iterator[ownuser.VoiceHealth] = reads) -> ownuser.VoiceHealth:
+            return next(reads)
+
+        found = ownuser.voice_end(health, calls=True, clock=voice, sleep=voice.sleep, say=said.append)
+        assert found == line and voice.now == ownuser.VOICE_POLL_SECONDS  # ended at the first look that said so
+    assert said == [ownuser.VOICE_WAITING] * 2
+
+
+def test_a_voice_still_loading_or_with_no_answer_keeps_the_loading_words() -> None:
+    """Only "resting" and "failed" are told apart: loading, not answering yet, and one engine ready beside one that
+    loads stay what they were."""
+    for health in (
+        {"stt": "loading", "tts": "loading"},
+        {"stt": "ready", "tts": "loading"},
+        {"stt": "loading", "tts": "ready"},
+        None,
+    ):
+        assert ownuser.voice_line(health) == ownuser.VOICE_LOADING
+        assert ownuser.voice_line(health, calls=False) == ownuser.VOICE_LOADING_NO_CALLS
+
+
 def test_without_calls_the_voice_end_promises_no_text_and_does_not_wait() -> None:
     said: list[str] = []
     voice = VoiceClock(ready_at=None)
@@ -2490,6 +2574,19 @@ def test_the_end_of_the_move_says_when_calls_work(
     said.clear()
     move._voice_end(False)  # no voice service: no line
     assert said == []
+
+
+def test_the_end_of_the_move_names_a_voice_that_cannot_speak(tmp_path: Path, no_user: None) -> None:
+    """The move shares the end line (`voice_end`): a voice that cannot run or rests is named at once, with [calls] too,
+    and no loading line, wait or promised text follows."""
+    said: list[str] = []
+    move, _host, _home, _root = migration(tmp_path, said=said)
+    move.calls = True
+    move.voice_health = lambda: FAILED_VOICE
+    move._voice_end(True)
+    move.voice_health = lambda: RESTING_VOICE
+    move._voice_end(True)
+    assert said == [ownuser.VOICE_FAILED.format(doctor=DOCTOR), ownuser.VOICE_RESTING.format(check=CHECK_LOG)]
 
 
 def test_a_ctrl_c_while_waiting_for_her_voice_leaves_the_finished_move_alone(tmp_path: Path, no_user: None) -> None:

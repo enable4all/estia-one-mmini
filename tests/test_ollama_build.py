@@ -1391,12 +1391,38 @@ def test_the_account_that_runs_the_listener_is_read_with_ps() -> None:
 
 
 def test_lsof_names_your_own_listener_when_netstat_lists_nothing() -> None:
-    """netstat started from some Pythons lists no internet sockets: lsof (your own processes) names it then."""
+    """netstat lists no internet sockets (seen on macOS 27.0.1 without admin rights, 3 Nov report; before, some
+    Pythons in a sandbox): lsof (your own processes) names it then, and another account's on the port is unread."""
     host = NetstatHost("", {"68243": "/opt/ollama/v0.40.4/ollama"}, lsof="p68243\nf3\nn*:11434\n")
-    assert Tools(Path("/"), host=host).listener() == Listener("/opt/ollama/v0.40.4/ollama", ("*.11434",))
+    expected = Listener("/opt/ollama/v0.40.4/ollama", ("*.11434",), others_unread=True)
+    assert Tools(Path("/"), host=host).listener() == expected
     assert host.asked[1] == ("/usr/sbin/lsof", "-nP", "-iTCP:11434", "-sTCP:LISTEN", "-Fpn")
     host = NetstatHost("", {"7": "/x/ollama"}, lsof="p7\nf3\nn127.0.0.1:11434\nf4\nn[::1]:11434\n")
-    assert Tools(Path("/"), host=host).listener() == Listener("/x/ollama", ("127.0.0.1.11434", "::1.11434"))
+    listener = Tools(Path("/"), host=host).listener()
+    assert listener == Listener("/x/ollama", ("127.0.0.1.11434", "::1.11434"), others_unread=True)
+
+
+def test_a_netstat_that_lists_sockets_reads_every_accounts_listener() -> None:
+    host = NetstatHost(NETSTAT, {"68243": "/opt/ollama/v0.40.4/ollama"})
+    assert Tools(Path("/"), host=host).listener().others_unread is False
+
+
+def test_no_program_found_while_netstat_lists_nothing_is_said_to_be_unread() -> None:
+    """Fix review 1 (3 Nov): netstat lists nothing and lsof finds none of the caller's own (another account's Ollama
+    on the port, as on 8151 while her service is down): the empty answer keeps the flag, so doctor never looks all
+    clear about it. Setup still refuses an empty program (OLLAMA_NOT_FOUND)."""
+    host = NetstatHost("", {})
+    assert Tools(Path("/"), host=host).listener() == Listener("", others_unread=True)
+    assert host.asked[1][0] == "/usr/sbin/lsof"
+    listed = NetstatHost(NETSTAT.replace("11434", "11435"), {})  # every account's sockets, none on the port
+    assert Tools(Path("/"), host=listed).listener() == Listener("")
+
+
+def test_a_listen_line_netstat_prints_in_another_form_is_never_read_as_every_accounts() -> None:
+    """Fix review 5: a LISTEN line that no longer parses (a new `-v` form) may be another account's listener."""
+    odd = "tcp4  0  0  127.0.0.1.11434  *.*  LISTEN  ollama\n"  # no counters, no pid
+    host = NetstatHost(NETSTAT + odd, {"68243": "/opt/ollama/v0.40.4/ollama"})
+    assert Tools(Path("/"), host=host).listener().others_unread is True
 
 
 MINE = "tcp4  0  0  127.0.0.1.11434  *.*  LISTEN  0  0  131072  131072  ollama:68243  00100 00000006\n"

@@ -9,9 +9,11 @@ Environment (the fake's wrapper sets it):
                      added; with services in it, one a line, only theirs), corrupt (what find-generic-password
                      gives back differs from what was stored), desk (at the Mac's own screen: a write to the
                      locked keychain opens macOS's own box, which the person answers; each one a line in `boxed`)
-                     and delete_asks (a delete on the locked keychain opens that box too, as macOS may: S06's desk
-                     check; without desk it is left unanswered or cancelled, and the item stays); lock-keychain
-                     removes unlocked
+                     delete_asks (a delete on the locked keychain opens that box too, as macOS may: S06's desk
+                     check; without desk it is left unanswered or cancelled, and the item stays) and find_asks (the
+                     same box at find-generic-password, the attribute search too, before any item is looked up;
+                     without desk it is cancelled: User canceled, errSecUserCanceled's 128, never "not found"'s
+                     44); lock-keychain removes unlocked
 
 security -i reads its commands from stdin, one a line, arguments in double quotes, as macOS's does, and ends with the
 status of its last command. As macOS 27's did on a scratch keychain (27 Oct): an item there already is refused
@@ -127,6 +129,13 @@ def main() -> int:
     if args[:1] == ["find-generic-password"]:
         given = options(args[1:])
         key = f"{given.get('-s')} {given.get('-a')}"
+        if not opened and (folder / "find_asks").exists():  # macOS's own box at the search of the locked keychain
+            if not (folder / "desk").exists():  # cancelled: the search has no answer, found or not
+                sys.stderr.write("security: SecKeychainSearchCopyNext: User canceled the operation.\n")
+                return 128
+            with (folder / "boxed").open("a", encoding="utf-8") as boxed:
+                boxed.write("find-generic-password\n")
+            (folder / "unlocked").touch()
         found = items.get(key)
         if found is None:
             return 44

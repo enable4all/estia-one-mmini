@@ -20,7 +20,7 @@ from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
 
-from local_assistant import hostsec, ownuser, prompts
+from local_assistant import harden, hostsec, ownuser, prompts
 from local_assistant.hostsec import SUDO, Host
 from local_assistant.setup_questions import RECOMMENDED, Option, Question, yes_no
 
@@ -188,9 +188,20 @@ class WindowHost(Host):
             bool(argv) and argv[0] == SUDO and not stays_yours(argv) and not self.dry_run and self.root == Path("/")
         )
         if through_window:
+            was_open = self.window_open()
             ran = self.face.admin(argv, input=input, capture=True, why=self.why, seconds=timeout)
             if ran is not None:
                 if ran.code != 0 and self.face.closed and "bootstrap" in argv:  # an AI-run's window closed meanwhile
                     self.face.unstarted = self.her_start(argv)
                 return ran.code, ran.output
+            if was_open and not self.window_open() and self.face.holding and list(argv[1:2]) == ["-n"]:
+                self.sign_in_terminal()
         return super().run(argv, shown=shown, input=input, read_only=read_only, cwd=cwd, env=env, timeout=timeout)
+
+    def sign_in_terminal(self) -> None:
+        """The window closed inside harden's held section (her stop, her PIN, her start): macOS's box gave no sign-in
+        to Terminal's sudo, so the rest (`sudo -n`) would fail there and leave her stopped. Terminal's sudo asks for
+        the Mac password once, first, in harden's words (review W20); refused, the rest fails as a run, and harden
+        names her start."""
+        self.say(harden.PASSWORD_HERS if self.face.wizard.own_user() else harden.PASSWORD_YOURS)
+        super().run([SUDO, "-v"])

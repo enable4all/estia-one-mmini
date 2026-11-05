@@ -253,6 +253,12 @@ class Health:
         failed = [part for part, value in (("listening", stt), ("speaking", tts)) if value == "failed"]
         if failed:
             return _problem_row("voice", "Voice", f"{' and '.join(failed)} failed to load")
+        if tts == "resting":  # her English Pocket TTS model after failed or late runs (the review of 4 Nov)
+            return _Row("Voice", "speaking rests after failed runs (tried again on its own)")
+        left_out = state.get("voices_left_out")
+        if isinstance(left_out, list) and left_out:  # a shipped voice's file: only an update puts it right
+            names = " and ".join(str(name) for name in left_out)
+            return _problem_row("voice", "Voice", f"{names} cannot speak (an update puts it right)")
         if stt == tts == "ready":
             return _Row("Voice", "ok (listening and speaking)")
         return _Row("Voice", "loading its models")

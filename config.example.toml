@@ -143,18 +143,16 @@ disk_free_min_percent = 10
 # program comes with an update); vera speaks only on a Mac with 32 GB of memory or more, and heart speaks for her on a
 # smaller one. heart is Kokoro's af_heart made a Pocket TTS voice, one file for each model; its files come with an
 # update, never downloaded. A Mac with Gemma 4 26B speaks them on Pocket TTS's larger model (about 250 MB), a smaller
-# one on its small model (about 130 MB): the voice service fetches it at its first start, and until then Kokoro says
-# her lines. eve-full is another name for eve. The others are Kokoro's (female: af_heart, af_bella, bf_emma; male:
-# am_michael; /voices lists all).
-# language_voice: the voice of Spanish, Italian, Portuguese, Dutch, German and French: jane, on Pocket TTS's own model
-# of each language (about 227 MB, downloaded only for a language in use, with /language or /babble; until then
-# Supertonic-3's F1 says her lines). Only jane is taken, or "" for Supertonic-3's F1 in them, as before jane.
-# Korean, Polish, Japanese and Russian use Supertonic-3's F1.
+# one on its small model (about 130 MB): the voice service fetches it at its first start, and until then her answers
+# come as text. eve-full is another name for eve. A Kokoro voice name from before 3 Nov 2026 (af_heart, am_michael)
+# still loads, as heart or michael: Kokoro was removed.
+# Pocket TTS is her only voice: a line it cannot say is said by no other voice. Spanish, Italian, Portuguese, Dutch,
+# German and French are spoken in jane, on Pocket TTS's own model of each language (about 227 MB, downloaded only for
+# a language in use, with /language or /babble; until then her answers come as text). Korean, Polish, Russian and
+# Japanese have no voice: her answers come as text, and calls in them are not picked up.
 #[voice]
 #url = "http://127.0.0.1:8150"
 #voice = "heart"
-#language_voice = "jane"
-#speed = 1.05               # Kokoro's and Supertonic-3's speed, not Pocket TTS's voices (none has a speed setting)
 #max_spoken_chars = 1500     # longer answers are cut at a sentence: "The rest is in the text."
 #max_audio_bytes = 10000000  # voice notes up to 10 MB / 3 minutes
 
@@ -218,7 +216,6 @@ disk_free_min_percent = 10
 #java_home = "/opt/homebrew/opt/openjdk/libexec/openjdk.jdk/Contents/Home"   # Homebrew openjdk (keg-only): write its path out in full (default: /usr/libexec/java_home, which does not find it)
 #tunnel = "<repo>/vendor/signal-call-tunnel/signal-call-tunnel/target/release/signal-call-tunnel"
 #socket_dir = "~/Library/Application Support/local-assistant/calls"   # default; ~/.la-calls if a long home folder makes this too long. Set by hand: under 65 characters (Unix sockets)
-#speed = 1.05                 # Kokoro's and Supertonic-3's speed on calls, not Pocket TTS's voices (voice notes keep [voice] speed)
 #end_of_turn_seconds = 2.3    # the full pause: this long ends your turn (laid back: room to think)
 #early_end = true             # a turn that sounds finished ends after a short pause: Smart Turn, a small model on the
 #                             # Mac, hears a turn's last 8 seconds; fairly sure, she waits 1.5 seconds; unsure, she waits

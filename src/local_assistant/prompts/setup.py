@@ -35,13 +35,13 @@ __all__ = [
     "SETUP_MOVE_OLDER", "SETUP_MOVE_OLDER_APP", "SETUP_MOVE_OLDER_ASK", "SETUP_MOVE_OLDER_ASK_SSH", "SETUP_MOVE_REFUSED",
     "SETUP_MOVE_SKIPPED", "SETUP_MOVE_SSH_ADVICE", "SETUP_NAME",
     "SETUP_NAME_ASK", "SETUP_NAME_BAD", "SETUP_NAME_CHOSEN", "SETUP_NAME_DRY_RUN", "SETUP_NAME_LEAD", "SETUP_NAME_LIST",
-    "SETUP_NAME_OTHER", "SETUP_NAME_RULE", "SETUP_NAME_SHOWN", "SETUP_NAME_SHOWN_HE", "SETUP_NO", "SETUP_NOT_ADMIN", "SETUP_NOT_KEPT",
+    "SETUP_NAME_OTHER", "SETUP_NAME_RULE", "SETUP_NAME_SHOWN", "SETUP_NAME_SHOWN_HE", "SETUP_NO", "SETUP_NOTHING_MEANWHILE", "SETUP_NOT_ADMIN", "SETUP_NOT_KEPT",
     "SETUP_NOT_ROOT",
     "SETUP_NO_BACK_HERE", "SETUP_NO_QUESTION", "SETUP_NO_TERMINAL", "SETUP_NO_VENV", "SETUP_NUCLEAR",
     "SETUP_NUCLEAR_TYPED", "SETUP_NUMBER", "SETUP_NUMBERLESS_DRY_RUN", "SETUP_NUMBER_ASK", "SETUP_NUMBER_BAD",
     "SETUP_OFFER_HOW", "SETUP_OFFER_NOT_RUN", "SETUP_OFFER_SKIPPED", "SETUP_OLD_PIN_ASK", "SETUP_OLLAMA_GOES_ON",
     "SETUP_OPENING", "SETUP_OS_ERROR", "SETUP_OS_ERROR_FULL", "SETUP_OS_ERROR_HIDDEN",
-    "SETUP_OS_ERROR_NO_PATH", "SETUP_OS_ERROR_OTHER", "SETUP_OWNER_IS_HER", "SETUP_PASTE_KEPT", "SETUP_PERSONALITY", "SETUP_PERSONALITY_HERS",
+    "SETUP_OS_ERROR_NO_PATH", "SETUP_OS_ERROR_OTHER", "SETUP_OS_ERROR_PRIVACY", "SETUP_OWNER_IS_HER", "SETUP_PASTE_KEPT", "SETUP_PERSONALITY", "SETUP_PERSONALITY_HERS",
     "SETUP_PINNED", "SETUP_PRESS_ENTER", "SETUP_PROFILE_LATER", "SETUP_PROFILE_NAME", "SETUP_PROJECTS",
     "SETUP_PROJECTS_ADDED", "SETUP_PROJECTS_ASK", "SETUP_PROJECTS_BAD_LEVEL", "SETUP_PROJECTS_CHOSEN",
     "SETUP_PROJECTS_DRY_RUN", "SETUP_PROJECTS_FOLDER", "SETUP_PROJECTS_FOLDER_RECOMMENDED", "SETUP_PROJECTS_HERS",
@@ -63,7 +63,7 @@ __all__ = [
     "SETUP_USERNAME_STOPPED", "SETUP_VOICE", "SETUP_VOICES", "SETUP_VOICE_ASK", "SETUP_VOICE_UNKNOWN",
     "SETUP_WINDOW_MOVE", "SETUP_WINDOW_MOVE_OLDER", "SETUP_WINDOW_WORD_MISSING", "SETUP_WINDOW_WORD_MISSING_USERNAME",
     "SETUP_WORD", "SETUP_WORD_ASK", "SETUP_WORD_MISSING", "SETUP_WORD_MISSING_USERNAME", "SETUP_WORD_STOP",
-    "SETUP_WORD_USERNAME", "SETUP_YES", "SETUP_YES_NO_AGAIN", "SIGNAL_LOGIN_ALLOWED", "SIGNAL_LOGIN_HERE",
+    "SETUP_WORD_USERNAME", "SETUP_YES", "SETUP_YES_NO_AGAIN", "SETUP_YES_NO_AGAIN_PLAIN", "SIGNAL_LOGIN_ALLOWED", "SIGNAL_LOGIN_HERE",
     "SIGNAL_LOGIN_KEPT",
     "SIGNAL_LOGIN_LIMITED", "SIGNAL_LOGIN_NEXT", "SIGNAL_LOGIN_NOTHING", "SIGNAL_LOGIN_SWITCHED", "SIGNAL_LOGIN_TOTP",
     "SIGNAL_LOGIN_USERNAME",
@@ -99,7 +99,8 @@ SETUP_OFFER_NOT_RUN = "✗ {program}: not run ({why})."  # a command that could 
 SETUP_RECOMMENDED = "{label} (recommended{advice})"
 # a yes or no's two buttons in the window (a command setup runs for you: SETUP_PRESS_ENTER, in Terminal)
 SETUP_YES = "Yes"
-SETUP_YES_NO_AGAIN = "Type y or n (the keyboard may be on Greek: switch it to ABC)."  # anything else at a yes or no
+SETUP_YES_NO_AGAIN = "Type y or n (the keyboard may be on Greek: switch it to ABC)."  # a word with a Greek letter
+SETUP_YES_NO_AGAIN_PLAIN = "Type y or n."  # any other word at a yes or no (P06: "ja" got the Greek keyboard's hint)
 SETUP_NO = "No"
 # setup run as root (sudo scripts/setup.sh): its own folders would be root's; the same words as scripts/setup.sh's
 SETUP_NOT_ROOT = "Run setup as yourself: it asks for admin rights when it needs them."
@@ -131,6 +132,13 @@ SETUP_OS_ERROR = (  # a file of your own home your account may not use ({hidden}
     " setup again: your answers are kept."
 )
 SETUP_OS_ERROR_HIDDEN = "; Command-Shift-. (period) shows a name that starts with a dot"
+# EPERM in Documents, Desktop or Downloads (setup-macos-04): macOS's privacy guard, which Finder's permissions do not
+# change; the folder is let in where macOS asks for it
+SETUP_OS_ERROR_PRIVACY = (
+    "✗ Setup: could not use {path} ({error}).\n"
+    "  Fix: System Settings → Privacy & Security → Files & Folders: let the app setup runs in (Terminal, or your AI"
+    " tool) use that folder, then run setup again: your answers are kept."
+)
 # any other file error (review of 30 Oct, P07): her folders never get the Finder fix (it would open them up)
 SETUP_OS_ERROR_OTHER = (
     "✗ Setup: could not use {path} ({error}).\n"
@@ -632,9 +640,8 @@ SETUP_USERNAME_STOPPED = (  # a run again keeps her Account ID and finds her acc
 )
 
 
-# the setup wizard's language question ({name}: her name), and the doctor's line about it
-SETUP_LANGUAGE = (
-    "{name} listens and speaks **one language** at a time, whatever language a message is in.\n"
+SETUP_LANGUAGE = (  # the setup wizard's language question ({name}: her name), and the doctor's line about it
+    "{name} listens and answers in **one language** at a time, whatever language a message is in.\n"
     "Her notes, /status and /help **stay English**.\n\n"
     "/language in Signal changes it later; it then wins over language in the config."
 )
@@ -658,9 +665,10 @@ SETUP_NAME_BAD = '  "{answer}" does not fit ({problem}).'
 SETUP_NAME_RULE = "1 to 20 letters, spaces or hyphens."  # only as the error (owner, 27 Oct)
 SETUP_NAME_SHOWN = "She will answer to {name}."  # the name shown back, as the input spec says it
 SETUP_NAME_SHOWN_HE = "He will answer to {name}."  # the male suggestion's (c-17, confirm-2)
-SETUP_VOICE = (
-    "Her **English voice**, for voice notes and calls once voice is on: the one that fits the name.\n"
-    "The other ten languages have **one voice** for now."
+SETUP_VOICE = (  # two paragraphs: the owner's rule, at most two lines in one (27 Oct)
+    "Her **English voice**, for voice notes and calls once voice is on: the one that fits the name.\n\n"
+    "Spanish, Italian, Portuguese, Dutch, German and French have **one voice**, jane.\n"
+    "Korean, Polish, Russian and Japanese have **no voice**: text only."
 )
 SETUP_VOICE_ASK = "Female or male voice? (Enter: female)"
 SETUP_VOICE_UNKNOWN = "  Type f for female or m for male."
@@ -696,8 +704,10 @@ SETUP_DISK_FULL = (  # Ollama's pull ran out of space: the disk, never the netwo
     "✗ Disk: the Mac ran out of space during the download ({why}).\n"
     "  Fix: free space (System Settings → General → Storage), then run setup again: the download goes on where it stopped."
 )
+SETUP_NOTHING_MEANWHILE = "Nothing to answer meanwhile. "  # left out on route 2: its phone part is done meanwhile (W14)
 SETUP_DOWNLOAD = (
-    "  Nothing to answer meanwhile. Keep the Mac plugged in, with its lid open: setup keeps it awake until it ends.\n"
+    f"  {SETUP_NOTHING_MEANWHILE}Keep the Mac plugged in (a MacBook with its lid open): setup keeps it awake until"
+    " it ends.\n"
     "  If the download stops, run setup again: it goes on where it stopped."
 )
 # once the plan is answered (the friend's review, ux-21): README's figures, without your typing at the Signal step

@@ -74,7 +74,7 @@ from local_assistant.setup_extras import Extra as Extra
 from local_assistant.setup_extras import outside_home as outside_home
 from local_assistant.setup_extras import parse_extras as parse_extras
 from local_assistant.setup_extras import projects_refusal as projects_refusal
-from local_assistant.setup_face import Back, Face, PlainFace, Readers, choose_face
+from local_assistant.setup_face import Back, Face, PlainFace, Readers, choose_face, yes_no_again
 from local_assistant.setup_plan import QUESTIONS, Mac, question, typed_name, unkept_ssh
 from local_assistant.setup_plan import nuclear_text as nuclear_text
 from local_assistant.setup_questions import Checked, Question, Value, fill, yes_or_no
@@ -108,9 +108,8 @@ REFUSED_MAX = 25
 SKIP_WORDS = ("s", "skip", "n", "no", "q")  # at a command setup offers: not this one
 # the name question's suggestions (owner's picks), and the English voice each brings: a female name Pocket TTS's heart
 # on either model (owner, 27 Oct: "make it default"; 29 Oct: "on 16gb make Heart the default as well": `female_voice`);
-# a male one its alba (26 Oct: "alba & michael for males"); the other ten languages speak with
-# Supertonic's voice F1 whatever the name, but Spanish, Italian, Portuguese, Dutch, German and French in Pocket TTS's
-# jane ([voice] language_voice)
+# a male one its alba (26 Oct: "alba & michael for males"); Spanish, Italian, Portuguese, Dutch, German and French
+# speak in Pocket TTS's jane whatever the name, and Korean, Polish, Russian and Japanese have no voice (3 Nov 2026)
 FEMALE_NAMES = ("Maya", "Melina")  # owner, 27 Oct: "give only 4 suggestions": Estia, Maya, Melina, Socrates
 MALE_NAMES = ("Socrates",)
 FEMALE_VOICE = DEFAULT_VOICE
@@ -757,8 +756,6 @@ class Wizard(SignalSteps, ExtrasSteps):
             self.ollama_app_asked = True
         elif qid == "smaller_model" and value is False:
             raise SystemExit(prompts.SETUP_SMALLER_MODEL_NO)
-        elif qid == "route" and value == "no_number" and not self.answers.kept("account_id"):
-            self.say(prompts.SETUP_ROUTE_NO_NUMBER_NEXT)  # the phone's part now, not at the Signal step (round 1)
         elif qid == "signal_app" and value is not True:  # the end of input there: setup waits only for a yes
             # Ctrl-D in your own terminal is setup's usual stop; without a terminal, where to run it
             raise SystemExit(prompts.SETUP_STOPPED if self.terminal() else prompts.SETUP_NO_TERMINAL)
@@ -794,6 +791,17 @@ class Wizard(SignalSteps, ExtrasSteps):
         calls = prompts.SETUP_STEPS_TIME_CALLS if self.given("calls") == "yes" else ""
         size = choice.download.split(",", 1)[0]
         self.say(prompts.SETUP_STEPS_TIME.format(minutes=choice.steps_minutes, size=size, calls=calls))
+
+    def phone_meanwhile(self) -> bool:
+        """Route 2 on a first install, with no Account ID kept from before: the phone's part is done while the steps
+        run, so the Account ID and the Recovery key are at hand at the Signal step (round 1)."""
+        return self.first_install and self.given("route") == "no_number" and not self.answers.kept("account_id")
+
+    def phone_part(self) -> None:
+        """Once the plan is answered, before Step 1 (W14): the phone's part on route 2, where the window shows its
+        log (a line said during the plan reached no question screen), whether or not her model downloads."""
+        if self.phone_meanwhile():
+            self.say(prompts.SETUP_ROUTE_NO_NUMBER_NEXT)
 
     def model_download(self) -> str:
         """Her model's size and time for its step's line: "" when Ollama lists local-worker, or nothing is pulled
@@ -855,7 +863,7 @@ class Wizard(SignalSteps, ExtrasSteps):
             said = yes_or_no(answer)  # English or Greek; anything else asked again (answers-extras-yes-no-other-words)
             if said is not None or not terminal:  # a pipe, never a person: a no
                 return said is True
-            self.say(prompts.SETUP_YES_NO_AGAIN)
+            self.say(yes_no_again(answer))
 
     def again(self, question: str, *, qid: str = "", **words: str) -> bool:
         """Enter (or anything but q): try again; q, or no terminal (Ctrl-D, a pipe): stop. In the window, its own
@@ -1147,7 +1155,12 @@ class Wizard(SignalSteps, ExtrasSteps):
         self.say(f"Model: {choice.tag} for this Mac's {memory:.0f} GB ({choice.note}).")
         if not choice.tested:  # owner, 15 Oct: still picked, but said plainly and never downloaded without a yes
             self.answer("smaller_model")  # asked in the plan; a no stops setup there (`took`)
-        self.say(prompts.SETUP_DOWNLOAD)
+        # route 2's phone part is to do meanwhile (W14): never "Nothing to answer meanwhile." there
+        self.say(
+            prompts.SETUP_DOWNLOAD.replace(prompts.SETUP_NOTHING_MEANWHILE, "", 1)
+            if self.phone_meanwhile()
+            else prompts.SETUP_DOWNLOAD
+        )
         why = self.pull(choice.tag, size=choice.size)
         if why and "no space" in why.lower():  # a full disk: named, never "run again to resume it" (round 1)
             raise SystemExit(prompts.SETUP_DISK_FULL.format(why=why))
@@ -1729,8 +1742,9 @@ def os_error_stop(exc: OSError) -> str:
     """A file error no step handled, as a stop (mac-ollama-home-unwritable-crash): the path and the error, with the
     fix; without a path, the error alone. A full disk (ENOSPC, or the quota: EDQUOT) gets setup's storage fix (fix
     review, dialogue-04); Finder's Read and Write only for a file of your own home your account may not use, with the
-    key that shows a dot name (Finder hides ~/.zprofile); any other path or error (her folders, a missing file) is
-    run again, then reported (review of 30 Oct, P07)."""
+    key that shows a dot name (Finder hides ~/.zprofile), but Privacy & Security for EPERM in Documents, Desktop or
+    Downloads (macOS's privacy guard, doctor's _GUARDED: Finder's permissions do not change it; setup-macos-04); any
+    other path or error (her folders, a missing file) is run again, then reported (review of 30 Oct, P07)."""
     error = exc.strerror or exc.__class__.__name__
     if exc.errno in (errno.ENOSPC, errno.EDQUOT):
         at = "" if exc.filename is None else f": {os.fsdecode(exc.filename)}"
@@ -1742,7 +1756,10 @@ def os_error_stop(exc: OSError) -> str:
     where = Path(os.path.normpath(os.path.abspath(path)))
     if exc.errno not in (errno.EACCES, errno.EPERM) or not where.is_relative_to(home):
         return prompts.SETUP_OS_ERROR_OTHER.format(path=path, error=error)
-    dotted = any(part.startswith(".") for part in where.relative_to(home).parts)
+    below = where.relative_to(home).parts
+    if exc.errno == errno.EPERM and below and below[0].casefold() in doctor._GUARDED:
+        return prompts.SETUP_OS_ERROR_PRIVACY.format(path=path, error=error)
+    dotted = any(part.startswith(".") for part in below)
     hidden = prompts.SETUP_OS_ERROR_HIDDEN if dotted else ""
     return prompts.SETUP_OS_ERROR.format(path=path, error=error, hidden=hidden)
 
@@ -1813,6 +1830,7 @@ def _run(wizard: Wizard, args: argparse.Namespace) -> int:
     _plan_stops(wizard, args, configured=configured)
     _disk_short(wizard, args)
     wizard.steps_time()
+    wizard.phone_part()
     wizard.begin("ollama")
     wizard.ollama()
     wizard.begin("model", wizard.model_download())

@@ -15,6 +15,7 @@ import re
 import subprocess
 import sys
 import textwrap
+import unicodedata
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -48,6 +49,13 @@ BACK_WORDS = ("b", "back")  # typed at a question of the plan with one before it
 class Back(Exception):
     """The person went back one question of the plan (b in Terminal, Back in the window): the Wizard asks the one
     before again, every answer kept."""
+
+
+def yes_no_again(typed: str) -> str:
+    """The line said when a yes or no gets a word that is neither (P06): the Greek keyboard's hint only when the word
+    holds a Greek letter ("υεσ" is yes on the Greek layout); any other word ("ja", "ok") gets the plain line."""
+    greek = any(unicodedata.name(char, "").startswith("GREEK") for char in typed)
+    return prompts.SETUP_YES_NO_AGAIN if greek else prompts.SETUP_YES_NO_AGAIN_PLAIN
 
 
 _ENTER_HINT = re.compile(r"\s*\([^()]*\)$")  # a question's "(Enter …)" at its end: the menu shows its own
@@ -325,7 +333,7 @@ class PlainFace:
 
     def confirm(self, q: Question, default: bool) -> bool | None:
         """y or n, as setup always asked: [Y/n] where Enter is yes, and only from a terminal; a yes or a no in English
-        or Greek (`yes_or_no`), anything else asked again with the keyboard's hint (a pipe, never a person: a no)."""
+        or Greek (`yes_or_no`), anything else asked again (`yes_no_again`; a pipe, never a person: a no)."""
         terminal = self.readers.terminal()
         enter = default and terminal
         while True:
@@ -337,7 +345,7 @@ class PlainFace:
             said = yes_or_no(answer)
             if said is not None or not terminal:
                 return said is True
-            self.say(prompts.SETUP_YES_NO_AGAIN)
+            self.say(yes_no_again(answer))
 
     def text(self, q: Question, kept: Value | None, message: str) -> str | None:
         return self.line(self._ask(q))

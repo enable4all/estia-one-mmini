@@ -12,7 +12,7 @@ Each area's rules, commands and gotchas are in `docs/agents/<area>.md`, plain Ma
 
 Modules in `src/local_assistant/` unless a folder is named; each line ends with its rule file.
 
-- Core: `app` (with its hosts `lifecycle`, `status_host`, `signal_host`), `config`, `store`, `gate`, `commands`, `gemma`, `watchers`, `health`, `part_status`, `keyfile`, `photos`, `timefmt` → `docs/agents/core.md`
+- Core: `app` (with its hosts `lifecycle`, `status_host`, `signal_host`), `config`, `store`, `gate`, `commands`, `gemma`, `watchers`, `health`, `part_status`, `keyfile`, `photos`, `thinking`, `timefmt` → `docs/agents/core.md`
 - Signal: `signal_io`, `signal_text`, `web_endings` → `docs/agents/signal-text.md`
 - What Gemma sees: `prompts/` (the rules in `__init__`, each area's lines in its own module, all re-exported), `context`, `code_notes`, `tools`, `brain`, `claims`, `soul`; `evals/` → `docs/agents/prompts-evals.md`
 - Calls and voice: `calls`, `call_host`, `call_audio`, `voice`, `voice_ready`, `voice_download`, `wake`; `tools/voice/`, `tools/call-tunnel/` → `docs/agents/calls.md`
@@ -21,7 +21,7 @@ Modules in `src/local_assistant/` unless a folder is named; each line ends with 
 - Documents and projects: `documents`, `documents_host`, `projects`, `share`; `tools/documents/` → `docs/agents/documents-projects.md`
 - Memory and her own messages: `profile`, `profiler`, `reminders`, `initiative`, `followups`, `calendar_watch` → `docs/agents/memory-initiative.md`
 - Languages: `language`, `babble` (language practice); `evals/practice/` → `docs/agents/languages.md`
-- Web, places, music, video and chords: `fetcher`, `web_search`, `maps`, `osm`, `osm_hours`, `map_data`, `spotify`, `spotify_auth`, `music_tools`, `soundtouch`, `video`, `theory`, `chords`; `tools/youtube/` → `docs/agents/web-maps-music-video.md`
+- Web, places, music, video and chords: `fetcher`, `web_search`, `maps`, `osm`, `osm_hours`, `map_data`, `spotify`, `spotify_auth`, `music_tools`, `soundtouch`, `video`, `video_find`, `theory`, `chords`; `tools/youtube/` → `docs/agents/web-maps-music-video.md`
 - Her own user, setup, deploy and doctor: `ownuser`, `deploy`, `hostsec`, `harden`, `doctor`, `setup` (with `setup_base`, `setup_questions`, `setup_plan`, `setup_answers`, `setup_face`, `setup_gum`, `setup_keychain`, `setup_progress`, `setup_signal`, `setup_keycard`, `setup_extras`, `setup_handover`, `setup_window`), `admin`, `secretfile`, `ollama_build`; `scripts/`, `launchd/`, `tools/setup-window/` → `docs/agents/own-user-deploy.md`
 - Tests: `tests/` (fakes in `tests/fakes/`) → `docs/agents/testing.md`
 - Public docs and releases: README.md, GUIDE.md, SECURITY.md, setup_assistant.md, SETUP-WITH-YOUR-AI.md, CHANGELOG.md, `.github/` → `docs/agents/docs-release.md`

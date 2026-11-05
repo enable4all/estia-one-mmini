@@ -34,7 +34,7 @@ One line and one example each. Every detail and limit: [What she can do](GUIDE.m
 
 <img src="docs/brand/tags/core.svg" alt="Core" height="22"> Works once setup is done.
 
-- **Chat.** A short, direct answer. The conversation is remembered, her own notes too: reminders set, the digest, calendar changes. Example: "What's a good question to ask about free will?"
+- **Chat.** A short, direct answer. The conversation is remembered, her own notes too: reminders set, the digest, calendar changes. **Deep Thinking** (`/thinking on`) makes her think before she answers your texts and voice notes: slower, never on calls, off by itself after 30 minutes without a message from you, and only on Macs with 24 GB of memory or more. Example: "What's a good question to ask about free will?"
 
 - **Memory.** Saves what you tell her, known in every message, and notes from your chats, given when they matter. Facts can be listed, corrected or removed. Example: "Remember that …", then `/profile`, `/fix` or `/forget`.
 
@@ -48,9 +48,9 @@ One line and one example each. Every detail and limit: [What she can do](GUIDE.m
 
 - **Photos.** An answer about the photo. The photo is deleted after the first answer. Example: a photo with a question.
 
-- **YouTube videos.** A summary from the video's captions, with the time of each main point. The captions are never stored. Example: a YouTube link, with or without a question.
+- **YouTube videos.** A summary from the video's captions, with the time of each main point. The captions are never stored. A video she finds for you is read only after your typed YES. Example: a YouTube link, with or without a question.
 
-- **Emergency stop.** `/lock` stops everything at once (answers, messages she starts, calls and reminders) until `/unlock` from the same device, 10 minutes later at the earliest. Example: `/lock`.
+- **Emergency stop.** `/lock` stops everything at once (answers, messages she starts, calls and reminders) until `/unlock` from the same device or your phone, 10 minutes later at the earliest. Example: `/lock`.
 
 <img src="docs/brand/tags/opt-in.svg" alt="Opt-in" height="22"> Off until you turn it on.
 
@@ -60,11 +60,11 @@ One line and one example each. Every detail and limit: [What she can do](GUIDE.m
 
 <img src="docs/brand/tags/extra.svg" alt="Extra" height="22"> Each one stays off until it is set up: `scripts/setup.sh --extras` lists them.
 
-- **Calls.** A spoken conversation that can be interrupted. A short summary text follows a call of two or more turns. Example: call her on Signal.
+- **Calls.** A spoken conversation in English, Spanish, Italian, Portuguese, Dutch, German or French, which can be interrupted. A text after each call she answers gives its start and end time; after two or more turns, a short summary in its place. Example: call her on Signal.
 
 - **Wake-up calls.** A text, then a Signal call at that time (once calls are set up). Example: "Call me at 7:00 to wake me up".
 
-- **Voice notes.** Transcribed on the Mac, answered in text, and optionally read back as a voice note, spoken on the Mac in heart, her default voice (`/voice`). Example: a voice note, in her language.
+- **Voice notes.** Transcribed on the Mac, answered in text, and optionally read back as a voice note in those seven languages, spoken on the Mac: in English in heart, her default voice, in the other six in jane (`/voice`). Example: a voice note, in her language.
 
 - **Calendar.** That day's events from each calendar, with times and places. Example: "What's on Friday?"
 
@@ -94,7 +94,7 @@ One line and one example each. Every detail and limit: [What she can do](GUIDE.m
 - **A spare phone number:** a prepaid SIM in any phone, for one SMS code at setup, kept topped up. The tested route.
 - **An account without a number:** made once in Signal for Android 8.31.2 or later, on a phone with Google Play, and bought once there ($2.99 or EUR 3.49); iPhone not yet. The phone for it is a spare or borrowed one where Signal is not set up yet, never the phone with your own Signal: one Signal app holds one account. Texts and voice notes work both ways; a call she answers on it is untested.
 
-**2. Two lines, in your own Terminal window.** At the Mac's own screen, setup opens its own window, Estia Setup, and every step runs there (Google Maps alone stays in Terminal); the Mac password goes only into macOS's own box, never into the window. Over a remote login (SSH), run it inside `screen` (built into macOS), so a dropped connection does not stop it. There, setup asks in Terminal, and the Signal codes, passwords and keys are typed hidden. Keep the Mac plugged in, with its lid open: setup keeps it awake until it ends. A Mac without Apple's Command Line Tools, which hold git, asks to install them in a window on its own screen; over a remote login, run Homebrew's installer first, which installs them (your Mac password once): `/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"`, then the two lines below.
+**2. Two lines, in your own Terminal window.** At the Mac's own screen, setup opens its own window, Estia Setup, and every step runs there (Google Maps alone stays in Terminal); the Mac password goes only into macOS's own box, never into the window. Over a remote login (SSH), run it inside `screen` (built into macOS), so a dropped connection does not stop it. There, setup asks in Terminal, and the Signal codes, passwords and keys are typed hidden. Keep the Mac plugged in (a MacBook with its lid open): setup keeps it awake until it ends. A Mac without Apple's Command Line Tools, which hold git, asks to install them in a window on its own screen; over a remote login, run Homebrew's installer first, which installs them (your Mac password once): `/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"`, then the two lines below.
 
 ```sh
 git clone https://github.com/enable4all/estia-one-mmini.git ~/estia && cd ~/estia

@@ -14,6 +14,7 @@ from local_assistant import config as config_module
 from local_assistant.app import signal_client
 from local_assistant.config import (
     DEFAULT_VOICE,
+    LANGUAGE_VOICE,
     STANDARD_ONLY,
     VOICE_ALIASES,
     AvatarError,
@@ -319,15 +320,16 @@ def test_voice_section_with_defaults() -> None:
     assert cfg.voice_enabled
     # the default English voice: Pocket TTS's heart (owner, 27 Oct: "not af_heart, do heart, and make it default"),
     # on either model (owner, 29 Oct: "on 16gb make Heart the default as well"); vera, the 100M's only, speaks as heart
-    # on a Mac with the 18M model (`voice_here`); Kokoro's af_heart and am_michael stay a choice
-    assert (cfg.voice_url, cfg.voice_name, cfg.voice_speed) == ("http://127.0.0.1:8150", "heart", 1.05)
+    # on a Mac with the 18M model (`voice_here`); no Kokoro voice (owner, 3 Nov 2026: Kokoro removed)
+    assert (cfg.voice_url, cfg.voice_name, cfg.voice_notes) == ("http://127.0.0.1:8150", "heart", ())
+    assert not hasattr(cfg, "voice_speed") and not hasattr(cfg, "voice_language_voice")
     assert DEFAULT_VOICE == "heart" and not hasattr(config_module, "SMALL_VOICE")
     assert voice_here(cfg.voice_name, True) == "heart" and voice_here(cfg.voice_name, False) == "heart"
     assert default_voice(True) == "heart" and default_voice(False) == "heart"
     assert {"vera"} == STANDARD_ONLY
     assert voice_here("vera", True) == "vera" and voice_here("vera", False) == "heart"
-    assert voice_here("jane", False) == "jane" and voice_here("af_heart", False) == "af_heart"
-    for name in ("heart", "jane", "eve", "vera", "alba", "michael", "af_heart", "am_michael"):
+    assert voice_here("jane", False) == "jane"
+    for name in ("heart", "jane", "eve", "vera", "alba", "michael"):
         voice = {"voice": name}
         assert parse_config({"bot_number": "+306900000000", "allowed_acis": [ACI], "voice": voice}).voice_name == name
     # eve-full, eve's name on the 100M beside the 18M's eve before (owner, 26 Oct), is another name for eve
@@ -339,17 +341,43 @@ def test_voice_section_with_defaults() -> None:
 
 
 def test_the_six_languages_speak_in_jane_and_no_other_voice_is_taken() -> None:
-    """Owner, 25 Oct: "jane jane, lets have her as default for those languages": `[voice] language_voice`, the voice of
-    Spanish, Italian, Portuguese, Dutch, German and French (Pocket TTS, each language's full model), is jane by default,
-    the only voice whose files are pinned for them; "" gives them back to Supertonic-3's F1, as before jane (the review
-    of 25 Oct: "as default" had no way back but a code change); any other name is refused with a clear message."""
+    """Owner, 25 Oct: "jane jane, lets have her as default for those languages": jane speaks Spanish, Italian,
+    Portuguese, Dutch, German and French (Pocket TTS, each language's full model), the only voice whose files are
+    pinned for them. `[voice] language_voice` may still say so; any other name is refused with a clear message."""
     base = {"bot_number": "+306900000000", "allowed_acis": [ACI]}
-    assert parse_config(base | {"voice": {}}).voice_language_voice == "jane"
-    assert parse_config(base | {"voice": {"language_voice": "jane"}}).voice_language_voice == "jane"
-    assert parse_config(base | {"voice": {"language_voice": ""}}).voice_language_voice == ""
+    assert LANGUAGE_VOICE == "jane"
+    assert parse_config(base | {"voice": {"language_voice": "jane"}}).voice_notes == ()
     for other in ("eve", "Jane", "vera", "af_heart", "F1", " ", 3):
         with pytest.raises(ConfigError, match=r"voice\.language_voice must be jane"):
             parse_config(base | {"voice": {"language_voice": other}})
+
+
+def test_a_config_that_names_kokoro_or_supertonic_still_loads_in_the_closest_pocket_voice() -> None:
+    """Owner, 3 Nov 2026: Kokoro and Supertonic-3 were removed (Supertonic's upstream was archived); Pocket TTS is her
+    only voice. A config written before still loads, never refused: a Kokoro voice id is the closest Pocket voice (a
+    male one michael, any other heart, af_heart's clone), `language_voice = ""` (Supertonic-3's F1 in the six) is
+    jane, and `speed` (read only by Kokoro and Supertonic-3) is left alone, also out of its old range. Each mapped
+    setting gives one note, logged at the start (app)."""
+    base = {"bot_number": "+306900000000", "allowed_acis": [ACI]}
+    old = parse_config(
+        base | {"voice": {"voice": "am_adam", "language_voice": "", "speed": 3}, "calls": {"speed": 0.2}}
+    )
+    assert old.voice_name == "michael"
+    assert old.voice_notes == (
+        '[voice] voice = "am_adam" was a Kokoro voice, and Kokoro was removed (3 Nov 2026): michael speaks instead.'
+        ' Set voice = "michael" to drop this line.',
+        '[voice] language_voice = "" was Supertonic-3\'s voice, and Supertonic-3 was removed (3 Nov 2026): jane speaks'
+        " Spanish, Italian, Portuguese, Dutch, German and French. Delete the line to drop this note.",
+    )
+    for kokoro, pocket in (
+        ("af_heart", "heart"),
+        ("bf_emma", "heart"),
+        ("am_michael", "michael"),
+        ("bm_lewis", "michael"),
+    ):
+        cfg = parse_config(base | {"voice": {"voice": kokoro}})
+        assert cfg.voice_name == pocket and len(cfg.voice_notes) == 1 and f'"{kokoro}"' in cfg.voice_notes[0]
+    assert not hasattr(old, "calls_speed")
 
 
 def test_voice_is_off_without_the_section() -> None:
@@ -370,7 +398,6 @@ def test_voice_is_off_without_the_section() -> None:
         ({"voice": "Michael"}, "voice.voice"),
         ({"voice": "eve_full"}, "voice.voice"),
         ({"voice": "marius"}, "voice.voice"),
-        ({"speed": 3}, "voice.speed"),
         ({"max_spoken_chars": 50}, "voice.max_spoken_chars"),
         ({"max_audio_bytes": 20_000_000}, "voice.max_audio_bytes"),
     ],
@@ -653,10 +680,7 @@ def test_calls_section_with_defaults(tmp_path: Path, monkeypatch: pytest.MonkeyP
     assert cfg.call_tunnel == vendor / "signal-call-tunnel/signal-call-tunnel/target/release/signal-call-tunnel"
     assert cfg.calls_java_home is None  # not set: found with /usr/libexec/java_home when the bridge starts
     assert cfg.call_socket_dir == cfg.data_dir / "calls"
-    assert (cfg.calls_speed, cfg.calls_end_of_turn_seconds) == (
-        1.05,
-        2.3,
-    )  # owner, 17 Oct: 0.5 s less than 2.8 ("2.8 is a lot right...?")
+    assert cfg.calls_end_of_turn_seconds == 2.3  # owner, 17 Oct: 0.5 s less than 2.8 ("2.8 is a lot right...?")
     assert (cfg.calls_idle_prompt_seconds, cfg.calls_max_minutes) == (90, 60)
     assert cfg.calls_summary
     assert cfg.calls_turn_timeout_seconds is None  # the Mac's tier decides (app: 45 s beside 26B, 60 s beside 12B)
@@ -686,7 +710,7 @@ def test_calls_settings() -> None:
     assert cfg.call_signal_cli == Path.home() / "sc/bin/signal-cli"
     assert (cfg.calls_java_home, cfg.call_tunnel) == (Path("/opt/jdk"), Path.home() / "t/sct")
     assert cfg.call_socket_dir == Path("/tmp/c")
-    assert (cfg.calls_speed, cfg.calls_end_of_turn_seconds) == (1.0, 2.5)
+    assert cfg.calls_end_of_turn_seconds == 2.5  # its speed: read by Kokoro only, removed (3 Nov 2026)
     assert (cfg.calls_idle_prompt_seconds, cfg.calls_max_minutes) == (60, 30)
     # a config from before keeps working: silence never ends a call now (owner, 18 Oct), so the old key does nothing
     assert not hasattr(cfg, "calls_idle_hangup_seconds")
@@ -729,7 +753,6 @@ def test_calls_are_off_without_the_section() -> None:
     ("calls", "message"),
     [
         ("on", r"\[calls\] must be a table"),
-        ({"speed": 2}, "calls.speed"),
         ({"end_of_turn_seconds": 0.2}, "calls.end_of_turn_seconds"),
         ({"end_of_turn_seconds": 9}, "calls.end_of_turn_seconds"),
         ({"idle_prompt_seconds": 0}, "calls.idle_prompt_seconds"),

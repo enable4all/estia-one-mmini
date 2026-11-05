@@ -23,7 +23,7 @@ from local_assistant.setup import (
     senders,
 )
 from local_assistant.setup_questions import Checked, plain_text
-from tests.fakes.fake_signal_cli import WRONG_CODE, WRONG_KEY
+from tests.fakes.fake_signal_cli import EXPIRED_CODE, WRONG_CODE, WRONG_KEY
 from tests.setup_helpers import (
     ACI,
     BOT,
@@ -278,6 +278,28 @@ def test_a_wrong_sms_code_as_signal_cli_answers_it_says_check_the_code_never_the
     assert prompts.SETUP_CODE_FAILED.format(reason=WRONG_CODE) in said
     assert not any("no answer from Signal" in line or "Wi-Fi" in line for line in said)
     assert verify_codes(folder) == ["111111", "222222"]
+
+
+def test_an_expired_sms_code_stops_with_register_again(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """sms-code-expired: signal-cli 0.14.9 answers a code Signal no longer takes with -3, "Verify error: Verification
+    code expired, please request a new one by registering again." (its jar, 31 Oct). It read "Check the code … type
+    them again", and every retype was one more verify that failed the same way. It stops, with the stop's
+    register-again lines; a wrong code is still asked again (above)."""
+    from local_assistant import setup_signal
+
+    wizard, said, folder = signal_step(tmp_path, monkeypatch, ["111111", "111111"], FAKE_SIGNAL_VERIFY_ERROR="expired")
+    with pytest.raises(SystemExit) as stopped:
+        wizard.signal_number()
+    stop = str(stopped.value)
+    assert stop == prompts.SETUP_CODE_EXPIRED.format(reason=EXPIRED_CODE)
+    assert stop.startswith(f"The SMS code expired ({EXPIRED_CODE}).\n")
+    assert stop.endswith(prompts.SETUP_CODE_STOPPED)  # the stop's own words, run setup again among them
+    assert "Run setup again: it registers the number again, with a new SMS code" in stop
+    assert not any("Check the code" in line for line in said)
+    assert len(verify_codes(folder)) == 1  # the code asked once: no second verify
+    assert setup_signal.code_expired(-3, EXPIRED_CODE) and setup_signal.code_expired(-3, "Code EXPIRED")
+    assert not setup_signal.code_expired(-3, WRONG_CODE) and not setup_signal.code_expired(None, EXPIRED_CODE)
+    assert not setup_signal.code_expired(-1, EXPIRED_CODE) and not setup_signal.code_expired(-3, "unexpiredness")
 
 
 def test_signal_clis_io_error_is_no_answer_only_when_it_names_the_network() -> None:
@@ -1717,6 +1739,42 @@ def test_in_the_window_a_box_left_at_the_delete_asks_no_second_time(
     assert prompts.SETUP_KEYCHAIN_NOT_KEPT in said
 
 
+def test_in_the_window_a_box_left_at_the_attribute_search_asks_no_second_time(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, keychain: Path
+) -> None:
+    """s06-attribute-search: where macOS's own box asks at the attribute search of the locked keychain too (S06's desk
+    check), a box cancelled there read as "none there": the delete's search asked again, then the add, then the
+    search after it, up to four boxes. A search with no answer while the keychain stays locked ends the save: one
+    box, no delete and no add tried, both copies from before kept. Answered, that one box opens the keychain and both
+    are kept; "not found" is an answer, so a locked keychain where the search asks nothing still asks at the add
+    (shows_macos_box_once, above)."""
+    from local_assistant.setup_signal import KEYCHAIN_ID, KEYCHAIN_KEY
+
+    before = {f"{KEYCHAIN_KEY} {me()}": "OLD" * 20, f"{KEYCHAIN_ID} {me()}": NUMBERLESS.upper()}
+    (keychain / "items.json").write_text(json.dumps(before))
+    (keychain / "find_asks").touch()
+    wizard, said, _folder = numberless_step(tmp_path, monkeypatch, [NUMBERLESS, KEY], ["estia.42"])
+    monkeypatch.setattr(wizard, "keychain_opener", lambda: lambda: True)  # the window's: macOS's box at the keychain
+    assert wizard.numberless() == NUMBERLESS
+    boxes = ("find-generic-password", "delete-generic-password", "-i")
+    asked = [call[0] for call in keychain_calls(keychain) if call[0] in boxes]
+    assert asked == ["find-generic-password"]  # one box, at the first search; the Account ID's save is not tried
+    assert keychain_items(keychain) == before
+    assert prompts.SETUP_KEYCHAIN_NOT_KEPT in said
+    (tmp_path / "desk").mkdir()
+    (keychain / "calls.jsonl").unlink()
+    (keychain / "desk").touch()  # at the desk: the box answered
+    wizard, said, _folder = numberless_step(tmp_path / "desk", monkeypatch, [NUMBERLESS, KEY], ["estia.42"])
+    monkeypatch.setattr(wizard, "keychain_opener", lambda: lambda: True)
+    assert wizard.numberless() == NUMBERLESS
+    assert (keychain / "boxed").read_text() == "find-generic-password\n"  # one box in all
+    assert keychain_items(keychain) == {
+        f"{KEYCHAIN_KEY} {me()}": SHOWN_KEY,
+        f"{KEYCHAIN_ID} {me()}": NUMBERLESS.upper(),
+    }
+    assert prompts.SETUP_KEYCHAIN_KEPT in said
+
+
 def test_an_account_already_here_or_a_refused_key_keeps_nothing_new(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, keychain: Path
 ) -> None:
@@ -1901,19 +1959,28 @@ def test_the_card_without_a_number_says_a_spare_phone_never_your_own() -> None:
     ]
 
 
-@pytest.mark.parametrize(("answer", "told"), [("2", True), ("", False)])
-def test_route_2_picked_says_the_phones_part_at_once(monkeypatch: pytest.MonkeyPatch, answer: str, told: bool) -> None:
+@pytest.mark.parametrize(("route", "told"), [("no_number", True), ("number", False)])
+def test_route_2_picked_says_the_phones_part_once_the_plan_is_answered(
+    monkeypatch: pytest.MonkeyPatch, route: str, told: bool
+) -> None:
     """signal-numberless-steps-late: the phone's part (a spare Android, Register without number, Pay, the Account ID
-    and the Recovery key) came only at the Signal step, about 25 minutes after the plan. Picked, the route says it
-    right away, so the account is made while the downloads run; the spare number's route says nothing of it."""
-    wizard, said, _prompted = account_step(monkeypatch, ["", answer])
-    wizard.signal_account()
-    text = "\n".join(said)
+    and the Recovery key) came only at the Signal step, about 25 minutes after the plan. Picked in the plan, route 2
+    says it once the plan is answered, before the steps, so the account is made while the downloads run (W14: said at
+    the pick, it reached no question screen in the window); the spare number's route says nothing of it."""
+    wizard, said, _prompted = account_step(monkeypatch, [])
+    wizard.planned["route"] = route
+    wizard.phone_part()
     heads_up = prompts.SETUP_ROUTE_NO_NUMBER_NEXT  # said as setup's words are (the face draws the bold)
-    assert (heads_up in text) is told
-    if told:
-        assert text.index(prompts.SETUP_ACCOUNT_ASK) < text.index(heads_up)
-        assert "**Register without number**" in heads_up and "Account ID and the Recovery key" in heads_up
+    assert said == ([heads_up] if told else [])
+    assert "**Register without number**" in heads_up and "Account ID and the Recovery key" in heads_up
+
+
+def test_route_2_picked_at_the_signal_step_itself_says_no_heads_up(monkeypatch: pytest.MonkeyPatch) -> None:
+    """W14: a step run on its own asks the route there; "Setup asks for both at the Signal step" would come at that
+    step, and the Account ID's card shows the phone's steps on its own."""
+    wizard, said, _prompted = account_step(monkeypatch, ["", "2"])
+    assert wizard.signal_account() == "numberless"
+    assert prompts.SETUP_ROUTE_NO_NUMBER_NEXT not in "\n".join(said)
 
 
 def test_a_registration_signal_refuses_is_said_by_what_happened() -> None:

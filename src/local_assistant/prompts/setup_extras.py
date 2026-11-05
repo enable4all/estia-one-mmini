@@ -131,8 +131,8 @@ __all__ = [
     "SETUP_VOICE_MODELS",
     "SETUP_VOICE_NOT_READ",
     "SETUP_VOICE_READY",
+    "SETUP_VOICE_RESTING",
     "SETUP_VOICE_STILL_LOADING",
-    "SETUP_VOICE_WARN_27",
     "SETUP_WEB_NO_KEY",
     "SETUP_WINDOW_BRAVE_KEY",
     "SETUP_WINDOW_EXTRAS_ASK",
@@ -169,16 +169,17 @@ SETUP_CALLS_AFTER_MOVE = (
     "Calls: her voice service runs only in her own macOS account. Run scripts/setup.sh again once she runs there."
 )
 # scripts/install-voice-daemon.sh's own lines, said the same way when setup's window runs its steps (a test pins them)
-SETUP_VOICE_WARN_27 = (
-    "warning: an Apple bug that can crash English speech (Kokoro) and the voice service with it, in the middle\n"
-    "of a call, was seen on macOS 27.0.1; no fix yet: the voice service starts again by itself"
-)
 SETUP_VOICE_MODELS = "waiting for the models (first start: download and Neural Engine compile, up to ~15 minutes)"
 SETUP_VOICE_NOT_READ = (
     "voice: not read as her (admin rights refused); /usr/bin/sudo /usr/local/estia/bin/estia check shows it"
 )
 SETUP_VOICE_READY = "voice: ready"
 SETUP_VOICE_FAILED = "voice: failed ({state}); see its log: /usr/bin/sudo /usr/local/estia/bin/estia logs voice"
+# Pocket TTS resting after failed or late runs: tried again on its own (scripts/install-voice-daemon.sh, the same words)
+SETUP_VOICE_RESTING = (
+    "voice: resting after failed runs ({state}). It is tried again on its own, and calls work once her voice speaks.\n"
+    "Check later: /usr/bin/sudo /usr/local/estia/bin/estia check (log: /usr/bin/sudo /usr/local/estia/bin/estia logs voice)"
+)
 SETUP_VOICE_STILL_LOADING = (
     "voice: still loading after 20 minutes ({state}). On a slow line the first download takes longer:\n"
     "the service keeps going, and calls work once her voice is ready. Check later: /usr/bin/sudo "

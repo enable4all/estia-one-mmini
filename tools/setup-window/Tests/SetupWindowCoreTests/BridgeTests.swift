@@ -93,6 +93,38 @@ private func bridge(_ sink: Recorder) -> BridgeCore { BridgeCore(sink: sink, adm
         #expect(sink.setup.last == closed && sink.quit == 1)
     }
 
+    /// Review W11: the page's process died while a command ran as root. The app may not quit before it ends (its
+    /// result would be lost), and nothing asked again once it did: a blank window stayed until quit by hand. Setup
+    /// hears closed at once; the window ends once the command's result went to setup.
+    @Test func aWindowThatBreaksDuringAnAdminCommandEndsOnceItIsDone() {
+        let sink = Recorder()
+        let bridge = bridge(sink)
+        sink.adminRunning = true
+        bridge.fromPage(ready())
+        bridge.broken()
+        #expect(sink.quit == 0 && Array(sink.setup.dropFirst()) == [closed])
+        sink.adminRunning = false
+        bridge.adminDone(id: "a1", code: 0, refused: false, unrun: false)
+        #expect(sink.quit == 1)
+        #expect(sink.setup.last == "{\"t\":\"admin_done\",\"id\":\"a1\",\"code\":0,\"refused\":false}\n")
+        bridge.adminDone(id: "a2", code: 0, refused: false, unrun: false)
+        #expect(sink.quit == 1)  // once
+    }
+
+    /// The same, when setup is gone by the command's end: the window still ends.
+    @Test func aBrokenWindowEndsAfterItsAdminCommandEvenWhenSetupIsGone() {
+        let sink = Recorder()
+        let bridge = bridge(sink)
+        sink.adminRunning = true
+        bridge.fromPage(ready())
+        bridge.broken()
+        #expect(sink.quit == 0)
+        sink.setupGone = true
+        sink.adminRunning = false
+        bridge.adminDone(id: "a1", code: 0, refused: false, unrun: false)
+        #expect(sink.quit == 1 && sink.ended == 1)
+    }
+
     @Test func anAnswerOverTheLineLimitEndsTheWindow() {
         let sink = Recorder()
         let bridge = bridge(sink)

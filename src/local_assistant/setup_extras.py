@@ -113,6 +113,8 @@ AS_HER = {
     "mail-login.sh": "mail-login",
     "spotify-login.sh": "spotify-login",
 }
+# her commands whose prompt the window shows in time only from a release with their flushing said(): the file it is in
+FLUSHES = {"hue-pair": "tools/tapo/hue.py", "mail-login": "src/local_assistant/mail_auth.py"}
 SIGN_INS = {
     "mail": ("mail", "mail-login.sh", "mail_ids"),
     "calendar": ("calendar", "set-calendar-url.sh", ""),
@@ -189,36 +191,34 @@ def _release_has_calls() -> bool:
     return helper.is_file() and not tunnel_stamp_differs(helper) and jvm_signal_cli(vendor) is not None
 
 
-def _release_reads_answer() -> bool:
-    """Her live release's Spotify sign-in asks for the address on a marked line (spotify_auth.read_answer), which the
-    window answers; one from before asks with input() and no line end. Read as you: her release is root's, 0755, under
-    the system root (a test's fake tree)."""
+def _release_holds(relative: str, marker: str) -> bool:
+    """Her live release's file `relative` holds `marker`. Read as you: her release is root's, 0755, under the system
+    root (a test's fake tree); one that cannot be read holds nothing."""
     from local_assistant.hostsec import estia_root
 
-    source = estia_root() / ownuser.CURRENT.relative_to("/") / "src" / "local_assistant" / "spotify_auth.py"
+    source = estia_root() / ownuser.CURRENT.relative_to("/") / relative
     try:
-        return "def read_answer(" in source.read_text(encoding="utf-8", errors="replace")
+        return marker in source.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return False
+
+
+def _release_reads_answer() -> bool:
+    """Her live release's Spotify sign-in asks for the address on a marked line (spotify_auth.read_answer), which the
+    window answers; one from before asks with input() and no line end."""
+    return _release_holds("src/local_assistant/spotify_auth.py", "def read_answer(")
+
+
+def _release_flushes(relative: str) -> bool:
+    """Her live release's `relative` prints each line at once (its said(), review FRIEND-1): off a terminal, as the
+    window reads her command, one from before holds its lines until it ends (W22)."""
+    return _release_holds(relative, "def said(")
 
 
 def _tunnel_built() -> bool:
     """The checkout's call helper is there, built from its own sources (build.sh's stamp beside it; signal-06): a
     later Estia's local.patch builds it again."""
     return TUNNEL.is_file() and not tunnel_stamp_differs(TUNNEL)
-
-
-def _macos_version() -> str:
-    """This Mac's macOS version (sw_vers by its full path under the tools' root, as the voice script reads it); ""
-    when it cannot be read."""
-    try:
-        done = subprocess.run(
-            [str(hostsec.tool_root() / "usr/bin/sw_vers"), "-productVersion"],
-            capture_output=True, text=True, timeout=10, check=False,
-        )  # fmt: skip
-    except (OSError, subprocess.SubprocessError):
-        return ""
-    return done.stdout.strip() if done.returncode == 0 else ""
 
 
 def _shown_command(command: list[str]) -> str:
@@ -1225,18 +1225,14 @@ class ExtrasSteps(WizardBase):
         return self.run(command).returncode
 
     def _voice_in_window(self) -> int:
-        """scripts/install-voice-daemon.sh's steps in the window, with its exit code: its warnings for macOS, the
-        deploy with her voice (`--ask-lines`: its review question a screen), then the wait for her voice as her, one
-        admin command (ownuser.VOICE_WAIT_AS_HER), read as the script reads it: ready 0, failed 1, still loading
-        VOICE_STILL_LOADING, not read 1."""
-        if re.fullmatch(r"27\.0(\..*)?", _macos_version()):
-            self.say(prompts.SETUP_VOICE_WARN_27)
+        """scripts/install-voice-daemon.sh's steps in the window, with its exit code: the deploy with her voice
+        (`--ask-lines`: its review question a screen), then the wait for her voice as her, one admin command
+        (`_voice_wait`), read as the script reads it: ready 0, failed 1, still loading VOICE_STILL_LOADING, not read
+        1."""
         if self._deploy_in_window([SUDO, str(ownuser.BIN / "estia-deploy"), "--ask-lines", "--voice", str(REPO)]):
             return 1
         self.say(prompts.SETUP_VOICE_MODELS)
-        env = ["/usr/bin/env", "-i", f"HOME={ownuser.HOME}", "PATH=/usr/bin:/bin"]
-        wait = [SUDO, "-u", ownuser.ROLE_USER, "-H", "--", *env, "/bin/bash", "-c", ownuser.VOICE_WAIT_AS_HER]
-        done = self.run(wait, capture_output=True, why=prompts.ADMIN_WHY_CALLS)
+        done = self._voice_wait()
         if done.returncode != 0:
             self.say(prompts.SETUP_VOICE_NOT_READ)
             if done.stderr == setup_admin.REFUSED:  # nothing failed: the friend's own Not now (review W04)
@@ -1249,8 +1245,29 @@ class ExtrasSteps(WizardBase):
         if "failed" in state:
             self.say(prompts.SETUP_VOICE_FAILED.format(state=state))
             return 1
+        if '"tts":"resting"' in state:  # tried again on its own (the review of 4 Nov): as loading, in its own words
+            self.say(prompts.SETUP_VOICE_RESTING.format(state=state))
+            return VOICE_STILL_LOADING
         self.say(prompts.SETUP_VOICE_STILL_LOADING.format(state=state or "no answer"))
         return VOICE_STILL_LOADING
+
+    def _voice_wait(self) -> subprocess.CompletedProcess[str]:
+        """The wait for her voice as her, one admin command. The window's own (ownuser.VOICE_WAIT_AS_HER_WINDOW) ends
+        with its input: Stop here or a Ctrl-C ends it after the look it is in, never up to 20 minutes later (review
+        W19). The window closed before it: Terminal's (ownuser.VOICE_WAIT_AS_HER), as the script runs it."""
+        from local_assistant.setup_window import WindowFace  # setup_window reads this module's questions
+
+        env = ["/usr/bin/env", "-i", f"HOME={ownuser.HOME}", "PATH=/usr/bin:/bin"]
+        wait = [SUDO, "-u", ownuser.ROLE_USER, "-H", "--", *env, "/bin/bash", "-c"]
+        face = self.face
+        if isinstance(face, WindowFace):
+            argv = [*wait, ownuser.VOICE_WAIT_AS_HER_WINDOW]
+            self.command("  $ " + " ".join(argv))
+            ran = face.admin(argv, capture=True, why=prompts.ADMIN_WHY_CALLS, ends_on_stop=True)
+            if ran is not None:
+                refused = setup_admin.REFUSED if ran.refused else None
+                return subprocess.CompletedProcess(argv, ran.code, ran.output, refused)
+        return self.run([*wait, ownuser.VOICE_WAIT_AS_HER], capture_output=True, why=prompts.ADMIN_WHY_CALLS)
 
     def _deploy_in_window(self, argv: list[str]) -> int:
         """Her release's update in the window (`estia-deploy --ask-lines`), macOS's own box asking for the admin
@@ -1676,15 +1693,27 @@ class ExtrasSteps(WizardBase):
     def _extra_offer(self, name: str, command: list[str], *, window: Callable[[], int] | None = None) -> bool:
         """A script an extra needs, shown and run on Enter; one that stops is named with its command. In the window,
         in her own macOS account, a script that only runs her command as her (`AS_HER`) is that command, macOS's own
-        box asking for the admin rights; `window`: what the window runs in the script's place (`offer`)."""
+        box asking for the admin rights; `window`: what the window runs in the script's place (`offer`). Her live
+        release from before that command's flushing said() would hold its lines until it ends (`FLUSHES`): named for
+        Terminal instead, nothing run (W22)."""
         hers = AS_HER.get(Path(command[0]).name)
         if hers is not None and self.in_window and not self.dry_run and self.own_user():
             command = [SUDO, str(ownuser.BIN / "estia"), hers, *command[1:]]
+            if hers in FLUSHES and not _release_flushes(FLUSHES[hers]):
+                self._old_release_for_terminal(hers, command)
+                return False
         failed = prompts.SETUP_EXTRA_FAILED.format(
             name=prompts.SETUP_FEATURE_NAMES[name], command=_shown_command(command)
         )
         why = prompts.ADMIN_WHY_HER if command[0] == SUDO else ""
         return self.offer(command, failed=failed, why=why, window=window)
+
+    def _old_release_for_terminal(self, hers: str, command: list[str]) -> None:
+        """Her command, which her live release does only in Terminal, named for it: in the log and the closing list."""
+        what = prompts.SETUP_WINDOW_RELEASE_OLD_WHAT[hers]
+        text = prompts.SETUP_WINDOW_RELEASE_OLD.format(what=what, command=" ".join(command))
+        self.say(text)
+        self.for_terminal = (*self.for_terminal, text)
 
     def _in_window(self, script: str) -> Callable[[], int] | None:
         """What the window runs in the place of a script that reads its answers on a terminal (the window has none):
@@ -1765,9 +1794,7 @@ class ExtrasSteps(WizardBase):
             else [str(REPO / "scripts" / "spotify-login.sh")]
         )
         if hers and not _release_reads_answer():  # input() with no line end: both sides would wait (FRIEND-8)
-            text = prompts.SETUP_WINDOW_SPOTIFY_OLD.format(command=" ".join(command))
-            self.say(text)
-            self.for_terminal = (*self.for_terminal, text)
+            self._old_release_for_terminal("spotify-login", command)
             return 0
         done = self.run(command, printed=True, why=prompts.ADMIN_WHY_HER if hers else "", answer=paste)
         if later:

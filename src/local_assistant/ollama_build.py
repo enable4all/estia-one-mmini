@@ -72,6 +72,7 @@ from local_assistant.hostsec import (
     TAR,
     Host,
     estia_root,
+    netstat_blind,
 )
 from local_assistant.ownuser import STREAM_LOGS
 
@@ -257,12 +258,15 @@ class Listener:
     """The program listening on Ollama's port ("" when none is found), the local addresses on that port, as netstat
     shows them ("127.0.0.1.11434", "::1.11434", "*.11434"), the account that runs it (its uid; None: not read), and
     every other program or account that listens on the port too (127.0.0.1 and ::1 are two addresses: one Ollama on
-    each)."""
+    each). `others_unread`: netstat's list could not be read (`hostsec.netstat_blind`: none at all, seen on macOS
+    27.0.1 on 3 Nov), so another account's program on the port could not be listed; doctor's line says so. It is set
+    on an empty answer too (fix review 1): no program found then may be another account's."""
 
     program: str
     addresses: tuple[str, ...] = ()
     uid: int | None = None
     others: tuple[Other, ...] = ()
+    others_unread: bool = False
 
 
 def host_address(value: str, port: int) -> str | None:
@@ -882,18 +886,20 @@ class Tools:
     def listener(self, port: int = PORT, *, by_service: bool = True) -> Listener:
         """The program listening on the port, where it listens and the account that runs it: netstat names every
         user's sockets with their pid and local address (lsof as a user only that user's), proc_pidpath the program
-        and ps its account, both for any user's process; Listener("") when none. When no socket can be seen at all
-        on her address, her own service's process stands for it (`her_service`; `by_service`: for an Ollama that
-        answered there, never as the proof that something holds it)."""
+        and ps its account, both for any user's process; Listener("") when none (`others_unread` set when netstat's
+        list could not be read, `hostsec.netstat_blind`). When no socket can be seen at all on her address, her own
+        service's process stands for it (`her_service`; `by_service`: for an Ollama that answered there, never as the
+        proof that something holds it)."""
         if not self.live:
             return Listener("")
         sockets: dict[str, list[str]] = {}  # each listening pid and its local addresses on the port
         code, out = self.host.run([NETSTAT, "-anv", "-p", "tcp"], read_only=True)
+        blind = netstat_blind(code, out)
         for line in out.splitlines() if code == 0 else []:
             listening = _LISTEN.match(line)
             if listening and listening[1].rpartition(".")[2] == str(port):
                 sockets.setdefault(listening[3], []).append(listening[1])
-        if not sockets:  # netstat started from some Pythons lists no internet sockets: your own, from lsof
+        if not sockets:  # netstat may list no internet sockets (seen on macOS 27.0.1, 3 Nov): your own, from lsof
             code, out = self.host.run([LSOF, "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-Fpn"], read_only=True)
             pid = ""
             for line in out.splitlines() if code == 0 else []:
@@ -904,25 +910,26 @@ class Tools:
                     host, _, at = line[1:].rpartition(":")
                     sockets[pid].append(f"{host.strip('[]')}.{at}")
         if not sockets and port == HER_PORT and by_service:
-            return self.her_service(port)
+            return replace(self.her_service(port), others_unread=blind)
         programs = {pid: self.host.program_path(pid) for pid in sockets}
         first = next((pid for pid in sockets if programs[pid]), None)
-        if first is None:
-            return Listener("")
+        if first is None:  # none named: unread when netstat's list was, as another account's may hold the port
+            return Listener("", others_unread=blind)
         accounts = {pid: self.uid_of(pid) for pid in sockets}
         mine = (programs[first], accounts[first])
         others = tuple(
             other for other in dict.fromkeys((programs[pid], accounts[pid]) for pid in sockets) if other != mine
         )
         addresses = tuple(dict.fromkeys(address for found in sockets.values() for address in found))
-        return Listener(mine[0], addresses, mine[1], others)
+        return Listener(mine[0], addresses, mine[1], others, others_unread=blind)
 
     def her_service(self, port: int) -> Listener:
-        """Her own Ollama when no socket can be seen (review of 30 Oct, P01: netstat started from a command tool's
-        shell lists none, lsof only your own): setup's service as launchd runs it (`launchctl print`, read-only, as
-        any account), kept only when its process's program is in root's copy (HER_FOLDER) and its OLLAMA_HOST is this
-        port; where it listens is that OLLAMA_HOST, its account from ps. `hers` then checks it as any listener.
-        Another account's second listener on the port cannot be seen this way. Listener("") otherwise."""
+        """Her own Ollama when no socket can be seen (netstat may list none: from a command tool's shell, review of
+        30 Oct, P01; on macOS 27.0.1 on 3 Nov; lsof lists only your own): setup's service as launchd runs it
+        (`launchctl print`, read-only, as any account), kept only when its process's program is in root's copy
+        (HER_FOLDER) and its OLLAMA_HOST is this port; where it listens is that OLLAMA_HOST, its account from ps.
+        `hers` then checks it as any listener. Another account's second listener on the port cannot be seen this way.
+        Listener("") otherwise."""
         code, out = self.host.run([LAUNCHCTL, "print", f"system/{LABEL}"], read_only=True)
         pid = _LAUNCHD_PID.search(out) if code == 0 else None
         environment = _LAUNCHD_ENVIRONMENT.search(out) if code == 0 else None

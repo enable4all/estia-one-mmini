@@ -11,7 +11,15 @@ from zoneinfo import ZoneInfo
 
 from local_assistant import prompts
 from local_assistant.babble import LEVELS, NOT_YET, OFFERED, START_LEVEL, Babble, listing, listing_lines
-from local_assistant.config import POCKET_LANGUAGES, POCKET_VOICES, STANDARD_ONLY, VOICE_ALIASES, canonical_voice
+from local_assistant.config import (
+    LANGUAGE_VOICE,
+    POCKET_LANGUAGES,
+    STANDARD_ONLY,
+    VOICE_ALIASES,
+    canonical_voice,
+    has_voice,
+    kokoro_voice,
+)
 from local_assistant.context import ContextBuilder
 from local_assistant.initiative import Initiative
 from local_assistant.language import ENGLISH, LANGUAGE_KEY, LANGUAGES, find
@@ -19,7 +27,8 @@ from local_assistant.profile import Profile, by_category, category_of
 from local_assistant.reminders import ReminderError, Reminders, parse_when
 from local_assistant.soul import SOUL_MAX_CHARS, has_parts, soul_part
 from local_assistant.store import Fact, Message, Store
-from local_assistant.timefmt import local_date, local_datetime, short_date
+from local_assistant.thinking import DeepThinking
+from local_assistant.timefmt import local_date, local_datetime, local_hhmm, local_when, short_date
 from local_assistant.voice import pocket_standard as macs_pocket_model
 from local_assistant.voice_download import LanguageDownload
 
@@ -33,6 +42,17 @@ def _percent(used: int, limit: int) -> int:
     return round(100 * used / limit)
 
 
+def answered_at_once(text: str) -> bool:
+    """A typed command the bridge answers the moment it arrives, as it answers /lock, never behind an answer in the queue
+    (owner, 4 Nov 2026): /thinking off. Parsed as `Commands.handle` parses it. Outside a call /thinking on and a plain
+    /thinking keep their place in the queue, so a message sent after /thinking on is the first to think, and an on that
+    still waits when its account's off is answered switches nothing (`Commands._thinking_switch`). During a call every
+    command not in `WAITING_COMMANDS` is answered at once, /thinking on too, so the texts waiting for the call's end
+    think after it."""
+    command, _, rest = text.strip().partition(" ")
+    return command.lower() == "/thinking" and rest.strip().lower() == "off"
+
+
 VOICE_MODE_KEY = "voice_mode"  # auto (default): a voice note gets a voice answer; on: every answer; off
 VOICE_ECHO_KEY = "voice_echo"  # on: what was heard is sent first; off (default)
 _VOICE_MODES = {
@@ -42,8 +62,8 @@ _VOICE_MODES = {
 }
 _VOICE_ECHO = {"on": "on (I show what I heard first)", "off": "off"}
 VOICE_NAME_KEY = "voice_name"  # a voice chosen with /voice <voice> or /voice name <voice> (else the config's)
-# the English voices the voice service can speak: (name, description); Pocket's first, in its order (config.POCKET_ORDER:
-# vera only beside the 100M model, `Commands.pocket_standard`), then Kokoro's
+# the English voices the voice service can speak, all Pocket TTS's (owner, 3 Nov 2026: Kokoro removed): (name,
+# description), in its order (config.POCKET_ORDER: vera only beside the 100M model, `Commands.pocket_standard`)
 VOICES: dict[str, str] = {
     "heart": "female",  # Kokoro's af_heart cloned onto each Pocket TTS model (owner, 27 Oct: "call the voice Heart")
     "jane": "female",
@@ -51,24 +71,6 @@ VOICES: dict[str, str] = {
     "vera": "female",
     "alba": "male",  # Alba MacKenna's voice, male to the owner's ear (26 Oct: "they are both male, definitely")
     "michael": "male",  # VCTK p360 (owner, 26 Oct: "alba & michael for males, both on small and big")
-    "am_michael": "American, male, warm",
-    "am_fenrir": "American, male, deeper",
-    "am_puck": "American, male, lively",
-    "am_echo": "American, male",
-    "am_eric": "American, male",
-    "am_liam": "American, male",
-    "am_onyx": "American, male, low",
-    "am_adam": "American, male",
-    "bm_george": "British, male",
-    "bm_fable": "British, male",
-    "bm_lewis": "British, male",
-    "bm_daniel": "British, male",
-    "af_heart": "American, female",
-    "af_bella": "American, female",
-    "af_nicole": "American, female, soft",
-    "af_sarah": "American, female",
-    "bf_emma": "British, female",
-    "bf_isabella": "British, female",
 }
 
 
@@ -77,8 +79,8 @@ _VOICE_KEYWORDS = {"echo", "name"}  # the words of /voice's two-word forms: alon
 
 def voice_label(voice: str) -> str:
     """A voice as the replies call it: a Pocket voice by its name ("Jane", "Heart"; eve-full, another name for eve, is
-    Eve), a Kokoro voice by its id as the owner types it ("af_heart", never "Heart", which is Pocket's heart: the id is
-    what /voice takes), any other word capitalised as a name ("Zoe")."""
+    Eve), a Kokoro voice id as typed ("af_heart", never "Heart", which is Pocket's heart), any other word capitalised as
+    a name ("Zoe")."""
     voice = canonical_voice(voice)
     return voice if "_" in voice else voice.capitalize()
 
@@ -89,12 +91,6 @@ def voice_pronoun(voice: str) -> str:
     return "her" if "female" in about else "his" if "male" in about else "its"
 
 
-def engine(voice: str) -> str:
-    """Who speaks an English voice: Pocket TTS for Pocket's (on the Mac's one model: owner, 26 Oct, never named by its
-    size), Kokoro for the others."""
-    return "Pocket TTS" if voice in POCKET_VOICES else "Kokoro"
-
-
 def voices_here(standard: bool) -> dict[str, str]:
     """The English voices of this Mac, in /voices' order: every one of `VOICES`, vera only beside the 100M model
     (`standard`; owner, 26 Oct: "vera stays on the 100M only"; heart on either: 29 Oct, "just make the small heart").
@@ -103,13 +99,11 @@ def voices_here(standard: bool) -> dict[str, str]:
 
 
 def voices_listing(standard: bool) -> list[str]:
-    """/voices' lines: each voice of this Mac with who speaks it, Pocket's first, then each other name after them
-    ("eve-full: another name for eve": owner, 26 Oct, old configs and habits), then Kokoro's."""
-    here = voices_here(standard)
-    lines = [f"{name}: {about} ({engine(name)})" for name, about in here.items()]
-    pocket = sum(1 for name in here if name in POCKET_VOICES)
-    aliases = [f"{alias}: another name for {name}" for alias, name in VOICE_ALIASES.items()]
-    return lines[:pocket] + aliases + lines[pocket:]
+    """/voices' lines: each voice of this Mac (Pocket TTS's, the only engine; on the Mac's one model: owner, 26 Oct,
+    never named by its size), then each other name ("eve-full: another name for eve": owner, 26 Oct, old configs and
+    habits)."""
+    lines = [f"{name}: {about} (Pocket TTS)" for name, about in voices_here(standard).items()]
+    return lines + [f"{alias}: another name for {name}" for alias, name in VOICE_ALIASES.items()]
 
 
 @dataclass(frozen=True)
@@ -128,7 +122,7 @@ class StatusInfo:
 
 # the lock (/lock, /unlock) in the state table: it survives a restart and needs no sudo
 LOCK_KEY = "lock:on"  # "on" while locked
-LOCK_DEVICE_KEY = "lock:device"  # "<aci> <device>": only that device can /unlock
+LOCK_DEVICE_KEY = "lock:device"  # "<aci> <device>": that device, or that account's phone, can /unlock
 LOCK_SINCE_KEY = "lock:since"  # when (epoch seconds)
 UNLOCK_WAIT_SECONDS = 600  # /unlock works this long after /lock at the earliest
 HELD_NOTED_KEY = "devices:noted:{aci}:{device}"  # when the last held-device note went out
@@ -139,16 +133,19 @@ TRUST_DAYS = 14  # an allowed linked device silent this long is held again (Sign
 
 class Guard:
     """Which of the allowed users' devices she answers, and the lock. Rollout rule: device 1 (the phone the account was
-    registered on) of every allowed account is known from the start; every linked device (2 and up) is held until a
-    known device allows it with /devices ok N. A held message gets no answer and never reaches Gemma: a code note goes to
-    the account, so the phone sees it too. Calls name no device: a call from any of the user's devices rings.
+    registered on) of every allowed account is known from the start; every linked device (2 and up) is held until the
+    phone allows it with /devices ok N. A held message gets no answer and never reaches Gemma: a code note goes to the
+    account, so the phone sees it too, naming the held message's own time. Calls name no device: a call from any of the
+    user's devices rings.
 
-    Signal gives a new linked device the lowest free number from 2, so a number is not a device: an allowed device
-    silent for TRUST_DAYS is held again, and /devices forget N (after unlinking it) removes one at once.
+    The phone is the root of trust (owner, 3 Nov): only it allows a device (/devices ok N) or forgets one (/devices
+    forget N), so a linked device, even an allowed one, never lets another in. Signal gives a new linked device the
+    lowest free number from 2, so a number is not a device: an allowed device silent for TRUST_DAYS is held again, and
+    /devices forget N (after unlinking it) removes one at once.
 
-    /lock (from a known device) stops every answer and call until /unlock comes from the same device, at least
-    UNLOCK_WAIT_SECONDS later; nothing else works meanwhile. The lock is kept in the state table: it survives a
-    restart."""
+    /lock (from a known device) stops every answer and call until /unlock comes from the same device or that account's
+    phone, at least UNLOCK_WAIT_SECONDS later; nothing else works meanwhile, and no other device ends it (a lock sent
+    from the phone ends only from the phone). The lock is kept in the state table: it survives a restart."""
 
     def __init__(
         self, store: Store, acis: frozenset[str], *, tz: ZoneInfo, clock: Callable[[], float] = time.time
@@ -196,9 +193,27 @@ class Guard:
         if device is not None and device != PHONE:
             self._store.touch_device(aci, device, self._stamp())
 
-    def hold(self, aci: str, device: int | None) -> str:
-        """A message from a device she does not answer: remembered as held; the note to send, or "" when one went out
-        for this device within the hour."""
+    def _phone(self, aci: str, device: int | None) -> bool:
+        """Whether this is the phone (Signal's device 1) of an allowed account: the only device that allows or forgets
+        another, and that ends a lock sent from any device of its account."""
+        return device == PHONE and self.known(aci, device)
+
+    def _received_at(self, received: object) -> str:
+        """When Signal received a held message (milliseconds), as her other notes give a time, in the user's time zone:
+        "14:05" today, "7 Oct 14:05" on another day. None, no whole number, 0 or less, or one no clock can show is
+        named so."""
+        if not isinstance(received, int) or isinstance(received, bool) or received <= 0:
+            return prompts.DEVICE_HELD_TIME_UNKNOWN
+        try:
+            return local_when(received / 1000, self._clock(), self._tz)
+        except (OverflowError, OSError, ValueError):
+            return prompts.DEVICE_HELD_TIME_UNKNOWN
+
+    def hold(self, aci: str, device: int | None, received: object) -> str:
+        """A message from a device she does not answer, received by Signal's servers at `received` (the envelope's
+        `serverReceivedTimestamp`, milliseconds, as signal-cli gave it: None when it named none): remembered as held;
+        the note to send, naming that time, or "" when one went out for this device within the hour. Never the sending
+        device's own time, which a device may set to any."""
         silent = device is not None and self._silent(aci, device)
         if device is not None and (silent or self._store.device_source(aci, device) is None):
             self._store.set_device(aci, device, "held")
@@ -209,11 +224,12 @@ class Guard:
         if last is not None and now - float(last) < HELD_NOTE_SECONDS:
             return ""
         self._store.set_state(key, f"{now:.0f}")
+        when = self._received_at(received)
         if device is None:
-            return prompts.DEVICE_HELD_UNNAMED
+            return prompts.DEVICE_HELD_UNNAMED.format(time=when)
         if silent:
-            return prompts.DEVICE_HELD_SILENT.format(device=device, days=TRUST_DAYS)
-        return prompts.DEVICE_HELD.format(device=device)
+            return prompts.DEVICE_HELD_SILENT.format(device=device, days=TRUST_DAYS, time=when)
+        return prompts.DEVICE_HELD.format(device=device, time=when)
 
     def listing(self, aci: str) -> str:
         """/devices: the devices she answers and the held ones, each list under a bold heading, one per line."""
@@ -240,12 +256,12 @@ class Guard:
         return self.allow(aci, device, args)
 
     def forget(self, aci: str, device: int | None, number: str) -> str:
-        """/devices forget N: only from a device she already answers; never the phone."""
+        """/devices forget N: only from the phone; never the phone itself."""
         if not number.isdecimal() or int(number) < 1:
             return prompts.DEVICES_USAGE
-        if not self.known(aci, device):
-            log.warning("devices: /devices forget from a device that is not known was refused")
-            return prompts.DEVICES_NOT_FROM_KNOWN
+        if not self._phone(aci, device):
+            log.warning("devices: /devices forget from device %s was refused: only the phone forgets", device)
+            return prompts.DEVICES_NOT_FROM_PHONE
         wanted = int(number)
         if wanted == PHONE:
             return prompts.DEVICES_FORGET_PHONE
@@ -256,14 +272,14 @@ class Guard:
         return prompts.DEVICES_FORGOTTEN.format(device=wanted)
 
     def allow(self, aci: str, device: int | None, args: str) -> str:
-        """/devices ok N: only from a device she already answers, only for a device that was held."""
+        """/devices ok N: only from the phone, only for a device that was held."""
         words = args.lower().split()
         number = words[1].lstrip("#") if len(words) == 2 and words[0] == "ok" else ""
         if not number.isdecimal() or int(number) < 1:
             return prompts.DEVICES_USAGE
-        if not self.known(aci, device):
-            log.warning("devices: /devices ok from a device that is not known was refused")
-            return prompts.DEVICES_NOT_FROM_KNOWN
+        if not self._phone(aci, device):
+            log.warning("devices: /devices ok from device %s was refused: only the phone allows", device)
+            return prompts.DEVICES_NOT_FROM_PHONE
         wanted = int(number)
         source = self._store.device_source(aci, wanted)
         if source in ("primary", "allowed"):
@@ -283,7 +299,7 @@ class Guard:
 
     @property
     def lock_device(self) -> tuple[str, int] | None:
-        """The account and device that locked her (only they can /unlock)."""
+        """The account and device that locked her (they, or that account's phone, can /unlock)."""
         aci, _, device = (self._store.get_state(LOCK_DEVICE_KEY) or "").partition(" ")
         return (aci, int(device)) if aci and device.isdecimal() else None
 
@@ -296,13 +312,20 @@ class Guard:
         self._store.set_state(LOCK_SINCE_KEY, str(int(now)))  # whole seconds, never later than now
         self._store.set_state(LOCK_KEY, "on")
         log.warning("lock: locked from device %d; no answers and no calls until /unlock", device)
-        return prompts.LOCKED.format(device=device, minutes=UNLOCK_WAIT_SECONDS // 60)
+        reply = prompts.LOCKED if device == PHONE else prompts.LOCKED_LINKED  # a linked device's: the phone ends it too
+        return reply.format(device=device, minutes=UNLOCK_WAIT_SECONDS // 60)
+
+    def _may_unlock(self, aci: str, device: int | None) -> bool:
+        """The device that locked her, or the phone of the same account (never another account's)."""
+        locker = self.lock_device
+        return locker == (aci, device) or (locker is not None and locker[0] == aci and self._phone(aci, device))
 
     def unlock(self, aci: str, device: int | None) -> str | None:
-        """/unlock: only from the device that locked her, after the wait; None (no answer) from any other device."""
+        """/unlock, after the wait: from the device that locked her or from that account's phone (owner, 3 Nov: the
+        phone ends a lock sent from a lost laptop, with no admin rights); None (no answer) from any other device."""
         if not self.locked:
             return prompts.UNLOCK_NOT_LOCKED if self.known(aci, device) else None
-        if self.lock_device != (aci, device):
+        if not self._may_unlock(aci, device):
             log.warning("lock: /unlock from another device was ignored")
             return None
         since = float(self._store.get_state(LOCK_SINCE_KEY) or 0)
@@ -337,7 +360,6 @@ class Commands:
         language: str = ENGLISH,
         set_language: Callable[[str], None] | None = None,
         voice_languages: VoiceLanguages | None = None,
-        language_voice: str = "",
         reminders: Reminders | None = None,
         initiative: Initiative | None = None,
         babble: Babble | None = None,
@@ -349,6 +371,7 @@ class Commands:
         downloads: LanguageDownload | None = None,
         pocket_standard: bool | None = None,
         has_home: Callable[[], bool] | None = None,
+        thinking: DeepThinking | None = None,
     ) -> None:
         """`capabilities`: code's list of what she can do here, which /help shows above the commands (the lines her
         rules carry); `inventory`: her tools' list as /tools shows it (prompts.inventory_text: the lines her rules
@@ -356,7 +379,8 @@ class Commands:
         /evening), so her rules follow. `downloads`: jane's model of a language downloading (owner, 25 Oct):
         /language's and /babble's replies say so. `pocket_standard`: this Mac speaks Pocket TTS's 100M model, vera's
         (owner, 26 Oct: by its Gemma); None reads it from the Mac's memory (`voice.pocket_standard`). `has_home`:
-        whether a home area is known (`Maps.has_home`), None with places off."""
+        whether a home area is known (`Maps.has_home`), None with places off. `thinking`: Deep Thinking's switch (/thinking,
+        /status's line); None: no /thinking."""
         self._store = store
         self._profile = profile
         self._context = context
@@ -367,7 +391,6 @@ class Commands:
         self._voice = voice
         self._set_voice = set_voice
         self._language = language
-        self._language_voice = language_voice  # jane: the voice of POCKET_LANGUAGES ("": none, as before)
         self._set_language = set_language
         self._voice_languages = voice_languages
         self._downloads = downloads
@@ -381,6 +404,7 @@ class Commands:
         self._docs = docs  # the documents (/docs, /docs send N): off without [documents]
         self._inventory = inventory
         self._has_home = has_home
+        self._thinking = thinking
 
     async def handle(self, message: Message) -> str:
         command, _, rest = message.text.strip().partition(" ")
@@ -398,7 +422,7 @@ class Commands:
             case "/fix":
                 return self._fix(args, message.id)
             case "/status":
-                return await self._status()
+                return await self._status(message.peer_aci)
             case "/learn":
                 return await self._learn_link(args, message)
             case "/voice":
@@ -431,6 +455,8 @@ class Commands:
                 return self._guard.lock(message.peer_aci, message.source_device) or prompts.LOCK_NOT_FROM_KNOWN
             case "/unlock" if self._guard is not None:
                 return self._guard.unlock(message.peer_aci, message.source_device) or prompts.LOCK_NOT_FROM_KNOWN
+            case "/thinking" if self._thinking is not None:
+                return self._thinking_switch(args.lower(), self._thinking, message)
             case "/tools" if self._inventory is not None:
                 return self._inventory()
             case "/help":
@@ -534,6 +560,50 @@ class Commands:
             self._changed()  # the list in her rules names its time while it is on
         return reply
 
+    def _thinking_switch(self, args: str, thinking: DeepThinking, message: Message) -> str:
+        """/thinking on|off, /thinking: Deep Thinking (owner, 4 Nov): her answers to the asking account's texts and voice
+        notes think first, until 30 minutes pass without a message from that account; each allowed account has its own
+        switch, and the reply is about the asker's own. Only a typed command reaches it, never a voice note, a call or
+        Gemma (no tool). /thinking off also stops the asker's answer that is thinking, and says so; it is answered the
+        moment it arrives (`answered_at_once`), never behind an answer in the queue. So an on that waited in the queue
+        is handled after the off typed behind it: the last command typed wins, and that on switches nothing (it says the
+        state, which is "off" unless a later on switched it on again)."""
+        aci = message.peer_aci
+        if not args:
+            return self._thinking_state(thinking, aci)
+        if args == "on":
+            if thinking.room and self._off_answered_first(message):
+                log.info("deep thinking: an on that waited behind an off answered at once switches nothing")
+                return prompts.THINKING_OFF if thinking.until(aci) is None else self._thinking_state(thinking, aci)
+            ends = thinking.start(aci)
+            return (
+                self._thinking_no_room(thinking) if ends is None else prompts.THINKING_ON.format(time=self._hhmm(ends))
+            )
+        if args == "off":
+            return prompts.THINKING_OFF_STOPPED if thinking.stop(aci) else prompts.THINKING_OFF
+        return prompts.THINKING_USAGE
+
+    def _off_answered_first(self, message: Message) -> bool:
+        """Whether this account's /thinking off, typed after `message`, is answered already: it was answered at once
+        (`answered_at_once`), ahead of the messages that waited in the queue before it, this one among them. Read from the
+        stored messages, so a restart that queues `message` again sees it too; a message number kept apart from them
+        could outlive them (SQLite uses a number again once a prune has emptied the table), and then beat a later on."""
+        return any(answered_at_once(text) for text in self._store.answered_commands_after(message.peer_aci, message.id))
+
+    @staticmethod
+    def _thinking_no_room(thinking: DeepThinking) -> str:
+        """Why it stays off: the model's context is too small, or the config does not say it (review of 4 Nov, promises-2)."""
+        return prompts.THINKING_NO_ROOM if thinking.known else prompts.THINKING_NO_CONTEXT
+
+    def _thinking_state(self, thinking: DeepThinking, aci: str) -> str:
+        if not thinking.room:  # /thinking on is refused here: never the reply that tells how to switch it on
+            return self._thinking_no_room(thinking)
+        ends = thinking.until(aci)
+        return prompts.THINKING_STATE_OFF if ends is None else prompts.THINKING_STATE_ON.format(time=self._hhmm(ends))
+
+    def _hhmm(self, epoch: float) -> str:
+        return local_hhmm(epoch, self._tz)
+
     def _soul(self) -> str:
         """The style in use: soul.md (with [chat] and [call] lines, what texts and calls each get), or why none is and
         the built-in style."""
@@ -575,10 +645,11 @@ class Commands:
         if not self._voice:
             return "Voice notes aren't set up on the Mac."
         words = args.lower().split()
+        silent = "" if has_voice(self._language) else f" {self._spoken_in()}"  # the review of 4 Nov: say so
         if words and words[0] in _VOICE_MODES and len(words) == 1:
             self._store.set_state(VOICE_MODE_KEY, words[0])
             self._changed()  # the list in her rules shows the voice answers' level
-            return f"Voice replies: {_VOICE_MODES[words[0]]}."
+            return f"Voice replies: {_VOICE_MODES[words[0]]}." + ("" if words[0] == "off" else silent)
         spoken_in = self._spoken_in()
         if words == ["voices"]:
             listed = "\n".join(voices_listing(self.pocket_standard))
@@ -586,6 +657,8 @@ class Commands:
         if (len(words) == 2 and words[0] == "name") or (len(words) == 1 and words[0] not in _VOICE_KEYWORDS):
             typed = words[-1]
             name = canonical_voice(typed)
+            if kokoro_voice(name):  # Kokoro was removed (owner, 3 Nov 2026): nothing changes
+                return prompts.VOICE_KOKORO_GONE.format(voice=name)
             if name not in VOICES:
                 return f"There's no voice called {voice_label(name)} here yet. /voice voices lists them."
             if name not in voices_here(self.pocket_standard):  # vera beside the 18M model: nothing changes
@@ -605,17 +678,20 @@ class Commands:
         mode = self._store.get_state(VOICE_MODE_KEY) or "auto"
         echo = self._store.get_state(VOICE_ECHO_KEY) or "off"
         return (
-            f"Voice replies: {_VOICE_MODES.get(mode, mode)}.\nTranscript echo: {_VOICE_ECHO.get(echo, echo)}.\n"
-            "Change with /voice auto, on or off, and /voice echo on or off."
+            f"Voice replies: {_VOICE_MODES.get(mode, mode)}.{'' if mode == 'off' else silent}\n"
+            f"Transcript echo: {_VOICE_ECHO.get(echo, echo)}.\nChange with /voice auto, on or off, and /voice echo on or off."
         )
 
     def _spoken_in(self) -> str:
         """While one of the six languages jane speaks is in use (owner, 25 Oct): that it is spoken in her voice and /voice
-        sets the English one; "" in English, in the four Supertonic-3 speaks and without a language voice."""
-        if not self._language_voice or self._language not in POCKET_LANGUAGES:
-            return ""
+        sets the English one; while Korean, Polish, Russian or Japanese is (no voice: owner, 3 Nov 2026), that; "" in
+        English."""
         language = LANGUAGES[self._language].english
-        return prompts.VOICE_IN_LANGUAGE.format(language=language, voice=voice_label(self._language_voice))
+        if not has_voice(self._language):
+            return prompts.VOICE_NO_LANGUAGE.format(language=language)
+        if self._language not in POCKET_LANGUAGES:
+            return ""
+        return prompts.VOICE_IN_LANGUAGE.format(language=language, voice=voice_label(LANGUAGE_VOICE))
 
     async def _language_setting(self, args: str, aci: str) -> str:
         """/language: the list; /language <code or name>: switch (only ever by this typed command). The text switches
@@ -642,6 +718,8 @@ class Commands:
         if chosen.code == ENGLISH:
             return prompts.LANGUAGE_SET_ENGLISH
         reply = prompts.LANGUAGE_SET.format(own=chosen.own, code=chosen.code, english=chosen.english)
+        if self._voice and not has_voice(chosen.code):  # no voice in it (owner, 3 Nov 2026)
+            return f"{reply}\n{prompts.VOICE_NO_LANGUAGE.format(language=chosen.english)}"
         installed = await self._voice_languages() if self._voice_languages is not None else None
         if installed is not None and chosen.code not in installed:
             reply += "\n" + prompts.LANGUAGE_VOICE_TOO_OLD.format(english=chosen.english)
@@ -716,11 +794,17 @@ class Commands:
         self._babble.start(aci, code, level)
         language = LANGUAGES[code]
         fields = {"name": prompts.language_label(code), "code": code, "level": level, "english": language.english}
-        lines = [prompts.BABBLE_RESUMED.format(**fields) if resumed else prompts.BABBLE_STARTED.format(**fields)]
+        silent = self._voice and not has_voice(code)  # Japanese (offered): no voice (owner, 3 Nov 2026), nothing asked
+        # no calls in it: its start never says calls are heard or end it (the review of 4 Nov)
+        started = prompts.BABBLE_STARTED_NO_VOICE if silent else prompts.BABBLE_STARTED
+        lines = [prompts.BABBLE_RESUMED.format(**fields) if resumed else started.format(**fields)]
         if first:
             lines.append(prompts.BABBLE_LIMITS)
-        installed = await self._voice_languages() if self._voice_languages is not None and code != ENGLISH else None
-        if installed is not None and code not in installed:
+        asks = self._voice_languages is not None and code != ENGLISH and not silent
+        installed = await self._voice_languages() if asks and self._voice_languages is not None else None
+        if silent:  # every call of this account rings out meanwhile, whatever its language (CALL_NO_VOICE_PRACTICE)
+            lines.append(prompts.CALL_NO_VOICE_PRACTICE.format(language=language.english))
+        elif installed is not None and code not in installed:
             lines.append(prompts.LANGUAGE_VOICE_TOO_OLD.format(english=language.english))
         elif installed is not None and self._downloads is not None and (note := await self._downloads.note(code, aci)):
             lines.append(note)  # jane's model of it downloads (owner, 25 Oct)
@@ -846,7 +930,16 @@ class Commands:
         self._context.refresh_snapshot()
         return prompts.FIX_DONE.format(number=fact_id, text=text)
 
-    async def _status(self) -> str:
+    def _thinking_status(self, aci: str) -> list[str]:
+        """/status's Deep Thinking line: the asker's own, on until HH:MM or off; none without the switch."""
+        if self._thinking is None:
+            return []
+        ends = self._thinking.until(aci)
+        if ends is None:
+            return [prompts.THINKING_STATUS_OFF]
+        return [prompts.THINKING_STATUS_ON.format(time=self._hhmm(ends))]
+
+    async def _status(self, aci: str) -> str:
         info = await self._status_provider()
         yours, notes = self._profile.yours(), self._profile.notes()
         mine = _percent(self._profile.used_chars(), self._profile.max_chars)
@@ -857,6 +950,7 @@ class Commands:
                 f"Gemma: {info.gemma}",
                 f"Waiting messages: {info.queue_length}",
                 f"Signal connection restarts: {info.restarts}",
+                *self._thinking_status(aci),
             ],
             prompts.STATUS_MEMORY: [
                 f"Profile: {len(yours)} facts of yours, {mine}% full; {len(notes)} notes from chats, {noted}% full",

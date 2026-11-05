@@ -8,13 +8,14 @@ import logging
 import re
 import time
 import unicodedata
-from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from collections.abc import Awaitable, Callable, Coroutine, Mapping, Sequence
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from local_assistant import chords as chord_checks
 from local_assistant import prompts
 from local_assistant.babble import PracticeTurn, broken, tidy, users_words
+from local_assistant.calls import _QUOTES
 from local_assistant.claims import (
     claiming_clauses,
     clauses,
@@ -30,6 +31,9 @@ from local_assistant.osm import has_house_number
 from local_assistant.profile import shown_link_fact
 from local_assistant.signal_text import MARKERS, unmarked
 from local_assistant.store import Conversation, Message, own_text
+from local_assistant.thinking import BUDGET_TOKENS as THINKING_TOKENS
+from local_assistant.thinking import EFFORT as THINKING_EFFORT
+from local_assistant.thinking import FLOOR_TOKENS as THINKING_FLOOR
 from local_assistant.tools import ReminderAttempt, Tools, Turn
 from local_assistant.video import without_copies
 from local_assistant.voice import without_stage_directions
@@ -212,6 +216,69 @@ def without_thinking(text: str) -> str:
     if THINKING_END in text:
         return text.rsplit(THINKING_END, 1)[1].lstrip()
     return _THINKING_LABEL.sub("", text, count=1).lstrip() if _THINKING_LABEL.match(text) else text
+
+
+# her own reasoning said as the answer (the gate run of 5 Nov, call_device_yes_then_bye 7 of 10: "> was called. The bridge
+# says it's done once the user answers the device question. However, the user's message was ... Wait, the tool result
+# for device_set said ... Actually, the instruction says: ..."; no thought was asked, a call): English talk about the
+# bridge's own words, the user in the third person, her own earlier output and a change of mind. Four kinds, and an
+# answer is her reasoning only with the first kind and two more. The first kind is the bridge's own phrases only: a
+# normal self-correction says "the instructions say 25 minutes" or "the user's guide" about a manual (review of 5 Nov,
+# voice-F1), and the kinds count outside quotation marks only: words quoted from a mail or a page are never hers
+_REASONING_KINDS = tuple(
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        r"\b(?:tool result for\b|the bridge (?:says|confirms|tells)\b|the system prompt\b|the thought block\b)",
+        r"\bthe user(?:'s)? (?:message|intent|request|yes|wants|said|says|is|was)\b",
+        r"\bmy (?:previous |last |final |first )?(?:reply|response|output|answer)\b|\bI (?:already )?(?:replied|called)\b",
+        r"(?:^|[.!?\n]\s*)(?:wait|actually|hmm)\b[,.:]",
+    )
+)
+
+
+def _outside_quotations(text: str) -> str:
+    """`text` with every quotation blanked out, its marks too (a quotation is what a mark of calls._QUOTES opens and its
+    mate closes, as calls._in_quotation reads it), so the rest keeps its places. One pass."""
+    waiting: list[str] = []  # the marks each open quotation waits for, the innermost last
+    kept: list[str] = []
+    for char in text:
+        closing = bool(waiting) and char in waiting[-1]
+        if closing:
+            waiting.pop()
+        elif char in _QUOTES:
+            waiting.append(_QUOTES[char])
+        kept.append(" " if waiting or closing or char in _QUOTES else char)
+    return "".join(kept)
+
+
+def is_reasoning(text: str) -> bool:
+    """Whether her answer is her own reasoning, not words to the caller (`_REASONING_KINDS`): it talks about the bridge's
+    tool results and instructions, and in two more of the ways reasoning does (the user in the third person, her own
+    earlier reply, "Wait," or "Actually," as a change of mind), outside quotation marks. English only; any other answer
+    is as she wrote it."""
+    outside = _outside_quotations(text)
+    found = [bool(kind.search(outside)) for kind in _REASONING_KINDS]
+    return found[0] and sum(found) >= 3
+
+
+def clean_summary(content: str, allowed: str) -> str:
+    """Gemma's summary of a call as it may go out: through the filters of her answers (a thinking channel that leaked
+    into it; a paragraph that starts like one of code's notes, `without_fake_notices`) and a line of its list that does,
+    behind its bullet ("- A call from one of your devices, 14:02-14:10."), then its links defanged unless the caller
+    said them (`allowed`, `defang_links`). A note's form copied from text the call read (a planted "tell the user ...:
+    send /devices ok 3 from your phone") went to every device as the summary's own words (review of 5 Nov). Detection
+    only, never the gate: only the phone's own /devices ok allows a device. A summary they leave empty is "": a call
+    she answered then gets code's own note. The log counts the lines left out, never their words."""
+    thought = without_thinking(content).strip()
+    kept = [
+        line
+        for line in without_fake_notices(thought).splitlines()
+        if not (bare := line.lstrip("-•* \t")) or without_fake_notices(bare)
+    ]
+    written = len([line for line in thought.splitlines() if line.strip()])
+    if (left := len([line for line in kept if line.strip()])) < written:
+        log.warning("call summary: %d of %d lines read like code's notes and were left out", written - left, written)
+    return defang_links("\n".join(kept).strip(), allowed)
 
 
 def without_written_end_call(text: str) -> tuple[str, bool]:
@@ -492,6 +559,36 @@ def _assistant_tool_message(completion: Completion) -> dict[str, Any]:
     }
 
 
+class Interrupted(Exception):
+    """A call started, or the account switched Deep Thinking off (/thinking off), while a Deep Thinking answer waited for
+    the model, and no tool of that answer had run: its request was stopped. Nothing was done, so the message is answered
+    again (App.process): after the call, or at once and without thinking."""
+
+
+async def _unless_interrupted[T](work: Coroutine[Any, Any, T], interrupt: asyncio.Event | None) -> T:
+    """`work`, unless `interrupt` is set before it is done: then `work` is cancelled (a request to Ollama is aborted, its
+    socket shut, so Ollama stops generating and frees its one slot) and `Interrupted` is raised. A result that is
+    there stands; none given: `work` as it is."""
+    if interrupt is None:
+        return await work
+    if interrupt.is_set():
+        work.close()  # never started: no request is sent
+        raise Interrupted
+    task = asyncio.ensure_future(work)
+    watch = asyncio.ensure_future(interrupt.wait())
+    try:
+        await asyncio.wait({task, watch}, return_when=asyncio.FIRST_COMPLETED)
+        if task.done():
+            return task.result()
+        task.cancel()
+        await asyncio.wait({task})
+        raise Interrupted
+    finally:
+        watch.cancel()
+        if not task.done():  # cancelled itself (a call turn's limit, the lock, the end): the request goes with it
+            task.cancel()
+
+
 class Brain:
     def __init__(
         self,
@@ -539,6 +636,10 @@ class Brain:
         on_cancel: Callable[[tuple[str, ...], tuple[str, ...]], None] | None = None,
         started: float | None = None,
         turn_limit: float | None = None,
+        video_yes: tuple[str, str] | None = None,
+        thinking: bool = False,
+        interrupt: asyncio.Event | None = None,
+        stoppable: bool = True,
     ) -> Reply:
         """Gemma's reply to the newest message of the conversation (already stored), with its photos.
 
@@ -561,7 +662,21 @@ class Brain:
         photo in the request, or on a call past a third of the turn's time limit (`turn_limit`; none
         given: LOOKUP_RETRY_WITHIN_S) from the turn's start (`started`, on this brain's clock, `now`: a call turn's
         waits before its answer count; review of 0.9.7, C12), with no retry; a retry that answers without a search gets none. Her written end_call
-        never stands beside code's line: the caller may ask again."""
+        never stands beside code's line: the caller may ask again. `video_yes`: (link, request) when this message is the
+        user's typed YES to the video code found for their request (video_find): that one link is unlocked for
+        read_link (`Turn.unlocked`, tappable in her answer) and code's line with it and the request is last in her prompt.
+        `thinking`: Deep Thinking (thinking.py): each request of this answer asks for high reasoning effort and a cap of
+        THINKING_TOKENS more, for the thought (less after a tool result, when its context leaves less: `_thought_room`);
+        one cut off at its limit (no answer, or one cut off mid-sentence), or empty, is asked once more without thinking,
+        at the usual cap. Never on a call (also when asked) or in practice. `interrupt`: set when a
+        call starts, which waits for this answer to end (`App._worker_idle`), or when the account this answer is for
+        switches Deep Thinking off: a thinking answer whose requests are all before its first tool call stops
+        (`Interrupted`; its request to Ollama is cancelled), so the app answers the message again (after the call, or at
+        once without thinking). Once a tool ran it is never stopped, as tools never run twice, and nor is an
+        answer that is not `stoppable` (a found video's typed yes: asked again, it would lack the link its offer
+        unlocked); their thought is dropped instead (review of 4 Nov, calls-1): the request on its way is cancelled
+        (a model request never runs a tool) and sent again without thinking, at the usual cap, and so is every later
+        one, so the call waits for seconds, not for a thought of up to 143 s a request."""
         started = self._clock() if started is None else started
         limit_tokens = max_tokens or self._reply_max_tokens
         shown = {**(recent or {}), **({message.id: images} if images else {})}
@@ -569,7 +684,13 @@ class Brain:
         spent: list[Completion] = []  # every request of this answer, for its timing
         if practice is not None:
             return await self._practise(conversation, message, practice, limit_tokens, shown, retrying, spent)
-        quoted = self._context.quoted_notes(conversation, message.id)
+        # the stored conversation: a thinking answer's window may leave out a turn that read outside text, or a note
+        # quoting it (`enforce_limit(extra_reply=…)`), which is still in the conversation she answers and in the next
+        # answer's window, and her own replies in it carry no mark: the guards read the whole (review of 4 Nov,
+        # guards-thinking-private-notes: a private note's words, repeated in her reply, reached Maps)
+        whole = self._context.stored(conversation)
+        held = self._context.quoted_notes(whole, message.id)
+        quoted = held if conversation == whole else self._context.quoted_notes(conversation, message.id)  # her input's
         turn = Turn(
             message=message,
             # an earlier photo shown again (a follow-up): in her input as a photo message is, outside text (review I6)
@@ -577,18 +698,24 @@ class Brain:
             other_outside=bool(recent),
             photo=bool(recent),
             photo_left=photo_left,
-            after_outside=self._context.after_outside(conversation, message.id),
-            outside_notes=tuple(note.text for note in quoted),
-            private_notes=tuple(note.text for note in quoted if note.private),
+            after_outside=self._context.after_outside(whole, message.id),
+            outside_notes=tuple(note.text for note in held),
+            private_notes=tuple(note.text for note in held if note.private),
         )
         if quoted:  # this answer stays outside text once the notes have left her input
             self._context.mark_outside_notes(message.id)
         self._tools.replayed_reminders(turn)  # set before a restart cut this answer off: told now
         # code's video lines, last in the prompt: a kept video's (reading it again), a YouTube link in this message's
         # (what read_link reads); none on a call, so never with a call's glance
-        glance = "\n\n".join(part for part in (glance, self._tools.video_hint(message)) if part)
+        find_line = prompts.VIDEO_FIND_LINE.format(link=video_yes[0], request=video_yes[1]) if video_yes else ""
+        glance = "\n\n".join(part for part in (glance, self._tools.video_hint(message), find_line) if part)
+        if video_yes:  # the user's own typed YES (app: video_find): this one link, code's own, read as if they sent it
+            turn.unlocked = video_yes[0]
+            turn.allowed_links.append(video_yes[0])
         # on a call her rules leave out the list of what she can do (spoken sentences, never a list)
         on_call = message.text.startswith(prompts.CALL_MARK)
+        think = THINKING_TOKENS if thinking and not on_call else 0  # the tokens this answer's requests may add
+        thought = bool(think)  # this answer thinks (its numbers are logged), though a call may drop the thought
         messages = self._input(conversation, shown, glance, call=on_call)
         # the message answered: the last of the user's (the lookup retry puts code's line in it)
         newest = max((index for index, chat in enumerate(messages) if chat.get("role") == "user"), default=0)
@@ -623,9 +750,20 @@ class Brain:
             room = DOCUMENT_REPLY_TOKENS if turn.read_documents and max_tokens is None else limit_tokens
             with_document = turn.read_documents or message.text.startswith(prompts.DOCUMENT_MARK)
             path = "call" if on_call else "document" if with_document else "text"
-            # the request within the model's context, her answer's tokens with it: this answer's newest tool result is
-            # cut at its end when it would not fit (review of 0.9.8, guards-2)
-            messages, cut = self._context.fit_turn(messages, max(limit_tokens, room), newest + 1)
+            cap = max(limit_tokens, room)
+            if think and interrupt is not None and interrupt.is_set():  # a call or /thinking off (before this request)
+                if not calls and stoppable:
+                    raise Interrupted  # nothing of this answer has run: no request is sent
+                think = 0  # a tool has run, or the answer must finish: it finishes without the thought
+                log.info(
+                    "message %d: told to stop thinking (a call, or /thinking off); the rest of this answer does not think",
+                    message.id,
+                )
+            # the thought gets only the room this answer's messages leave (never the tool results': they are cut for a
+            # plain answer only); the request within the model's context, her answer's tokens with it: this answer's
+            # newest tool result is cut at its end when it would not fit (review of 0.9.8, guards-2)
+            thought_now = self._thought_room(messages, cap, think, message.id)
+            messages, cut = self._context.fit_turn(messages, cap + thought_now, newest + 1)
             if cut:
                 log.warning(
                     "message %d: over the model's context; %d characters of this answer's tool results cut",
@@ -633,15 +771,25 @@ class Brain:
                     cut,
                 )
             try:
-                completion = await self._complete(
-                    messages,
-                    allow_tools,
-                    max(limit_tokens, room),
-                    retrying,
-                    path=path,
-                    message_id=message.id,
-                    spent=spent,
+                completion = await _unless_interrupted(
+                    self._complete(
+                        messages,
+                        allow_tools,
+                        cap,
+                        retrying,
+                        path=path,
+                        message_id=message.id,
+                        spent=spent,
+                        thinking=thought_now,
+                    ),
+                    interrupt if thought_now else None,  # only a request that thinks is raced against a call
                 )
+            except Interrupted:
+                if not calls and stoppable:
+                    raise  # no tool has run: the app answers the message again (after the call, or without thinking)
+                think = 0  # the request on its way is cancelled: the same one again, without the thought
+                log.info("message %d: told to stop thinking (a call, or /thinking off); asked again plain", message.id)
+                continue
             except GemmaError as exc:  # what this answer already did is still told, in code's words (review I25)
                 exc.notes, exc.outside = _done_notes(turn)
                 raise
@@ -672,6 +820,10 @@ class Brain:
                     messages.append({"role": "tool", "tool_call_id": call.id, "content": result})
                 continue
             text, wrote_end_call = _filtered(completion.content, message.id)
+            reasoned = is_reasoning(text)
+            if reasoned:  # her own reasoning is no answer: code's device question while one waits, else a plain retry
+                log.warning("message %d: her answer was her own reasoning (%d chars); left out", message.id, len(text))
+                text, wrote_end_call = "", False
             # an answer sent back (the save nudge, the chords nudge) is set aside with its written end_call; an
             # end_call tool she called before it stands (review of 0.9.8, guards-4)
             ended_before = turn.end_call
@@ -748,6 +900,13 @@ class Brain:
             blank_chars = len(text) if text and blank(text) else 0  # only a rule or stray markup: no words of hers
             if blank_chars:
                 text = ""
+            # on a call, the device change this answer asked waits for the caller's yes: the call stays open for it (and
+            # ends after it on her end_call or the caller's goodbye), so her goodbye never stands before code's question
+            # (calls-099-01; the gate run of 4 Nov: all ten answers ended "Goodbye!"); before code's reminder line,
+            # which comes after her words
+            if (shorter := self._tools.without_goodbye(turn, text)) != text:
+                text = shorter
+                log.info("message %d: her closing goodbye left out; a device question waits for the yes", message.id)
             reminder = list(turn.reminder_notes)
             spoken = list(turn.reminder_spoken)
             # per answer, never across turns: a set_reminder that stored nothing gets code's line whatever she wrote;
@@ -829,6 +988,8 @@ class Brain:
                 or device_line
                 or (prompts.CHORDS_DONE if any(result.ok for result in turn.chords) else prompts.CONFUSED)
             )
+            if reasoned and text == prompts.CONFUSED:
+                turn.end_call = False  # asked to say it again: a call stays open for the caller's words
             # append only, her words stay: after a promise with no retry (late on a call), or a retry that still
             # promises; a retry that answered without a search left nothing undone (review G6)
             undone = lookup_checked and not calls and (not lookup_retried or only_promises_a_lookup(text))
@@ -840,6 +1001,14 @@ class Brain:
                 log.warning("message %d: no tool call after the lookup retry; code's line follows", message.id)
             if lookup:  # "Ask me again and I'll search." never ends the call (review of 0.9.7, C12)
                 turn.end_call = False
+            if thought:  # numbers only: the thought itself is never kept, logged or shown
+                log.info(
+                    "message %d: deep thinking: %s characters of thought (not kept), %s tokens, %.1f s",
+                    message.id,
+                    f"{sum(c.reasoning_chars for c in spent):,}",
+                    f"{sum(c.completion_tokens for c in spent):,}",
+                    sum(c.total_ms for c in spent) / 1000,
+                )
             return Reply(
                 text=text,
                 tool_calls=calls,
@@ -860,6 +1029,26 @@ class Brain:
                 lookup=lookup,
                 timing=Timing.of(spent),
             )
+
+    def _thought_room(self, messages: list[dict[str, Any]], cap: int, think: int, message_id: int) -> int:
+        """The tokens the next request of a thinking answer may add for its thought: `think`, or only what the model's
+        context leaves after these messages and the plain cap (review of 4 Nov, correctness-2: `enforce_limit` keeps the
+        thought's room free of the history, but this answer's tool results came after, and cutting them for it lost a
+        whole page a plain answer keeps), none below `THINKING_FLOOR` (that request does not think). With no context,
+        `think`. One line when it is less, numbers only."""
+        if not think:
+            return 0
+        left = self._context.room_left(messages, cap)
+        if left is None or left >= think:
+            return think
+        room = left if left >= THINKING_FLOOR else 0
+        log.info(
+            "message %d: deep thinking: room for %s of %s thought tokens after this answer's tool results",
+            message_id,
+            f"{max(room, 0):,}",
+            f"{think:,}",
+        )
+        return room
 
     def _chords_checked(
         self, text: str, turn: Turn, message: Message, before: Sequence[chord_checks.Result]
@@ -1032,11 +1221,14 @@ class Brain:
         max_tokens: int,
         tools: list[dict[str, Any]] | None,
         spent: list[Completion],
+        *,
+        effort: str = "none",
     ) -> tuple[Completion, float]:
-        """One Gemma call and the seconds it took; the completion is added to the answer's `spent`."""
+        """One Gemma call (`effort`: its reasoning effort, "none" unless Deep Thinking asks) and the seconds it took; the
+        completion is added to the answer's `spent`."""
         self._halt()
         started = self._clock()
-        completion = await self._gemma.chat(messages, max_tokens=max_tokens, tools=tools)
+        completion = await self._gemma.chat(messages, max_tokens=max_tokens, tools=tools, reasoning_effort=effort)
         spent.append(completion)
         return completion, self._clock() - started
 
@@ -1050,19 +1242,37 @@ class Brain:
         path: str,
         message_id: int,
         spent: list[Completion],
+        thinking: int = 0,
     ) -> Completion:
         """One Gemma call; an answer with neither text nor a usable tool call is retried once (`on_retry` first), and
         the retry's result is checked: a second empty one is a warning of its own, and the caller gives the confused
         line. Each try of an empty answer is one log line, metadata only (`_Shape`; `path`: call, text or
-        document)."""
+        document). `thinking`: the tokens a Deep Thinking request may add for its thought (0: none, as every other
+        request): one that was cut off at its limit and calls no tool (the thought ate the cap: no answer, or one cut
+        off mid-sentence) is asked once more as the same request without thinking, at the usual cap; an empty one that
+        was not cut is nudged, without thinking."""
         tools = self._offered(allow_tools)
-        completion, took = await self._timed(messages, max_tokens, tools, spent)
+        effort = THINKING_EFFORT if thinking else "none"
+        completion, took = await self._timed(messages, max_tokens + thinking, tools, spent, effort=effort)
         if not _has_images(messages):  # image tokens are counted by Ollama but not in our characters
             self._context.calibrate(messages, completion.prompt_tokens)
+        after_tool = bool(messages) and messages[-1].get("role") == "tool"
+        shape = _Shape(path, max_tokens + thinking, len(tools or ()), self._language(), after_tool)
+        if thinking and completion.finish_reason == "length" and not completion.tool_calls:
+            # the cap counts the thought and the answer together: one cut off with no words left, or in the middle of its
+            # sentence (review of 4 Nov, correctness-4: the cut-off words went out as they were), is asked once more
+            # as the same request without the thought
+            log.warning(
+                "message %d: deep thinking left %s; asking once more without thinking (%s)",
+                message_id,
+                "no answer" if blank(completion.content) else "her answer cut off",
+                shape.of(completion, 1, took),
+            )
+            return await self._complete(
+                messages, allow_tools, max_tokens, on_retry, path=path, message_id=message_id, spent=spent
+            )
         if _usable(completion, allow_tools):
             return completion
-        after_tool = bool(messages) and messages[-1].get("role") == "tool"
-        shape = _Shape(path, max_tokens, len(tools or ()), self._language(), after_tool)
         log.warning(
             "message %d: empty answer from Gemma; retrying once (%s)", message_id, shape.of(completion, 1, took)
         )
@@ -1071,6 +1281,7 @@ class Brain:
             *messages,
             {"role": "user", "content": prompts.EMPTY_NUDGE},
         ]  # an identical request may come back empty again
+        shape = replace(shape, max_tokens=max_tokens)  # the retry asks for the usual cap, without thinking
         retried, took = await self._timed(nudged, max_tokens, tools, spent)
         if _usable(retried, allow_tools):
             log.info(

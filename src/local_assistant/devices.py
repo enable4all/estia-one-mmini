@@ -28,6 +28,7 @@ from local_assistant.claims import about_earlier, names_music
 from local_assistant.config import Config, DeviceSpec
 from local_assistant.language import YES_WORDS, yes_form
 from local_assistant.part_status import PartStatus, Reason
+from local_assistant.prompts import CALL_MARK
 
 log = logging.getLogger(__name__)
 
@@ -45,6 +46,7 @@ COLOURS: dict[str, tuple[str, int]] = {
     "pink": ("hue", 320),
 }
 _YES = {"yes", "y", "ok", "okay", "ja", "ναι", "do it", "yes please", "👍"} | YES_WORDS  # the 11 languages' yes words
+YES = frozenset(_YES)  # the same set, for a found video's yes (video_find): one list of yes words
 # the start of code's note while a device waits for the yes: typed, or said on a call (where a typed yes waits for the
 # call's end, and the question ends with the call)
 _ASK_TYPED = "reply yes within"
@@ -53,6 +55,10 @@ _ASKS = (_ASK_TYPED, _ASK_SPOKEN)
 # why a call's standby dropped a waiting change, in code's note ("heater not switched off: …"; the second deep scan of
 # 0.9.8, dialogue-standby-drops-yes-silently: a yes after the pause switched nothing, and nothing said why)
 LAPSED_IN_STANDBY = "no yes came before the call went quiet"
+LAPSED_UNHEARD = "my voice could not ask it on the call"  # Pocket TTS could not say the question (the review of 4 Nov)
+# a text's question that a yes said on the call would have answered: an answer that finished while the call was on had
+# asked it as a text, never on the call (the review of 4 Nov, calls-1)
+LAPSED_TEXTED = "the question went as a text, never asked on the call"
 _LOGIN = "The TP-Link login failed: run scripts/set-tapo-credentials.sh on the Mac."
 _NOT_ANSWERING = "isn't answering (switched off at the wall, or a new address?)"
 _HELPER_FAILED = "The device helper failed."
@@ -134,6 +140,7 @@ class _Pending:
     change: Change
     at: float
     aci: str  # only this person's yes counts
+    spoken: bool = False  # asked on a call: a yes said on a call answers only a question asked on one
 
 
 # a message with one of these words (or a word of a device's name) is about lights and plugs; a change asked for in
@@ -400,7 +407,7 @@ class Devices:
         request came in an answer that read outside text (a mail, page or file), so even a normal device waits
         for the user's yes; `held`: that hold's reason when it is another ("a photo is shown with this message");
         `unasked`: the user's message is not about devices (see `about_devices`), likewise. `spoken`: the request came
-        on a call, so the user is asked to say yes."""
+        on a call, so the user is asked to say yes; a yes said on a call answers only such a question (`confirm`)."""
         spec = self.find(name)
         if power not in (None, "on", "off"):
             return 'Power must be "on" or "off".'
@@ -428,7 +435,7 @@ class Devices:
                     f"Not done: {waiting.spec.name} {waiting.change.text()} is still waiting for the user's yes; "
                     "one device at a time."
                 )
-            self._pending = _Pending(spec, change, self._clock(), aci)
+            self._pending = _Pending(spec, change, self._clock(), aci, spoken)
             minutes = round(self._confirm_seconds / 60)
             within = f"{minutes} minute{'s' if minutes != 1 else ''}"
             # the user reads in the bridge's own note exactly what their yes will do: one question, the one waiting
@@ -473,12 +480,22 @@ class Devices:
 
     async def confirm(self, text: str, aci: str = "") -> str | None:
         """The asked user's next message after an "ask first" request: a clear yes in time carries it out (what
-        happened comes back); anything else cancels it and the message is handled as usual (None)."""
+        happened comes back); anything else cancels it and the message is handled as usual (None). A message said on a
+        call never answers a question that went out as a text (an answer that finished while the call was on): the
+        caller did not hear it, so it is dropped and code's next note says why (`LAPSED_TEXTED`)."""
         pending, self._pending = self._pending, None
         if pending is None:
             return None
         self._done = [line for line in self._done if not line.startswith(_ASKS)]  # answered now
-        if self._expired(pending) or not _is_yes(text) or (pending.aci and aci and aci != pending.aci):
+        elsewhere = bool(pending.aci and aci and aci != pending.aci)  # another person's message
+        if text.lstrip().startswith(CALL_MARK) and not pending.spoken and not elsewhere and not self._expired(pending):
+            self._done.append(f"{pending.spec.name} not switched {pending.change.text()}: {LAPSED_TEXTED}")
+            log.info(
+                "device action for %s cancelled: its question went as a text, never asked on the call",
+                pending.spec.name,
+            )
+            return None
+        if self._expired(pending) or not _is_yes(text) or elsewhere:
             log.info("device action for %s cancelled", pending.spec.name)
             return None
         result = await self._execute(pending.spec, pending.change)

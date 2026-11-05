@@ -8,6 +8,11 @@ a while; Brave gets at most one request a second (its free plan's limit), and at
 calendar month whatever the config says (`BRAVE_MONTHLY_MAX`), its try again included: its free plan is a $5 monthly
 credit (about 1,000 searches) that bills the card beyond it. A key other programs use too, or a billing month that
 does not start on the 1st, can still go past the credit: only this install's searches are counted.
+
+The video search for a named show, channel or topic (`search_videos`, find_video: code's, never Gemma's tool) asks
+Brave first, as its results carry a video's channel and length (`video.creator`, `video.duration`), with Ollama as the
+backup (title and link only). It reads no page and keeps no text beyond a title, a link, a channel and a length; Gemma's
+`search` is as it was, Brave's video data never read there.
 """
 
 from __future__ import annotations
@@ -39,6 +44,10 @@ OLLAMA_URL = "https://ollama.com/api/web_search"
 BRAVE_URL = "https://api.search.brave.com/res/v1/web/search"
 MAX_RESULTS = 5
 QUICK_RESULTS = 3  # on a call
+VIDEO_BRAVE_RESULTS = 20  # code's own video search asks for more: the song's own match is ranked out of them
+VIDEO_OLLAMA_RESULTS = 10  # Ollama's most
+VIDEO_LINKS = 60  # kept of Brave's web results and video cluster together
+VIDEO_TEXT_CHARS = 320  # a video's title or channel, cut first: the cleaning stays cheap (the match cleans it)
 TITLE_CHARS = 150
 RESULT_CHARS = 1_200
 PAGE_CHARS = 2_000  # from Brave's top page, added to its description
@@ -59,6 +68,7 @@ _TAG = re.compile(r"<[^<>]{1,20}>")  # Brave's <strong> highlights
 _HOST = re.compile(r"[a-z0-9.-]+")
 _ODD = frozenset({"Cc", "Cf", "Co", "Cs", "Zs", "Zl", "Zp"})  # hidden, control and space characters
 _DATE = re.compile(r"\d{4}-\d\d-\d\d")
+_CLOCK = re.compile(r"[0-9]{1,3}(?::[0-9]{2}){1,2}")  # Brave's video length: "05:30", "5:30", "1:02:03"
 # private details that never go into a query (an answer's private text could otherwise leave the house)
 _PRIVATE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")  # an email address
 _LONG_NUMBER = re.compile(r"(?:\d[\s().-]?){9,}")  # phone, account or card numbers (a date has 8 digits)
@@ -92,6 +102,25 @@ class WebResults:
 
 
 @dataclass(frozen=True)
+class VideoResult:
+    """One link of code's own video search: the title and link as the service gave them, and what only Brave's video
+    data adds: the channel ("" when not given), the length in seconds (None when not given) and the day Brave dates the
+    page (`page_age`; "" when not given)."""
+
+    title: str
+    url: str
+    channel: str = ""
+    seconds: int | None = None
+    date: str = ""  # Brave's `page_age` as its day ("2026-10-28"); "" when not given or not a day
+
+
+@dataclass(frozen=True)
+class VideoResults:
+    provider: str  # "Brave", "Ollama" (title and link only) or the one that answered with nothing
+    results: tuple[VideoResult, ...]
+
+
+@dataclass(frozen=True)
 class Limits:
     """Seconds per request; on a call ("quick") the whole turn has about 45 s."""
 
@@ -106,14 +135,16 @@ DEFAULT_LIMITS = Limits()
 
 
 @dataclass(frozen=True)
-class _Answer:
+class _Answer[T]:
     status: int  # 0: no answer (network error, timeout)
     headers: dict[str, str]
-    items: list[tuple[object, object, str, str]] | None  # title, url, date, text; None: unreadable or failed
+    items: list[T] | None  # Gemma's search: (title, url, date, text); None: unreadable or failed
 
 
 class Searcher(Protocol):
     async def search(self, query: str, *, quick: bool = False) -> WebResults: ...
+
+    async def search_videos(self, query: str) -> VideoResults: ...
 
 
 def _this_month() -> str:
@@ -160,6 +191,20 @@ class WebSearch:
     async def search(self, query: str, *, quick: bool = False) -> WebResults:
         """Up to 5 results (3 on a call) for the query; ValueError for a bad query, WebSearchError when no service
         answers. `quick`: on a call, with shorter limits and no page reading."""
+        query, ollama, brave = self._checked(query)
+        self._problem = None
+        return self._answered(await self._first_answer(query, ollama, brave, quick))
+
+    async def search_videos(self, query: str) -> VideoResults:
+        """Song parts' own search for a named song: up to 20 links, Brave first (a video's channel and length), Ollama
+        as the backup (title and link only). Never a page read, never Gemma's path; ValueError and WebSearchError as
+        `search` raises them."""
+        query, ollama, brave = self._checked(query)
+        self._problem = None
+        return self._answered(await self._first_video_answer(query, ollama, brave))
+
+    def _checked(self, query: str) -> tuple[str, str, str]:
+        """The query as one line and the two keys, after the checks every search makes before any request."""
         query = " ".join(query.split())
         if not query:
             raise ValueError("the search words are empty.")
@@ -175,8 +220,10 @@ class WebSearch:
         if not brave and not ollama:
             self._status.failed("web", "no_key")
             raise WebSearchError(NO_KEYS)
-        self._problem = None
-        found = await self._first_answer(query, ollama, brave, quick)
+        return query, ollama, brave
+
+    def _answered[R](self, found: R | None) -> R:
+        """What a search found, recorded as the web part's state; WebSearchError when no service answered."""
         if found is not None:
             self._status.ok("web")
             return found
@@ -201,6 +248,22 @@ class WebSearch:
                 return WebResults("Brave", found)
             answered = "Brave" if found is not None else answered
         return WebResults(answered, ()) if answered else None
+
+    async def _first_video_answer(self, query: str, ollama: str, brave: str) -> VideoResults | None:
+        """Brave first, Ollama as the backup; None when no service answered."""
+        answered = ""  # a service that answered, if only with nothing
+        if brave and self._brave_used() < self._brave_cap and not self._is_paused("Brave"):
+            videos = await self._brave_asked(query, brave, VIDEO_BRAVE_RESULTS, False, _brave_video_items)
+            if videos:
+                return VideoResults("Brave", tuple(videos))
+            answered = "Brave" if videos is not None else answered
+        if ollama and not self._is_paused("Ollama"):
+            items = await self._ollama_asked(query, ollama, VIDEO_OLLAMA_RESULTS, False)
+            links = _ollama_video_results(items)
+            if links:
+                return VideoResults("Ollama", links)
+            answered = "Ollama" if links is not None else answered
+        return VideoResults(answered, ()) if answered else None
 
     def usage(self) -> str:
         """One status line: searches today (Ollama) and this month (Brave), keys, and paused services."""
@@ -231,6 +294,11 @@ class WebSearch:
         log.warning("web search: %s paused for %d min (%s)", provider, math.ceil(seconds / 60), why)
 
     async def _ollama(self, query: str, key: str, count: int, quick: bool) -> tuple[WebResult, ...] | None:
+        return _results(await self._ollama_asked(query, key, count, quick), query, count)
+
+    async def _ollama_asked(
+        self, query: str, key: str, count: int, quick: bool
+    ) -> list[tuple[object, object, str, str]] | None:
         self._count(f"web_ollama_{self._day()}")
         headers = {"Content-Type": "application/json", "Authorization": f"Bearer {key}"}
         body = json.dumps({"query": query, "max_results": count}).encode()
@@ -240,9 +308,14 @@ class WebSearch:
             self._pause("Ollama", BUSY_PAUSE_SECONDS, "too many requests")
         elif answer.status in (401, 402, 403):
             self._pause("Ollama", REFUSED_PAUSE_SECONDS, f"key refused, HTTP {answer.status}")
-        return _results(answer.items, query, count)
+        return answer.items
 
     async def _brave(self, query: str, key: str, count: int, quick: bool) -> tuple[WebResult, ...] | None:
+        return _results(await self._brave_asked(query, key, count, quick, _brave_items), query, count)
+
+    async def _brave_asked[T](
+        self, query: str, key: str, count: int, quick: bool, parse: Callable[[Any], list[T] | None]
+    ) -> list[T] | None:
         params = {
             "q": query,
             "count": count,
@@ -260,12 +333,12 @@ class WebSearch:
             if wait > 0:
                 await self._sleep(wait)
             self._count(self._month_key())  # a failed request may still count
-            answer = await self._ask("Brave", "GET", url, headers, None, limit, _brave_items)
+            answer = await self._ask("Brave", "GET", url, headers, None, limit, parse)
             self._brave_last = self._clock()
             if answer.status in (401, 402, 403):
                 self._pause("Brave", REFUSED_PAUSE_SECONDS, f"key refused, HTTP {answer.status}")
             if answer.status != 429:
-                return _results(answer.items, query, count)
+                return answer.items
             per_month = _pair(answer.headers.get("x-ratelimit-remaining", ""))[1]
             if per_month == 0:
                 reset = _pair(answer.headers.get("x-ratelimit-reset", ""))[1]
@@ -313,7 +386,7 @@ class WebSearch:
     def _count(self, key: str) -> None:
         self._store.set_state(key, str(self._counted(key) + 1))
 
-    async def _ask(
+    async def _ask[T](
         self,
         provider: str,
         method: str,
@@ -321,8 +394,8 @@ class WebSearch:
         headers: dict[str, str],
         body: bytes | None,
         limit: float,
-        parse: Callable[[Any], list[tuple[object, object, str, str]] | None],
-    ) -> _Answer:
+        parse: Callable[[Any], list[T] | None],
+    ) -> _Answer[T]:
         """One request; never raises (logged as metadata only)."""
         try:
             answer = await asyncio.wait_for(self._http(method, url, headers, body, socket_timeout=limit), limit)
@@ -469,6 +542,71 @@ def _ollama_items(body: Any) -> list[tuple[object, object, str, str]] | None:
             content = item.get("content")
             items.append((item.get("title"), item.get("url"), "", content if isinstance(content, str) else ""))
     return items
+
+
+def _video_text(value: object) -> str:
+    return value[:VIDEO_TEXT_CHARS] if isinstance(value, str) else ""
+
+
+def _duration(value: object) -> int | None:
+    """Brave's video length ("05:30", "1:02:03") in seconds; None for anything else, and for no length at all."""
+    if not isinstance(value, str) or not _CLOCK.fullmatch(value := value.strip()):
+        return None
+    *rest, seconds = (int(part) for part in value.split(":"))
+    if seconds > 59 or any(part > 59 for part in rest[1:]):
+        return None
+    total = seconds + sum(part * 60 ** (index + 1) for index, part in enumerate(reversed(rest)))
+    return total or None
+
+
+def _day(value: object) -> str:
+    """Brave's `page_age` ("2026-10-28T10:00:00") as its day; "" for anything else."""
+    return value[:10] if isinstance(value, str) and _DATE.fullmatch(value[:10]) else ""
+
+
+def _brave_video_items(body: Any) -> list[VideoResult] | None:
+    """Brave's web results and its video cluster, each with the channel (`video.creator`) and the length
+    (`video.duration`) its video data gives; a link or a title that is no text is left out or empty."""
+    if not isinstance(body, dict):
+        return None
+    sections = [body.get("web"), body.get("videos")]
+    lists = [
+        section["results"]
+        for section in sections
+        if isinstance(section, dict) and isinstance(section.get("results"), list)
+    ]
+    if not lists:
+        return [] if sections == [None, None] and body.get("type") == "search" else None
+    found: list[VideoResult] = []
+    for item in (item for results in lists for item in results):
+        if not isinstance(item, dict):
+            continue
+        url = item.get("url")
+        if not isinstance(url, str) or len(url) > 2_000:
+            continue
+        data = item.get("video")
+        data = data if isinstance(data, dict) else {}
+        found.append(
+            VideoResult(
+                _video_text(item.get("title")),
+                url.strip(),
+                _video_text(data.get("creator")).strip(),
+                _duration(data.get("duration")),
+                _day(item.get("page_age")),
+            )
+        )
+    return found[:VIDEO_LINKS]
+
+
+def _ollama_video_results(items: list[tuple[object, object, str, str]] | None) -> tuple[VideoResult, ...] | None:
+    """Ollama's results as video links: a title and a link, never a channel or a length; None stays None."""
+    if items is None:
+        return None
+    return tuple(
+        VideoResult(_video_text(title), url.strip())
+        for title, url, _, _ in items
+        if isinstance(url, str) and len(url) <= 2_000
+    )
 
 
 def sources(searches: Sequence[WebResults]) -> list[tuple[str, str]]:

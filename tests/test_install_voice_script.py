@@ -1,22 +1,21 @@
-"""scripts/install-voice-daemon.sh warns on macOS 27.0.x (an Apple bug that can crash English speech, seen on 27.0.1:
-the review of 28 Oct, calls-03), before anything else. Estia needs macOS 27 or later (owner, 29 Oct): no 26.x line.
-`sw_vers` is a stub at its full path in a test's fake tree (ESTIA_TEST_ROOT), which holds no own-user install, so the
-script stops right after, and no sudo is ever run."""
+"""scripts/install-voice-daemon.sh warns about nothing on any macOS: its macOS 27.0.x warning was about an Apple bug
+that crashed Kokoro's English speech, and Kokoro was removed (owner, 3 Nov 2026). Estia needs macOS 27 or later (owner,
+29 Oct): no 26.x line. A test's fake tree (ESTIA_TEST_ROOT) holds no own-user install, so the script stops at its
+first check, and no sudo is ever run."""
 
 import subprocess
 from pathlib import Path
 
 import pytest
 
+from local_assistant import prompts
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
-@pytest.mark.parametrize(
-    ("version", "seen"),
-    [("26.4", False), ("26.5.1", False), ("27.0", True), ("27.0.1", True), ("27.1", False)],
-)
-def test_the_install_warns_on_macos_27_0(tmp_path: Path, version: str, seen: bool) -> None:
-    stubs = tmp_path / "root/usr/bin"  # the script reads /usr/bin/sw_vers by its full path: never one on your PATH
+@pytest.mark.parametrize("version", ["26.4", "27.0", "27.0.1", "27.1"])
+def test_the_install_warns_about_no_macos_version(tmp_path: Path, version: str) -> None:
+    stubs = tmp_path / "root/usr/bin"  # a sw_vers stub at its full path: never read now
     stubs.mkdir(parents=True)
     (stubs / "sw_vers").write_text(f'#!/bin/sh\n[ "$1" = -productVersion ] && echo {version}\n')
     (stubs / "sw_vers").chmod(0o755)
@@ -27,11 +26,7 @@ def test_the_install_warns_on_macos_27_0(tmp_path: Path, version: str, seen: boo
         text=True,
         check=False,
     )
-    assert done.returncode == 1 and "her own macOS account comes first" in done.stderr
-    assert "26.6" not in done.stderr
-    assert ("was seen on macOS 27.0.1; no fix yet" in done.stderr) is seen
-    assert "27.0.1 too" not in done.stderr  # the 26.4 and 26.5 lines it followed are gone (words review, 30 Oct)
-    assert ("Kokoro" in done.stderr) is seen
+    assert done.returncode == 1 and done.stderr == "her own macOS account comes first: scripts/install-daemon.sh\n"
 
 
 def installed(tmp_path: Path, state: str, *, refused: bool = False) -> tuple[Path, Path, dict[str, str]]:
@@ -105,6 +100,17 @@ def test_a_failed_voice_says_so_and_the_check_later_is_her_wrappers(tmp_path: Pa
     assert "the service keeps going, and calls work once her voice is ready." in done.stderr
     assert "Check later: /usr/bin/sudo /usr/local/estia/bin/estia check" in done.stderr
     assert "curl -s http" not in done.stderr  # your own curl would be refused
+
+
+def test_a_voice_resting_after_failed_runs_is_no_failure(tmp_path: Path) -> None:
+    """The review of 4 Nov: Pocket TTS resting after failed or late runs (a busy Mac) is tried again on its own; the
+    wait reads on, and at its end says so with the loading exit (3), never "voice: failed" (exit 1). Setup's window
+    says it in the same words (prompts.SETUP_VOICE_RESTING)."""
+    _log, _mine, env = installed(tmp_path, '{"stt":"ready","tts":"resting","pocket":"unavailable"}')
+    done = run_install(env)
+    assert done.returncode == 3 and "voice: failed" not in done.stderr
+    resting = prompts.SETUP_VOICE_RESTING.format(state='{"stt":"ready","tts":"resting","pocket":"unavailable"}')
+    assert done.stderr.strip() == resting
 
 
 def test_a_refused_admin_command_says_her_voice_was_not_read(tmp_path: Path) -> None:

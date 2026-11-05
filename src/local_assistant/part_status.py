@@ -59,6 +59,7 @@ Reason = Literal[
     "login",
     "unsupported",
     "loading",
+    "not_working",
     "bad_answer",
     "no_consent",
     "not_shared",

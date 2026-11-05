@@ -11,6 +11,8 @@ private final class Spy: @unchecked Sendable {
     private var _runs: [(argv: [String], environment: [String: String], input: String, seconds: TimeInterval)] = []
     private var _waits: [TimeInterval] = []
     var answer: ProgramResult
+    /// A run whose argv names a file ending in `suffix` (a voice's) gets `result`, not `answer`.
+    var failing: (suffix: String, result: ProgramResult)?
 
     init(answer: ProgramResult) { self.answer = answer }
 
@@ -22,6 +24,7 @@ private final class Spy: @unchecked Sendable {
     func ran(_ argv: [String], _ environment: [String: String], _ input: Data, _ seconds: TimeInterval) -> ProgramResult {
         lock.withLock {
             _runs.append((argv, environment, String(decoding: input, as: UTF8.self), seconds))
+            if let failing, argv.contains(where: { $0.hasSuffix(failing.suffix) }) { return failing.result }
             return answer
         }
     }
@@ -225,7 +228,7 @@ private func programWAV(_ samples: [Int16]) -> Data {
 
     /// Owner, 25 Oct ("could I try Jane also for a bit?"): a second voice beside eve in the same model. Its file is
     /// fetched and checked with the model's, a line runs with the asked voice's file and comes out at that voice's own
-    /// gain, and a voice the model does not have is never run (Kokoro says that line).
+    /// gain, and a voice the model does not have is never run (no other voice says that line).
     @Test func eachVoiceSpeaksFromItsOwnFileAtItsOwnGain() async throws {
         let models = models()
         defer { try? FileManager.default.removeItem(at: models) }
@@ -241,7 +244,7 @@ private func programWAV(_ samples: [Int16]) -> Data {
         await pocket.load()
         #expect(await pocket.state == .ready)
         #expect(spy.downloads == ["pocket-tts/test/weights", "pocket-tts/test/tokenizer", "pocket-tts/test/eve", "pocket-tts/test/jane"])
-        #expect(spy.runs.map(\.input) == ["Ready."])  // the first run is eve's: the first voice by name
+        #expect(spy.runs.map(\.input) == ["Ready."])  // the first run is eve's: the first fetched voice by name
         let real = PocketRun.real(models).path
         let (eveRun, janeRun) = (try await pocket.speak("Hi.", voice: "eve"), try await pocket.speak("Hi.", voice: "jane"))
         #expect(spy.runs[1].argv.contains("\(real)/pocket-tts/test/eve/eve.safetensors"))
@@ -277,7 +280,7 @@ private func programWAV(_ samples: [Int16]) -> Data {
     /// voice service (`PocketVoice.bundled`) is never fetched: its file is copied from the voice service's own
     /// resources beside its program (`PocketTTS.resources`: no download, no network) into its folder beside the other
     /// voices, then checked by its sha256 as they are, and run from there. Not there, or other bytes there, only its
-    /// own lines are Kokoro's (the next test); a copy changed in the models folder is set aside and copied again.
+    /// own lines are not said (the next test); a copy changed in the models folder is set aside and copied again.
     @Test func aShippedVoiceIsCopiedFromBesideTheVoiceServiceNeverFetched() async throws {
         let models = models()
         defer { try? FileManager.default.removeItem(at: models) }
@@ -292,6 +295,11 @@ private func programWAV(_ samples: [Int16]) -> Data {
         await pocket.load()
         #expect(await pocket.state == .ready)
         #expect(spy.downloads == ["pocket-tts/test/weights", "pocket-tts/test/tokenizer", "pocket-tts/test/eve"])  // never heart's
+        // its first runs: the model's in eve (the first fetched voice by name), then heart's own once
+        let real = PocketRun.real(models).path
+        try #require(spy.runs.map(\.input) == ["Ready.", "Ready."])
+        #expect(spy.runs[0].argv.contains("\(real)/pocket-tts/test/eve/eve.safetensors"))
+        #expect(spy.runs[1].argv.contains("\(real)/pocket-tts/test/heart/heart.safetensors"))
         let copy = models.appendingPathComponent("pocket-tts/test/heart/heart.safetensors")
         #expect(try String(contentsOf: copy, encoding: .utf8) == "h")
         let wav = try await pocket.speak("Hi.", voice: "heart")
@@ -345,7 +353,7 @@ private func programWAV(_ samples: [Int16]) -> Data {
     /// The review of 27 Oct (swift-voice-1): the native build (Swift 6.2's default, `--build-system native`) lays the
     /// voice service's bundle out flat, its files at the bundle's top, where the default build of Swift 6.4
     /// (swiftbuild) puts them in Contents/Resources. Such a Mac's voice service reads heart's file there too (as
-    /// Foundation reads the bundle), so heart is ready, never Kokoro's for the bundle's layout.
+    /// Foundation reads the bundle), so heart is ready, never unsaid for the bundle's layout.
     @Test func aFlatBundleBesideTheVoiceServiceGivesHeartToo() async throws {
         let models = models()
         defer { try? FileManager.default.removeItem(at: models) }
@@ -368,7 +376,7 @@ private func programWAV(_ samples: [Int16]) -> Data {
     /// The review of 27 Oct (swift-voice-2, CALLS-2): a shipped voice's file that is not beside the voice service, or
     /// not the pinned one there, is only an update's to put right, so it never takes the model's other voices down
     /// and no timer tries it again: the model is ready, eve (and jane, alba, michael on a real Mac) speak Pocket's, and
-    /// a line in heart is Kokoro's (`notReady`), never a failed run counted towards a rest. Nothing is fetched in its
+    /// a line in heart is not said (`notReady`), never a failed run counted towards a rest. Nothing is fetched in its
     /// place and it is never run.
     @Test func aMissingShippedVoiceLeavesTheOtherVoicesReady() async throws {
         let models = models()
@@ -393,6 +401,7 @@ private func programWAV(_ samples: [Int16]) -> Data {
             }
             #expect(spy.runs.count == 2)  // heart never run
             #expect(await pocket.state == .ready && spy.waits.isEmpty)  // no rest, no timer
+            #expect(await pocket.leftOut == ["heart"])  // /health lists it: a call in heart is not picked up
             _ = try await pocket.speak("Hi.", voice: "eve")  // eve still Pocket's
             #expect(spy.runs.count == 3 && !spy.runs.contains { $0.argv.contains("\(real)/pocket-tts/test/heart/heart.safetensors") })
             if bytes == nil { #expect(!FileManager.default.fileExists(atPath: copy.path)) }
@@ -402,8 +411,69 @@ private func programWAV(_ samples: [Int16]) -> Data {
         let spy = Spy(answer: ProgramResult(output: programWAV([1000, -2000])))
         let fixed = try speaker(models, spy, programs: programs, model: withHeart)
         await fixed.load()
+        #expect(await fixed.leftOut.isEmpty)
         _ = try await fixed.speak("Hi.", voice: "heart")
         #expect(spy.runs.last?.argv.contains("\(real)/pocket-tts/test/heart/heart.safetensors") == true)
+    }
+
+    /// The release review of 0.9.8 (V01): the first run ("Ready.") was the first voice by name only, so heart, the
+    /// default voice, never ran at load. A shipped file with its pinned bytes that fails every run (a state the program
+    /// rejects) left load ready; heart's first three lines failed and rested the whole model, so jane, eve, alba and
+    /// michael were Kokoro's for 1 to 30 minutes. Now each shipped voice says "Ready." once at load, after the model's
+    /// first run in a fetched voice: one that fails (an exit, a signal, too much audio, no WAV) is set aside as a
+    /// missing one is (its lines not said, never run, no rest, no timer) until the next start, which tries it again. A
+    /// run past its time limit (a busy Mac) is not a broken file: that voice is not set aside.
+    @Test func aShippedVoiceThatFailsItsFirstRunLeavesTheOtherVoicesReady() async throws {
+        let models = models()
+        defer { try? FileManager.default.removeItem(at: models) }
+        let programs = try programs(models)
+        try write("h", to: programs.appendingPathComponent(PocketTTS.bundle).appendingPathComponent("Contents/Resources/heart.safetensors"))
+        let real = PocketRun.real(models).path
+        let (eveFile, heartFile) = ("\(real)/pocket-tts/test/eve/eve.safetensors", "\(real)/pocket-tts/test/heart/heart.safetensors")
+        let spy = Spy(answer: ProgramResult(output: programWAV([1000, -2000])))
+        spy.failing = ("/pocket-tts/test/heart/heart.safetensors", ProgramResult(status: 1))
+        let pocket = try speaker(models, spy, programs: programs, model: withHeart)
+        await pocket.load()
+        #expect(await pocket.state == .ready)
+        try #require(spy.runs.map(\.input) == ["Ready.", "Ready."])
+        #expect(spy.runs[0].argv.contains(eveFile) && spy.runs[1].argv.contains(heartFile))
+        for _ in 0..<(PocketTTS.failuresBeforeRest + 1) {
+            await #expect(throws: PocketFailure.notReady("shipped voice heart failed its first run (exit 1)")) {
+                try await pocket.speak("Hi.", voice: "heart")
+            }
+        }
+        #expect(spy.runs.count == 2)  // heart never run again
+        #expect(await pocket.state == .ready && spy.waits.isEmpty)  // no rest, no timer
+        _ = try await pocket.speak("Hi.", voice: "eve")  // eve still Pocket's
+        #expect(spy.runs.count == 3)
+        // the next start tries it again: a file that runs now speaks heart
+        spy.failing = nil
+        let next = try speaker(models, spy, programs: programs, model: withHeart)
+        await next.load()
+        #expect(await next.state == .ready && spy.runs.dropFirst(3).map(\.input) == ["Ready.", "Ready."])
+        _ = try await next.speak("Hi.", voice: "heart")
+        try #require(spy.runs.count == 6)
+        #expect(spy.runs[5].argv.contains(heartFile))
+        // heart's first run past its time limit: ready, heart not set aside, its next line runs
+        spy.failing = ("/pocket-tts/test/heart/heart.safetensors", ProgramResult(signalled: true, timedOut: true))
+        let late = try speaker(models, spy, programs: programs, model: withHeart)
+        await late.load()
+        #expect(await late.state == .ready && spy.runs.dropFirst(6).map(\.input) == ["Ready.", "Ready."])
+        spy.failing = nil
+        _ = try await late.speak("Hi.", voice: "heart")
+        try #require(spy.runs.count == 9)
+        #expect(spy.runs[8].argv.contains(heartFile))
+        #expect(await late.state == .ready && spy.waits.isEmpty)
+        // a signal or output that is no WAV sets it aside as an exit does
+        for (result, why) in [(ProgramResult(status: 9, signalled: true), "signal 9"), (ProgramResult(output: Data("no".utf8)), "short")] {
+            spy.failing = ("/pocket-tts/test/heart/heart.safetensors", result)
+            let broken = try speaker(models, spy, programs: programs, model: withHeart)
+            await broken.load()
+            #expect(await broken.state == .ready, "\(why)")
+            await #expect(throws: PocketFailure.notReady("shipped voice heart failed its first run (\(why))")) {
+                try await broken.speak("Hi.", voice: "heart")
+            }
+        }
     }
 
     /// The files the voice service ships for heart (owner, 27 Oct: its file in the public repository, "yes"; 29 Oct, the
@@ -428,7 +498,7 @@ private func programWAV(_ samples: [Int16]) -> Data {
     }
 
     /// The review of 24 Oct: the program lived in her home, where any program of hers could change it. It is only
-    /// ever beside the voice service now (a deploy puts it there): none there, unavailable (Kokoro speaks, nothing of
+    /// ever beside the voice service now (a deploy puts it there): none there, unavailable (no other voice speaks, nothing of
     /// the model fetched, tried again later); other bytes, refused, never run, never moved or fetched over.
     @Test func theProgramIsOnlyTakenFromBesideTheVoiceService() async throws {
         let models = models()
@@ -437,6 +507,7 @@ private func programWAV(_ samples: [Int16]) -> Data {
         let none = try speaker(models, spy, programs: try programs(models, missing: true))
         await none.load()
         #expect(await none.state == .unavailable && spy.downloads.isEmpty && spy.runs.isEmpty)
+        #expect(!(await none.resting))  // no program: /health says "failed", never "resting"
         await #expect(throws: PocketFailure.notReady("unavailable")) { try await none.speak("Hi.", voice: "eve") }
         for _ in 0..<200 where spy.waits.isEmpty { try await Task.sleep(nanoseconds: 5_000_000) }
         #expect(spy.waits.first == 60)
@@ -449,7 +520,7 @@ private func programWAV(_ samples: [Int16]) -> Data {
         #expect(try FileManager.default.contentsOfDirectory(atPath: changed.path) == ["pocket-tts"])
     }
 
-    /// Offline at the first start: unavailable (Kokoro speaks), tried again after 1 minute, then ready.
+    /// Offline at the first start: unavailable (no other voice speaks), tried again after 1 minute, then ready.
     @Test func offlineItRestsAndTriesAgain() async throws {
         let models = models()
         defer { try? FileManager.default.removeItem(at: models) }
@@ -457,6 +528,7 @@ private func programWAV(_ samples: [Int16]) -> Data {
         let pocket = try speaker(models, spy, offline: true)
         await pocket.load()
         #expect(await pocket.state == .unavailable)
+        #expect(!(await pocket.resting))  // files missing: "failed"
         await #expect(throws: PocketFailure.notReady("unavailable")) { try await pocket.speak("Hi.", voice: "eve") }
         for _ in 0..<200 where spy.waits.isEmpty { try await Task.sleep(nanoseconds: 5_000_000) }
         #expect(spy.waits.first == 60)
@@ -474,7 +546,7 @@ private func programWAV(_ samples: [Int16]) -> Data {
         await #expect(throws: PocketFailure.notReady("refused")) { try await pocket.speak("Hi.", voice: "eve") }
     }
 
-    /// A checked file that changes after the start is never run: that line is Kokoro's, and the files are checked
+    /// A checked file that changes after the start is never run: that line is not said, and the files are checked
     /// again (here: fetched fresh, the right bytes).
     @Test func aFileChangedAfterItsCheckStopsTheRun() async throws {
         let models = models()
@@ -527,8 +599,8 @@ private func programWAV(_ samples: [Int16]) -> Data {
     }
 
     /// The review of 26 Oct (R1-F2): the English speaker's check and fetch start before Whisper's load (on a first
-    /// start a download and a compile of about 15 minutes) and Kokoro's, so "My voice is ready" (both ready) does not
-    /// go out long before her Pocket voice; its first run is on Pocket's own queue, never the one they share.
+    /// start a download and a compile of about 15 minutes), so "My voice is ready" (both ready) does not wait for
+    /// Whisper and then her Pocket voice; its first run is on Pocket's own queue, never Whisper's.
     @Test func herPocketVoiceLoadsWhileWhisperLoads() async throws {
         let models = models()
         defer { try? FileManager.default.removeItem(at: models) }
@@ -538,8 +610,8 @@ private func programWAV(_ samples: [Int16]) -> Data {
         await startEngines(pockets: [pocket], listening: {
             for _ in 0..<400 where spy.downloads.isEmpty { try? await Task.sleep(nanoseconds: 5_000_000) }
             order.add(spy.downloads.isEmpty ? "listening ready, nothing of Pocket fetched" : "listening ready, Pocket fetching")
-        }, speaking: { order.add("speaking ready") })
-        #expect(order.all == ["listening ready, Pocket fetching", "speaking ready"])
+        })
+        #expect(order.all == ["listening ready, Pocket fetching"])
         for _ in 0..<400 where await pocket.state != .ready { try await Task.sleep(nanoseconds: 5_000_000) }
         #expect(await pocket.state == .ready)
     }
@@ -547,7 +619,7 @@ private func programWAV(_ samples: [Int16]) -> Data {
     /// Owner, 25 Oct ("the pocket language models we download in Estia only if they are requested right?"): a
     /// language's model (jane in French, German, Italian, Spanish, Portuguese or Dutch) is fetched only for the language
     /// in use. It is idle at every start, its files there or not (nothing checked, fetched or run); the first line asked
-    /// in it starts its check, and its fetch when a file is missing (Supertonic-3 says that line); a fetch that fails is
+    /// in it starts its check, and its fetch when a file is missing (that line is not said); a fetch that fails is
     /// never tried again on its own: after the wait it is idle again, and only a line asked in it tries again.
     @Test func aLanguagesModelIsFetchedOnlyOnceALineIsAskedInIt() async throws {
         let models = models()
@@ -624,7 +696,7 @@ private func programWAV(_ samples: [Int16]) -> Data {
         #expect(PocketSpeaker.retried(askedOnly: true) == "tried again at the next line in it, after a wait")
     }
 
-    /// Runs that fail are Kokoro's lines; three in a row rest it until its next try.
+    /// Runs that fail leave their lines unsaid; three in a row rest it until its next try.
     @Test func threeFailedRunsInARowRestIt() async throws {
         let models = models()
         defer { try? FileManager.default.removeItem(at: models) }
@@ -639,6 +711,8 @@ private func programWAV(_ samples: [Int16]) -> Data {
             await #expect(throws: failure) { try await pocket.speak("Hi.", voice: "eve") }
         }
         #expect(await pocket.state == .unavailable)
+        #expect(await pocket.resting)  // /health: "resting", not "failed"
+        #expect(await pocket.leftOut.isEmpty)
         // a success between failures starts the count again
         let other = try speaker(models, spy)
         spy.answer = ProgramResult(output: programWAV([1]))
@@ -652,11 +726,12 @@ private func programWAV(_ samples: [Int16]) -> Data {
         spy.answer = ProgramResult(tooLarge: true)
         await #expect(throws: PocketFailure.tooLarge) { try await other.speak("Hi.", voice: "eve") }
         #expect(await other.state == .ready)
+        #expect(!(await other.resting))
     }
 
     /// The review of 28 Oct (calls-03): resting after failed runs left every line of a call to Kokoro for 1 to 30
     /// minutes, and an Apple bug can crash Kokoro and the voice service with the call. On a call each line tries Pocket
-    /// again: a run that works makes it ready, one that fails leaves it resting (Kokoro says that line); a line off a
+    /// again: a run that works makes it ready, one that fails leaves it resting (that line not said); a line off a
     /// call waits for the rest as before, and a speaker unavailable for anything but its runs (no program) never runs.
     @Test func onACallARestingPocketTriesEachLineAgain() async throws {
         let models = models()
@@ -690,7 +765,7 @@ private func programWAV(_ samples: [Int16]) -> Data {
 
     /// The final review of 0.9.8 (calls-03-pocket-retry-latency): resting after runs that ran past their time limit (a
     /// busy Mac), each call line waited out that limit (2 s and 10 ms a character, up to 17 s) before Kokoro said it.
-    /// Then a call's line tries it at most once a minute (`PocketTTS.callRetrySeconds`), its stand-in saying the others
+    /// Then a call's line tries it at most once a minute (`PocketTTS.callRetrySeconds`), the others not said
     /// at once; after a run that failed fast, every call line still tries it.
     @Test func onACallAPocketRestingAfterLateRunsTriesAtMostOnceAMinute() async throws {
         let models = models()
@@ -706,7 +781,7 @@ private func programWAV(_ samples: [Int16]) -> Data {
         #expect(await pocket.state == .unavailable)
         let ran = spy.runs.count
         await #expect(throws: PocketFailure.notReady("unavailable")) { try await pocket.speak("Hi.", voice: "eve", call: true) }
-        #expect(spy.runs.count == ran)  // its last run was late a moment ago: the stand-in at once
+        #expect(spy.runs.count == ran)  // its last run was late a moment ago: not said, at once
         clock.pass(PocketTTS.callRetrySeconds)
         await #expect(throws: PocketFailure.timeout) { try await pocket.speak("Hi.", voice: "eve", call: true) }
         #expect(spy.runs.count == ran + 1)  // a minute on: one call line tries it
@@ -731,7 +806,7 @@ private func programWAV(_ samples: [Int16]) -> Data {
         await pocket.load()
         #expect(await pocket.state == .unavailable && spy.runs.map(\.input) == ["Ready."])  // its first run, late
         await #expect(throws: PocketFailure.notReady("unavailable")) { try await pocket.speak("Hi.", voice: "eve", call: true) }
-        #expect(spy.runs.count == 1)  // within the minute: the stand-in at once, no run
+        #expect(spy.runs.count == 1)  // within the minute: not said, at once, no run
         clock.pass(PocketTTS.callRetrySeconds)
         spy.answer = ProgramResult(output: programWAV([1]))
         _ = try await pocket.speak("Hi.", voice: "eve", call: true)
@@ -1056,6 +1131,62 @@ struct RealPocket {
             let wav = try await pocket.speak(spoken, voice: "heart")
             let seconds = Double(wav.count - 44) / 48_000
             #expect(seconds > 0.15 * words && seconds < 0.35 * words, "heart \(tier.size): \(seconds) s for \(words) words")
+        }
+    }
+
+    /// heart's level against jane's on either model (HEART-2, the release review of 0.9.8: the 18M's heart had 0 dB,
+    /// never measured, so one turn could step in level between heart and its af_heart stand-in or a canned line): the 5
+    /// spike lines, 2 rounds, each voice at its pinned gain, the 20 ms frames above -50 dBFS pooled (calls.md's level,
+    /// as the measurements through the voice service took it). heart within 1 dB of jane, its peak under -1 dBFS.
+    @Test func heartIsAsLoudAsJaneOnEitherModel() async throws {
+        let environment = ProcessInfo.processInfo.environment
+        let models = environment["VOICE_POCKET_MODELS"].map { URL(fileURLWithPath: $0) }
+            ?? FileManager.default.temporaryDirectory.appendingPathComponent("pocket-real-\(UUID().uuidString)")
+        let programs = FileManager.default.temporaryDirectory.appendingPathComponent("pocket-program-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: programs) }
+        #expect(await fetchPocket(into: programs))
+        let lines = [
+            "Yes?",
+            "Take your time, I'm here. Say Tiffany when you need me.",
+            "It's 14:35 now. Your dentist appointment is tomorrow at 9:15, and it should be sunny, around 18 degrees.",
+            "Got it: I'll answer this after the call.",
+            "The pharmacy on Main Street closes at 8 tonight, so you still have about two hours. It's a ten-minute walk, or four minutes by car. Shall I remind you at 7:30?",
+        ]
+        for tier in [PocketVoices(english: .english18M), PocketVoices(english: .english)] {
+            let pocket = PocketSpeaker(models: models, her: models.deletingLastPathComponent(), programs: programs,
+                                       model: tier.english, name: tier.name(of: tier.english),
+                                       resources: PocketTTS.resources(beside: Bundle.module.bundleURL.deletingLastPathComponent()))
+            await pocket.load()
+            try #require(await pocket.state == .ready, "\(tier.size)")
+            var frames: [String: [Double]] = ["heart": [], "jane": []]
+            var peak: [String: Int] = ["heart": 0, "jane": 0]
+            for round in 0..<2 {
+                for line in lines {
+                    for voice in round == 0 ? ["heart", "jane"] : ["jane", "heart"] {
+                        let wav = try await pocket.speak(PocketText.spoken(line), voice: voice)
+                        let samples = wav.dropFirst(44).withUnsafeBytes { raw in
+                            (0..<(raw.count / 2)).map { Int(Int16(littleEndian: raw.loadUnaligned(fromByteOffset: $0 * 2, as: Int16.self))) }
+                        }
+                        peak[voice] = max(peak[voice] ?? 0, samples.map(abs).max() ?? 0)
+                        let size = SpeechAudio.sampleRate / 50
+                        for start in stride(from: 0, to: samples.count - size, by: size) {
+                            let power = samples[start..<start + size].reduce(0.0) { $0 + Double($1 * $1) } / Double(size) / (32768.0 * 32768.0)
+                            if power > pow(10, -50.0 / 10) { frames[voice, default: []].append(power) }
+                        }
+                    }
+                }
+            }
+            func level(_ voice: String) -> Double {
+                let pooled = frames[voice] ?? []
+                return 10 * log10(pooled.reduce(0, +) / Double(max(pooled.count, 1)))
+            }
+            let (heart, jane) = (level("heart"), level("jane"))
+            let heartPeak = 20 * log10(Double(max(peak["heart"] ?? 0, 1)) / 32768)
+            let said = String(format: "%@: heart %.2f dBFS RMS (%d frames, peak %.1f dBFS), jane %.2f (%d frames)",
+                              tier.size, heart, frames["heart"]?.count ?? 0, heartPeak, jane, frames["jane"]?.count ?? 0)
+            print("heartIsAsLoudAsJane \(said)")
+            #expect(abs(heart - jane) <= 1.0, "\(said)")
+            #expect(heartPeak < -1.0, "\(said)")
         }
     }
 

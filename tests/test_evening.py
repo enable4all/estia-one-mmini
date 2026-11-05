@@ -465,17 +465,20 @@ def test_the_log_takes_the_evening_note_and_an_older_database_moves_up(tmp_path:
 # call's and the tools unchanged; with its reminders' lines naming no call in an install without calls: 4106183d…;
 # before the review of 24 Oct changed her list's lines and its rule (docs/agents/prompts-evals.md): e210d8d4…; before
 # review G11 and G12 (25 Oct: her photo line, no model size): chat 06568cb2…, call b81b5c4c…; before how long she
-# answers on a call (26 Oct, owner: a deep question gets the full answer; docs/agents/prompts-evals.md): call 4e30986b…
+# answers on a call (26 Oct, owner: a deep question gets the full answer; docs/agents/prompts-evals.md): call 4e30986b…;
+# before find_video's web lines (31 Oct): chat 7efa0b85…; before the security line's "or your phone" (3 Nov, laptop P0,
+# E1: the phone ends any lock of its account): chat 13bd67d6…, a call's and the tools unchanged
 BEFORE_EVENING_SHA256 = {
-    "chat": "7efa0b855f9d3cbcae3a73ca6cef3a2f36c8609d4673721d73d477905a7eab05",
+    "chat": "4dff90ada8ce56e1de7a962365b7cb66c8ddcf1ada9dd3944bbc88ff24c09051",
     "call": "aa18eb7814ca13004f6208e230ee02dcbca015e1f8c2b8eff5383a8d3e922826",
     "tools": "42afa6769c213febcdab193788d983d0543a8158c28f83d3215c5176ee06b7ae",
 }
 BEFORE_EVENING_INITIATIVE_ON_SHA256 = (
-    # e80197d9… before review G11 and G12 (25 Oct), cc1bbfd6… before the review of 24 Oct changed her list's lines and
+    # 86999e39… before the security line's "or your phone" (3 Nov),
+    # 843b0430… before find_video's web lines (31 Oct), e80197d9… before review G11 and G12 (25 Oct), cc1bbfd6… before the review of 24 Oct changed her list's lines and
     # its rule, 33d03577… before her tools' list named no call without calls, e6ee0da8… before the list (24 Oct),
     # a82b00b5… before the owner's wording (24 Oct), f4731c56… before 18 Oct, 22bef8cf… before 16
-    "843b04309bcb9897623f7ba3e1383838fe8d47242b883958bd1db484749beb34"
+    "6b68a932746143d582ea95d07483ea94c77ba62cb2266ae199abde8be998d329"
 )
 # the evening note inside the line of the messages she starts, never a line of its own: a line of its own took
 # video_auto from 8 of 8 to 3 of 8, this from 8 of 8 to 7 of 8 (15 Oct, run in turn, a fresh prefix each run). It says

@@ -8,76 +8,58 @@ private func request(_ fields: [String: Any]) throws -> SpeechRequest {
 
 /// Owner, 25 Oct: "pocket does more languages than English right... lets use those, leave koroko for the ones that
 /// Pocket does not do", and after eve and jane in the six: "jane jane, lets have her as default for those languages".
+/// Owner, 3 Nov 2026: "remove kokoro and supertonic", and for what they said: "Nothing".
 @Suite struct PocketLanguageRouting {
-    /// French, German, Italian, Spanish, Portuguese and Dutch in jane are Pocket's (each language's full model); any other
-    /// voice in them, and Korean, Polish, Japanese and Russian in any voice, stay Supertonic-3's; English as before.
-    @Test func janeInTheSixIsPocketsAndTheFourStaySupertonics() throws {
+    /// French, German, Italian, Spanish, Portuguese and Dutch are jane's, each on its language's own model, whatever
+    /// voice a request names there: jane is their only voice (an older bridge's `language_voice = ""` named its English
+    /// voice for Supertonic-3's F1, and the bridge reads that setting as jane now). Korean, Polish, Japanese and Russian,
+    /// which Pocket has no model for, have no voice: refused (409, `no_voice`), never said. English as before.
+    @Test func janeSpeaksTheSixAndTheFourHaveNoVoice() throws {
+        let six: [(String, PocketModel)] = [
+            ("es", PocketModel.spanish), ("it", PocketModel.italian), ("pt", PocketModel.portuguese),
+            ("nl", PocketModel.dutch), ("de", PocketModel.german), ("fr", PocketModel.french),
+        ]
+        for tier in [PocketVoices(english: .english), PocketVoices(english: .english18M)] {  // the same six on either
+            for (code, model) in six {
+                for voice in ["jane", "heart", "eve", "vera", "alba", "michael"] {
+                    let speech = tier.speech(voice, language: code)
+                    #expect(speech?.model == model && speech?.speaks == "jane" && speech?.voice == "jane", "\(code) \(voice)")
+                }
+            }
+            #expect(tier.speech("jane", language: "en") == tier.speech("jane") && tier.speech("jane")?.model == tier.english)
+            for code in ["ko", "pl", "ja", "ru"] { #expect(tier.speech("jane", language: code) == nil, "\(code)") }
+        }
         for code in ["fr", "de", "it", "es", "pt", "nl"] {
             let jane = try request(["input": "Hallo.", "voice": "jane", "language": code])
-            #expect(jane.engine == .pocket && jane.voice == "jane", "\(code)")
-            for other in ["eve", "eve-full", "vera", "alba", "michael", "af_heart"] {
-                #expect(try request(["input": "Hallo.", "voice": other, "language": code]).engine == .supertonic, "\(code) \(other)")
-            }
-            #expect(try request(["input": "Hallo.", "language": code]).engine == .supertonic, "\(code)")
+            #expect(jane.language == code && jane.voice == "jane" && PocketTTS.speaks(code), "\(code)")
         }
         for code in ["ko", "pl", "ja", "ru"] {
-            #expect(try request(["input": "Hallo.", "voice": "jane", "language": code]).engine == .supertonic, "\(code)")
-        }
-        #expect(try request(["input": "Hi.", "voice": "jane"]).engine == .pocket)  // English jane: the Mac's model
-        for tier in [PocketVoices(english: .english), PocketVoices(english: .english18M)] {  // the same six on either
-            #expect(tier.speech("jane", language: "de")?.model == PocketModel.german)
-            #expect(tier.speech("jane", language: "en") == tier.speech("jane") && tier.speech("jane")?.model == tier.english)
-            #expect(tier.speech("eve", language: "de") == nil && tier.speech("jane", language: "ko") == nil)
+            #expect(throws: VoiceError.noVoice, "\(code)") { try request(["input": "Hallo.", "voice": "jane", "language": code]) }
+            #expect(!PocketTTS.speaks(code), "\(code)")
         }
         #expect(PocketTTS.voices == ["heart", "jane", "eve", "vera", "alba", "michael"])  // the English voices the bridge names
     }
 
-    /// Whatever jane cannot say in a language (not fetched yet, refused, a failed, late or oversized run, an odd WAV)
-    /// Supertonic-3's F1 says in it, as before her, never silence; the answer names it (`X-Voice-Stand-In: F1`), so the
-    /// bridge never keeps such a clip of a canned line. In English the stand-in stays Kokoro's af_heart.
-    @Test func whatJaneCannotSayInALanguageSupertonicsF1Says() async throws {
-        #expect(PocketTTS.standIn(for: "de", voice: "jane") == "F1" && PocketTTS.standIn(for: "fr", voice: "jane") == "F1")
-        #expect(PocketTTS.standIn(for: "en", voice: "jane") == SpeechRequest.defaultVoice)
+    /// Whatever jane cannot say in a language (not fetched yet, refused, a failed, late or oversized run, an odd WAV) no
+    /// other voice says (owner, 3 Nov 2026; Supertonic-3's F1 said it before): the line is refused (409, `not_said`)
+    /// and the bridge sends that answer as text. The first line asked in a language starts its fetch, unsaid.
+    @Test func whatJaneCannotSayInALanguageNoOtherVoiceSays() async throws {
         var said: [String] = []
-        let out = try await SpeechFallback.speak(pocket: { throw PocketFailure.notReady("idle") }, instead: { Data("s".utf8) },
-                                                 standIn: PocketTTS.standIn(for: "de", voice: "jane"), log: { said.append($0) })
-        #expect(out == SpokenLine(wav: Data("s".utf8), standIn: "F1"))
-        #expect(said == ["speaking: Pocket TTS did not say this line (not ready (idle)); Supertonic-3 (F1) said it"])
-        // the stand-in fails too (offline at its first download): no line claims it said it (the review of 25 Oct)
-        said = []
-        await #expect(throws: VoiceError.notReady) {
-            try await SpeechFallback.speak(pocket: { throw PocketFailure.notReady("idle") }, instead: { throw VoiceError.notReady },
-                                           standIn: "F1", log: { said.append($0) })
+        await #expect(throws: VoiceError.notSaid) {
+            try await PocketLine.speak({ throw PocketFailure.notReady("idle") }, log: { said.append($0) })
         }
-        #expect(said == ["speaking: Pocket TTS did not say this line (not ready (idle)); Supertonic-3 (F1) could not say it either"])
-        let marked = String(decoding: HTTP.response(200, contentType: "audio/wav", body: Data(), headers: out.headers), as: UTF8.self)
-        #expect(marked.contains("\r\nX-Voice-Stand-In: F1\r\n"))
+        #expect(said == ["speaking: Pocket TTS did not say this line (not ready (idle)); no other voice says it"])
     }
 
-    /// The stand-in says its own engine's text (`SpeechRequest.standInInput`), never Pocket's: Kokoro's in English,
-    /// Supertonic-3's in another language, the engine `PocketTTS.standIn(for:voice:)` names. The service works it out off the
-    /// engines' actor, as every line's text (review 0.9.7, C7; the merge review of 25 Oct, L1: it was worked out on it).
-    @Test func aStandInSaysItsOwnEnginesText() throws {
-        let text = "Es ist 9:15 Uhr. The chord is C7(b9), at 7:30 in the morning."
-        for (voice, code) in [("eve", "en"), ("jane", "en"), ("jane", "de"), ("jane", "fr"), ("jane", "nl")] {
-            let line = try request(["input": text, "voice": voice, "language": code])
-            let engine: SpeechEngine = PocketTTS.standIn(for: code, voice: voice) == SpeechRequest.defaultVoice ? .kokoro : .supertonic
-            #expect(line.engine == .pocket && line.standInEngine == engine, "\(voice) \(code)")
-            #expect(line.standInInput == line.spokenInput(for: engine), "\(voice) \(code)")
-        }
-        #expect(try request(["input": text, "voice": "eve"]).standInEngine == .kokoro)
-        #expect(try request(["input": text, "voice": "jane", "language": "it"]).standInEngine == .supertonic)
-    }
-
-    /// Pocket TTS has no speed setting (`pocket-tts generate --help`; the review of 25 Oct): a line in a Pocket voice,
-    /// jane in the six or eve in English, is the same text at any speed and its run's arguments name none, while Kokoro
-    /// and Supertonic-3 (jane's stand-in) get the request's speed. A later speed for Pocket shows up here.
+    /// Pocket TTS has no speed setting (`pocket-tts generate --help`; the review of 25 Oct): the speed an older bridge
+    /// sends is taken and never read (Kokoro and Supertonic-3, which read it, were removed on 3 Nov 2026), and a run's
+    /// arguments name none. A later speed for Pocket shows up here.
     @Test func aPocketLineIgnoresTheSpeed() throws {
         for (voice, code) in [("jane", "de"), ("jane", "fr"), ("eve", "en"), ("jane", "en")] {
             let slow = try request(["input": "Morgen um 9:15.", "voice": voice, "language": code, "speed": 0.7])
             let fast = try request(["input": "Morgen um 9:15.", "voice": voice, "language": code, "speed": 1.5])
-            #expect(slow.engine == .pocket && fast.engine == .pocket, "\(voice) \(code)")
-            #expect(slow.spokenInput == fast.spokenInput && slow.speed == 0.7 && fast.speed == 1.5, "\(voice) \(code)")
+            let none = try request(["input": "Morgen um 9:15.", "voice": voice, "language": code])
+            #expect(slow == fast && slow == none && slow.spokenInput == fast.spokenInput, "\(voice) \(code)")
         }
         let folder = URL(fileURLWithPath: "/private/var/x")
         let argv = PocketRun.arguments(program: folder.appendingPathComponent("pocket-tts"), config: folder,
@@ -85,8 +67,8 @@ private func request(_ fields: [String: Any]) throws -> SpeechRequest {
         #expect(!argv.contains { ["--speed", "--rate", "--tempo", "--length-scale"].contains($0.lowercased()) })
     }
 
-    /// Pocket in a language gets every pass Supertonic-3 gets for it (numbers, times, dates, units, chords in its own
-    /// words), then the long-stretch guard; Supertonic's own text (its stand-in) is the language's passes alone.
+    /// Pocket in a language gets every pass of its own (numbers, times, dates, units, chords in its own words), then
+    /// the long-stretch guard.
     @Test func pocketGetsTheLanguagesPassesThenTheGuard() throws {
         let lines = [
             ("de", "Es ist jetzt 14:35 Uhr. Dein Termin ist morgen um 9:15 Uhr, etwa 18 Grad."),
@@ -99,7 +81,6 @@ private func request(_ fields: [String: Any]) throws -> SpeechRequest {
         for (code, text) in lines {
             let jane = try request(["input": text, "voice": "jane", "language": code])
             #expect(jane.spokenInput == SpokenLanguage.spoken(text, language: code), "\(code)")
-            #expect(jane.spokenInput(for: .supertonic) == SpokenLanguage.spoken(text, language: code), "\(code)")
             let spoken = jane.spokenInput
             #expect(spoken.allSatisfy { !$0.isNumber }, "\(code): \(spoken)")
         }
@@ -108,7 +89,7 @@ private func request(_ fields: [String: Any]) throws -> SpeechRequest {
         let long = Array(repeating: "Morgen kommt die Nachbarin mit dem Paket vorbei und bringt die Unterlagen mit", count: 6)
             .joined(separator: " ")
         let paced = try request(["input": long, "voice": "jane", "language": "de"])
-        #expect(paced.spokenInput.contains(",") && paced.spokenInput(for: .supertonic) == long)
+        #expect(paced.spokenInput.contains(",") && SpokenLanguage.spoken(long, language: "de") == long)
         #expect(PocketPace.runs(paced.spokenInput).allSatisfy { $0 <= PocketPace.limit })
     }
 }

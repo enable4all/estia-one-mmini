@@ -2,9 +2,11 @@
 keeps one-line delegates for the names the tests and the call manager use."""
 
 import ast
+import re
 from pathlib import Path
 
 from local_assistant import app as app_module
+from local_assistant import entry as entry_module
 from local_assistant import lifecycle
 
 SRC = Path(__file__).resolve().parent.parent / "src/local_assistant"
@@ -161,6 +163,40 @@ def test_app_and_the_hosts_are_readable_sizes() -> None:
     assert sizes["call_host"] <= 525 and sizes["lifecycle"] <= 365, sizes
     assert sizes["status_host"] <= 250 and sizes["documents_host"] <= 200, sizes
     assert sizes["signal_host"] <= 150, sizes
+
+
+def test_the_process_entry_lives_in_entry_and_app_only_hands_its_names_on() -> None:
+    """The command line, the log caps, signal-cli's command and the run loop moved out of app.py (its size cap, 0.9.8.3):
+    app.py defines none of them again and hands on the names the tests, the console script and `__main__` import."""
+    moved = {"CappedStream", "cap_file", "cap_streams", "setup_logging", "signal_client", "_serve", "model_pin", "main"}
+
+    def defined(path: Path) -> set[str]:
+        body = ast.parse(path.read_text()).body
+        return {n.name for n in body if isinstance(n, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef)}
+
+    assert moved <= defined(SRC / "entry.py")
+    assert not moved & defined(SRC / "app.py")
+    for name in ("main", "model_pin", "setup_logging", "signal_client"):
+        assert getattr(app_module, name) is getattr(entry_module, name), name
+
+
+def test_no_comment_or_rule_file_points_at_a_name_that_moved_to_entry_through_app() -> None:
+    """A name entry.py took with it and app.py does not hand on is no attribute of `app`: a pointer through `app.` leads
+    nowhere (review of 4 Nov, correctness-2: ownuser's comment named the log caps there)."""
+    body = ast.parse((SRC / "entry.py").read_text()).body
+    defined = {n.name for n in body if isinstance(n, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef)}
+    gone = defined - set(dir(app_module))
+    assert {"CappedStream", "cap_file", "cap_streams", "_serve"} <= gone
+    pointer = re.compile(rf"\bapp\.({'|'.join(sorted(gone))})\b")
+    root = SRC.parent.parent
+    files = [*SRC.rglob("*.py"), *(root / "docs/agents").glob("*.md"), root / "AGENTS.md"]
+    found = [
+        f"{file.relative_to(root)}:{number}"
+        for file in files
+        for number, line in enumerate(file.read_text().splitlines(), 1)
+        if pointer.search(line)
+    ]
+    assert found == []
 
 
 def test_her_signal_accounts_state_lives_on_signal_host() -> None:

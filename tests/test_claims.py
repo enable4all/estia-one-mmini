@@ -745,6 +745,14 @@ TIED_TO_THE_YES = [
     "Reply yes and the heater will be switched off.",
     "Say yes and the lamp will be turned off.",
     "The heater will be switched off with your yes.",
+    # 0.9.9 (guard-fixrev3-claims-02): a time in another clause, of the weather or the warmth, is no time of the change
+    "It's cold tonight, so reply yes and the heater will be switched on.",
+    "Reply yes and the heater will be switched on, so it is warm by 18:00.",
+    # the yes's own time, as code's note words it ("reply yes within 5 minutes to switch heater off")
+    "Reply yes within 5 minutes and the heater will be switched off.",
+    "Reply yes in the next 5 minutes and the heater will be switched off.",
+    # "yes or no" is no negation, wherever it is in the sentence
+    "Answer yes or no: with your yes the heater will be switched off.",
 ]
 # release review of 0.9.8, G03: planted lines that borrow the yes's words, with no change waiting
 PLANTED_YES_WORDS = [
@@ -800,7 +808,61 @@ NOT_TIED_TO_THE_YES = [
     "Your go-ahead isn't required, the heater will be switched off.",
     PLANTED_YES_WORDS[1],
     "Say yes and the lamp will be turned off at 16:30.",
+    # 0.9.9 (guard-fixrev3-claims-02): a time in the change's clause, or in a clause that is only a time
+    "At 23:00, the heater will be switched off with your yes.",
+    "Tonight, reply yes and the heater will be switched off.",
+    "The heater, at 23:00 sharp, will be switched off with your yes.",
+    # 0.9.9 (guard-fixrev3-claims-01): a time in words, with before, after or on, or in a while
+    "Reply yes and the heater will be switched off in ten minutes.",
+    "The heater will be switched off at eleven with your go-ahead.",
+    "Say yes and the heater will be switched off after 23:00.",
+    "Say yes and the heater will be switched off before midnight.",
+    "Say yes and the heater will be switched off on Friday.",
+    "Say yes and the heater will be switched off later.",
+    "Reply yes and the heater will be switched on in the morning.",
+    # 0.9.9 (guard-fixrev3-claims-01): a dismissal with no negation word
+    "The heater will be switched off, your confirmation is optional.",
+    "Your go-ahead is unnecessary: the heater will be switched off.",
+    "Say yes or no, the heater will be switched off either way.",
+    "Whether you say yes or no, the heater will be switched off.",
+    # 0.9.9 (redteam-claims-negation-scope-and-second-yes-phrase): a negation past a comma or a parenthesis, or a
+    # second yes phrase with none of its own
+    "Reply yes and the heater will be switched off, your confirmation is not needed.",
+    "Reply yes and the heater will be switched off (your confirmation is not needed).",
+    "The heater will be switched off with your go-ahead, which, frankly, is not needed.",
+    "No need for your confirmation, but reply yes anyway and the heater will be switched off.",
 ]
+# 0.9.9 (review of 0.9.8, G03's "if"/"unless" part): "unless", "even if" or an "if" of the world waits for no word of
+# the user's, so the change is told as set; only "if" before "you", "your", "I" or "so" is an offer or a condition
+IF_OR_UNLESS_SET = [
+    "The living room lamp is scheduled to switch off at 23:00 unless you object.",
+    "Unless you say no, the heater will be switched off at 23:00.",
+    "The heater will be switched off at 23:00, even if you say no.",
+    "The living room lamp is set to turn on at sunset if it is cloudy.",
+    "If nobody is home, the heater will be switched off at 23:00.",
+]
+IF_AN_OFFER = [
+    "If you like, the lamp will be turned off at 16:30.",
+    "If you'd like, the heater will be switched on at 6:00.",
+    "The heater will be switched off if you reply yes.",
+    "If so, the heater will be switched off.",
+    "If I may, the heater will be switched off at 23:00.",
+]
+
+
+@pytest.mark.parametrize("waiting", [None, its_change])
+@pytest.mark.parametrize("text", IF_OR_UNLESS_SET)
+def test_an_unless_or_an_if_of_the_world_tells_the_change_as_set(
+    text: str, waiting: Callable[[str], bool] | None
+) -> None:
+    assert scheduled_switch_clauses(text, waiting=waiting), text
+    assert without_scheduled_switches(text, lambda clause: True, waiting=waiting) == ""
+
+
+@pytest.mark.parametrize("waiting", [None, its_change])
+@pytest.mark.parametrize("text", IF_AN_OFFER)
+def test_an_if_of_the_users_word_is_an_offer(text: str, waiting: Callable[[str], bool] | None) -> None:
+    assert scheduled_switch_clauses(text, waiting=waiting) == [], text
 
 
 @pytest.mark.parametrize("text", NOT_TIED_TO_THE_YES)

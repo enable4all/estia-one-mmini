@@ -3,7 +3,8 @@
 import Foundation
 
 /// Expands numerics to spoken-form words *before* g2p, sidestepping the TTS
-/// engine's weak number handling (FluidAudio Kokoro mangles `$5.99` → "X X").
+/// engine's weak number handling (Kokoro, her voice until 3 Nov 2026, mangled `$5.99` → "X X"; Pocket TTS reads
+/// the words).
 /// Pure, dependency-free, unit-tested in isolation.
 public enum NumberNormalizer {
 

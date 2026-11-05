@@ -21,7 +21,8 @@ def local_stamp(epoch_ms: int, tz: ZoneInfo, *, year: bool = False) -> str:
     return f"[{day} {moment:%H:%M}]"
 
 
-def local_hhmm(epoch_s: float, tz: ZoneInfo) -> str:
+def local_hhmm(epoch_s: float, tz: ZoneInfo | None) -> str:
+    """'14:02' on the config's clock (`tz`; None: the Mac's own zone)."""
     return datetime.fromtimestamp(epoch_s, tz).strftime("%H:%M")
 
 

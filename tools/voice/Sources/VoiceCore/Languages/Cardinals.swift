@@ -1,6 +1,7 @@
 import Foundation
 
-/// Numbers in words in the ten Supertonic-3 languages: Foundation's spell-out in the language's full locale (CLDR's
+/// Numbers in words in the ten languages beside English (Korean, Polish, Russian and Japanese have no voice now: kept
+/// for a future one): Foundation's spell-out in the language's full locale (CLDR's
 /// rules; pt is pt_PT), with the 0.9.3 plan's fixes: the soft hyphens Foundation puts inside it, nl and de words
 /// (U+00AD) are taken out, pt_PT's "um mil milhões" is "mil milhões", and ru says "ноль целых" before a fraction under
 /// one. One formatter per language, made once (NumberFormatter is safe to share for formatting).

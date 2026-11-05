@@ -217,6 +217,15 @@ def test_a_step_line_is_followed_by_a_blank_line() -> None:
     assert prompts.SETUP_STEP.format(n=2, m=9, what="her model") == "\nStep 2 of 9: her model\n"
 
 
+def test_the_lid_is_named_only_for_a_macbook() -> None:
+    """W17: "with its lid open" was said on every Mac; a Mac mini or a Mac Studio has no lid."""
+    awake = "Keep the Mac plugged in (a MacBook with its lid open): setup keeps it awake until it ends."
+    assert prompts.SETUP_DOWNLOAD.splitlines()[0] == f"  Nothing to answer meanwhile. {awake}"
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    assert awake in readme
+    assert "with its lid open:" not in readme.replace("(a MacBook with its lid open):", "")
+
+
 def test_the_page_draws_paragraphs_lists_bold_and_the_small_line() -> None:
     script = (PAGE / "page.js").read_text(encoding="utf-8")
     assert "function blocks(" in script and "split(/\\n\\s*\\n/)" in script

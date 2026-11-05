@@ -23,57 +23,52 @@ private func pcm(_ wav: Data) -> [Int16] {
 }
 
 @Suite struct PocketRouting {
-    /// Owner, 24 Oct: "from pocket it would be EVE", "af_heart is great, lets keep it as an option": English in eve is
-    /// Pocket's, in a Kokoro voice Kokoro's; the other ten languages stay Supertonic-3's whatever the voice.
-    @Test func englishInEveIsPocketsAndEveryOtherVoiceKeepsItsEngine() throws {
-        #expect(try request(["input": "Hi.", "voice": "eve"]).engine == .pocket)
-        #expect(try request(["input": "Hi.", "voice": "eve", "language": "en"]).engine == .pocket)
-        #expect(try request(["input": "Hi.", "voice": "af_heart"]).engine == .kokoro)
-        #expect(try request(["input": "Hallo.", "voice": "eve", "language": "nl"]).engine == .supertonic)
-        #expect(try request(["input": "Hi.", "voice": "eve"]).voice == "eve")
-        // owner, 25 Oct: "could I try Jane also for a bit?": a second Pocket voice, the same routing
-        #expect(try request(["input": "Hi.", "voice": "jane"]).engine == .pocket)
-        #expect(try request(["input": "Hi.", "voice": "jane", "language": "en"]).engine == .pocket)
-        // owner, 25 Oct ("jane jane, lets have her as default for those languages"): jane in Dutch is Pocket's Dutch
-        // model's (PocketLanguageTests)
-        #expect(try request(["input": "Hallo.", "voice": "jane", "language": "nl"]).engine == .pocket)
-        #expect(try request(["input": "Hi.", "voice": "jane"]).voice == "jane")
-        // owner, 25 Oct ("let me test Vera on the big model"): vera, the 100M model's, is Pocket's too
-        #expect(try request(["input": "Hi.", "voice": "vera"]).engine == .pocket)
-        #expect(try request(["input": "Hi.", "voice": "vera"]).voice == "vera")
-        #expect(try request(["input": "Hallo.", "voice": "vera", "language": "nl"]).engine == .supertonic)
-        // owner, 26 Oct ("alba & michael for males, both on small and big"): alba and michael are Pocket's too, and
-        // Kokoro's am_michael stays Kokoro's
-        for male in ["alba", "michael"] {
-            #expect(try request(["input": "Hi.", "voice": male]).engine == .pocket)
-            #expect(try request(["input": "Hi.", "voice": male]).voice == male)
-            #expect(try request(["input": "Hallo.", "voice": male, "language": "nl"]).engine == .supertonic)
+    /// Owner, 3 Nov 2026 ("remove kokoro and supertonic"): every voice is Pocket TTS's: heart, jane, eve, vera, alba and
+    /// michael by name (owner, 24-27 Oct), a Kokoro voice id an older bridge sends as the closest one (michael for a
+    /// male one, heart for any other: `config.pocket_voice`), any other name heart, the default. eve-full is the
+    /// bridge's other name for eve (owner, 26 Oct), never a voice of the service's.
+    @Test func everyVoiceIsPocketsByItsName() throws {
+        for voice in PocketTTS.order {
+            #expect(try request(["input": "Hi.", "voice": voice]).voice == voice, "\(voice)")
+            #expect(try request(["input": "Hi.", "voice": voice, "language": "en"]).voice == voice, "\(voice)")
         }
-        #expect(try request(["input": "Hi.", "voice": "am_michael"]).engine == .kokoro)
-        // owner, 27 Oct ("call the voice Heart", "not af_heart, do heart, and make it default"): heart, af_heart's
-        // warmth cloned onto the 100M model, is Pocket's; af_heart stays Kokoro's own
-        #expect(try request(["input": "Hi.", "voice": "heart"]).engine == .pocket)
-        #expect(try request(["input": "Hi.", "voice": "heart"]).voice == "heart")
-        #expect(try request(["input": "Hallo.", "voice": "heart", "language": "nl"]).engine == .supertonic)
-        #expect(try request(["input": "Hi.", "voice": "af_heart"]).engine == .kokoro)
-        // eve-full is the bridge's other name for eve (owner, 26 Oct), never a voice of the service's: an older bridge
-        // that still sends it gets the default, Kokoro's af_heart
+        #expect(try request(["input": "Hi.", "voice": "af_heart"]).voice == "heart")
+        #expect(try request(["input": "Hi.", "voice": "am_michael"]).voice == "michael")
+        #expect(SpeechRequest.defaultVoice == "heart")
         for odd in ["Eve", "eve2", "../eve", "eve ", "marius", "Jane", "jane2", "../jane", "jane ", "jan", "Eve-Full",
                     "eve-full", "eve-full ", "eve_full", "Vera", "vera ", "vera-full", "Alba", "alba ", "alba-full",
                     "Michael", "michael ", "mike", "Heart", "heart ", "hearts", "af-heart", "../heart"] {
-            let plain = try request(["input": "Hi.", "voice": odd])
-            #expect(plain.voice == SpeechRequest.defaultVoice && plain.engine == .kokoro, "\(odd)")
+            #expect(try request(["input": "Hi.", "voice": odd]).voice == SpeechRequest.defaultVoice, "\(odd)")
         }
     }
 
-    /// Pocket reads plain text: the English passes unchanged (numbers, times), then the lexicon's capitals said as
-    /// letters written as letters with hyphens (24 Oct, eve through Whisper: "I.D." came out "eye. D", "W-H-O" as
-    /// long as the letters "WHO", "WHO is it?" as "Though is it?"); Kokoro's own text (its fallback for the line)
-    /// keeps the word for its lexicon.
+    /// Each voice speaks on the Mac's English model (`PocketVoices.speech`), the model's voice of its name. vera is the
+    /// 100M's alone (owner, 25 Oct: "let me test Vera on the big model"): beside the 18M a line asked in vera is said in
+    /// heart, the default, as the bridge reads it there (`config.voice_here`), where Kokoro's af_heart said it as a
+    /// stand-in before 3 Nov 2026. A name no Pocket voice has is none.
+    @Test func veraBesideThe18MIsHeart() {
+        let standard = PocketVoices(english: .english), small = PocketVoices(english: .english18M)
+        for voice in PocketTTS.order {
+            #expect(standard.speech(voice)?.speaks == voice && standard.speech(voice)?.model == PocketModel.english, "\(voice)")
+        }
+        for voice in PocketTTS.order where voice != "vera" {
+            #expect(small.speech(voice)?.speaks == voice && small.speech(voice)?.model == PocketModel.english18M, "\(voice)")
+        }
+        #expect(small.speech("vera") != nil && small.speech("vera") == small.speech("heart"))
+        #expect(small.speech("vera")?.speaks == "heart" && small.speech("vera", language: "en") == small.speech("heart"))
+        for odd in ["af_heart", "eve-full", "", "Vera"] {
+            #expect(standard.speech(odd) == nil && small.speech(odd) == nil, "\(odd)")
+        }
+    }
+
+    /// Pocket reads plain text: the English passes unchanged (numbers, times), then the capitals meant as letters
+    /// written as letters with hyphens (24 Oct, eve through Whisper: "I.D." came out "eye. D", "W-H-O" as long as the
+    /// letters "WHO", "WHO is it?" as "Though is it?"); the passes alone keep the word.
     @Test func pocketGetsTheEnglishPassesAndTheLettersAsText() throws {
         let eve = try request(["input": "Show your ID at 9:30, the ETA is 5 min.", "voice": "eve"])
         #expect(eve.spokenInput == "Show your I-D at nine thirty in the morning, the E-T-A is five minutes.")
-        #expect(eve.spokenInput(for: .kokoro) == "Show your ID at nine thirty in the morning, the ETA is five minutes.")
+        #expect(SpokenEnglish.spoken("Show your ID at 9:30, the ETA is 5 min.")
+            == "Show your ID at nine thirty in the morning, the ETA is five minutes.")
         #expect(PocketText.spoken("The WHO said so. Bring your ID.") == "The W-H-O said so. Bring your I-D.")
         #expect(PocketText.spoken("An id, who knows, WHOM, IDs, I.D. cards.") == "An id, who knows, WHOM, IDs, I.D. cards.")
         let call = try request(["input": "Shall I call at 7:30?", "voice": "eve", "context": "It closes tonight."])
@@ -82,8 +77,9 @@ private func pcm(_ wav: Data) -> [Int16] {
 }
 
 @Suite struct PocketAudio {
-    /// The program's stream (placeholder sizes) becomes Kokoro's own format at the fixed gain; louder is clipped.
-    @Test func theProgramsWAVComesOutAsKokorosFormatAtItsGain() throws {
+    /// The program's stream (placeholder sizes) becomes the bridge's format (24 kHz mono 16-bit) at the fixed gain;
+    /// louder is clipped.
+    @Test func theProgramsWAVComesOutInTheBridgesFormatAtItsGain() throws {
         let out = try PocketWAV.speech(programWAV([0, 1000, -1000, 32767, -32768]), gainDB: -6.0)
         #expect(out.count == 44 + 10)
         #expect(String(decoding: out.prefix(4), as: UTF8.self) == "RIFF")
@@ -159,8 +155,10 @@ private func pcm(_ wav: Data) -> [Int16] {
             // every voice its model pins is one of the bridge's
             #expect(Set(tier.english.voices.keys) == Set(tier.speakers.map(\.voice)))
         }
-        // vera (VCTK p229, owner, 25 Oct): the 100M model only. heart on the 18M too (owner, 29 Oct), its own clone
-        #expect(small.speech("vera") == nil && PocketModel.english18M.voices["vera"] == nil)
+        // vera (VCTK p229, owner, 25 Oct): the 100M model only (heart says her lines on the 18M: PocketRouting). heart
+        // on the 18M too (owner, 29 Oct), its own clone
+        #expect(small.speakers.allSatisfy { $0.voice != "vera" } && PocketModel.english18M.voices["vera"] == nil)
+        #expect(small.speech("vera")?.speaks == "heart")
         #expect(small.speech("heart")?.model == PocketModel.english18M && small.speech("heart")?.speaks == "heart")
         let eve = try #require(small.speech("eve"))
         let full = try #require(standard.speech("eve"))
@@ -248,8 +246,10 @@ private func pcm(_ wav: Data) -> [Int16] {
         #expect(PocketModel.english.pins.contains(heart.pin))
         // heart on the 18M (owner, 29 Oct: "just make the small heart and we test it later"): the same af_heart audio
         // cloned onto the 18M model on 27 Oct, 5,768,848 bytes, shipped beside the 100M's under its own name, copied into
-        // the 18M's folder and checked by its sha256 the same way. Its gain is not measured yet (no listening test: the
-        // owner tests it later): 0 dB, jane's -5.0 plus the 5 dB the 100M's heart is above the 100M's jane
+        // the 18M's folder and checked by its sha256 the same way. Its gain, 0 dB (jane's -5.0 plus the 5 dB the 100M's
+        // heart is above the 100M's jane), measured 31 Oct (the 5 spike lines pooled, through the voice service on port
+        // 8151 with --pocket 18M, 4 rounds): -24.71 dBFS RMS against jane's -24.60 in the same runs, its peak -6.5 dBFS,
+        // so 0 (not heard yet: the owner tests it later)
         let small18 = try #require(PocketModel.english18M.voices["heart"])
         #expect(small18.pin.sha256 == ["heart-18m.safetensors": "0d9e5334433271a849bfa97b1a8626cb690446a98ea3008ba016704bc51cd2bb"])
         #expect(small18.bundled && small18.pin.local == "pocket-tts/english_18m_refl/heart")
@@ -407,75 +407,29 @@ private func pcm(_ wav: Data) -> [Int16] {
         #expect(FileStamp.checked(folder.appendingPathComponent("gone"), sha256: two) == nil)
     }
 
-    /// What Pocket cannot say Kokoro says, and the reason is logged (never silence, never the text).
-    /// Its answer says so (`standIn`, the response's `X-Voice-Stand-In`): the bridge never keeps such a clip of a canned
-    /// line (the review of 24 Oct: a greeting Kokoro said while Pocket was still fetching stayed af_heart's).
-    @Test func whatPocketCannotSayKokoroSays() async throws {
+    /// Owner, 3 Nov 2026 ("remove kokoro and supertonic", and for a line Pocket fails: "Nothing"): what Pocket cannot
+    /// say (not ready, a changed file, a run that fails, is late or writes too much, an odd WAV) no other voice says.
+    /// The reason is logged (never the text) and the line is refused (409, `not_said`), whatever the request asked; the
+    /// bridge then sends that answer as text. Before, Kokoro said it (or Supertonic-3 in another language).
+    @Test func whatPocketCannotSayNoOtherVoiceSays() async throws {
         var said: [String] = []
-        let ok = try await SpeechFallback.speak(pocket: { Data("p".utf8) }, instead: { Data("k".utf8) }, log: { said.append($0) })
-        #expect(ok == SpokenLine(wav: Data("p".utf8), standIn: nil) && said.isEmpty)
-        for (failure, reason) in [(PocketFailure.exit(1), "exit 1"), (.timeout, "timeout"), (.changed, "files changed"),
-                                  (.notReady("loading"), "not ready (loading)")] as [(PocketFailure, String)] {
-            let out = try await SpeechFallback.speak(pocket: { throw failure }, instead: { Data("k".utf8) }, log: { said.append($0) })
-            #expect(out == SpokenLine(wav: Data("k".utf8), standIn: "af_heart"))
-            #expect(said.last == "speaking: Pocket TTS did not say this line (\(reason)); Kokoro (af_heart) said it")
+        let ok = try await PocketLine.speak({ Data("p".utf8) }, log: { said.append($0) })
+        #expect(ok == Data("p".utf8) && said.isEmpty)
+        let failures: [(Error, String)] = [
+            (PocketFailure.exit(1), "exit 1"), (PocketFailure.timeout, "timeout"), (PocketFailure.changed, "files changed"),
+            (PocketFailure.notReady("loading"), "not ready (loading)"), (PocketFailure.signal(9), "signal 9"),
+            (PocketFailure.tooLarge, "too much audio"), (PocketWAV.Invalid(reason: "not a WAV"), "not a WAV"),
+            (VoiceError.notReady, "not_ready"),
+        ]
+        for (failure, reason) in failures {
+            said = []
+            await #expect(throws: VoiceError.notSaid, "\(reason)") {
+                try await PocketLine.speak({ throw failure }, log: { said.append($0) })
+            }
+            #expect(said == ["speaking: Pocket TTS did not say this line (\(reason)); no other voice says it"])
         }
-        // Kokoro fails too: the line is logged as said by nobody, after it tried (the review of 25 Oct: "said it" came
-        // first, so a stand-in that failed left a line nobody said)
-        said = []
-        await #expect(throws: VoiceError.notReady) {
-            try await SpeechFallback.speak(pocket: { throw PocketFailure.timeout }, instead: { throw VoiceError.notReady },
-                                           log: { said.append($0) })
-        }
-        #expect(said == ["speaking: Pocket TTS did not say this line (timeout); Kokoro (af_heart) could not say it either"])
-        let marked = String(decoding: HTTP.response(200, contentType: "audio/wav", body: Data("k".utf8),
-                                                    headers: SpokenLine(wav: Data(), standIn: "af_heart").headers), as: UTF8.self)
-        #expect(marked.contains("\r\nX-Voice-Stand-In: af_heart\r\n") && marked.hasSuffix("\r\n\r\nk"))
-        #expect(SpokenLine(wav: Data(), standIn: nil).headers.isEmpty)
-    }
-
-    /// Owner, 28 Oct (calls-03): a call's line after its turn's one Kokoro line asks for no stand-in, and so do the
-    /// lines before her answer and before a device question (the review of 28 Oct, pipeline-01 and words-01: the log
-    /// line names the ask, never a Kokoro line the turn may not have had). Pocket says it as ever; when Pocket cannot,
-    /// the stand-in is never asked (no Kokoro run, which an Apple bug can crash with the service and the call) and the
-    /// line is refused (409, `no_stand_in`).
-    @Test func aLineAskedWithNoStandInIsRefusedWhenPocketCannotSayIt() async throws {
-        var said: [String] = []
-        var asked = 0
-        let ok = try await SpeechFallback.speak(pocket: { Data("p".utf8) }, instead: { asked += 1; return Data("k".utf8) },
-                                                standInAllowed: false, log: { said.append($0) })
-        #expect(ok == SpokenLine(wav: Data("p".utf8), standIn: nil) && said.isEmpty)
-        await #expect(throws: VoiceError.noStandIn) {
-            try await SpeechFallback.speak(pocket: { throw PocketFailure.timeout }, instead: { asked += 1; return Data("k".utf8) },
-                                           standInAllowed: false, log: { said.append($0) })
-        }
-        #expect(asked == 0)
-        #expect(said == ["speaking: Pocket TTS did not say this line (timeout); Kokoro (af_heart) not asked: "
-                         + "the call asked for no stand-in"])
-        let refused = String(decoding: VoiceError.noStandIn.response, as: UTF8.self)
-        #expect(refused.hasPrefix("HTTP/1.1 409 Conflict\r\n") && refused.hasSuffix(#"{"error":"no_stand_in"}"#))
-    }
-
-    /// The review of 26 Oct (R1-F1): a line Pocket cannot say (the first start's fetch, a rest, a failed run) comes in
-    /// Kokoro's voice of the asked one's kind, never a woman's in the middle of a male-voiced call: alba's and
-    /// michael's (setup's for a male name) in am_michael, jane's, eve's and vera's in af_heart; in another language
-    /// Supertonic-3's F1. The log names the stand-in's engine by its voice.
-    @Test func aMaleVoicesLineIsKokorosMaleVoicesWhenPocketCannotSayIt() async throws {
-        for voice in ["alba", "michael"] { #expect(PocketTTS.standIn(for: "en", voice: voice) == "am_michael", "\(voice)") }
-        // heart's stand-in is af_heart, the voice it was cloned from (owner, 27 Oct)
-        for voice in ["heart", "jane", "eve", "vera", "other"] { #expect(PocketTTS.standIn(for: "en", voice: voice) == "af_heart", "\(voice)") }
-        #expect(try request(["input": "Hi.", "voice": "heart"]).standInVoice == "af_heart")
-        #expect(PocketTTS.standIn(for: "de", voice: "jane") == "F1" && PocketTTS.standIn(for: "fr", voice: "michael") == "F1")
-        #expect(try request(["input": "Hi.", "voice": "michael"]).standInVoice == "am_michael")
-        #expect(try request(["input": "Hi.", "voice": "alba"]).standInVoice == "am_michael")
-        #expect(try request(["input": "Hi.", "voice": "jane"]).standInVoice == "af_heart")
-        #expect(try request(["input": "Hallo.", "voice": "jane", "language": "de"]).standInVoice == "F1")
-        var said: [String] = []
-        let line = try request(["input": "Hi.", "voice": "michael"])
-        let out = try await SpeechFallback.speak(pocket: { throw PocketFailure.notReady("loading") }, instead: { Data("k".utf8) },
-                                                 standIn: line.standInVoice, log: { said.append($0) })
-        #expect(out == SpokenLine(wav: Data("k".utf8), standIn: "am_michael"))
-        #expect(said == ["speaking: Pocket TTS did not say this line (not ready (loading)); Kokoro (am_michael) said it"])
+        let refused = String(decoding: VoiceError.notSaid.response, as: UTF8.self)
+        #expect(refused.hasPrefix("HTTP/1.1 409 Conflict\r\n") && refused.hasSuffix(#"{"error":"not_said"}"#))
     }
 
     /// The review of 24 Oct: one run could hold her line for 30 s whatever its length. Its limit is a measured base and
@@ -619,18 +573,19 @@ private func pcm(_ wav: Data) -> [Int16] {
         }
     }
 
-    @Test func onlyPocketsTextIsPacedNeverKokorosOrSupertonics() throws {
+    /// Every line is Pocket TTS's since 3 Nov 2026 (Kokoro and Supertonic-3 removed), so every one is paced: English by
+    /// its words in any voice (a Kokoro id's too: heart's), each of the six languages by its own (jane's, whatever voice
+    /// is named).
+    @Test func everyLineIsPaced() throws {
         let long = Self.runOn
-        let eve = try request(["input": long, "voice": "eve"])
-        #expect(eve.spokenInput.contains(","))
-        #expect(PocketPace.runs(eve.spokenInput).allSatisfy { $0 <= PocketPace.limit })
-        #expect(eve.spokenInput(for: .kokoro) == SpokenEnglish.spoken(long))  // Kokoro's own text, as before
-        #expect(try request(["input": long, "voice": "af_heart"]).spokenInput == SpokenEnglish.spoken(long))
-        let dutch = try request(["input": long, "voice": "eve", "language": "nl"])
-        #expect(dutch.spokenInput == SpokenLanguage.spoken(long, language: "nl"))
-        // jane in German is Pocket's (owner, 25 Oct): paced too, by German's own words (PocketLanguageTests)
-        let german = try request(["input": long, "voice": "jane", "language": "de"])
-        #expect(german.spokenInput == PocketPace.paced(SpokenLanguage.spoken(long, language: "de"), language: "de"))
-        #expect(german.spokenInput(for: .supertonic) == SpokenLanguage.spoken(long, language: "de"))
+        for voice in ["eve", "heart", "af_heart", "michael"] {
+            let line = try request(["input": long, "voice": voice])
+            #expect(line.spokenInput == PocketText.spoken(long) && line.spokenInput.contains(","), "\(voice)")
+            #expect(PocketPace.runs(line.spokenInput).allSatisfy { $0 <= PocketPace.limit }, "\(voice)")
+        }
+        for (voice, code) in [("eve", "nl"), ("jane", "de")] {
+            let line = try request(["input": long, "voice": voice, "language": code])
+            #expect(line.spokenInput == PocketPace.paced(SpokenLanguage.spoken(long, language: code), language: code), "\(code)")
+        }
     }
 }

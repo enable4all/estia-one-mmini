@@ -84,7 +84,7 @@ private func answer(_ response: Data) -> (status: String, body: String) {
     private let second = Data(count: 32_000)
 
     @Test func theTurnDetectorRunsOnTheCPUOnly() {
-        // never on the Neural Engine, where a window would wait behind Whisper, Kokoro or Supertonic
+        // never on the Neural Engine, where a window would wait behind Whisper
         #expect(turnModelConfiguration().computeUnits == .cpuOnly)
     }
 

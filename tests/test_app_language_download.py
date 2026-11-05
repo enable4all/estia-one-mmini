@@ -1,11 +1,12 @@
 """The bridge while jane's model of a language downloads (owner, 25 Oct: "why use supersonic while
 downloading pocket? lets make it clear via a msg, that language is downloading, we need 3 minutes"): /language and
 /babble say so, a voice note gets its text answer and that note, a call rings out with a text, and one note says when
-her voice is ready. Never Supertonic-3's F1 in that language meanwhile: no speech request but the warm-up line, whose
-clip is thrown away."""
+her voice is ready. Nothing in that language is spoken meanwhile (owner, 3 Nov 2026: no other voice says a line): no
+speech request but the warm-up line, which is not said."""
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 import pytest
@@ -63,7 +64,7 @@ async def test_language_says_her_voice_downloads_a_voice_note_gets_text_and_the_
             deliver(folder, None, T0 + 1, attachments=[voice("v1.m4a", M4A)])
             await until(lambda: len(sent(folder)) == 3)
             assert sent(folder)[1:] == ["Es ist drei Uhr.", NOTE]
-            assert voice_notes(folder) == []  # her answer as text only: no Supertonic-3 stand-in
+            assert voice_notes(folder) == []  # her answer as text only: no other voice says it
             assert warm_up_lines(service, "de") == [prompts.CALL_SPOKEN["de"].now_speaking]  # the warm-up only
             service.health["pocket_de"] = "ready"
             await until(lambda: READY in sent(folder))
@@ -147,7 +148,7 @@ async def test_a_call_while_her_model_downloads_rings_out_with_a_text(
             await stop(harness)
 
 
-async def test_a_failed_download_says_so_and_supertonic_speaks_again(
+async def test_a_failed_download_says_so_and_her_answers_stay_text(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     with FakeVoiceService() as service:
@@ -162,10 +163,13 @@ async def test_a_failed_download_says_so_and_supertonic_speaks_again(
             service.health["pocket_de"] = "unavailable"
             failed = prompts.VOICE_DOWNLOAD_FAILED.format(language="German")
             await until(lambda: failed in sent(folder))
-            service.stand_in = "F1"
+            # an older voice service has Supertonic-3's F1 say it in Pocket TTS's place: never played (3 Nov 2026)
+            service.stand_in, service.stands_in_always = "F1", True
             put(folder, "v1.m4a", M4A)
             deliver(folder, None, T0 + 1, attachments=[voice("v1.m4a", M4A)])
-            await until(lambda: len(voice_notes(folder)) == 1)  # Supertonic-3's F1 says it: the failure was told
-            assert NOTE not in sent(folder)
+            await until(lambda: len(warm_up_lines(service, "de")) >= 2)  # the warm-up, then her answer: asked
+            await asyncio.sleep(0.3)
+            assert "Es ist drei Uhr." in sent(folder) and voice_notes(folder) == []  # her answer as text alone
+            assert NOTE not in sent(folder)  # the failure was told: no download note
         finally:
             await stop(harness)

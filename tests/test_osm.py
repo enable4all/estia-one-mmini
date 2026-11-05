@@ -426,7 +426,13 @@ async def test_injected_text_in_a_name_or_the_hours_is_cleaned() -> None:
         ("Example Loop 5, Apt 1203, Town", True, "Example Loop, Apt, Town"),
         ("c/o Alex Example, 1234-B Main St, Town", True, "c/o Alex Example, Main St, Town"),
         ("Town, 12345/A Example Avenue", True, "Town, Example Avenue"),
+        # 0.9.9 (osm-spelled-ordinal-floor): a spelled floor is a floor's label too; a postcode right after it loses its
+        # number, with advice, as one after "3rd Floor" does (fails safe)
+        ("Second Floor, 1234 Example Loop, Town", True, "Second Floor, Example Loop, Town"),
+        ("Example Park, Ground Floor, 1234 Example Loop", True, "Example Park, Ground Floor, Example Loop"),
+        ("Example Street, Second Floor, 1015 AA Amsterdam", True, "Example Street, Second Floor, AA Amsterdam"),
         # a street that only looks like a flat's part stays the street, and a postcode after it stays
+        ("Second Street, 1234 Example Loop", False, "Second Street, 1234 Example Loop"),
         ("Example Street B, 20100 Milano", False, "Example Street B, 20100 Milano"),
         ("Av B, 20100 Milano", False, "Av B, 20100 Milano"),
         # a postcode before a town's name stays
@@ -446,15 +452,44 @@ async def test_injected_text_in_a_name_or_the_hours_is_cleaned() -> None:
         ("Example Loop, Block 1234, Town", True, "Example Loop, Block, Town"),
         ("Example Loop, Blk 12345, Town", True, "Example Loop, Blk, Town"),
         ("Example Loop, Bldg. #1234, Town", True, "Example Loop, Bldg. #, Town"),
-        # what that fix leaves as it was: "St." read as a street word before a town still takes the postcode, with
-        # advice (fails safe; 0.9.9: guards-G01-st-town-false-advice)
-        ("Bahnhofstrasse, 9000 St. Gallen", True, "Bahnhofstrasse, St. Gallen"),
-        # (guard-03): a sign left in a flat's part ("№", "&") or a label of 1-3 digits keeps it a flat's part; "A-12"
-        # itself stays after the first comma (SECURITY.md, known gaps)
+        # 0.9.9 (osm-level-lvl-rm-lot): "Level" and "Lvl" are a floor's words, "Rm" and "Lot" a flat's; a floor's word
+        # still cuts no 4-5 digits after the first comma
+        ("Level 2, 1234 Example Loop, Town", True, "Level, Example Loop, Town"),
+        ("Lvl 3, 1234 Example Loop, Town", True, "Lvl, Example Loop, Town"),
+        ("Rm 12, 1234 Example Loop, Town", True, "Rm, Example Loop, Town"),
+        ("Lot 7, 1234 Example Loop, Town", True, "Lot, Example Loop, Town"),
+        ("Unit 5, Level 2, 1234 Example Loop, Town", True, "Unit, Level, Example Loop, Town"),
+        ("Example Loop, Rm 1203, Town", True, "Example Loop, Rm, Town"),
+        ("Example Loop, Lot 1234, Town", True, "Example Loop, Lot, Town"),
+        ("Example Loop, Level, 12345 Town", False, "Example Loop, Level, 12345 Town"),
+        # 0.9.9 (osm-st-ter-before-town): "St." or "Ter" right after the number, with no other street word after it,
+        # is a town's name, so the postcode before it stays, with no advice (it got the advice and lost its postcode)
+        ("Bahnhofstrasse, 9000 St. Gallen", False, "Bahnhofstrasse, 9000 St. Gallen"),
+        ("Hauptstrasse, 3100 St. Pölten", False, "Hauptstrasse, 3100 St. Pölten"),
+        ("Example Road, 9561 TA Ter Apel", False, "Example Road, 9561 TA Ter Apel"),
+        ("Example Road, 2461 AA Ter Aar", False, "Example Road, 2461 AA Ter Aar"),
+        ("Example Rue, 83990 St-Tropez", False, "Example Rue, 83990 St-Tropez"),
+        # with another street word after it, or a street word before it, the number still goes
+        ("c/o Alex Example, 1234 St. Example Way, Town", True, "c/o Alex Example, St. Example Way, Town"),
+        ("Town, 1234 St Example Ave", True, "Town, St Example Ave"),
+        ("c/o X, 1234 Main St Apt 5", True, "c/o X, Main St Apt"),
+        ("Town, 1234 Main Street North", True, "Town, Main Street North"),
+        ("c/o Alex Example, 1234 Main St NW, Town", True, "c/o Alex Example, Main St NW, Town"),
+        ("c/o X, 1234 NW Example Ter", True, "c/o X, NW Example Ter"),
+        ("c/o X, 1234 US Hwy 19, Town", True, "c/o X, US Hwy, Town"),
+        # (guard-03): a sign left in a flat's part ("№", "&") or a label of 1-3 digits keeps it a flat's part
         ("Apt № 4, 1234 Example Loop, Town", True, "Apt №, Example Loop, Town"),
         ("Unit 4 & 5, 1234 Example Loop, Town", True, "Unit &, Example Loop, Town"),
-        ("Town, Unit A-12, 12345 Example Loop", True, "Town, Unit A-12, Example Loop"),
         ("Unit A-12, 12345 Example Loop, Town", True, "Unit, Example Loop, Town"),
+        ("Building B-2, 1234 Example Loop, Town", True, "Building, Example Loop, Town"),  # a building's label, too
+        # 0.9.9 (osm-flat-dash-label-after-comma): after the first comma, a dash label right after a flat's, a floor's or
+        # a building's word goes too; alone it stays, as a lettered postcode does ("B-7", "IS-101": SECURITY.md, known
+        # gaps)
+        ("Town, Unit A-12, 12345 Example Loop", True, "Town, Unit, Example Loop"),
+        ("Example Road, Unit A-12, Town", True, "Example Road, Unit, Town"),
+        ("Example Park, Building B-2, 1234 Example Loop, Town", True, "Example Park, Building, Example Loop, Town"),
+        ("Example Road, B-7, Town", False, "Example Road, B-7, Town"),
+        ("Example Road, IS-101 Reykjavik", False, "Example Road, IS-101 Reykjavik"),
         # (docs-01-house-number-exception-incomplete): Spanish and Portuguese "nº12" with no space ("º" is a letter)
         ("Calle Mayor nº12, Madrid", True, "Calle Mayor nº, Madrid"),
         ("Calle Mayor Nº12, Madrid", True, "Calle Mayor Nº, Madrid"),
@@ -478,6 +513,16 @@ async def test_injected_text_in_a_name_or_the_hours_is_cleaned() -> None:
         ("B-1000 Brussels", False, "B-1000 Brussels"),
         ("A-1010 Wien", False, "A-1010 Wien"),
         ("London W8", False, "London W8"),
+        # 0.9.9 (osm-is-fo-postcode-first-part): Iceland's and the Faroes' postcodes, a dash and 3 digits, stay too
+        ("IS-101 Reykjavik", False, "IS-101 Reykjavik"),
+        ("FO-100 Tórshavn", False, "FO-100 Tórshavn"),
+        ("IS-101 Reykjavik, Laugavegur", False, "IS-101 Reykjavik, Laugavegur"),
+        # 0.9.9 (osm-uk-postcode-first-part): a UK postcode in the first part stays whole, as written on post
+        ("SW1A 1AA London", False, "SW1A 1AA London"),
+        ("SW1A 1AA", False, "SW1A 1AA"),
+        ("London SW1A 2AA", False, "London SW1A 2AA"),
+        ("M1 1AE Manchester", False, "M1 1AE Manchester"),
+        ("10 Downing Street SW1A 2AA", True, "Downing Street SW1A 2AA"),
         # a word after the number stays, and so does an ordinal ("5th Avenue" above)
         ("12 Rue de Rivoli, Paris", True, "Rue de Rivoli, Paris"),
         ("21st Street 5, Town", True, "21st Street, Town"),
@@ -577,6 +622,22 @@ async def test_a_good_italian_restaurant_is_found() -> None:
     found = await osm(http).places("good italian restaurant", CENTRE)
     assert [(place.name, place.unlisted) for place in found] == [("Trattoria", ())]
     assert query(http, 2)["q"] == "restaurant"
+
+
+async def test_a_word_the_map_describes_nothing_by_is_never_the_kind() -> None:
+    """0.9.9 (found-osm-kind-unmapped-last-word): the kind was the last word even when the map describes no place by
+    it, so "vegan restaurants nearby" searched for "nearby" and ranked by "restaurants"."""
+    http = FakeHttp()
+    http.add(NOMINATIM_URL, 200, [])
+    http.add(NOMINATIM_URL, 200, [])
+    http.add(
+        NOMINATIM_URL,
+        200,
+        [restaurant("Steakhouse", 52.3701, None, 1), restaurant("Green Kitchen", 52.3705, {"diet:vegan": "yes"}, 2)],
+    )
+    found = await osm(http).places("vegan restaurants nearby", CENTRE)
+    assert query(http, 2)["q"] == "restaurants"
+    assert [(place.name, place.unlisted) for place in found] == [("Green Kitchen", ())]
 
 
 async def test_a_vegan_restaurant_is_found_by_its_diet() -> None:

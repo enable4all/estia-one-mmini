@@ -11,7 +11,7 @@ import Foundation
 import VoiceCore
 
 /// The CoreML configuration the model loads with: the CPU only. On the Neural Engine a window would wait behind
-/// Whisper, Kokoro or Supertonic (one speaking or transcribing for seconds), and the bridge gives up on an answer
+/// Whisper (transcribing for seconds), and the bridge gives up on an answer
 /// after 0.3 s; the CPU answers a window in about 3 ms (spike A: 18 ms at most with every core busy).
 func turnModelConfiguration() -> MLModelConfiguration {
     let configuration = MLModelConfiguration()

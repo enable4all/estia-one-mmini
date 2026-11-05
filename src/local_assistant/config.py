@@ -132,7 +132,9 @@ _ACCOUNT_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]{0,19}$")
 _ADDRESS = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 _HHMM = re.compile(r"^([01][0-9]|2[0-3]):[0-5][0-9]$")
 _VOICE_URL = re.compile(r"^http://(127\.0\.0\.1|localhost):[0-9]{1,5}$")
-_VOICE_NAME = re.compile(r"^[a-z]{2}_[a-z]{2,20}$")  # Kokoro's
+# a Kokoro voice id (af_heart, am_michael, bf_emma: language, sex, name): Kokoro was removed (owner, 3 Nov 2026), so
+# a setting written before that names one is read as the closest Pocket TTS voice (`pocket_voice`)
+_KOKORO_ID = re.compile(r"^[a-z]{2}_[a-z]{2,20}$")
 # Pocket TTS's English voices in their order (VoiceCore `PocketTTS.order`, pinned equal by a test): heart, the default
 # (owner, 27 Oct: "call the voice Heart", "not af_heart, do heart, and make it default": Kokoro's af_heart cloned onto
 # each model, its files shipped with the voice service; 29 Oct, the 18M's too: "just make the small heart"), jane, eve,
@@ -144,9 +146,6 @@ POCKET_VOICES = frozenset(POCKET_ORDER)
 # the default English voice (an empty [voice], setup for a female name) on either model (owner, 29 Oct: "on 16gb make
 # Heart the default as well", in place of 27 Oct's "for small, do Jane"), which also speaks for vera beside the 18M
 DEFAULT_VOICE = "heart"
-# the Pocket voices setup gives a male name; what they cannot say Kokoro's am_michael says (VoiceCore
-# `PocketTTS.maleVoices`, `maleStandIn`, pinned equal by a test; the review of 26 Oct, R1-F1), the others' af_heart
-MALE_POCKET_VOICES = frozenset({"alba", "michael"})
 # the voices only the 100M model has (VoiceCore `PocketModel.english18M` has none of them): offered only beside it
 STANDARD_ONLY = frozenset({"vera"})
 # other names for them (owner, 26 Oct): eve-full was eve on the 100M model beside the 18M's eve, so an old config or a
@@ -159,20 +158,26 @@ def canonical_voice(name: str) -> str:
     return VOICE_ALIASES.get(name, name)
 
 
-def kokoro_stand_in(name: str) -> str:
-    """Who says a line in the English voice `name` that Pocket TTS cannot: Kokoro's am_michael for alba and michael,
-    af_heart for heart (the voice it was cloned from), jane, eve and vera, as the voice service picks it; a Kokoro voice
-    says its own."""
-    if name in MALE_POCKET_VOICES:
-        return "am_michael"
-    return "af_heart" if name in POCKET_VOICES else name
+def kokoro_voice(name: str) -> bool:
+    """Whether `name` is a Kokoro voice id (af_heart, am_michael): Kokoro was removed (owner, 3 Nov 2026)."""
+    return bool(_KOKORO_ID.match(name))
+
+
+def pocket_voice(name: str) -> str:
+    """The Pocket TTS voice for `name`: a Kokoro voice id (an old config or /voice choice; owner, 3 Nov 2026: Kokoro
+    removed, a stored setting must keep loading) as the closest one, michael for a male one (its second letter m:
+    am_michael, bm_george), heart for any other (af_heart's clone); another name (`VOICE_ALIASES`) as its voice; any
+    other as given."""
+    if kokoro_voice(name):
+        return "michael" if name[1] == "m" else DEFAULT_VOICE
+    return canonical_voice(name)
 
 
 def voice_here(name: str, standard: bool) -> str:
     """The English voice that speaks for `name` (a config's) on this Mac: one only the 100M model has (`STANDARD_ONLY`:
-    vera) beside the 18M (`standard` false) is the default, heart (the review of 26 Oct, R1-F4: used as written, every
-    line was Kokoro's af_heart, as a stand-in, and no canned call line was kept); any other as it is. Config load still
-    takes them: a config may move between Macs."""
+    vera) beside the 18M (`standard` false) is the default, heart (the review of 26 Oct, R1-F4: used as written, no line
+    was said in it, as the 18M has no vera); any other as it is. Config load still takes them: a config may move between
+    Macs."""
     return DEFAULT_VOICE if not standard and name in STANDARD_ONLY else name
 
 
@@ -183,11 +188,30 @@ def default_voice(standard: bool) -> str:
 
 # the six languages jane speaks in Pocket TTS (VoiceCore `PocketTTS.languages`, pinned equal by a test; owner, 25 Oct:
 # "jane jane, lets have her as default for those languages"), each its language's full model, fetched only for the
-# language in use; Korean, Polish, Japanese and Russian (no Pocket model) stay Supertonic-3's F1
+# language in use; Korean, Polish, Japanese and Russian, which Pocket TTS has no model for, have no voice (owner,
+# 3 Nov 2026: Kokoro and Supertonic-3 removed, nothing replaces them; Supertonic's upstream was archived in Sept 2026)
 POCKET_LANGUAGES = ("es", "it", "pt", "nl", "de", "fr")
-# the voices pinned for them (VoiceCore `PocketTTS.languageVoice`): only jane's; `[voice] language_voice = ""` gives
-# the six back to Supertonic-3's F1, as before (the review of 25 Oct)
-LANGUAGE_VOICES = frozenset({"jane"})
+# the voice pinned for them (VoiceCore `PocketTTS.languageVoice`): jane's only
+LANGUAGE_VOICE = "jane"
+
+
+def has_voice(language: str) -> bool:
+    """Whether her voice speaks `language`: English and the six of Pocket TTS (`POCKET_LANGUAGES`) only. In the
+    others (Korean, Polish, Russian, Japanese) her answers come as text and calls are not picked up (owner, 3 Nov
+    2026)."""
+    return language == "en" or language in POCKET_LANGUAGES
+
+
+# the notes on a setting written before 3 Nov 2026 that named a removed voice: it still loads, in the closest Pocket
+# voice, and the bridge logs each note once at its start
+KOKORO_SETTING_NOTE = (
+    '[voice] voice = "{old}" was a Kokoro voice, and Kokoro was removed (3 Nov 2026): {new} speaks instead.'
+    ' Set voice = "{new}" to drop this line.'
+)
+SUPERTONIC_SETTING_NOTE = (
+    '[voice] language_voice = "" was Supertonic-3\'s voice, and Supertonic-3 was removed (3 Nov 2026): jane speaks'
+    " Spanish, Italian, Portuguese, Dutch, German and French. Delete the line to drop this note."
+)
 
 
 @dataclass(frozen=True)
@@ -491,9 +515,10 @@ class Config:
     mail_reply_days: int = 7
     # voice notes through the local voice service (tools/voice); off without [voice]
     voice_url: str = ""
-    voice_name: str = DEFAULT_VOICE  # Pocket TTS's heart (alba for a male name)
-    voice_language_voice: str = "jane"  # the voice of POCKET_LANGUAGES (Pocket TTS; "": F1); English's is voice_name
-    voice_speed: float = 1.05
+    voice_name: str = DEFAULT_VOICE  # Pocket TTS's heart (alba for a male name); jane speaks POCKET_LANGUAGES
+    # a setting written before 3 Nov 2026 that named Kokoro or Supertonic-3, read as the closest Pocket voice: one note
+    # each (KOKORO_SETTING_NOTE, SUPERTONIC_SETTING_NOTE), logged at the bridge's start
+    voice_notes: tuple[str, ...] = ()
     voice_max_spoken_chars: int = 1500
     voice_max_audio_bytes: int = 10_000_000
     # lights and plugs on the home network through tools/tapo (python-kasa: Kasa and Tapo); off without [tapo]
@@ -530,7 +555,6 @@ class Config:
     calls_java_home: Path | None = None  # default: what /usr/libexec/java_home says
     calls_tunnel: Path | None = None  # default: data_dir / "vendor" / ...
     calls_socket_dir: Path | None = None  # default: data_dir / "calls", or ~/.la-calls when that is too long
-    calls_speed: float = 1.05
     calls_end_of_turn_seconds: float = 2.3  # owner, 15 Oct: room to think (2.8); 17 Oct: 0.5 s less
     calls_idle_prompt_seconds: float = 90
     calls_max_minutes: float = 60
@@ -1190,14 +1214,15 @@ def _mail_settings(mail: dict[str, object]) -> _MailSettings:
 class _VoiceSettings(TypedDict, total=False):
     voice_url: str
     voice_name: str
-    voice_language_voice: str
-    voice_speed: float
+    voice_notes: tuple[str, ...]
     voice_max_spoken_chars: int
     voice_max_audio_bytes: int
 
 
 def _voice_settings(voice: object) -> _VoiceSettings:
-    """The [voice] table as Config keyword arguments; an empty [voice] turns voice on with the defaults."""
+    """The [voice] table as Config keyword arguments; an empty [voice] turns voice on with the defaults. A setting
+    written before 3 Nov 2026 that names Kokoro or Supertonic-3 still loads, in the closest Pocket voice, with a note
+    (`voice_notes`); `speed`, read only by them, is left alone (Pocket TTS has none)."""
     if voice is None:
         return {}
     if not isinstance(voice, dict):
@@ -1206,21 +1231,22 @@ def _voice_settings(voice: object) -> _VoiceSettings:
     if not isinstance(url, str) or not _VOICE_URL.match(url):
         raise ConfigError("voice.url must be the local voice service, like http://127.0.0.1:8150")
     name = voice.get("voice", DEFAULT_VOICE)
-    if not isinstance(name, str) or not (_VOICE_NAME.match(name) or name in POCKET_VOICES or name in VOICE_ALIASES):
+    if not isinstance(name, str) or not (kokoro_voice(name) or name in POCKET_VOICES or name in VOICE_ALIASES):
         raise ConfigError(
             "voice.voice must be heart, jane, eve, vera, alba or michael (Pocket TTS; eve-full is another name for eve)"
-            " or a Kokoro voice name like af_heart"
         )
-    name = canonical_voice(name)
-    language_voice = voice.get("language_voice", "jane")
-    if not isinstance(language_voice, str) or language_voice not in LANGUAGE_VOICES | {""}:
+    notes: list[str] = []
+    if kokoro_voice(name):
+        notes.append(KOKORO_SETTING_NOTE.format(old=name, new=pocket_voice(name)))
+    name = pocket_voice(name)
+    language_voice = voice.get("language_voice", LANGUAGE_VOICE)
+    if not isinstance(language_voice, str) or language_voice not in (LANGUAGE_VOICE, ""):
         raise ConfigError(
-            "voice.language_voice must be jane, the only Pocket TTS voice pinned for Spanish, Italian, Portuguese,"
-            ' Dutch, German and French, or "" for Supertonic-3\'s F1 in them, as before'
+            "voice.language_voice must be jane, the only voice of Spanish, Italian, Portuguese, Dutch, German and"
+            " French (or leave the line out)"
         )
-    speed = voice.get("speed", 1.05)
-    if isinstance(speed, bool) or not isinstance(speed, int | float) or not 0.7 <= speed <= 1.5:
-        raise ConfigError("voice.speed must be between 0.7 and 1.5")
+    if not language_voice:  # Supertonic-3's F1 in the six, before 3 Nov 2026
+        notes.append(SUPERTONIC_SETTING_NOTE)
     limits: dict[str, int] = {}
     for key, default, low, high in (
         ("max_spoken_chars", 1500, 100, 1500),
@@ -1233,8 +1259,7 @@ def _voice_settings(voice: object) -> _VoiceSettings:
     return {
         "voice_url": url,
         "voice_name": name,
-        "voice_language_voice": language_voice,
-        "voice_speed": float(speed),
+        "voice_notes": tuple(notes),
         "voice_max_spoken_chars": limits["max_spoken_chars"],
         "voice_max_audio_bytes": limits["max_audio_bytes"],
     }
@@ -1432,7 +1457,6 @@ class _CallsSettings(TypedDict, total=False):
     calls_java_home: Path
     calls_tunnel: Path
     calls_socket_dir: Path
-    calls_speed: float
     calls_end_of_turn_seconds: float
     calls_idle_prompt_seconds: float
     calls_max_minutes: float
@@ -1521,10 +1545,7 @@ def _calls_settings(calls: object, *, voice: bool) -> _CallsSettings:
             "your home folder's path is too long for the call sockets: set calls.socket_dir to a short folder "
             "(under 65 characters)"
         )
-    speed = calls.get("speed", 1.05)
-    if isinstance(speed, bool) or not isinstance(speed, int | float) or not 0.7 <= speed <= 1.5:
-        raise ConfigError("calls.speed must be between 0.7 and 1.5")
-    numbers: dict[str, float] = {}
+    numbers: dict[str, float] = {}  # `speed` is left alone: only Kokoro read it (removed, 3 Nov 2026)
     for key, default, low, high in (
         ("end_of_turn_seconds", 2.3, 0.5, 5.0),
         ("idle_prompt_seconds", 90, 10, 3600),
@@ -1560,7 +1581,6 @@ def _calls_settings(calls: object, *, voice: bool) -> _CallsSettings:
         raise ConfigError(f"calls.turn_timeout_seconds must be from {low} to {high}")
     settings: _CallsSettings = {
         "calls_enabled": True,
-        "calls_speed": float(speed),
         "calls_end_of_turn_seconds": numbers["end_of_turn_seconds"],
         "calls_idle_prompt_seconds": numbers["idle_prompt_seconds"],
         "calls_max_minutes": numbers["max_call_minutes"],

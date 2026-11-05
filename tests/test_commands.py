@@ -3,6 +3,7 @@ import re
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -11,10 +12,11 @@ from local_assistant.babble import Babble, listing, listing_lines
 from local_assistant.commands import TRUST_DAYS, UNLOCK_WAIT_SECONDS, Commands, Guard, StatusInfo, VoiceLanguages
 from local_assistant.context import ContextBuilder
 from local_assistant.initiative import Initiative, Settings, Writer
-from local_assistant.language import LANGUAGE_KEY, LANGUAGES
+from local_assistant.language import CODES, LANGUAGE_KEY, LANGUAGES
 from local_assistant.profile import Profile
 from local_assistant.reminders import Reminders
 from local_assistant.store import Message, Store
+from local_assistant.timefmt import local_when
 from tests.conftest import ME, STRANGER, T0, TZ
 from tests.fakes.fake_gemma import FakeGemma, text
 
@@ -125,7 +127,7 @@ def test_help_groups_the_commands_under_bold_headings() -> None:
     assert sections[-1] == "/help - this list\nAnything else is a message for me."
     commands = [line.split()[0] for line in prompts.HELP.splitlines() if line.startswith("/")]
     assert commands == [
-        *["/new", "/profile", "/fix", "/forget", "/learn", "/soul", "/docs"],
+        *["/new", "/profile", "/fix", "/forget", "/learn", "/soul", "/docs", "/thinking"],
         *["/voice", "/language", "/babble"],
         *["/remind", "/reminders", "/initiative", "/quiet", "/evening"],
         *["/status", "/tools", "/lock", "/unlock", "/devices"],
@@ -429,13 +431,13 @@ async def test_voice_name_switches_the_voice_and_lists_the_choices(store: Store)
 
     assert (await say("/voices", T0 - 1)).startswith("Voices (try one with /voice <voice>)")
     listed = await say("/voice voices", T0)
-    assert "bm_george: British, male" in listed and "am_michael: American, male, warm" in listed
-    assert await say("/voice name bm_george", T0 + 1) == "bm_george is on: calls and voice notes use his voice now."
-    assert chosen == ["bm_george"] and store.get_state("voice_name") == "bm_george"
+    assert "michael: male (Pocket TTS)" in listed and "jane: female (Pocket TTS)" in listed
+    assert await say("/voice name michael", T0 + 1) == "Michael is on: calls and voice notes use his voice now."
+    assert chosen == ["michael"] and store.get_state("voice_name") == "michael"
     assert await say("/voice name robot", T0 + 2) == "There's no voice called Robot here yet. /voice voices lists them."
-    assert chosen == ["bm_george"]
-    assert await say("/voice af_heart", T0 + 3) == "af_heart is on: calls and voice notes use her voice now."
-    assert chosen == ["bm_george", "af_heart"] and store.get_state("voice_name") == "af_heart"
+    assert chosen == ["michael"]
+    assert await say("/voice jane", T0 + 3) == "Jane is on: calls and voice notes use her voice now."
+    assert chosen == ["michael", "jane"] and store.get_state("voice_name") == "jane"
 
 
 def voice_commands(store: Store, chosen: list[str], **options: Any) -> Callable[[str, int], Awaitable[str]]:
@@ -462,10 +464,10 @@ def voice_commands(store: Store, chosen: list[str], **options: Any) -> Callable[
     return say
 
 
-async def test_the_pocket_voices_and_af_heart_on_a_mac_with_the_large_model(store: Store) -> None:
+async def test_the_pocket_voices_on_a_mac_with_the_large_model(store: Store) -> None:
     """Owner, 26 Oct: "Jane is the default voice", "alba & michael for males, both on small and big", vera on the big
-    model, eve-full another name for eve; af_heart and am_michael stay Kokoro's. /voices names each voice's engine,
-    Pocket's first in its order, and `/voice <voice>` switches at once, as `/voice name` does."""
+    model, eve-full another name for eve; 3 Nov 2026: Kokoro removed, Pocket TTS's voices only. /voices lists them in
+    Pocket's order, and `/voice <voice>` switches at once, as `/voice name` does."""
     chosen: list[str] = []
     say = voice_commands(store, chosen, pocket_standard=True)
     lines = (await say("/voices", T0)).splitlines()
@@ -479,15 +481,13 @@ async def test_the_pocket_voices_and_af_heart_on_a_mac_with_the_large_model(stor
         "michael: male (Pocket TTS)",
         "eve-full: another name for eve",
     ]
-    assert "af_heart: American, female (Kokoro)" in lines and "am_michael: American, male, warm (Kokoro)" in lines
-    assert all(line.endswith(("(Pocket TTS)", "(Kokoro)", "another name for eve")) for line in lines[1:])
+    assert len(lines) == 8 and not any("Kokoro" in line for line in lines)
     assert await say("/voice eve", T0 + 1) == "Eve is on: calls and voice notes use her voice now."
     assert chosen == ["eve"] and store.get_state("voice_name") == "eve"
-    assert await say("/voice af_heart", T0 + 2) == "af_heart is on: calls and voice notes use her voice now."
     assert await say("/voice name jane", T0 + 3) == "Jane is on: calls and voice notes use her voice now."
-    assert chosen == ["eve", "af_heart", "jane"]
+    assert chosen == ["eve", "jane"]
     assert await say("/voice marius", T0 + 4) == "There's no voice called Marius here yet. /voice voices lists them."
-    assert chosen == ["eve", "af_heart", "jane"] and store.get_state("voice_name") == "jane"
+    assert chosen == ["eve", "jane"] and store.get_state("voice_name") == "jane"
     # eve-full is eve: chosen and kept by her name, and the reply says so
     assert await say("/voice eve-full", T0 + 5) == (
         "Eve is on: calls and voice notes use her voice now. eve-full is another name for eve."
@@ -497,14 +497,24 @@ async def test_the_pocket_voices_and_af_heart_on_a_mac_with_the_large_model(stor
     assert chosen[-1] == "vera" and store.get_state("voice_name") == "vera"
     assert await say("/voice alba", T0 + 7) == "Alba is on: calls and voice notes use his voice now."
     assert await say("/voice michael", T0 + 8) == "Michael is on: calls and voice notes use his voice now."
-    assert await say("/voice am_michael", T0 + 9) == "am_michael is on: calls and voice notes use his voice now."
-    assert chosen[-3:] == ["alba", "michael", "am_michael"] and store.get_state("voice_name") == "am_michael"
-    # heart, af_heart's warmth on Pocket TTS (owner, 27 Oct: "not af_heart, do heart"): /voice heart picks it, and
-    # af_heart stays Kokoro's own, by its id
+    assert chosen[-2:] == ["alba", "michael"] and store.get_state("voice_name") == "michael"
+    # heart, af_heart's warmth on Pocket TTS (owner, 27 Oct: "not af_heart, do heart"): /voice heart picks it
     assert await say("/voice heart", T0 + 10) == "Heart is on: calls and voice notes use her voice now."
     assert chosen[-1] == "heart" and store.get_state("voice_name") == "heart"
-    assert await say("/voice af_heart", T0 + 11) == "af_heart is on: calls and voice notes use her voice now."
-    assert chosen[-1] == "af_heart"
+
+
+async def test_a_kokoro_voice_is_no_choice_any_more(store: Store) -> None:
+    """Owner, 3 Nov 2026: Kokoro was removed. `/voice af_heart` (or any Kokoro id, in any case, after `name` too) says
+    so and changes nothing; a stored choice from before is read as the closest Pocket voice at the start (app)."""
+    chosen: list[str] = []
+    say = voice_commands(store, chosen, pocket_standard=True)
+    assert await say("/voice heart", T0) == "Heart is on: calls and voice notes use her voice now."
+    for at, typed in enumerate(("/voice af_heart", "/voice AM_Michael", "/voice name bf_emma")):
+        voice = typed.split()[-1].lower()
+        assert await say(typed, T0 + 1 + at) == (
+            f"{voice} was one of Kokoro's voices, and Kokoro was removed. /voice voices lists the voices here."
+        )
+    assert chosen == ["heart"] and store.get_state("voice_name") == "heart"
 
 
 async def test_a_mac_with_the_small_model_offers_no_vera(store: Store) -> None:
@@ -523,7 +533,6 @@ async def test_a_mac_with_the_small_model_offers_no_vera(store: Store) -> None:
         "eve-full: another name for eve",
     ]
     assert not any(line.startswith("vera") for line in lines)
-    assert "af_heart: American, female (Kokoro)" in lines  # Kokoro's own stays on every Mac
     assert await say("/voice jane", T0 + 1) == "Jane is on: calls and voice notes use her voice now."
     assert await say("/voice vera", T0 + 2) == prompts.VOICE_STANDARD_ONLY.format(voice="Vera")
     assert prompts.VOICE_STANDARD_ONLY.format(voice="Vera") == (
@@ -550,8 +559,8 @@ def test_without_a_figure_commands_read_the_macs_model(store: Store, monkeypatch
 async def test_in_janes_languages_voice_says_she_speaks_them(store: Store) -> None:
     """Owner, 25 Oct: "jane jane, lets have her as default for those languages". While Spanish, Italian, Portuguese,
     Dutch, German or French is in use, /voice still chooses the English voice, and its reply and /voices say that this
-    language is spoken in Jane's voice; in English, or in Korean, Polish, Japanese and Russian (Supertonic-3's), the
-    replies stay as they were."""
+    language is spoken in Jane's voice; in English the replies stay as they were, and in Korean, Polish, Japanese and
+    Russian (no voice: owner, 3 Nov 2026) they say so."""
     chosen: list[str] = []
     profile = Profile(store)
     commands = Commands(
@@ -564,7 +573,6 @@ async def test_in_janes_languages_voice_says_she_speaks_them(store: Store) -> No
         voice=True,
         set_voice=chosen.append,
         language="de",
-        language_voice="jane",
     )
     conversation = store.current_conversation()
 
@@ -578,8 +586,8 @@ async def test_in_janes_languages_voice_says_she_speaks_them(store: Store) -> No
         "/voice sets the English voice."
     )
     assert chosen == ["eve"] and store.get_state("voice_name") == "eve"
-    assert await say("/voice am_michael", T0 + 1) == (
-        "am_michael is on: calls and voice notes in English use his voice now. German is spoken in Jane's voice "
+    assert await say("/voice michael", T0 + 1) == (
+        "Michael is on: calls and voice notes in English use his voice now. German is spoken in Jane's voice "
         "(Pocket TTS); /voice sets the English voice."
     )
     listed = (await say("/voices", T0 + 2)).splitlines()
@@ -596,26 +604,24 @@ async def test_in_janes_languages_voice_says_she_speaks_them(store: Store) -> No
             voice=True,
             set_voice=chosen.append,
             language=code,
-            language_voice="jane",
         )
         reply = await say("/voice eve", T0 + 3 + step)
-        if english is None:
+        if code == "en":
             assert reply == "Eve is on: calls and voice notes use her voice now.", code
+        elif english is None:  # Korean: no voice at all
+            assert reply == (
+                "Eve is on: calls and voice notes in English use her voice now. I have no voice in Korean: my answers"
+                " come as text, and calls in Korean are not picked up."
+            )
         else:
             assert reply.endswith(f"{english} is spoken in Jane's voice (Pocket TTS); /voice sets the English voice.")
-    # without a language voice (a voice service from before), as it was
-    bare = Commands(
-        store, profile, ContextBuilder(store, profile, TZ), TZ, status, lambda: None, voice=True, language="de"
-    )
-    commands = bare
-    assert await say("/voice eve", T0 + 9) == "Eve is on: calls and voice notes use her voice now."
 
 
 async def test_a_voice_command_answers_in_plain_words_whatever_the_spelling(store: Store) -> None:
-    """Owner, 25 Oct (the Tiffany line's /voice, on main's Kokoro voices): a voice matches in any case, by itself or
-    after `name`; a known voice answers "<voice> is on: ..." by its id as the owner types it ("af_heart", never
-    "Heart"), his for a male voice, her for a female one (the list's own word); a single word that is no mode, no
-    `voices` and no voice says so (an id as typed, a name capitalised) and never falls through to the usage line."""
+    """Owner, 25 Oct (the Tiffany line's /voice): a voice matches in any case, by itself or after `name`; a known voice
+    answers "<Voice> is on: ...", his for a male voice, her for a female one (the list's own word); a single word that
+    is no mode, no `voices` and no voice says so (an id as typed, a name capitalised) and never falls through to the
+    usage line."""
     chosen: list[str] = []
     profile = Profile(store)
     commands = Commands(
@@ -635,24 +641,20 @@ async def test_a_voice_command_answers_in_plain_words_whatever_the_spelling(stor
         assert message_id is not None
         return await commands.handle(store.message(message_id))
 
-    assert await say("/voice AF_Heart", T0) == "af_heart is on: calls and voice notes use her voice now."
-    assert await say("/voice JANE", T0 + 30) == "Jane is on: calls and voice notes use her voice now."  # a Pocket name
-    assert await say("/voice BF_EMMA", T0 + 1) == "bf_emma is on: calls and voice notes use her voice now."
-    assert await say("/voice Name Am_Michael", T0 + 2) == "am_michael is on: calls and voice notes use his voice now."
-    assert await say("/voice am_puck", T0 + 3) == "am_puck is on: calls and voice notes use his voice now."
-    assert (
-        chosen == ["af_heart", "jane", "bf_emma", "am_michael", "am_puck"]
-        and store.get_state("voice_name") == "am_puck"
-    )
+    assert await say("/voice HEART", T0) == "Heart is on: calls and voice notes use her voice now."
+    assert await say("/voice JANE", T0 + 30) == "Jane is on: calls and voice notes use her voice now."
+    assert await say("/voice Eve", T0 + 1) == "Eve is on: calls and voice notes use her voice now."
+    assert await say("/voice Name Michael", T0 + 2) == "Michael is on: calls and voice notes use his voice now."
+    assert await say("/voice alba", T0 + 3) == "Alba is on: calls and voice notes use his voice now."
+    assert chosen == ["heart", "jane", "eve", "michael", "alba"] and store.get_state("voice_name") == "alba"
     nobody = "There's no voice called {} here yet. /voice voices lists them."
     assert await say("/voice Zoe", T0 + 4) == nobody.format("Zoe")
     assert await say("/voice zoe", T0 + 5) == nobody.format("Zoe")
     assert await say("/voice name ZOE", T0 + 6) == nobody.format("Zoe")
     assert await say("/voice 12345", T0 + 7) == nobody.format("12345")
-    assert await say("/voice AF_Nova", T0 + 8) == nobody.format("af_nova")  # an id the owner types: never "Nova"
-    assert await say("/voice f1", T0 + 9) == nobody.format("F1")  # Supertonic's voice speaks the other languages
-    assert chosen == ["af_heart", "jane", "bf_emma", "am_michael", "am_puck"]  # nothing changed
-    assert store.get_state("voice_name") == "am_puck"
+    assert await say("/voice f1", T0 + 9) == nobody.format("F1")  # Supertonic-3's voice: removed (3 Nov 2026)
+    assert chosen == ["heart", "jane", "eve", "michael", "alba"]  # nothing changed
+    assert store.get_state("voice_name") == "alba"
     for at, mode in enumerate(("auto", "on", "off", "Auto", "ON")):  # the modes and the list keep their own answers
         assert (await say(f"/voice {mode}", T0 + 10 + at)).startswith("Voice replies: ")
     assert (await say("/voice Voices", T0 + 20)).startswith("Voices (try one with /voice <voice>)")
@@ -738,7 +740,7 @@ async def test_help_lists_fix() -> None:
 
 
 def with_language(
-    store: Store, language: str = "en", voice_languages: VoiceLanguages | None = None
+    store: Store, language: str = "en", voice_languages: VoiceLanguages | None = None, *, voice: bool = False
 ) -> tuple[Commands, list[str]]:
     switched: list[str] = []
     profile = Profile(store)
@@ -752,6 +754,7 @@ def with_language(
         language=language,
         set_language=switched.append,
         voice_languages=voice_languages,
+        voice=voice,
     )
     return commands, switched
 
@@ -761,9 +764,31 @@ async def test_language_lists_the_eleven_and_marks_the_current_one(store: Store)
     lines = (await commands.handle(command(store, "/language"))).splitlines()
     listed = [line for line in lines if line.startswith("• ")]
     assert len(listed) == 11 and listed[0] == "• English (en)"
-    assert "• Nederlands, Dutch (nl) ← now" in listed and "• 日本語, Japanese (ja)" in listed
+    assert "• Nederlands, Dutch (nl) ← now" in listed and "• 日本語, Japanese (ja) (text only: no voice)" in listed
+    # the review of 4 Nov: the four languages with no voice are marked before one is chosen, the others are not
+    marked = [line for line in listed if line.endswith(" (text only: no voice)")]
+    assert [line.split("(")[-2].strip(") ") for line in marked] == ["ko", "pl", "ja", "ru"]
     assert lines[-1] == "Switch with /language and a name or code, like /language nl or /language dutch."
     assert switched == [] and store.get_state(LANGUAGE_KEY) is None
+
+
+@pytest.mark.parametrize(
+    ("typed", "reply"),
+    [
+        ("/voice on", "Voice replies: on (every answer)."),
+        ("/voice auto", "Voice replies: auto (a voice note gets a voice answer)."),
+    ],
+)
+async def test_voice_modes_say_there_is_no_voice_in_the_language(store: Store, typed: str, reply: str) -> None:
+    """The review of 4 Nov: in Polish "/voice on" said "on (every answer)", and a bare /voice "auto (a voice note gets
+    a voice answer)", both false there. Each says so in /language's words; /voice off and English say nothing more."""
+    commands, _ = with_language(store, "pl", voice=True)
+    no_voice = prompts.VOICE_NO_LANGUAGE.format(language="Polish")
+    assert await commands.handle(command(store, typed)) == f"{reply} {no_voice}"
+    assert no_voice in await commands.handle(command(store, "/voice", T0 + 1))
+    assert await commands.handle(command(store, "/voice off", T0 + 2)) == "Voice replies: off."
+    english, _ = with_language(store, "en", voice=True)
+    assert await english.handle(command(store, typed, T0 + 3)) == reply
 
 
 async def test_language_switches_by_code_or_name_and_says_so(store: Store) -> None:
@@ -811,6 +836,34 @@ async def test_a_switch_says_when_the_voice_service_cannot_do_the_language(store
     assert len(asked) == 3
     assert await commands.handle(command(store, "/language en", T0 + 3)) == prompts.LANGUAGE_SET_ENGLISH
     assert len(asked) == 3  # English works with any voice service
+
+
+@pytest.mark.parametrize(
+    ("code", "english"), [("ko", "Korean"), ("pl", "Polish"), ("ru", "Russian"), ("ja", "Japanese")]
+)
+async def test_a_switch_to_a_language_with_no_voice_says_so(store: Store, code: str, english: str) -> None:
+    """Owner, 3 Nov 2026: Korean, Polish, Russian and Japanese have no voice (Pocket TTS has no model for them,
+    nothing replaces Supertonic-3): with voice set up, /language's reply says so in the words of the call's text; the
+    voice service is not asked. Without voice the reply is as before."""
+    asked: list[str] = []
+
+    async def voice_languages() -> tuple[str, ...] | None:
+        asked.append("health")
+        return tuple(CODES)
+
+    profile = Profile(store)
+    commands = Commands(
+        store, profile, ContextBuilder(store, profile, TZ), TZ, status, lambda: None, voice=True,
+        voice_languages=voice_languages,
+    )  # fmt: skip
+    reply = await commands.handle(command(store, f"/language {code}"))
+    assert reply.endswith(
+        f"From now on I listen and answer in {english}. Code-written notes stay in English.\n"
+        f"I have no voice in {english}: my answers come as text, and calls in {english} are not picked up."
+    )
+    assert asked == [] and store.get_state(LANGUAGE_KEY) == code
+    plain, _ = with_language(store)  # no voice set up: as before
+    assert (await plain.handle(command(store, f"/language {code}", T0 + 2))).endswith("stay in English.")
 
 
 # /remind and /reminders: code only, no Gemma (a dependable path when Gemma is slow or down)
@@ -1021,7 +1074,7 @@ def from_device(store: Store, text: str, device: int | None, ts: int = T0) -> Me
 
 def test_the_phone_of_every_allowed_account_is_known_from_the_start(store: Store) -> None:
     """The rollout rule: Signal's device 1 is the phone the account was registered on; every linked device (2 and up)
-    is held until it is allowed from a known device."""
+    is held until the phone allows it."""
     guard = Guard(store, frozenset({ME, STRANGER}), tz=TZ)
     assert guard.seed() == 2
     assert guard.seed() == 0  # once
@@ -1034,22 +1087,69 @@ def test_a_new_device_is_held_and_the_note_comes_at_most_once_an_hour(store: Sto
     clock = Clock()
     guard, _ = guarded(store, clock)
     guard.seed()
-    note = guard.hold(ME, 3)
-    assert note == prompts.DEVICE_HELD.format(device=3)
+    note = guard.hold(ME, 3, T0)
+    assert note == prompts.DEVICE_HELD.format(device=3, time="09:32")
     assert "/devices ok 3" in note and "not answered" in note
     assert store.device_source(ME, 3) == "held" and not guard.known(ME, 3)
     clock.now += 600
-    assert guard.hold(ME, 3) == ""  # the same device again within the hour: held, no second note
+    assert guard.hold(ME, 3, T0 + 600_000) == ""  # the same device again within the hour: held, no second note
     clock.now += 3_000
-    assert guard.hold(ME, 3) == note
-    assert guard.hold(ME, None) == prompts.DEVICE_HELD_UNNAMED  # Signal named no device: held, never allowed
-    assert guard.hold(ME, None) == ""
+    assert guard.hold(ME, 3, T0 + 3_600_000) == prompts.DEVICE_HELD.format(device=3, time="10:32")
+    unnamed = prompts.DEVICE_HELD_UNNAMED.format(time="10:32")
+    assert guard.hold(ME, None, T0 + 3_600_000) == unnamed  # Signal named no device: held, never allowed
+    assert guard.hold(ME, None, T0 + 3_600_000) == ""
+
+
+def test_the_held_note_names_when_signal_received_the_held_message(store: Store) -> None:
+    """Owner, 3 Nov: the note names when the held message came in, in the person's time zone (as her other notes give
+    a time). Review of 3 Nov: by Signal's own clock (the envelope's `serverReceivedTimestamp`, set by Signal's
+    servers), never the sending device's (`timestamp`), which a device may set to any time, a real message's among
+    them. A time no clock can show, none at all, or one that is not a whole number never stops the note."""
+    clock = Clock()
+    guard = Guard(store, frozenset({ME}), tz=ZoneInfo("America/New_York"), clock=clock)
+    guard.seed()
+    assert guard.hold(ME, 2, T0).startswith("A message Signal received at 03:32 came from a new linked device (2) ")
+    days_ago = guard.hold(ME, 3, T0 - 3 * 86_400_000)  # another day: with its date
+    assert days_ago.startswith("A message Signal received at 5 Oct 03:32 came from a new linked device (3) ")
+    odd: tuple[object, ...] = (2**63, -(2**62), 10**400, None, 0, str(T0), True, float(T0))  # as the envelope gives it
+    for device, bogus in zip((4, 5, 6, 8, 9, 10, 11, 12), odd, strict=True):
+        note = guard.hold(ME, device, bogus)
+        assert note == prompts.DEVICE_HELD.format(device=device, time=prompts.DEVICE_HELD_TIME_UNKNOWN), bogus
+    assert prompts.DEVICE_HELD_TIME_UNKNOWN == "an unknown time"
+    store.set_device(ME, 7, "allowed")
+    store.touch_device(ME, 7, "2020-01-01T00:00:00+00:00")
+    silent = guard.hold(ME, 7, T0)
+    assert silent == prompts.DEVICE_HELD_SILENT.format(device=7, days=TRUST_DAYS, time="03:32")
+    assert silent.startswith(
+        "A message Signal received at 03:32 came from linked device 7, silent for more than 14 days, "
+    )
+    unnamed = guard.hold(ME, None, T0)
+    assert unnamed.startswith("A message Signal received at 03:32 came from a device Signal did not name ")
+
+
+def test_the_held_note_says_how_to_remove_a_device_that_is_not_yours(store: Store) -> None:
+    """Review of 3 Nov: a device linked by phishing gets a copy of every message the user sends, so it can send one in
+    the same minute as a real one; a matching time shows nothing. The note gives the step for a device that is not
+    the user's beside the step that allows it, in the docs' words (GUIDE.md, Troubleshooting)."""
+    clock = Clock()
+    guard, _ = guarded(store, clock)
+    guard.seed()
+    assert guard.hold(ME, 3, T0).endswith(
+        " To allow that device, send /devices ok 3 from your phone. Not yours, or you linked no device just now: remove "
+        "it in Signal → Settings → Linked devices."
+    )
+    store.set_device(ME, 7, "allowed")
+    store.touch_device(ME, 7, "2020-01-01T00:00:00+00:00")
+    assert guard.hold(ME, 7, T0).endswith(
+        " If it is still yours, send /devices ok 7 from your phone. If not, remove it in Signal → Settings → Linked "
+        "devices."
+    )
 
 
 async def test_devices_lists_the_known_and_the_held_ones(store: Store) -> None:
     guard, commands = guarded(store)
     guard.seed()
-    guard.hold(ME, 4)
+    guard.hold(ME, 4, T0)
     store.set_device(ME, 2, "allowed")
     listing = await commands.handle(from_device(store, "/devices", 1))
     found = re.search(r"allowed (\d+ \w+ \d{4})", listing)
@@ -1061,30 +1161,37 @@ async def test_devices_lists_the_known_and_the_held_ones(store: Store) -> None:
         f"Device 2: allowed {day}\n"
         "\n"
         "**Held, not answered**\n"
-        f"Device 4: held since {day} · /devices ok 4 allows it\n"
+        f"Device 4: held since {day} · /devices ok 4 from your phone allows it\n"  # read on any device: says where
         "\n"
         f"{prompts.DEVICES_CALLS}\n"  # the limit: a call names no device
         f"{prompts.DEVICES_FORGET_HINT.format(days=TRUST_DAYS)}"
     )
 
 
-async def test_devices_ok_allows_a_held_device_only_from_a_known_one(store: Store) -> None:
+async def test_devices_ok_allows_a_held_device_only_from_the_phone(store: Store) -> None:
+    """The phone (Signal's device 1) is the root of trust, as SECURITY.md says: "until your phone sends /devices ok N".
+    A linked device she answers never lets another in (owner, 3 Nov: a phished one could bring a second)."""
     guard, commands = guarded(store)
     guard.seed()
-    guard.hold(ME, 4)
-    guard.hold(ME, 5)
-    assert await commands.handle(from_device(store, "/devices ok 4", 5, T0)) == prompts.DEVICES_NOT_FROM_KNOWN
-    assert await commands.handle(from_device(store, "/devices ok 4", None, T0 + 1)) == prompts.DEVICES_NOT_FROM_KNOWN
-    assert not guard.known(ME, 4)
-    assert await commands.handle(from_device(store, "/devices ok 4", 1, T0 + 2)) == prompts.DEVICES_OK.format(device=4)
+    guard.hold(ME, 4, T0)
+    guard.hold(ME, 5, T0)
+    store.set_device(ME, 2, "allowed")
+    refused = prompts.DEVICES_NOT_FROM_PHONE
+    assert refused == "Not allowed: /devices ok and /devices forget work only from your phone."
+    assert await commands.handle(from_device(store, "/devices ok 4", 5, T0)) == refused  # a held device
+    assert await commands.handle(from_device(store, "/devices ok 4", None, T0 + 1)) == refused
+    assert await commands.handle(from_device(store, "/devices ok 4", 2, T0 + 2)) == refused  # an allowed linked one
+    assert guard.allow(STRANGER, 1, "ok 4") == refused  # the phone of an account she does not answer
+    assert not guard.known(ME, 4) and store.device_source(ME, 4) == "held"
+    assert await commands.handle(from_device(store, "/devices ok 4", 1, T0 + 3)) == prompts.DEVICES_OK.format(device=4)
     assert guard.known(ME, 4) and store.device_source(ME, 4) == "allowed"
-    assert await commands.handle(from_device(store, "/devices ok #5", 4, T0 + 3)) == prompts.DEVICES_OK.format(
-        device=5
-    )  # an allowed device is a known one
-    assert await commands.handle(from_device(store, "/devices ok 4", 1, T0 + 4)) == prompts.DEVICES_OK_ALREADY.format(
+    assert await commands.handle(from_device(store, "/devices ok #5", 4, T0 + 4)) == refused  # allowed, not the phone
+    assert store.device_source(ME, 5) == "held"
+    assert await commands.handle(from_device(store, "/devices ok #5", 1, T0 + 5)) == prompts.DEVICES_OK.format(device=5)
+    assert await commands.handle(from_device(store, "/devices ok 4", 1, T0 + 6)) == prompts.DEVICES_OK_ALREADY.format(
         device=4
     )
-    unknown = await commands.handle(from_device(store, "/devices ok 9", 1, T0 + 5))
+    unknown = await commands.handle(from_device(store, "/devices ok 9", 1, T0 + 7))
     assert unknown == prompts.DEVICES_OK_UNKNOWN.format(device=9)
     for number, bad in enumerate(("/devices ok", "/devices ok x", "/devices yes 4", "/devices ok 0")):
         assert await commands.handle(from_device(store, bad, 1, T0 + 10 + number)) == prompts.DEVICES_USAGE
@@ -1095,18 +1202,69 @@ def test_lock_and_unlock_from_the_same_device_after_the_wait(store: Store) -> No
     guard, _ = guarded(store, clock)
     guard.seed()
     store.set_device(ME, 2, "allowed")
+    store.set_device(ME, 3, "allowed")
     assert not guard.locked
     reply = guard.lock(ME, 2)
-    assert reply == prompts.LOCKED.format(device=2, minutes=UNLOCK_WAIT_SECONDS // 60)
+    assert reply == prompts.LOCKED_LINKED.format(device=2, minutes=UNLOCK_WAIT_SECONDS // 60)
+    assert reply.startswith("Locked: I answer nothing and take no calls until /unlock comes from this device (2) or ")
+    assert "or your phone, 10 minutes from now at the earliest" in reply
     assert guard.locked and guard.lock_device == (ME, 2)
     assert guard.lock(ME, 1) is None  # nothing else works while locked: no answer
-    assert guard.unlock(ME, 1) is None  # another device: no answer at all
+    assert guard.unlock(ME, 3) is None  # another linked device: no answer at all
     too_soon = guard.unlock(ME, 2)
     assert too_soon is not None and too_soon.startswith("Still locked") and guard.locked
     clock.now += UNLOCK_WAIT_SECONDS
+    assert guard.unlock(ME, 3) is None and guard.locked  # after the wait too
     assert guard.unlock(ME, 2) == prompts.UNLOCKED
     assert not guard.locked and store.get_state("lock:on") is None
     assert guard.unlock(ME, 2) == prompts.UNLOCK_NOT_LOCKED
+
+
+def test_the_phone_ends_a_lock_sent_from_any_device_of_its_account(store: Store) -> None:
+    """Owner, 3 Nov: the phone is the root of trust. A lock sent from a lost or stolen laptop ends with /unlock from the
+    phone, after the same wait; before, only `estia unlock` on the Mac (admin rights) ended it. Another account's phone
+    never does."""
+    clock = Clock()
+    guard = Guard(store, frozenset({ME, STRANGER}), tz=TZ, clock=clock)
+    guard.seed()
+    store.set_device(ME, 2, "allowed")
+    guard.lock(ME, 2)
+    assert guard.unlock(ME, 1) == prompts.UNLOCK_TOO_SOON.format(time="09:42") and guard.locked
+    clock.now += UNLOCK_WAIT_SECONDS
+    assert guard.unlock(STRANGER, 1) is None and guard.locked
+    assert guard.unlock(ME, 1) == prompts.UNLOCKED and not guard.locked
+
+
+def test_a_lock_sent_from_the_phone_ends_only_from_the_phone(store: Store) -> None:
+    clock = Clock()
+    guard, _ = guarded(store, clock)
+    guard.seed()
+    store.set_device(ME, 2, "allowed")
+    reply = guard.lock(ME, 1)
+    assert reply == prompts.LOCKED.format(device=1, minutes=UNLOCK_WAIT_SECONDS // 60) and "your phone" not in reply
+    clock.now += UNLOCK_WAIT_SECONDS
+    assert guard.unlock(ME, 2) is None and guard.locked  # a linked device never ends the phone's lock
+    assert guard.unlock(ME, 1) == prompts.UNLOCKED
+
+
+def test_a_lock_whose_device_cannot_be_read_ends_only_on_the_mac(store: Store) -> None:
+    """A lock with `lock:on` but no readable `lock:device` (a database changed by hand, or a write cut short: Guard.lock
+    writes `lock:on` last) names no account, so no phone ends it: not even the phone of an allowed account, which
+    could end another account's lock. Only `estia unlock` on the Mac does (admin.unlock clears every lock key)."""
+    clock = Clock()
+    guard = Guard(store, frozenset({ME, STRANGER}), tz=TZ, clock=clock)
+    guard.seed()
+    store.set_state("lock:on", "on")
+    store.set_state("lock:since", str(int(clock.now)))
+    for broken in (None, "", ME, f"{ME} x", f"{ME} 2 3"):
+        if broken is None:
+            store.delete_state("lock:device")
+        else:
+            store.set_state("lock:device", broken)
+        clock.now += UNLOCK_WAIT_SECONDS
+        assert guard.lock_device is None, broken
+        for aci in (ME, STRANGER):
+            assert guard.unlock(aci, 1) is None and guard.locked, (broken, aci)
 
 
 def test_the_lock_survives_a_restart(store: Store) -> None:
@@ -1123,13 +1281,17 @@ def test_the_lock_survives_a_restart(store: Store) -> None:
 def test_only_a_known_device_can_lock(store: Store) -> None:
     guard, _ = guarded(store)
     guard.seed()
-    guard.hold(ME, 6)
+    guard.hold(ME, 6, T0)
     assert guard.lock(ME, 6) is None and guard.lock(ME, None) is None and guard.lock(STRANGER, 1) is None
     assert not guard.locked
 
 
 async def test_lock_unlock_and_devices_are_in_the_help(store: Store) -> None:
     assert "/lock - " in prompts.HELP and "/unlock - " in prompts.HELP and "/devices - " in prompts.HELP
+    lines = {line.split(" - ", 1)[0]: line for line in prompts.HELP.splitlines() if " - " in line}
+    assert "until /unlock from the same device or your phone (10 minutes" in lines["/lock"]
+    assert lines["/unlock"] == "/unlock - answer again (only from the device that sent /lock, or your phone)"
+    assert lines["/devices"].endswith("/devices forget N after you unlink one; both only from your phone)")
     guard, commands = guarded(store)
     guard.seed()
     assert await commands.handle(from_device(store, "/lock", 1)) == prompts.LOCKED.format(
@@ -1155,7 +1317,7 @@ async def test_lock_and_unlock_through_the_queue_never_answer_with_nothing(store
 async def allowed(store: Store, clock: Clock, device: int) -> tuple[Guard, Commands]:
     guard, commands = guarded(store, clock)
     guard.seed()
-    guard.hold(ME, device)
+    guard.hold(ME, device, T0)
     assert await commands.handle(
         from_device(store, f"/devices ok {device}", 1, T0 + device)
     ) == prompts.DEVICES_OK.format(device=device)
@@ -1172,9 +1334,12 @@ async def test_an_allowed_device_silent_for_the_trust_days_is_held_again(store: 
     assert guard.known(ME, 2)
     clock.now += 2 * 86_400  # silent longer than the trust days
     assert not guard.known(ME, 2)
-    assert guard.hold(ME, 2) == prompts.DEVICE_HELD_SILENT.format(device=2, days=TRUST_DAYS)
+    when = local_when(clock.now, clock.now, TZ)
+    assert guard.hold(ME, 2, int(clock.now * 1000)) == prompts.DEVICE_HELD_SILENT.format(
+        device=2, days=TRUST_DAYS, time=when
+    )
     assert store.device_source(ME, 2) == "held"
-    assert guard.hold(ME, 2) == ""  # once an hour, as for any held device
+    assert guard.hold(ME, 2, int(clock.now * 1000)) == ""  # once an hour, as for any held device
 
 
 async def test_the_phone_never_falls_silent(store: Store) -> None:
@@ -1190,16 +1355,22 @@ async def test_devices_forget_removes_a_device_so_its_number_is_held_again(store
     guard, commands = await allowed(store, clock, 2)
     forgotten = await commands.handle(from_device(store, "/devices forget 2", 1, T0 + 20))
     assert forgotten == prompts.DEVICES_FORGOTTEN.format(device=2)
+    assert forgotten.endswith(" is held again until /devices ok 2 from your phone.")  # as the held note says it
     assert store.device_source(ME, 2) is None and not guard.known(ME, 2)
-    assert guard.hold(ME, 2) == prompts.DEVICE_HELD.format(device=2)  # a new device with the same number: held
+    new_device = prompts.DEVICE_HELD.format(device=2, time="09:32")
+    assert guard.hold(ME, 2, T0) == new_device  # a new device with the same number: held
 
 
-async def test_devices_forget_only_from_a_known_device_and_never_the_phone(store: Store) -> None:
+async def test_devices_forget_only_from_the_phone_and_never_the_phone_itself(store: Store) -> None:
     clock = Clock()
     guard, commands = await allowed(store, clock, 2)
-    guard.hold(ME, 3)
-    assert await commands.handle(from_device(store, "/devices forget 2", 3, T0 + 20)) == prompts.DEVICES_NOT_FROM_KNOWN
-    assert await commands.handle(from_device(store, "/devices forget 1", 2, T0 + 21)) == prompts.DEVICES_FORGET_PHONE
+    guard.hold(ME, 3, T0)
+    refused = prompts.DEVICES_NOT_FROM_PHONE
+    assert await commands.handle(from_device(store, "/devices forget 2", 3, T0 + 20)) == refused  # a held device
+    for number, forget in enumerate(("/devices forget 2", "/devices forget 3", "/devices forget 1")):  # allowed 2
+        assert await commands.handle(from_device(store, forget, 2, T0 + 30 + number)) == refused
+    assert guard.known(ME, 2) and store.device_source(ME, 3) == "held"
+    assert await commands.handle(from_device(store, "/devices forget 1", 1, T0 + 21)) == prompts.DEVICES_FORGET_PHONE
     assert await commands.handle(
         from_device(store, "/devices forget 7", 1, T0 + 22)
     ) == prompts.DEVICES_FORGET_UNKNOWN.format(device=7)
@@ -1217,6 +1388,7 @@ async def test_the_device_list_says_to_forget_an_unlinked_device(store: Store) -
     _, commands = await allowed(store, clock, 2)
     listing = await commands.handle(from_device(store, "/devices", 1, T0 + 30))
     assert prompts.DEVICES_FORGET_HINT.format(days=TRUST_DAYS) in listing and "/devices forget" in listing
+    assert "send /devices forget N from your phone:" in listing
     assert "/devices forget N" in prompts.HELP and TRUST_DAYS == 14
 
 
@@ -1259,7 +1431,13 @@ def test_help_lists_babble() -> None:
 class Practice:
     """Commands with a Babble on the test store; its recap notes are marked sent and kept in `sent`."""
 
-    def __init__(self, store: Store, voice_languages: VoiceLanguages | None = None, gemma: FakeGemma | None = None):
+    def __init__(
+        self,
+        store: Store,
+        voice_languages: VoiceLanguages | None = None,
+        gemma: FakeGemma | None = None,
+        voice: bool = False,
+    ):
         self.store = store
         self.sent: list[str] = []
         self.to: list[str] = []
@@ -1285,6 +1463,7 @@ class Practice:
             set_language=lambda code: None,
             voice_languages=voice_languages,
             babble=self.babble,
+            voice=voice,
         )
         self.ts = T0
 
@@ -1324,6 +1503,30 @@ async def test_babble_with_a_language_starts_it_at_a2_and_tells_the_limits_once(
     assert store.current_conversation().kind == "chat"
     assert await practice.typed("/babble off") == prompts.BABBLE_ENDED.format(english="Dutch", level="A2")
     assert await practice.typed("/babble Deutsch B1") == started("de", "B1")  # no limits the second time
+
+
+async def test_practice_in_a_language_with_no_voice_says_so(store: Store) -> None:
+    """Owner, 3 Nov 2026: Japanese practice (offered) has no voice: with voice set up, its start says so in the words
+    of /language's reply; the six and English say nothing of it. The review of 4 Nov: its start no longer says calls
+    are heard in Japanese or that a practice call ends it, and the list marks Japanese before it is chosen."""
+    practice = Practice(store, voice=True)
+    # review of 4 Nov, DLG-0983-07: during practice every call of the account takes the practised language and rings
+    # out, an English one too, so the start says that (the ring-out note's own words), never "calls in Japanese"
+    no_calls = prompts.CALL_NO_VOICE_PRACTICE.format(language="Japanese")
+    fields = {"name": prompts.language_label("ja"), "code": "ja", "level": "A2", "english": "Japanese"}
+    quiet = prompts.BABBLE_STARTED_NO_VOICE.format(**fields)
+    assert await practice.typed("/babble ja") == f"{quiet}\n\n{prompts.BABBLE_LIMITS}\n\n{no_calls}"
+    assert "calls" not in quiet and "practice call" not in quiet and "Voice notes are heard in Japanese" in quiet
+    assert quiet.replace("Voice notes are heard", "Voice notes and calls are heard").replace(
+        "/babble off or 30 minutes", "/babble off, the end of a practice call, or 30 minutes"
+    ) == started("ja")  # the same words but those
+    await practice.typed("/babble off")
+    resumed = await practice.typed("/babble")  # a plain /babble resumes it, with the same line
+    assert prompts.BABBLE_RESUMED.format(**fields) in resumed and no_calls in resumed
+    assert prompts.VOICE_NO_LANGUAGE.format(language="Japanese") not in resumed
+    await practice.typed("/babble off")
+    assert await practice.typed("/babble nl") == started("nl")
+    assert "• 日本語, Japanese (ja) (text only: no voice)" in listing(None)
 
 
 async def test_a_plain_babble_resumes_the_last_setting_with_the_list(store: Store) -> None:

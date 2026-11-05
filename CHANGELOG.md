@@ -1,11 +1,94 @@
 # Changelog
 
 Every release of Estia, newest first. The form is [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
-follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html). From 0.9.4 on, a release's page on GitHub holds its
-section here, word for word, under the tagline and above what is in 0.9 (`.github/release-page.md`). The pages of 0.9.1
-to 0.9.3 were written on GitHub and say more (security, requirements, install, tests); 0.9.0 has no release page.
+follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html), except that a release between 0.9.8 and 0.9.9 carries
+a fourth number: 0.9.8.3. From 0.9.4 on, a release's page on GitHub holds its section here, word for word, under the
+tagline and above what is in 0.9 (`.github/release-page.md`). The pages of 0.9.1 to 0.9.3 were written on GitHub and say
+more (security, requirements, install, tests); 0.9.0 has no release page.
 
 ## [Unreleased]
+
+## [0.9.8.3] - 2026-11-05
+
+### Added
+
+- **Deep Thinking:** `/thinking on` makes her think before she answers your texts and voice notes; off by itself after
+  30 minutes without a message from you. One switch per allowed account; only on Macs with 24 GB of memory or more.
+- **A video found by name:** asked for a video by name, she texts one match with its link; it is read only after
+  your typed YES.
+- **A text after each call she answers gives its start and end time** on all your devices, also after a call from a
+  device you do not know; the call summary names them in place of its minutes.
+- **Doctor names her Python and its OpenSSL,** which encrypts her connections to mail, calendars, maps and the web, and
+  how a newer one comes.
+- **Project folders are listed at every level:** names only, nothing opened; only names git tracks, never a
+  secret-like name such as `.env`.
+
+### Changed
+
+- **Pocket TTS is her only voice:** Kokoro and Supertonic-3 are removed and no longer downloaded or loaded; the voice
+  install, its log and the docs no longer warn about macOS 27.0.x, which was about Kokoro.
+- **A line Pocket TTS cannot say is said by no other voice:** a voice note's answer comes as text alone; on a call the
+  line is left unsaid, the call goes on, and the rest of that answer comes as a text.
+- **Korean, Polish, Russian and Japanese have no voice:** answers come as text, and calls in them are not picked up:
+  the call gets a text, at most once in 10 minutes; during language practice in one of them, the text names
+  /babble off.
+- **The four with no voice are named:** language lists mark them "(text only: no voice)"; setup, the welcome, /voice,
+  call reminders, /babble and doctor (during practice) say so; no call is offered in them, and an answer that would be
+  spoken gets a note once.
+- **A call is answered while her voice is not working:** a note says so and her answers come as texts until the call
+  ends; with her speech recognition not ready either, the call is not answered and a text says why.
+- **/status, the voice install and setup name her voice's state:** loading, resting after failed runs (tried again on
+  its own) or not working.
+- **"My voice is ready" waits for Pocket TTS** and goes to no account in a language with no voice.
+- **A language's voice loads as a call rings,** after the voice service restarts, before the greeting; a call she
+  places keeps its language.
+- **A check-in left unsaid starts no standby:** the next words are answered without her name.
+- **Settings from before still load:** a Kokoro voice as heart or michael, `language_voice = ""` as jane; `speed` is
+  no longer read.
+- **The held-device note names when Signal received the message,** by Signal's own clock, and says how to remove
+  a device that is not yours.
+
+### Fixed
+
+- **A device question never heard on a call is dropped:** her voice could not say it, or it came as a text; a yes said
+  on the call never answers it, and a text says the device was not switched, and why.
+- **No goodbye before a device question on a call:** with a light or plug waiting for your yes, her goodbye is left out
+  of what you hear, and the call stays open for the yes.
+- **Her own reasoning is never said as an answer:** when the model writes its notes about the bridge's tool results and
+  instructions where the answer belongs, you get the device question, or a request to say it again, instead.
+- **Python on the firewall's list is caught whatever its letter case:** an allow for macOS's framework Python
+  ("Python") no longer passes as the nuclear level, and `scripts/harden.sh --nuclear` offers to take it off.
+- **Doctor never looks all clear about listeners it cannot see:** where macOS's list of network connections shows none
+  (seen on macOS 27.0.1), or the firewall's list cannot be read, doctor's firewall and Ollama lines say what was not
+  checked.
+- **The nuclear level's firewall question no longer says nothing listens:** it names your own listening programs and
+  says other accounts' are not listed; paths from the firewall's list are shown without control characters.
+- **More goodbyes end a call after outside text** (a page, mail or the calendar read on it): "Na razie, dzięki!",
+  "じゃあ、またあとで", "Gracias, buenas noches.", "Ну пока!", "That is enough for today."
+- **Doctor warns on a macOS before 27:** an install made before setup refused one showed a green Mac line.
+- **Setup names the lid only for a MacBook:** "Keep the Mac plugged in (a MacBook with its lid open)."
+- **An expired SMS code stops setup with the register-again steps,** where it asked for the code again.
+- **A folder macOS blocks names the right setting:** a refused Documents, Desktop or Downloads says System Settings,
+  Privacy and Security, Files and Folders.
+- **Stop here, or a Ctrl-C, ends the setup window's wait for her voice** after its next look, not up to about 20
+  minutes later.
+- **The phone steps of the Signal route without a number come after the plan,** not the moment the route is picked.
+
+### Security
+
+- **Only your phone allows or forgets a linked device:** `/devices ok N` and `/devices forget N` from any other
+  device are refused.
+- **Your phone ends a lock sent from any device of your account,** 10 minutes later at the earliest, so a lock sent
+  from a lost laptop ends without admin rights on the Mac. Besides your phone, only the device that sent `/lock` ends
+  it.
+- **A paragraph of hers that starts like code's note** on a held device or a call is dropped before it is sent;
+  in a call summary, also a line that does.
+- **A call limit, named in SECURITY.md:** on a laptop's speakers, her own voice that is not told apart counts as your
+  words; untested on Signal Desktop with speakers.
+- **Typed words stay typed:** a text or caption that starts with a word in square brackets ("[call] yes", "[todo]") is
+  kept with a backslash before the bracket, so code never takes it for words said on a call, a voice note or a photo.
+- **A macOS limit, named in SECURITY.md:** on macOS 26 and later, with FileVault and remote login (SSH) on, remote login
+  takes passwords after a restart until the disk is unlocked; a right password unlocks the disk but opens no session.
 
 ## [0.9.8] - 2026-10-30
 
@@ -523,7 +606,8 @@ The first public release.
   code-level rules, not eliminated; signal-cli is an unofficial Signal client; on 16 or 24 GB the smaller model,
   Gemma 4 12B, failed some of her safety tests.
 
-[Unreleased]: https://github.com/enable4all/estia-one-mmini/compare/v0.9.8...HEAD
+[Unreleased]: https://github.com/enable4all/estia-one-mmini/compare/v0.9.8.3...HEAD
+[0.9.8.3]: https://github.com/enable4all/estia-one-mmini/compare/v0.9.8...v0.9.8.3
 [0.9.8]: https://github.com/enable4all/estia-one-mmini/compare/v0.9.6...v0.9.8
 [0.9.6]: https://github.com/enable4all/estia-one-mmini/compare/v0.9.5...v0.9.6
 [0.9.5]: https://github.com/enable4all/estia-one-mmini/compare/v0.9.4...v0.9.5

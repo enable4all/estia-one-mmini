@@ -555,6 +555,7 @@ OUTSIDE_TOOLS = (
     "learn_link",
     "search_history",
     "web_search",
+    "find_video",
     "places_search",
     "route",
     "search_documents",
@@ -1195,6 +1196,13 @@ class Store:
                 (conversation_id, utc_now(), message_id),
             )
 
+    def unassign_seq(self, message_id: int) -> None:
+        """Take a message out of the conversation's order until it is answered (`assign_seq` again): the state
+        `add_incoming(defer_seq=True)` gives a text that waits for a call. A Deep Thinking answer a call stopped
+        (App.process), so the call's turns never see it unanswered and it is not answered twice."""
+        with self.tx():
+            self._conn.execute("UPDATE messages SET seq = NULL, updated_at = ? WHERE id = ?", (utc_now(), message_id))
+
     def add_outgoing(
         self,
         conversation_id: int,
@@ -1265,6 +1273,14 @@ class Store:
         with self.tx():
             self._conn.execute(
                 "UPDATE messages SET text = ?, updated_at = ? WHERE id = ?", (text, utc_now(), message_id)
+            )
+
+    def set_kind(self, message_id: int, kind: MessageKind) -> None:
+        """Change a message's kind: a typed text that code matched as a song's pick becomes a command (never in her
+        history, never learned, never found by search: those read only kind 'text')."""
+        with self.tx():
+            self._conn.execute(
+                "UPDATE messages SET kind = ?, updated_at = ? WHERE id = ?", (kind, utc_now(), message_id)
             )
 
     def set_status(self, message_id: int, status: MessageStatus) -> None:
@@ -1395,6 +1411,16 @@ class Store:
             "SELECT 1 FROM messages WHERE direction = 'in' AND peer_aci = ? AND id > ? LIMIT 1", (peer_aci, message_id)
         ).fetchone()
         return row is not None
+
+    def answered_commands_after(self, peer_aci: str, message_id: int) -> list[str]:
+        """The texts of this user's typed commands stored after the message `message_id` that are answered already,
+        oldest first: those that did not wait in the queue behind it (commands answered at once, `answered_at_once`)."""
+        rows = self._conn.execute(
+            "SELECT text FROM messages WHERE direction = 'in' AND kind = 'command' AND status = 'answered'"
+            " AND peer_aci = ? AND id > ? ORDER BY id",
+            (peer_aci, message_id),
+        ).fetchall()
+        return [str(row["text"]) for row in rows]
 
     def _neighbours(self, message: Message, before: int, after: int) -> list[Message]:
         earlier = self._conn.execute(

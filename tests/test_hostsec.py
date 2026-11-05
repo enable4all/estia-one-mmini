@@ -120,6 +120,48 @@ def test_allowed_interpreters_are_removed_from_the_firewall_list(tmp_path: Path)
     assert (clean.status, clean.apply) == ("ok", ())
 
 
+FRAMEWORK = "/opt/homebrew/Cellar/python@3.13/3.13.9/Frameworks/Python.framework/Versions/3.13/Resources/Python.app"
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        f"{FRAMEWORK}/Contents/MacOS/Python",  # macOS's framework Python runs as "Python"
+        FRAMEWORK,  # the list may name its app instead
+        "/usr/local/bin/Python3",
+        "/opt/example/bin/python3.13t",  # the free-threaded build
+        "/opt/example/bin/RUBY",
+        "/opt/example/bin/ruby3.3",
+    ],
+)
+def test_an_allowed_interpreter_is_found_whatever_its_case_or_form(tmp_path: Path, path: str) -> None:
+    """3 Nov report: the name was matched case-sensitively, so a firewall allow for macOS's framework Python ("Python")
+    slipped through, and the Mac still read as the nuclear level."""
+    apps = f"Total number of apps = 1 \n1 : {path} \n             (Allow incoming connections)\n"
+    check = hostsec.firewall_apps(FakeHost(tmp_path, fw(apps=apps)))
+    assert check.status == "warn" and path in check.text
+    assert check.apply == ((SUDO, "-n", SOCKETFILTERFW, "--remove", path),)
+
+
+@pytest.mark.parametrize("folder", ["ex\x1b[2Jample", "ex\u202eelpma"], ids=["escape", "bidi"])
+def test_an_allowed_interpreter_is_shown_cleaned_and_removed_by_its_own_path(tmp_path: Path, folder: str) -> None:
+    """Fix review 8: a folder another account named reaches the owner's terminal in `harden --nuclear`: its control
+    and format characters are shown as "?", while --remove gets the path as the firewall's list has it."""
+    path = f"/opt/{folder}/bin/python3"
+    apps = f"Total number of apps = 1 \n1 : {path} \n             (Allow incoming connections)\n"
+    check = hostsec.firewall_apps(FakeHost(tmp_path, fw(apps=apps)))
+    assert check.status == "warn" and path not in check.text and hostsec.clean(path) in check.text
+    assert check.apply == ((SUDO, "-n", SOCKETFILTERFW, "--remove", path),)
+
+
+@pytest.mark.parametrize(
+    "path", ["/Applications/Python Launcher.app", "/opt/example/bin/pythonista", "/opt/example/bin/rubyist"]
+)
+def test_a_program_that_only_starts_like_an_interpreter_is_not_one(tmp_path: Path, path: str) -> None:
+    apps = f"Total number of apps = 1 \n1 : {path} \n             (Allow incoming connections)\n"
+    assert hostsec.firewall_apps(FakeHost(tmp_path, fw(apps=apps))).status == "ok"
+
+
 def sshd(root: Path, main: str, dropins: dict[str, str]) -> None:
     folder = root / "etc" / "ssh" / "sshd_config.d"
     folder.mkdir(parents=True)
@@ -564,6 +606,7 @@ def test_the_doctor_checks_have_their_keys_and_never_print_the_pin(tmp_path: Pat
     checks = doctor_checks(host, home, "+306900000000")
     assert [check.key for check in checks] == [
         "firewall",
+        "firewall_others",  # no netstat answer here: other accounts' listeners could not be listed
         "ssh_password",
         "filevault",
         "data_modes",
@@ -576,7 +619,8 @@ def test_the_doctor_checks_have_their_keys_and_never_print_the_pin(tmp_path: Pat
     for check in checks:
         assert "731904" not in check.text + check.fix and "+306900000000" not in check.text + check.fix
     assert all(arg[0].startswith("/") for arg in host.asked)  # absolute tools only
-    assert doctor_checks(host, home)[4].status == "ok"  # one account: the number may be left out
+    # one account: the number may be left out
+    assert by_key(doctor_checks(host, home))["registration_lock"].status == "ok"
 
 
 def test_a_registration_lock_that_is_on_says_where_the_pin_belongs(tmp_path: Path) -> None:
@@ -874,14 +918,19 @@ def test_a_listener_whose_program_is_not_found_is_named_with_how_to_find_it(tmp_
     assert "--add" in check.fix and "System Settings" not in check.fix
 
 
-def test_with_the_firewall_off_or_unreadable_lists_there_are_no_listener_lines(tmp_path: Path) -> None:
+def test_with_the_firewall_off_or_its_list_unreadable_no_listener_is_named(tmp_path: Path) -> None:
     sockets = listen("tcp4", "*.8170", "node", 501)
     off = firewall_host(tmp_path, sockets, {"501": NODE}, {NODE: (0, ADHOC)}, state=DISABLED)
     assert hostsec.firewall_listeners(off) == []  # the firewall's own line says it is off
     assert not any(argv[0] == hostsec.NETSTAT for argv in off.asked)
     unreadable = firewall_host(tmp_path, sockets, {"501": NODE}, {NODE: (0, ADHOC)})
     unreadable.answers[f"{SOCKETFILTERFW} --listapps"] = (1, "")
-    assert hostsec.firewall_listeners(unreadable) == []  # cannot tell: nothing claimed
+    # cannot tell: no listener claimed, and (fix review 4) one ○ line, so doctor never looks all clear about them
+    [line] = hostsec.firewall_listeners(unreadable)
+    assert (line.key, line.status, line.part, line.apply) == ("firewall_list", "info", "Firewall", ())
+    assert line.text == "its list could not be read: listening programs not checked"
+    assert line.fix == f"to read it: /usr/bin/sudo {SOCKETFILTERFW} --listapps"
+    assert not any(argv[0] == hostsec.NETSTAT for argv in unreadable.asked)
 
 
 def test_doctor_shows_the_listener_lines_after_the_firewall(tmp_path: Path) -> None:
@@ -903,8 +952,81 @@ def test_your_own_listeners_are_found_with_lsof_when_netstat_names_none(tmp_path
     host.answers[f"{hostsec.LSOF} -nP -iTCP -sTCP:LISTEN -F pcn"] = (0, "p501\ncnode\nf23\nn*:8170\n")
     host.answers[f"{hostsec.LSOF} -nP -a -p 501 -d txt -Fn"] = (0, f"p501\nftxt\nn{NODE}\n")
     assert [check.text for check in hostsec.firewall_listeners(host)] == [
-        "node on port 8170 cannot be reached from other machines"
+        "node on port 8170 cannot be reached from other machines",
+        hostsec.OTHERS_UNLISTED,
     ]
+
+
+# recorded 3 Nov on macOS 27.0.1, without admin rights, from zsh (an AI tool's command shell may have been the one: not
+# yet checked in a Terminal window, docs/e2e-checklist.md 122): `netstat -anv -p tcp` prints nothing at all (exit 0);
+# `lsof -nP -iTCP -sTCP:LISTEN -F pcn` names that account's own listeners (addresses changed)
+NETSTAT_MACOS_27 = (0, "")
+LSOF_MACOS_27 = (
+    "p648\ncpostgres\nf7\nn[::1]:5432\nf8\nn127.0.0.1:5432\n"
+    "p22043\ncnode\nf12\nn100.64.0.7:8191\n"
+    "p68243\ncollama\nf3\nn127.0.0.1:11434\n"
+)
+
+
+@pytest.mark.parametrize("netstat", [NETSTAT_MACOS_27, (1, "")], ids=["lists-nothing", "fails"])
+def test_doctor_says_other_accounts_listeners_could_not_be_listed_when_netstat_lists_none(
+    tmp_path: Path, netstat: tuple[int, str]
+) -> None:
+    """3 Nov report: netstat listed no network sockets (macOS 27.0.1, without admin rights), and lsof shows only the
+    caller's own. Doctor then never looks fine about every account's listeners: one neutral line (○) says what it
+    could not list and how to list them all, and what lsof sees is still named."""
+    host = firewall_host(tmp_path, "", {}, {NODE: (0, ADHOC)})
+    host.answers[NETSTAT_ARGV] = netstat
+    host.answers[f"{hostsec.LSOF} -nP -iTCP -sTCP:LISTEN -F pcn"] = (0, LSOF_MACOS_27)
+    host.answers[f"{hostsec.LSOF} -nP -a -p 22043 -d txt -Fn"] = (0, f"p22043\nftxt\nn{NODE}\n")
+    checks = hostsec.firewall_listeners(host)
+    assert [check.text for check in checks] == [
+        "node on port 8191 cannot be reached from other machines",
+        hostsec.OTHERS_UNLISTED,
+    ]
+    unlisted = checks[-1]
+    assert (unlisted.key, unlisted.status, unlisted.part, unlisted.apply) == ("firewall_others", "info", "Firewall", ())
+    assert unlisted.text == (
+        "other accounts' listening programs could not be listed without admin rights: only the account doctor runs as "
+        "was checked"
+    )
+    assert (
+        unlisted.fix
+        == "to list every account's listening programs: /usr/bin/sudo /usr/sbin/lsof -nP -iTCP -sTCP:LISTEN"
+    )
+    assert all(len(line) <= 135 for line in (f"○ Firewall: {unlisted.text}", f"    → {unlisted.fix}"))
+
+
+def test_nothing_of_yours_listening_and_netstat_listing_none_is_never_all_clear(tmp_path: Path) -> None:
+    host = firewall_host(tmp_path, "", {}, {})
+    host.answers[NETSTAT_ARGV] = NETSTAT_MACOS_27
+    assert [check.key for check in hostsec.firewall_listeners(host)] == ["firewall_others"]
+    host.answers.update({f"{SOCKETFILTERFW} --getblockall": (0, "Firewall has block all state set to enabled.\n")})
+    assert [check.key for check in hostsec.firewall_listeners(host)] == ["firewall_others"]
+
+
+def test_a_netstat_that_lists_sockets_gives_no_unlisted_line(tmp_path: Path) -> None:
+    """A netstat that lists internet sockets (here one only this Mac reaches), each LISTEN line in the form it parses,
+    is taken to list every account's: the live Mac's did on 13 Oct (other accounts' sockets with their pids). One that
+    listed only the caller's own would not be noticed: an assumption, not a recorded fact."""
+    host = firewall_host(tmp_path, listen("tcp4", "127.0.0.1.11434", "ollama", 502), {"502": "/opt/ollama"}, {})
+    assert hostsec.firewall_listeners(host) == []
+
+
+def test_a_listen_line_netstat_prints_in_another_form_is_never_read_as_every_accounts(tmp_path: Path) -> None:
+    """Fix review 5: a LISTEN line that no longer parses (a new `-v` form) was skipped, and every account's listeners
+    read as listed. The lines that parse are still named."""
+    odd = "tcp4       0      0  *.8171                 *.*                    LISTEN      node\n"  # no counters, no pid
+    host = firewall_host(tmp_path, listen("tcp4", "*.8170", "node", 501) + odd, {"501": NODE}, {NODE: (0, ADHOC)})
+    assert [check.text for check in hostsec.firewall_listeners(host)] == [
+        "node on port 8170 cannot be reached from other machines",
+        hostsec.OTHERS_UNLISTED,
+    ]
+    established = (
+        "tcp4  0  0  127.0.0.1.53227  127.0.0.1.53305  ESTABLISHED  262  206  408256  146988  x:21196  00102\n"
+    )
+    assert not hostsec.netstat_blind(0, NETSTAT_HEAD + listen("tcp4", "*.8170", "node", 501) + established)
+    assert hostsec.netstat_blind(0, NETSTAT_HEAD + odd) and hostsec.netstat_blind(0, NETSTAT_HEAD)
 
 
 def test_a_listener_both_tools_name_is_one_line(tmp_path: Path) -> None:
@@ -1052,7 +1174,7 @@ def test_the_security_level_is_read_from_what_the_security_step_sets(
     tmp_path: Path, firewall: str, pin: str | None, level: str
 ) -> None:
     """hardened: SSH with keys only or off, her files private, her Registration Lock; nuclear: that, the firewall on
-    and no interpreter on its list."""
+    and python3 and ruby off its list."""
     home = hardened_home(tmp_path, pin)
     checks = hostsec.level_checks(level_host(tmp_path, firewall=firewall), home, "+306900000000")
     keys = ["firewall", "ssh_password", "data_modes", "registration_lock", "firewall_apps"]
@@ -1121,6 +1243,18 @@ def test_doctor_names_the_security_level_last(
         assert "hardened" in line.text and "nuclear" in line.text  # both levels named, the current one first
     if words == "nuclear":
         assert "stealth mode and the keychain lock do not count" in line.text
+        # fix review 2: the words of NUCLEAR_LINE, never "no interpreter" (node, perl and others are not counted)
+        assert "the firewall on and python3 and ruby off its list" in line.text and "interpreter" not in line.text
+
+
+def test_an_allowed_framework_python_keeps_the_mac_at_the_hardened_level(tmp_path: Path) -> None:
+    """3 Nov report: an allow for macOS's framework Python ("Python") read as the nuclear level."""
+    home = hardened_home(tmp_path)
+    allowed = "             (Allow incoming connections)\n"
+    apps = f"Total number of apps = 1 \n1 : {FRAMEWORK}/Contents/MacOS/Python \n{allowed}"
+    checks = hostsec.level_checks(level_host(tmp_path, firewall=ENABLED, apps=apps), home, "+306900000000")
+    assert hostsec.security_level(checks) == "hardened"
+    assert hostsec.level_check(checks).text.startswith("hardened")
 
 
 # owner, 20 Oct: the nuclear level in these words, in setup, harden, doctor, GUIDE.md, SECURITY.md and the AI's

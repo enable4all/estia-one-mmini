@@ -7,19 +7,20 @@ import Foundation
 /// jane, eve, vera, alba and michael (owner, 26 Oct: "alba & michael for males, both on small and big"), all
 /// on one model a Mac, by its Gemma (`english(memory:)`: owner, 26 Oct, "the Pocket model follows the Gemma tier"): the
 /// 100M beside Gemma 4 26B, the 18M beside 12B, which has no vera (its heart a clone of its own); and
-/// jane in Spanish, Italian, Portuguese, Dutch, German and French on each language's own model (`PocketTTS.languages`);
-/// every other English voice is Kokoro's, the other languages Supertonic-3's. Its pinned release program (the Rust
+/// jane in Spanish, Italian, Portuguese, Dutch, German and French on each language's own model (`PocketTTS.languages`):
+/// her only voice (owner, 3 Nov 2026: "remove kokoro and supertonic"; Korean, Polish, Japanese and Russian have none).
+/// Its pinned release program (the Rust
 /// `pocket-tts`) sits beside the voice service in her root-owned release (estia-deploy puts it there with
 /// `voice-service --fetch-pocket`, so everything she runs stays root's: the review of 24 Oct), and runs once per text
 /// on the CPU, one thread, int8, from a config naming only local files, under a sandbox with no network, no other
-/// program, no signal to another, no macOS service and no file written (`PocketRun`), on a queue of its own (never the
-/// one Whisper and Kokoro share): the
+/// program, no signal to another, no macOS service and no file written (`PocketRun`), on a queue of its own (never
+/// Whisper's): the
 /// release has no resident mode, its `serve` mode is a web server (CORS for kyutai.org, voices fetched from the web)
 /// and is never used, and the Python package kept resident was slower on 4 of the 5 measured lines (24 Oct: a whole
 /// sentence in 90-601 ms against the program's 123-374 ms, loading included). Every file is pinned by its sha256 and
-/// checked before the first run and whenever its size or times change; a changed file is never run. What cannot speak a
-/// line (no files yet, a refused file, a run that fails) leaves that line to Kokoro (am_michael for alba and michael,
-/// af_heart for the others; in another language to Supertonic-3's F1), never silence.
+/// checked before the first run and whenever its size or times change; a changed file is never run. A line it cannot
+/// say (no files yet, a refused file, a run that fails) is said by no other voice (owner, 3 Nov 2026: Kokoro, and
+/// Supertonic-3 in another language, said it before): the voice service refuses it (`PocketLine`).
 public enum PocketTTS {
     /// The English voices Pocket speaks, as the bridge names them (`/voice heart`, `/voice jane`, `/voice eve`, `/voice
     /// vera`, `/voice alba`, `/voice michael`: `config.POCKET_VOICES`, pinned equal by a test), in this order (the log's;
@@ -66,7 +67,7 @@ public enum PocketTTS {
     /// of 24 Oct: a flat 30 s could hold her line that long). 10 ms a character since the 100M speaks every English
     /// voice on a Mac with Gemma 4 26B (our own install, 26 Oct: with other programs busy on the Mac a 608-character
     /// line took 3.7-5.7 s through the voice service, 1.8-1.9 s on 25 Oct, and 5 ms a character stopped it in 2 runs
-    /// of 4). Past it the run is stopped and Kokoro says the line.
+    /// of 4). Past it the run is stopped and the line is not said.
     public static func runSeconds(for text: String) -> TimeInterval { 2 + 0.01 * Double(text.count) }
     /// The most WAV bytes a run may write (2 minutes of speech are 5.8 MB).
     public static let maxOutputBytes = 16 << 20
@@ -99,13 +100,18 @@ public struct PocketVoices: Equatable, Sendable {
             PocketSpeech(voice: $0, model: english, speaks: $0, health: "pocket")
         }
     }
-    /// The English voice by the bridge's name, nil for any other (vera on the 18M among them: Kokoro says its lines).
-    public func speech(_ voice: String) -> PocketSpeech? { speakers.first { $0.voice == voice } }
-    /// The voice by the bridge's name in `language`: English's, or jane in one of the six (`PocketTTS.languages`); nil
-    /// for any other (Supertonic-3 speaks those).
+    /// The English voice by the bridge's name (`SpeechRequest.voice`): the model's voice of that name; vera, which the
+    /// 18M has not (owner, 25 Oct: the 100M only), is heart there, the default, as the bridge reads it
+    /// (`config.voice_here`; Kokoro's af_heart said vera's lines there as a stand-in before 3 Nov 2026); nil for a name
+    /// no Pocket voice has.
+    public func speech(_ voice: String) -> PocketSpeech? {
+        speakers.first { $0.voice == voice }
+            ?? (PocketTTS.voices.contains(voice) ? speakers.first { $0.voice == SpeechRequest.defaultVoice } : nil)
+    }
+    /// The voice by the bridge's name in `language`: English's (`speech(_:)`), or jane in one of the six whatever voice
+    /// it names (`PocketTTS.languages`: jane is their only voice); nil in a language her voice does not speak.
     public func speech(_ voice: String, language: String) -> PocketSpeech? {
-        language == Languages.english ? speech(voice)
-            : PocketTTS.languages.first { $0.voice == voice && $0.language == language }
+        language == Languages.english ? speech(voice) : PocketTTS.languages.first { $0.language == language }
     }
     /// Every Pocket voice: English's, then the six languages'.
     public var all: [PocketSpeech] { speakers + PocketTTS.languages }
@@ -214,8 +220,10 @@ public struct PocketVoice: Equatable, Sendable {
     /// -5.0, so -7.0, michael -25.71 at -5.0, so -4.0; the 100M's alba -21.67 at -4.0, so -7.0, michael -24.07 at -4.0,
     /// so -4.5. heart's (27 Oct, the 100M, through the voice service, 4 rounds, jane -24.34 in the same runs): -29.24
     /// at -4.0 (the quietest voice), -24.94 at +0.5 and -24.48 at +1.0 (more of its quiet frames counted as speech as
-    /// the gain grows), so +1.0; its peak -8.1 dBFS there, so no clipping. The 18M's heart (29 Oct) is not measured: 0,
-    /// jane's -5.0 there plus the 5 dB the 100M's heart is above the 100M's jane, never a boost (no clipping added).
+    /// the gain grows), so +1.0; its peak -8.1 dBFS there, so no clipping. The 18M's heart (29 Oct: 0, jane's -5.0 there
+    /// plus the 5 dB the 100M's heart is above the 100M's jane), measured 31 Oct through the voice service on port 8151
+    /// (`--pocket 18M`, 4 rounds, jane in the same runs; `RealPocket.heartIsAsLoudAsJaneOnEitherModel` the same):
+    /// -24.71 at 0 against jane's -24.60, so 0; its peak -6.5 dBFS.
     public let gainDB: Double
 
     public init(pin: HubPin, gainDB: Double, bundled: Bool = false) {
@@ -359,8 +367,8 @@ public struct PocketModel: Equatable, Sendable {
             // Kokoro-82M's af_heart cloned onto this model from the same 14 s of af_heart's audio as the 100M's, exported
             // with the 18M model (27 Oct, 5,768,848 bytes; owner, 29 Oct: "just make the small heart and we test it
             // later", "on 16gb make Heart the default as well"), shipped beside the 100M's under its own name. Its
-            // questions end flatter here (27 Oct: a question's end -0.1 semitones against the 100M's +3.2). Its gain is
-            // not measured yet (`PocketVoice.gainDB`)
+            // questions end flatter here (27 Oct: a question's end -0.1 semitones against the 100M's +3.2). Its gain, 0,
+            // measured 31 Oct against jane's (`PocketVoice.gainDB`)
             "heart": PocketVoice(
                 pin: HubPin(repo: "", revision: "", folder: "",
                             sha256: ["heart-18m.safetensors": "0d9e5334433271a849bfa97b1a8626cb690446a98ea3008ba016704bc51cd2bb"],
@@ -372,8 +380,8 @@ public struct PocketModel: Equatable, Sendable {
     )
 }
 
-/// English as Pocket reads it: every English pass (`SpokenEnglish`: chords, numbers, times, dates, units), then
-/// Kokoro's lexicon as text. Pocket reads plain text, no phonemes: a capitals word meant as its letters
+/// English as Pocket reads it: every English pass (`SpokenEnglish`: chords, numbers, times, dates, units), then the
+/// capitals meant as letters as text. Pocket reads plain text, no phonemes: a capitals word meant as its letters
 /// (`EnglishLexicon.spelledWords`: "ID", "ETA", "WHO") is written as its letters with hyphens ("I-D"). Measured 24 Oct
 /// (eve, through Whisper): "I.D." came out "eye. D"; "W-H-O" took as long as the letters "WHO" (2.4 s), "who" 1.8 s;
 /// "WHO is it?" came out "Though is it?".
@@ -382,8 +390,8 @@ public enum PocketText {
         PocketPace.paced(letters(SpokenEnglish.spoken(text, before: before)))
     }
 
-    /// Another language as jane reads it: every pass Supertonic-3 gets for it (`SpokenLanguage`: numbers, times,
-    /// dates, units and chords in its own words), then the guard for a long stretch with no pause mark.
+    /// Another language as jane reads it: every pass of its own (`SpokenLanguage`: numbers, times, dates, units and
+    /// chords in its own words), then the guard for a long stretch with no pause mark.
     public static func spoken(_ text: String, language: String) -> String {
         PocketPace.paced(SpokenLanguage.spoken(text, language: language), language: language)
     }
@@ -396,9 +404,10 @@ public enum PocketText {
     }
 }
 
-/// The program's WAV (24 kHz mono 16-bit PCM; written to a pipe, so its sizes are placeholders) as Kokoro's own
-/// format, at a fixed gain, its quiet before the first sound cut to `leadSeconds` (24 Oct, on a call's path: eve's
-/// clips began with 0.45-0.5 s of near silence against af_heart's 0.3 s, and her first sound came 155-280 ms later).
+/// The program's WAV (24 kHz mono 16-bit PCM; written to a pipe, so its sizes are placeholders) as the bridge gets it
+/// (`SpeechAudio`), at a fixed gain, its quiet before the first sound cut to `leadSeconds` (24 Oct, on a call's path:
+/// eve's clips began with 0.45-0.5 s of near silence against af_heart's 0.3 s, and her first sound came 155-280 ms
+/// later).
 public enum PocketWAV {
     public struct Invalid: Error, Equatable {
         public let reason: String
@@ -556,55 +565,18 @@ public struct FileStamp: Equatable, Sendable {
     }
 }
 
-/// A line's WAV, and the voice that said it in the asked one's place (nil: the asked voice said it). The response
-/// says so in `X-Voice-Stand-In` (`headers`): the bridge never keeps such a clip of a canned line (the review of 24
-/// Oct: a greeting Kokoro said while Pocket was still fetching stayed af_heart's on every later call).
-public struct SpokenLine: Equatable, Sendable {
-    public let wav: Data
-    public let standIn: String?
-
-    public init(wav: Data, standIn: String? = nil) {
-        self.wav = wav
-        self.standIn = standIn
-    }
-
-    public static let standInHeader = "X-Voice-Stand-In"
-
-    /// The response's extra header: the stand-in's voice, when there is one.
-    public var headers: [(String, String)] { standIn.map { [(Self.standInHeader, $0)] } ?? [] }
-}
-
-/// Pocket's audio for a line, or its stand-in's (`instead`: in English Kokoro's af_heart, or am_michael for a male
-/// voice, in another language Supertonic-3's F1; `standIn` its name, `SpeechRequest.standInVoice`) when Pocket cannot
-/// speak it; never silence, unless the stand-in may not say it (`standInAllowed` false, `SpeechRequest.standInAllowed`:
-/// a call's line after its turn's one Kokoro line, or one before her answer or before a device question; owner, 28
-/// Oct, calls-03): then `instead` never runs and the line is refused (`VoiceError.noStandIn`). `log` gets one line once the stand-in has tried or was not asked: why Pocket did
-/// not say it, and whether the stand-in did (the review of 25 Oct: "said it" was logged before it tried, so a stand-in
-/// that failed too, offline at its first download, left a line nobody said), naming the stand-in's engine by its voice
-/// (Kokoro's ids, else Supertonic-3).
-public enum SpeechFallback {
-    public static func speak(
-        pocket: () async throws -> Data, instead: () async throws -> Data, standIn: String = SpeechRequest.defaultVoice,
-        standInAllowed: Bool = true, log: (String) -> Void
-    ) async throws -> SpokenLine {
-        let why: String
+/// Pocket's audio for a line, or none: a line Pocket cannot say (not ready, a refused file, a voice it has not, a run
+/// that fails, is late or writes too much, an odd WAV) is said by no other voice, whatever the request asked (owner,
+/// 3 Nov 2026: "remove kokoro and supertonic", and for those lines "Nothing"; before, Kokoro said it in English and
+/// Supertonic-3's F1 in another language, the response marked `X-Voice-Stand-In`). `log` gets one line, why Pocket did
+/// not say it, and the line is refused (`VoiceError.notSaid`, 409): the bridge sends that answer as text.
+public enum PocketLine {
+    public static func speak(_ pocket: () async throws -> Data, log: (String) -> Void) async throws -> Data {
         do {
-            return SpokenLine(wav: try await pocket())
+            return try await pocket()
         } catch {
-            why = "speaking: Pocket TTS did not say this line (\(reason(error))); "
-                + "\(SpeechRequest.isKokoro(standIn) ? "Kokoro" : "Supertonic-3") (\(standIn))"
-        }
-        guard standInAllowed else {
-            log(why + " not asked: the call asked for no stand-in")
-            throw VoiceError.noStandIn
-        }
-        do {
-            let wav = try await instead()
-            log(why + " said it")
-            return SpokenLine(wav: wav, standIn: standIn)
-        } catch {
-            log(why + " could not say it either")
-            throw error
+            log("speaking: Pocket TTS did not say this line (\(reason(error))); no other voice says it")
+            throw VoiceError.notSaid
         }
     }
 

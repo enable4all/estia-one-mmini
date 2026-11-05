@@ -14,10 +14,6 @@ private func pcm(_ wav: Data) -> [Int16] {
     stride(from: 44, to: wav.count - 1, by: 2).map { Int16(bitPattern: UInt16(wav[$0]) | UInt16(wav[$0 + 1]) << 8) }
 }
 
-private func sine(_ hertz: Double, rate: Int, count: Int, amplitude: Float = 1) -> [Float] {
-    (0..<count).map { amplitude * Float(sin(2 * .pi * hertz * Double($0) / Double(rate))) }
-}
-
 @Suite struct HTTPParsing {
     @Test func completeRequestWithBody() {
         let request = raw("POST /v1/audio/transcriptions HTTP/1.1\r\nHost: 127.0.0.1:8150\r\nContent-Length: 4\r\n\r\nabcd")
@@ -99,6 +95,31 @@ private func sine(_ hertz: Double, rate: Int, count: Int, amplitude: Float = 1) 
         // "hints": a transcription takes her name as a hint (the wake harness reads it)
         #expect(text.hasSuffix(#"{"hints":true,"languages":["en","es","it","ko","pt","nl","pl","de","ja","ru","fr"],"pocket":"loading","pocket_de":"idle","stt":"ready","tts":"loading","turn":"ready","vad":"unavailable"}"#))
     }
+
+    /// Owner, 3 Nov 2026 ("remove kokoro and supertonic"): Pocket TTS is her only voice, so `tts` is her English Pocket
+    /// model's state as the bridge reads speaking (`calls.voice_ready`: a call is answered only with it ready): ready;
+    /// resting while it rests after failed or late runs (tried again on its own, and by a call's lines); failed while
+    /// it cannot speak until a later try or an update (no program, files missing or refused); else loading. The review
+    /// of 4 Nov: a rest after runs was "failed", so the bridge's note and doctor named the wrong cause. A language's
+    /// model never counts: its own key says it.
+    @Test func speakingIsHerEnglishPocketModels() {
+        #expect(speakingState("ready") == "ready" && speakingState("ready", resting: true) == "ready")
+        #expect(speakingState("loading") == "loading" && speakingState("idle") == "loading" && speakingState("") == "loading")
+        #expect(speakingState("unavailable") == "failed" && speakingState("refused") == "failed")
+        #expect(speakingState("unavailable", resting: true) == "resting")
+        #expect(speakingState("refused", resting: true) == "failed")
+    }
+
+    /// The review of 4 Nov: heart's file missing left the model ready, so a call was picked up into silence. The
+    /// shipped voices a ready model leaves out are listed (`voices_left_out`), only when there are any: the body is
+    /// otherwise byte for byte as it was.
+    @Test func healthListsTheVoicesLeftOut() {
+        let body = healthBody(stt: "ready", tts: "ready", vad: "ready", turn: "ready", pocket: ["pocket": "ready"],
+                              leftOut: ["heart"])
+        #expect(body["voices_left_out"] as? [String] == ["heart"])
+        let none = healthBody(stt: "ready", tts: "ready", vad: "ready", turn: "ready", pocket: ["pocket": "ready"])
+        #expect(none["voices_left_out"] == nil)
+    }
 }
 
 @Suite struct Routing {
@@ -118,14 +139,20 @@ private func sine(_ hertz: Double, rate: Int, count: Int, amplitude: Float = 1) 
 @Suite struct Speech {
     @Test func validRequestWithDefaults() throws {
         let request = try SpeechRequest(json: raw(#"{"input": "  Hello there.  "}"#))
-        #expect(request.input == "Hello there." && request.voice == "af_heart" && request.speed == 1.1)
+        #expect(request.input == "Hello there." && request.voice == "heart" && request.language == "en")
     }
 
-    @Test func voiceAndSpeedAreChecked() throws {
-        let request = try SpeechRequest(json: raw(#"{"input": "Hi.", "voice": "bm_george", "speed": 9}"#))
-        #expect(request.voice == "bm_george" && request.speed == 1.5)
-        let odd = try SpeechRequest(json: raw(#"{"input": "Hi.", "voice": "../../x", "speed": 0.1}"#))
-        #expect(odd.voice == "af_heart" && odd.speed == 0.7)
+    /// Owner, 3 Nov 2026 ("remove kokoro and supertonic"): every voice is Pocket TTS's. A Kokoro voice id an older
+    /// bridge sends (a setting written before then) is the closest Pocket voice, as the bridge reads it
+    /// (`config.pocket_voice`): michael for a male one, heart for any other; anything else is heart, the default. The
+    /// speed an older bridge sends is taken and never read (Pocket TTS has none).
+    @Test func aKokoroVoiceIsTheClosestPocketVoice() throws {
+        for (asked, voice) in [("bm_george", "michael"), ("am_michael", "michael"), ("af_heart", "heart"),
+                               ("bf_emma", "heart"), ("../../x", "heart"), ("", "heart"), ("alba", "alba")] {
+            #expect(try SpeechRequest(json: raw(#"{"input": "Hi.", "voice": "\#(asked)", "speed": 9}"#)).voice == voice, "\(asked)")
+        }
+        let slow = try SpeechRequest(json: raw(#"{"input": "Hi.", "voice": "alba", "speed": 0.1}"#))
+        #expect(try slow == SpeechRequest(json: raw(#"{"input": "Hi.", "voice": "alba"}"#)))
     }
 
     /// The review of 28 Oct (calls-03): a call's line says so, and a Pocket TTS voice resting after failed runs is
@@ -136,17 +163,16 @@ private func sine(_ hertz: Double, rate: Int, count: Int, amplitude: Float = 1) 
         #expect(try !SpeechRequest(json: raw(#"{"input": "Hi.", "call": "yes"}"#)).call)
     }
 
-    /// Owner, 28 Oct (calls-03): on a call Kokoro says at most one line of a turn; each later line of it asks for no
-    /// Kokoro (`"kokoro": false`), so Kokoro never stands in for it in English. Supertonic-3, the stand-in in the other
-    /// ten languages, is no Kokoro: asked so, it stands in as ever. Only a JSON false asks it; any other request is as
-    /// before.
-    @Test func aCallsLineMayAskForNoKokoro() throws {
-        let english = try SpeechRequest(json: raw(#"{"input": "Hi.", "voice": "jane", "call": true, "kokoro": false}"#))
-        #expect(!english.kokoro && !english.standInAllowed)
-        let german = try SpeechRequest(json: raw(#"{"input": "Hallo.", "voice": "jane", "language": "de", "kokoro": false}"#))
-        #expect(!german.kokoro && german.standInAllowed)
-        #expect(try SpeechRequest(json: raw(#"{"input": "Hi.", "voice": "jane"}"#)).standInAllowed)
-        #expect(try SpeechRequest(json: raw(#"{"input": "Hi.", "kokoro": "no"}"#)).kokoro)
+    /// Owner, 3 Nov 2026: a line Pocket TTS cannot say is said by no other voice, whatever the request asks. An older
+    /// bridge's `"kokoro"` (calls-03's "no Kokoro for this line") is taken and never read: a request with it, true,
+    /// false or odd, is the same request as one without it, and the voice service refuses what Pocket cannot say
+    /// (409, `not_said`: VoiceServiceTests' `PocketOnly`).
+    @Test func theKokoroFieldIsTakenAndIgnored() throws {
+        let plain = try SpeechRequest(json: raw(#"{"input": "Hi.", "voice": "jane", "call": true}"#))
+        for kokoro in ["false", "true", #""no""#, "null"] {
+            let asked = try SpeechRequest(json: raw(#"{"input": "Hi.", "voice": "jane", "call": true, "kokoro": \#(kokoro)}"#))
+            #expect(asked == plain, "\(kokoro)")
+        }
     }
 
     @Test func emptyTooLongOrBroken() {
@@ -160,17 +186,25 @@ private func sine(_ hertz: Double, rate: Int, count: Int, amplitude: Float = 1) 
         #expect(request.spokenInput == "It's done. Next: two lamps.")
     }
 
-    @Test func englishWithKokoroUnlessALanguageIsNamed() throws {
-        let request = try SpeechRequest(json: raw(#"{"input": "Hi.", "voice": "bm_george"}"#))
-        #expect(request.language == "en" && request.engine == .kokoro && request.voice == "bm_george")
-        #expect(try SpeechRequest(json: raw(#"{"input": "Hi.", "language": "en"}"#)).engine == .kokoro)
+    @Test func englishUnlessALanguageIsNamed() throws {
+        #expect(try SpeechRequest(json: raw(#"{"input": "Hi."}"#)).language == "en")
+        #expect(try SpeechRequest(json: raw(#"{"input": "Hi.", "language": "en"}"#)).language == "en")
     }
 
-    @Test func theOtherTenSpeakWithSupertonic() throws {
-        for code in Languages.all.dropFirst() {
-            let request = try SpeechRequest(json: raw(#"{"input": "Hallo.", "language": "\#(code)"}"#))
-            #expect(request.language == code && request.engine == .supertonic)
+    /// Owner, 3 Nov 2026: her voice speaks English and, in jane, Spanish, Italian, Portuguese, Dutch, German and French
+    /// (Pocket TTS's models); Korean, Polish, Japanese and Russian have none: refused (409, `no_voice`) before any text
+    /// work, never said by another voice (Supertonic-3 said them before). Listening stays in all eleven
+    /// (`LanguageChoice`).
+    @Test func theSixSpeakAndTheFourHaveNoVoice() throws {
+        for code in ["es", "it", "pt", "nl", "de", "fr"] {
+            #expect(try SpeechRequest(json: raw(#"{"input": "Hallo.", "language": "\#(code)"}"#)).language == code)
         }
+        for code in ["ko", "pl", "ja", "ru"] {
+            #expect(throws: VoiceError.noVoice, "\(code)") {
+                try SpeechRequest(json: raw(#"{"input": "Hallo.", "voice": "jane", "language": "\#(code)"}"#))
+            }
+        }
+        #expect(Languages.all.filter(PocketTTS.speaks) == ["en", "es", "it", "pt", "nl", "de", "fr"])
     }
 
     @Test func anyOtherLanguageIsRefused() {
@@ -408,7 +442,7 @@ private func sine(_ hertz: Double, rate: Int, count: Int, amplitude: Float = 1) 
             (.notAudio, 415, "not_audio"), (.tooLong, 413, "too_long"), (.unreadable, 422, "unreadable"),
             (.notReady, 503, "not_ready"), (.failed, 500, "failed"), (.unsupportedLanguage, 400, "unsupported_language"),
             (.badStream, 400, "bad_stream"), (.badChunk, 400, "bad_chunk"), (.unavailable, 503, "unavailable"),
-            (.noStandIn, 409, "no_stand_in"),
+            (.notSaid, 409, "not_said"), (.noVoice, 409, "no_voice"),
         ]
         for (error, status, code) in cases {
             let text = String(decoding: error.response, as: UTF8.self)
@@ -431,37 +465,6 @@ private func sine(_ hertz: Double, rate: Int, count: Int, amplitude: Float = 1) 
     }
 }
 
-@Suite struct Resampling {
-    @Test func sameRateOrNothingIsUnchanged() {
-        #expect(resample([0.1, -0.2, 0.3], from: 24_000, to: 24_000) == [0.1, -0.2, 0.3])
-        #expect(resample([], from: 44_100, to: 24_000).isEmpty)
-    }
-
-    @Test func theDurationIsKept() {
-        #expect(resample([Float](repeating: 0, count: 44_100), from: 44_100, to: 24_000).count == 24_000)
-        #expect(resample([Float](repeating: 0, count: 441), from: 44_100, to: 24_000).count == 240)
-        #expect(resample([0], from: 44_100, to: 24_000).count == 1)
-    }
-
-    @Test func speechFrequenciesPassUnchanged() {
-        // a 1 kHz tone at 44.1 kHz becomes the same tone at 24 kHz (away from the edges, where the filter runs out)
-        let out = resample(sine(1000, rate: 44_100, count: 44_100), from: 44_100, to: 24_000)
-        let expected = sine(1000, rate: 24_000, count: 24_000)
-        #expect((200..<23_800).map { abs(out[$0] - expected[$0]) }.max()! < 0.002)
-    }
-
-    @Test func aToneAboveTheNewNyquistIsRemovedNotFolded() {
-        // 15 kHz cannot exist at 24 kHz (Nyquist 12 kHz): unfiltered it would come back as a 9 kHz whistle
-        let out = resample(sine(15_000, rate: 44_100, count: 44_100), from: 44_100, to: 24_000)[200..<23_800]
-        #expect((out.map { $0 * $0 }.reduce(0, +) / Float(out.count)).squareRoot() < 0.003)
-    }
-
-    @Test func aSteadyLevelIsKept() {
-        let out = resample([Float](repeating: 0.5, count: 4410), from: 44_100, to: 24_000)
-        #expect(out[100..<2300].allSatisfy { abs($0 - 0.5) < 0.0001 })
-    }
-}
-
 @Suite struct WAVFiles {
     @Test func monoSixteenBitLayoutAndClipping() {
         let wav = pcm16WAV([0, 0.5, -0.5, 1, -1, 2, -2, .nan, .infinity], sampleRate: 24_000)
@@ -472,70 +475,6 @@ private func sine(_ hertz: Double, rate: Int, count: Int, amplitude: Float = 1) 
         #expect(le(wav, 32, 2) == 2 && le(wav, 34, 2) == 16)  // block size, bits
         #expect(le(wav, 40, 4) == 18)  // data size
         #expect(pcm(wav) == [0, 16384, -16384, 32767, -32767, 32767, -32767, 0, 0])
-    }
-
-    @Test func speechIs24kHzMonoAtItsOwnLevel() {
-        // Supertonic-3's 44.1 kHz output as the bridge gets every voice: Kokoro's 24 kHz mono 16-bit. Not
-        // peak-normalised: both engines speak at about -26 dBFS RMS, normalising made Supertonic 5-9 dB louder.
-        let wav = SpeechAudio.wav(sine(440, rate: 44_100, count: 44_100, amplitude: 0.3), sampleRate: 44_100)
-        #expect(le(wav, 22, 2) == 1 && le(wav, 24, 4) == 24_000 && le(wav, 34, 2) == 16)
-        #expect(le(wav, 40, 4) == 48_000)
-        #expect(abs(pcm(wav).map { abs(Int($0)) }.max()! - 9830) < 50)
-    }
-
-    @Test func silenceAndBrokenSamplesStaySilent() {
-        let wav = SpeechAudio.wav([Float](repeating: 0, count: 440) + [.nan], sampleRate: 44_100)
-        #expect(le(wav, 40, 4) == 480 && pcm(wav).allSatisfy { $0 == 0 })
-    }
-}
-
-/// Counts loads; the test's loader decides what each one does.
-private actor Loads {
-    private(set) var count = 0
-    func next() -> Int {
-        count += 1
-        return count
-    }
-}
-
-private struct LoadFailed: Error {}
-
-@Suite struct FirstUseLoading {
-    @Test func concurrentFirstUsesShareOneLoad() async throws {
-        let loads = Loads()
-        let engine = LoadOnce<Int> {
-            let n = await loads.next()
-            try await Task.sleep(for: .milliseconds(100))  // the others arrive while it loads
-            return n
-        }
-        let values = try await withThrowingTaskGroup(of: Int.self) { group in
-            for _ in 0..<10 { group.addTask { try await engine.get() } }
-            return try await group.reduce(into: []) { $0.append($1) }
-        }
-        #expect(values == [Int](repeating: 1, count: 10))
-        #expect(await loads.count == 1)
-    }
-
-    @Test func aLoadedValueIsKept() async throws {
-        let loads = Loads()
-        let engine = LoadOnce<Int> { await loads.next() }
-        #expect(try await engine.get() == 1)
-        #expect(try await engine.get() == 1)
-        #expect(await loads.count == 1)
-    }
-
-    @Test func aFailedLoadIsNotReadyAndTriedAgainByTheNextUse() async throws {
-        let loads = Loads()
-        let engine = LoadOnce<Int> {
-            let n = await loads.next()
-            if n == 1 { throw LoadFailed() }
-            return n
-        }
-        // the bridge gets 503 not_ready, never the engine's own error
-        await #expect(throws: VoiceError.notReady) { try await engine.get() }
-        #expect(try await engine.get() == 2)
-        #expect(try await engine.get() == 2)
-        #expect(await loads.count == 2)
     }
 }
 
@@ -605,47 +544,12 @@ private struct LoadFailed: Error {}
     }
 }
 
-/// The Apple BNNS crash in Kokoro's speech (SIGSEGV in libBNNS) was seen on macOS 27.0.1 (calls.md, Gotchas): 27.0.x
-/// is warned until measured otherwise (the review of 28 Oct, calls-03). The service says so in its log at start.
-/// Estia needs macOS 27 or later (owner, 29 Oct): FluidAudio's own 26.4 and 26.5 advisory is no line of hers.
-@Suite struct KokoroOnThisMac {
-    @Test(arguments: [(26, 4, false), (26, 5, false), (27, 0, true), (27, 1, false), (28, 0, false)])
-    func macOS270IsCrashProne(major: Int, minor: Int, prone: Bool) {
-        #expect(KokoroAdvisory.crashProne(OperatingSystemVersion(majorVersion: major, minorVersion: minor, patchVersion: 1)) == prone)
-    }
-
-    @Test func theWarningSaysThereIsNoFixYet() {
-        func warning(_ major: Int, _ minor: Int) -> String? {
-            KokoroAdvisory.warning(OperatingSystemVersion(majorVersion: major, minorVersion: minor, patchVersion: 1))
-        }
-        let seen = warning(27, 0) ?? ""
-        #expect(seen.contains("macOS 27.0.1") && seen.contains("no fix yet") && seen.contains("Kokoro"))
-        #expect(warning(26, 5) == nil && warning(27, 1) == nil)
-    }
-}
-
-/// Speaking that fails to load keeps the service up (listening and the speech detector work on) and is tried again in
-/// the process after 1, 5 and 30 minutes, then every 30 minutes: never a restart loop that reloads Whisper each time.
+/// A Pocket TTS model that fails (no program, files not fetched, runs that fail) keeps the service up (listening and the
+/// speech detector work on) and is tried again in the process after 1, 5 and 30 minutes, then every 30 minutes
+/// (`PocketSpeaker`'s rest): never a restart loop that reloads Whisper each time.
 @Suite struct SpeakingRetries {
-    actor Record {
-        var slept: [TimeInterval] = []
-        var tries = 0
-        func sleep(_ seconds: TimeInterval) { slept.append(seconds) }
-        func attempt(succeedOn: Int) -> Bool {
-            tries += 1
-            return tries >= succeedOn
-        }
-    }
-
     @Test func theDelaysGrowToHalfAnHour() {
         #expect((0..<5).map(SpeakingRetry.delay(afterFailures:)) == [60, 300, 1800, 1800, 1800])
-    }
-
-    @Test func itTriesAgainUntilSpeakingLoads() async {
-        let record = Record()
-        await SpeakingRetry.run(sleep: { await record.sleep($0) }, load: { await record.attempt(succeedOn: 4) })
-        #expect(await record.slept == [60, 300, 1800, 1800])
-        #expect(await record.tries == 4)
     }
 }
 

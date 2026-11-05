@@ -2,13 +2,15 @@ import Foundation
 import Testing
 @testable import VoiceCore
 
-/// What Supertonic-3 is given for a text in `language`: the call's and the voice note's path (`SpeechRequest.spokenInput`).
+/// What the passes give for a text in `language` (`SpokenLanguage`), as one line (`SpeechRequest.oneLine`): the call's
+/// and the voice note's path in the six languages jane speaks (`SpeechRequest.spokenInput`, before Pocket's guard:
+/// `PocketText`); kept for Korean, Polish, Japanese and Russian, which have no voice since 3 Nov 2026 (Supertonic-3,
+/// which these rows were written for, was removed), for a Pocket model of them.
 private func spoken(_ text: String, _ language: String) throws -> String {
-    let body = try JSONSerialization.data(withJSONObject: ["input": text, "language": language])
-    return try SpeechRequest(json: body).spokenInput
+    SpokenLanguage.spoken(SpeechRequest.oneLine(text), language: language)
 }
 
-/// The 0.9.3 plan's rows per language: what is written, what Supertonic-3 is given. Every planned row is here, the
+/// The 0.9.3 plan's rows per language: what is written, what the passes give (written for Supertonic-3). Every planned row is here, the
 /// ones that must stay as written too; every row runs through the whole path, so a pass in the wrong order fails.
 enum LanguageTable {
     typealias Row = (kind: String, written: String, said: String)

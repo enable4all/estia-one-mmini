@@ -106,6 +106,7 @@ class Lifecycle:
             initiative=self.app.initiative.settings.line()
             if self.app.initiative and self.app.initiative.enabled
             else "",
+            language=self.app.language,
         )
 
     async def welcome(self) -> None:

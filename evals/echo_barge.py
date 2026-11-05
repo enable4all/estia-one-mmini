@@ -18,7 +18,7 @@ your own macOS account (hers answers only her own programs), never her live one:
 another port (`cd tools/voice && swift build -c release`, then `tools/voice/.build/release/voice-service --port 8152`,
 with `--pocket 100M` for vera and the 100M's heart). Its health must say "vad": "ready" for the rule "speech".
 
-    uv run python -m evals.echo_barge --voices heart,jane,af_heart --rules loudness,speech [--level 3]
+    uv run python -m evals.echo_barge --voices heart,jane,michael --rules loudness,speech [--level 3]
     uv run python -m evals.echo_barge --report evals/out/echo-<UTC time>.jsonl
 
 Output: evals/out/echo-<UTC time>.jsonl (a row per line: voice, rule, level, text, stops, verdicts, what Whisper heard
@@ -255,7 +255,7 @@ def report(rows: Sequence[dict[str, Any]]) -> str:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m evals.echo_barge", description=__doc__.split("\n")[0])
     parser.add_argument("--url", default=DEFAULT_URL)
-    parser.add_argument("--voices", default="heart,jane,af_heart", help="voices, comma-separated")
+    parser.add_argument("--voices", default="heart,jane,michael", help="Pocket TTS voices, comma-separated")
     parser.add_argument("--rules", default=",".join(RULES), help=f"of {', '.join(RULES)}")
     parser.add_argument("--level", type=float, default=3.0, help="her echo at 1/LEVEL of her level (3, 5)")
     parser.add_argument("--name", default="Estia", help="her name in her lines")
@@ -282,7 +282,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if call_running(listing(CALL_HELPER)):
             print("echo barge: a call is on: wait until it ends, or --force", file=sys.stderr)
             return 3
-    client = VoiceClient(args.url, voice=voices[0], speed=1.05)
+    client = VoiceClient(args.url, voice=voices[0])
     health = asyncio.run(client.health()) or {}
     needed = ("stt", "tts", *(("vad",) if "speech" in rules else ()))
     if not all(health.get(part) == "ready" for part in needed):

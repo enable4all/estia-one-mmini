@@ -278,6 +278,29 @@ CALLING: dict[str, tuple[str, ...]] = {
     "ru": ("эй", "привет", "алло", "слушай"),
     "fr": ("hé", "salut", "allô", "coucou", "euh"),
 }  # fmt: skip
+# On a call she places, the words that alone answer the phone ("Pronto?", "¿Diga?", "Słucham?"): with CALLING's, over
+# her opening they resume it and are no turn (calls.only_greeting; review of 0.9.8, V02). Never CALLING's: those also
+# end standby as her name alone (wake.only_name). Translations need a native speaker's check
+PICKUP: dict[str, tuple[str, ...]] = {
+    "es": ("diga", "dígame", "bueno"),
+    "it": ("pronto",),
+    "pl": ("słucham",),
+    "ru": ("слушаю",),
+}
+# the yes words allowed beside a calling or pickup word there ("Ja, hallo?", "Да, алло?"), never alone: "Ja?" is a turn
+PICKUP_SOFT: dict[str, tuple[str, ...]] = {
+    "en": ("yes",),
+    "es": ("sí",),
+    "it": ("sì",),
+    "ko": ("네",),
+    "pt": ("sim",),
+    "nl": ("ja",),
+    "pl": ("tak",),
+    "de": ("ja",),
+    "ja": ("はい",),
+    "ru": ("да",),
+    "fr": ("oui",),
+}
 # leave-taking that also means something else alone ("I'm off" is a day off too): it counts only with a soft word
 # beside it ("Okay, I'm off.", "I'm off now")
 LEAVING_NOT_ALONE: dict[str, tuple[str, ...]] = {"en": ("i'm off", "i am off")}
@@ -437,6 +460,7 @@ GOODBYES: dict[str, tuple[str, ...]] = {
 # closes the call too (calls.closes_only; review of 0.9.7: only English goodbyes ended it). Translations need a native
 # speaker's check
 PARTING: dict[str, tuple[str, ...]] = {
+    "es": ("buenas noches",),
     "it": ("ciao", "ciao ciao"),
     "ko": ("안녕", "안녕히"),
     "pt": ("tchau tchau", "boa noite", "falou"),
@@ -448,9 +472,11 @@ PARTING: dict[str, tuple[str, ...]] = {
     "fr": ("salut", "ciao", "bonne soirée", "bonne journée"),
 }
 # the ones of PARTING that alone are also a greeting or a turn's opening ("Ciao!", "Dag!", "Salut !": "hello" too, as
-# GOODBYES says; "Servus!", "hello" in the south; "じゃあ", "well then"; "falou", "said"): from the caller, after outside
-# text, one closes the call only after a thanks ("Grazie, ciao!"; calls.closes_call; fix review of 0.9.8, voice-01)
+# GOODBYES says; "Servus!", "hello" in the south; "じゃあ", "well then"; "falou", "said"; "buenas noches" and "boa
+# noite", "good evening" too): from the caller, after outside text, one closes the call only after a thanks ("Grazie,
+# ciao!", "Gracias, buenas noches."; calls.closes_call; fix review of 0.9.8, voice-01)
 PARTING_NOT_ALONE: dict[str, tuple[str, ...]] = {
+    "es": ("buenas noches",),
     "it": ("ciao",),
     "ko": ("안녕",),
     "pt": ("boa noite", "falou"),
@@ -467,6 +493,13 @@ PARTING_NOT_ALONE: dict[str, tuple[str, ...]] = {
 GOODBYES_NOT_ALONE: dict[str, tuple[str, ...]] = {
     "pl": ("na razie",),
     "ja": ("またあとで", "また今度"),
+}
+# the soft words (LEAVING_SOFT) that make "пока" or "na razie" read as "so far" ("Пока всё понятно.", "Ну, пока всё.",
+# "Na razie dobrze."): never beside such a goodbye in its part (calls._Byes.beside; third fix review of 0.9.8,
+# dialogue-F5). Translations need a native speaker's check
+SO_FAR: dict[str, tuple[str, ...]] = {
+    "ru": ("всё", "все", "хорошо"),
+    "pl": ("dobrze",),
 }
 # On a call, words after a goodbye, leave-taking or a request to end the call that say more is coming: "wait", "one
 # more thing", "actually", "before you go" (calls._closing_talk keeps the call open; review 18 Oct: they were English
@@ -634,6 +667,19 @@ CONTINUING: dict[str, tuple[str, ...]] = {
     "de": ("zu", "zum", "zur", "nach", "um", "für", "mit", "zurück"),
     "ru": ("в", "на", "к", "домой"),
     "fr": ("à", "au", "aux", "chez", "pour", "avec"),
+}  # fmt: skip
+# a part that starts with one of these is a clause that leads to what follows ("Once it's off, sleep well!"): left without
+# its wish it stands broken, so the sentence goes whole (calls.without_goodbye_parts). None for Japanese and Korean.
+SUBORDINATING: dict[str, tuple[str, ...]] = {
+    "en": ("once", "when", "if", "before", "after", "as soon as", "until", "till", "while", "whenever"),
+    "es": ("cuando", "si", "antes de", "después de", "en cuanto", "hasta que"),
+    "it": ("quando", "se", "prima di", "dopo", "appena", "finché"),
+    "pt": ("quando", "se", "antes de", "depois de", "assim que", "até que"),
+    "nl": ("zodra", "wanneer", "als", "voordat", "nadat", "tot"),
+    "pl": ("kiedy", "gdy", "jeśli", "zanim", "po tym jak", "jak tylko"),
+    "de": ("sobald", "wenn", "bevor", "nachdem", "falls", "sobald du"),
+    "ru": ("когда", "если", "перед тем как", "после того как", "как только"),
+    "fr": ("quand", "lorsque", "si", "avant de", "après", "dès que"),
 }  # fmt: skip
 # words a turn never ends on: an early end after one is held like one after a "but" or a comma (calls.goes_on; review
 # 0.9.7: "Set a reminder for five and", then a pause to think, was answered cut off). English's count on every call.

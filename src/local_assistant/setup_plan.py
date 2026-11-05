@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from local_assistant import hostsec, ollama_build, ownuser, prompts
-from local_assistant.config import DEFAULT_NAME, DEFAULT_STYLE, STYLES, ConfigError, check_name
+from local_assistant.config import DEFAULT_NAME, DEFAULT_STYLE, STYLES, ConfigError, check_name, has_voice
 from local_assistant.language import ENGLISH, LANGUAGES, find
 from local_assistant.setup_questions import (
     OTHER,
@@ -269,8 +269,10 @@ def _language_for(answers: Known, mac: Mac) -> Variant:
 
 
 def _label(code: str) -> str:
+    """ "Nederlands, Dutch"; one her voice does not speak marked (prompts.NO_VOICE_MARK; the review of 4 Nov)."""
     language = LANGUAGES[code]
-    return language.own if language.own == language.english else f"{language.own}, {language.english}"
+    label = language.own if language.own == language.english else f"{language.own}, {language.english}"
+    return label + ("" if has_voice(code) else prompts.NO_VOICE_MARK)
 
 
 def model_there(answers: Known, mac: Mac) -> bool:

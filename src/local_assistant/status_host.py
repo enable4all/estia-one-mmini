@@ -69,6 +69,7 @@ class StatusHost:
             documents=shown_folder(cfg.documents_folder) if cfg.documents_enabled else "",
             chords=cfg.chords_enabled,
             security=self.level,
+            language=self.app.language,  # no call is offered where her voice has none (review of 4 Nov, DLG-0983-06)
         )
 
     def inventory(self) -> prompts.Inventory | None:
@@ -90,16 +91,9 @@ class StatusHost:
             ask_first=any(spec.rule == "ask first" for spec in cfg.tapo_devices),
             documents=cfg.documents_enabled,
             osm=self.osm(),
-            english_voice=self.english_voice(),
-            language_voice=cfg.voice_language_voice,
             read_pages=tools.read_pages,
+            language=self.app.language,
         )
-
-    def english_voice(self) -> str:
-        """Her English voice in use: the voice clients' (a /voice choice, or the config's as this Mac speaks it), else
-        the config's."""
-        client = self.app.voice or self.app._call_voice
-        return client.voice if client is not None else self.app.cfg.voice_name
 
     def osm(self) -> bool:
         """Whether her places and routes are OpenStreetMap's (no Google Maps key); her first rules come before maps."""

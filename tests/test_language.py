@@ -510,3 +510,9 @@ def test_leave_takings_soft_words_are_an_okay_never_a_yes_and_what_goes_on_is_kn
     assert set(language.LEAVING_NOT_ALONE["en"]) <= set(language.LEAVING["en"])
     assert set(language.CONTINUING) <= set(CODES) - {"ja", "ko"}
     assert {"to", "back"} <= set(language.CONTINUING["en"]) and "naar" in language.CONTINUING["nl"]
+
+
+def test_subordinating_words_are_known_for_the_languages_with_spaces() -> None:
+    """A clause that starts with one leads to a closing wish and goes with it (calls.without_goodbye_parts)."""
+    assert set(language.SUBORDINATING) == set(CODES) - {"ja", "ko"}
+    assert {"once", "when", "before", "as soon as"} <= set(language.SUBORDINATING["en"])

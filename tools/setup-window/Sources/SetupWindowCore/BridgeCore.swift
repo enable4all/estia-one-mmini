@@ -39,6 +39,8 @@ public final class BridgeCore: AdminSink {
     public private(set) var ended = false
     private var waiting: [String] = []
     private var closedSent = false
+    /// The window broke while a command ran as root: it ends once that command's result went to setup (review W11).
+    private var endPending = false
     /// Setup's last word reached the page (the closing list, a stop's screen) or the page stopped it (Stop here): its
     /// end then needs nothing more. Without it, setup's end brings Terminal to the front, where it says why.
     public private(set) var lastWord = false
@@ -95,8 +97,13 @@ public final class BridgeCore: AdminSink {
 
     public func adminLine(id: String, line: String) { toSetup(.line(id: id, line: line)) }
 
+    /// A command's result, to setup; a window that broke meanwhile ends now (setup gone or not).
     public func adminDone(id: String, code: Int, refused: Bool, unrun: Bool) {
         toSetup(.done(id: id, code: code, refused: refused, unrun: unrun))
+        if endPending {
+            endPending = false
+            sink?.endWindow()
+        }
     }
 
     private func toSetup(_ message: AdminMessage) {
@@ -150,11 +157,16 @@ public final class BridgeCore: AdminSink {
         send(.closed)
     }
 
-    /// Something that never should happen (a line setup should never send, a page that did not load): setup goes on
-    /// in Terminal, the window ends.
+    /// Something that never should happen (a line setup should never send, a page that did not load, the page's
+    /// process gone): setup goes on in Terminal, the window ends. While a command runs as root, the app may not quit
+    /// (`mayClose`): the window ends once its result went to setup, never a blank window left to quit by hand (W11).
     public func broken() {
         closed()
-        sink?.endWindow()
+        if admin?.running == true {
+            endPending = true
+        } else {
+            sink?.endWindow()
+        }
     }
 
     /// stdin's end: setup ended. The page says so; nothing more goes to setup. Without setup's last word (a Ctrl-C in

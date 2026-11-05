@@ -10,7 +10,8 @@ __all__ = [
     "DOCTOR_ALWAYS_ON_MISSING", "DOCTOR_ALWAYS_ON_NONE_YET", "DOCTOR_ALWAYS_ON_NOT_LOADED",
     "DOCTOR_ALWAYS_ON_RESTARTING", "DOCTOR_ALWAYS_ON_SILENT", "DOCTOR_ALWAYS_ON_SILENT_SINCE",
     "DOCTOR_ALWAYS_ON_STOPPED", "DOCTOR_ALWAYS_ON_STOPPED_NEVER", "DOCTOR_ALWAYS_ON_UNREAD", "DOCTOR_BARGE_UNREAD",
-    "DOCTOR_BARGE_UNREAD_FIX", "DOCTOR_CALLS_BUILDS_FIX_OWN", "DOCTOR_CALLS_JAVA_FIX_OWN", "DOCTOR_CALL_HELPER_OLD", "DOCTOR_CALL_HELPER_OLD_FIX_OWN", "DOCTOR_DETECTOR_FALLS", "DOCTOR_DETECTOR_LOADING", "DOCTOR_DETECTOR_LOADING_FIX",
+    "DOCTOR_BARGE_UNREAD_FIX", "DOCTOR_CALLS_BUILDS_FIX_OWN", "DOCTOR_CALLS_JAVA_FIX_OWN", "DOCTOR_CALL_HELPER_OLD",
+    "DOCTOR_CALL_HELPER_OLD_FIX_OWN", "DOCTOR_DETECTOR_FALLS", "DOCTOR_DETECTOR_LOADING", "DOCTOR_DETECTOR_LOADING_FIX",
     "DOCTOR_DETECTOR_OLD", "DOCTOR_DETECTOR_SILENT", "DOCTOR_DETECTOR_UNAVAILABLE", "DOCTOR_DETECTOR_UNAVAILABLE_FIX",
     "DOCTOR_DEVICES_NOT_COUNTED", "DOCTOR_DOCUMENTS_BUILD_FIX", "DOCTOR_DOCUMENTS_CLOSED", "DOCTOR_DOCUMENTS_HERS",
     "DOCTOR_DOCUMENTS_HERS_FIX", "DOCTOR_DOCUMENTS_MAKE_FIX", "DOCTOR_DOCUMENTS_MISSING", "DOCTOR_DOCUMENTS_MKDIR_FIX",
@@ -22,12 +23,14 @@ __all__ = [
     "DOCTOR_HISTORY_FIX", "DOCTOR_HISTORY_KEPT", "DOCTOR_HISTORY_NOT_YET", "DOCTOR_HISTORY_PRUNED",
     "DOCTOR_HOME_NUMBER", "DOCTOR_HOME_USUAL_NAMES", "DOCTOR_HOST_FAILED", "DOCTOR_INITIATIVE_FIX",
     "DOCTOR_INITIATIVE_OFF", "DOCTOR_INITIATIVE_OFF_BY_USER", "DOCTOR_INTERRUPT_OLD", "DOCTOR_INTERRUPT_OLD_FIX",
+    "DOCTOR_MACOS_OLD", "DOCTOR_MACOS_OLD_FIX",
     "DOCTOR_MODEL_BUILD", "DOCTOR_MODEL_CLOUD", "DOCTOR_MODEL_CONTEXT", "DOCTOR_MODEL_CONTEXT_FIX",
     "DOCTOR_MODEL_PROMPT", "DOCTOR_MODEL_PROMPT_FIX", "DOCTOR_MODEL_PROMPT_FIX_HERS", "DOCTOR_MODEL_PROMPT_OTHER_FIX",
-    "DOCTOR_MODEL_TAG", "DOCTOR_OLLAMA_APP", "DOCTOR_OLLAMA_APP_DOWN_FIX", "DOCTOR_OLLAMA_DOWN_FIX",
+    "DOCTOR_MODEL_TAG", "DOCTOR_NO_VOICE_LANGUAGE", "DOCTOR_NO_VOICE_PRACTICE", "DOCTOR_OLLAMA_APP", "DOCTOR_OLLAMA_APP_DOWN_FIX", "DOCTOR_OLLAMA_DOWN_FIX",
     "DOCTOR_OLLAMA_HERS_OK", "DOCTOR_OLLAMA_JOB_FIX", "DOCTOR_OLLAMA_NOT_LOADED_FIX",
-    "DOCTOR_OLLAMA_OK", "DOCTOR_OLLAMA_OLD", "DOCTOR_OLLAMA_SERVICE_CHANGED", "DOCTOR_OLLAMA_SERVICE_FIX",
-    "DOCTOR_OLLAMA_SETUP_FIX", "DOCTOR_OLLAMA_UPDATE_FIX", "DOCTOR_OWN_EDIT", "DOCTOR_OWN_USER_CONFIG",
+    "DOCTOR_OLLAMA_OK", "DOCTOR_OLLAMA_OLD", "DOCTOR_OLLAMA_OTHERS_UNREAD", "DOCTOR_OLLAMA_SERVICE_CHANGED",
+    "DOCTOR_OLLAMA_SERVICE_FIX", "DOCTOR_OLLAMA_SETUP_FIX", "DOCTOR_OLLAMA_UNSEEN", "DOCTOR_OLLAMA_UNSEEN_FIX",
+    "DOCTOR_OLLAMA_UPDATE_FIX", "DOCTOR_OWN_EDIT", "DOCTOR_OWN_USER_CONFIG",
     "DOCTOR_PICTURE_BAD", "DOCTOR_PICTURE_ESTIA", "DOCTOR_PICTURE_FIX", "DOCTOR_PICTURE_NONE", "DOCTOR_PICTURE_OWN",
     "DOCTOR_PIN_CHANGED", "DOCTOR_PIN_CHANGED_FIX", "DOCTOR_PIN_FIX", "DOCTOR_PIN_FIX_UNKNOWN", "DOCTOR_PIN_NONE",
     "DOCTOR_PIN_OK", "DOCTOR_PIN_UNREAD", "DOCTOR_POCKET_CHANGED", "DOCTOR_POCKET_CHANGED_FIX",
@@ -39,7 +42,8 @@ __all__ = [
     "DOCTOR_POCKET_UNAVAILABLE", "DOCTOR_POCKET_UNREAD", "DOCTOR_POCKET_UNREAD_FIX", "DOCTOR_POWER_ADAPTER_OK", "DOCTOR_POWER_BATTERY", "DOCTOR_POWER_FIX",
     "DOCTOR_POWER_LAPTOP", "DOCTOR_POWER_LAPTOP_FIX", "DOCTOR_POWER_LAPTOP_OK", "DOCTOR_POWER_NO_RESTART", "DOCTOR_POWER_OFF", "DOCTOR_POWER_OK", "DOCTOR_POWER_SLEEPS", "DOCTOR_PROJECTS_CLOSED",
     "DOCTOR_PROJECTS_EMPTY", "DOCTOR_PROJECTS_MISSING", "DOCTOR_PROJECTS_NONE_READ", "DOCTOR_PROJECTS_OK",
-    "DOCTOR_PROJECTS_ROOT_FIX", "DOCTOR_PROJECTS_SHARE_FIX", "DOCTOR_PROJECTS_SOME", "DOCTOR_REMINDERS_FIX",
+    "DOCTOR_PROJECTS_ROOT_FIX", "DOCTOR_PROJECTS_SHARE_FIX", "DOCTOR_PROJECTS_SOME", "DOCTOR_PYTHON", "DOCTOR_PYTHON_FIX",
+    "DOCTOR_REMINDERS_FIX",
     "DOCTOR_REMINDERS_NONE", "DOCTOR_REMINDERS_STUCK", "DOCTOR_SAFETY_UNCHANGED", "DOCTOR_SIGNAL_ACCOUNT_BY_HAND",
     "DOCTOR_SIGNAL_ACCOUNT_FIX", "DOCTOR_SIGNAL_ACCOUNT_NONE", "DOCTOR_SIGNAL_ACCOUNT_OK",
     "DOCTOR_SIGNAL_ACCOUNT_UNFINISHED", "DOCTOR_SIGNAL_CLI_ESTIA_FIX", "DOCTOR_SIGNAL_CLI_FIX",
@@ -157,15 +161,13 @@ DOCTOR_TURN_UNAVAILABLE_FIX = (
 DOCTOR_TURN_SILENT = "not ready: turns end after the full pause until it is"
 # doctor's Pocket TTS voices line (with [voice]): the English voices' files against their pins (voice.pocket_files) on
 # the Mac's model (owner, 26 Oct: the 100M beside Gemma 4 26B, the 18M beside 12B; {size}: 100M or 18M, {voices}: its
-# voices) and its state in the voice service's health; whatever stops them, Kokoro says her lines meanwhile ({stand_in}:
-# am_michael for alba and michael, af_heart for the others, `config.kokoro_stand_in`); while Pocket TTS is not there,
-# its limit on a call in the docs' words (owner, 28 Oct: "yes to both", words-04; calls.py's `_KokoroTurn`), the line
-# split to fit the terminal (doctor's `_pocket`)
+# voices) and its state in the voice service's health; whatever stops them, her answers come as text meanwhile (owner,
+# 3 Nov 2026: Pocket TTS is her only voice, no other voice says a line; until then Kokoro did), the line split to fit
+# the terminal (doctor's `_pocket`)
 DOCTOR_POCKET_ENGLISH_OK = "Pocket TTS ready on its {size} model ({voices}); its files are the pinned ones"
 DOCTOR_POCKET_OK = "Pocket TTS ready; its files are the pinned ones"  # a language's (jane's)
 DOCTOR_POCKET_MISSING = (  # {size}: the model's files in MB (250 the 100M's, 130 the 18M's)
-    "not fetched yet (about {size} MB, at the voice service's start): Kokoro's {stand_in} says her lines meanwhile"
-    " (on a call, one line each time she answers; the rest comes as a Signal text)"
+    "not fetched yet (about {size} MB, at the voice service's start): her answers come as text meanwhile"
 )
 # the config's voice vera on a Mac with the 18M model (owner, 26 Oct: "vera stays on the 100M only"): heart, the
 # default (owner, 29 Oct), speaks there
@@ -173,18 +175,27 @@ DOCTOR_POCKET_NO_VERA = "the config's voice vera speaks only on a Mac with 32 GB
 DOCTOR_POCKET_NO_VERA_FIX = 'pick another with /voice (/voices lists them), or set [voice] voice = "heart"'
 # jane in the language in use (owner, 25 Oct: Spanish, Italian, Portuguese, Dutch, German or French, each its own model
 # of Pocket TTS, fetched only for the language in use); {language}: its English name
-DOCTOR_POCKET_LANGUAGE_NOT_YET = "not fetched yet: fetched the first time she speaks {language} (about 227 MB); until then Supertonic-3's F1 speaks it"
+DOCTOR_POCKET_LANGUAGE_NOT_YET = (
+    "not fetched yet: fetched the first time she speaks {language} (about 227 MB); until then her answers in {language}"
+    " come as text"
+)
 DOCTOR_POCKET_LANGUAGE_IDLE = "fetched; checked again the first time she speaks {language} after a start"
-DOCTOR_POCKET_LANGUAGE_FETCHING = "being fetched (about 227 MB): Supertonic-3's F1 speaks {language} meanwhile"
-DOCTOR_POCKET_LANGUAGE_LOADING = "loading: Supertonic-3's F1 speaks {language} until it is ready"
+DOCTOR_POCKET_LANGUAGE_FETCHING = "being fetched (about 227 MB): her answers in {language} come as text meanwhile"
+DOCTOR_POCKET_LANGUAGE_LOADING = "loading: her answers in {language} come as text until it is ready"
 DOCTOR_POCKET_LANGUAGE_UNAVAILABLE = (
-    "unavailable (a download or a run failed; tried again when she next speaks {language} after a wait): Supertonic-3's"
-    " F1 speaks it meanwhile"
+    "unavailable (a download or a run failed; tried again when she next speaks {language} after a wait): her answers"
+    " in {language} come as text meanwhile"
 )
 DOCTOR_POCKET_LANGUAGE_OLD = (
-    "the voice service is older than jane's {language}: Supertonic-3's F1 speaks it until it is updated"
+    "the voice service is older than jane's {language}: her answers in {language} come as text until it is updated"
 )
-DOCTOR_POCKET_LANGUAGE_CHANGED = "its files are not the pinned ones: never run; Supertonic-3's F1 speaks {language}"
+DOCTOR_POCKET_LANGUAGE_CHANGED = "its files are not the pinned ones: never run; her answers in {language} come as text"
+# Korean, Polish, Russian or Japanese in use (owner, 3 Nov 2026: Pocket TTS has no model for them, nothing replaces
+# Supertonic-3): no voice, /language's sentence in doctor's words; a practice in one of them (calls.CALL_NO_VOICE_PRACTICE)
+DOCTOR_NO_VOICE_LANGUAGE = "no voice in {language}: answers come as text, and calls in {language} are not picked up"
+DOCTOR_NO_VOICE_PRACTICE = (
+    "practice in {language} is text only: no voice in it, so calls are not picked up until /babble off"
+)
 # a language's model is checked only once a line is asked in it, never at the voice service's start ({folder}: its own)
 DOCTOR_POCKET_LANGUAGE_CHANGED_FIX = (
     "see {log} for why; after {restart}, the first line she speaks in {language} (a voice note or a call; she asks one"
@@ -192,36 +203,30 @@ DOCTOR_POCKET_LANGUAGE_CHANGED_FIX = (
     " delete {folder} first{rights}"
 )
 DOCTOR_POCKET_MISSING_FIX = "wait a few minutes and run doctor again; if it stays, see {log}"
-DOCTOR_POCKET_LOADING = (
-    "loading: Kokoro's {stand_in} says her lines until it is ready (on a call, one line each time she answers; the"
-    " rest comes as a Signal text)"
-)
+DOCTOR_POCKET_LOADING = "loading: her answers come as text until it is ready"
 DOCTOR_POCKET_UNAVAILABLE = (
-    "unavailable (a download or a run failed; tried again by itself): Kokoro's {stand_in} says her lines meanwhile"
-    " (on a call, one line each time she answers; the rest comes as a Signal text)"
+    "unavailable (a download or a run failed; tried again by itself): her answers come as text meanwhile"
 )
 DOCTOR_POCKET_LOG_FIX = "see {log} for why"
-DOCTOR_POCKET_OLD = "the voice service is older than Pocket TTS: Kokoro's {stand_in} says her lines until it is updated"
-DOCTOR_POCKET_CHANGED = "its files are not the pinned ones: never run; Kokoro's {stand_in} says her lines"
+DOCTOR_POCKET_OLD = "the voice service is older than Pocket TTS, her only voice: update it"
+DOCTOR_POCKET_CHANGED = "its files are not the pinned ones: never run; her answers come as text"
 DOCTOR_POCKET_CHANGED_FIX = (
     "see {log} for why; the voice service sets them aside and fetches them again when it starts again: {restart};"
     " files that could not be set aside: delete {folder} first{rights}"
 )
-DOCTOR_POCKET_NO_PROGRAM = "its program is not in her release yet: Kokoro's {stand_in} says her lines meanwhile"
+DOCTOR_POCKET_NO_PROGRAM = "its program is not in her release yet: her answers come as text meanwhile"
 # heart's voice file for the Mac's model (owner, 27 Oct: the 100M's, `voice.POCKET_SHIPPED`; 29 Oct: the 18M's,
-# `voice.POCKET_SHIPPED_18M`), shipped in the voice service's own bundle in her release: without it only heart's lines
-# are Kokoro's (the review of 27 Oct, swift-voice-2: her other Pocket voices speak as before); {file}: its name
-# (heart.safetensors or heart-18m.safetensors), {stand_in}: heart's stand-in, af_heart
+# `voice.POCKET_SHIPPED_18M`), shipped in the voice service's own bundle in her release: without it only heart is not
+# said (the review of 27 Oct, swift-voice-2: her other Pocket voices speak as before); {file}: its name
+# (heart.safetensors or heart-18m.safetensors)
 DOCTOR_POCKET_NO_SHIPPED = (
-    "Heart's voice file ({file}) is not in her release yet: Kokoro's {stand_in} says only heart's lines meanwhile"
+    "Heart's voice file ({file}) is not in her release yet: in heart's voice her answers come as text meanwhile"
 )
 DOCTOR_POCKET_SHIPPED_CHANGED = (
-    "Heart's voice file ({file}) in her release is not the pinned one: never run; Kokoro's {stand_in} says only"
-    " heart's lines"
+    "Heart's voice file ({file}) in her release is not the pinned one: never run; in heart's voice her answers come"
+    " as text"
 )
-DOCTOR_POCKET_PROGRAM_CHANGED = (
-    "its program in her release is not the pinned one: never run; Kokoro's {stand_in} says her lines"
-)
+DOCTOR_POCKET_PROGRAM_CHANGED = "its program in her release is not the pinned one: never run; her answers come as text"
 DOCTOR_POCKET_PROGRAM_FIX = (
     "an update puts the pinned one there: {deploy} (if it says the root-run tools differ: read the diff, run {deploy}"
     " --update-tools, then {deploy} again)"
@@ -386,6 +391,9 @@ DOCTOR_POWER_LAPTOP_FIX = (
 )
 # doctor's Your home line (share.OPEN_TEXT): as her it cannot list your home, so it looks the usual names up one by one
 DOCTOR_HOME_USUAL_NAMES = " (the usual names only: her account cannot list your home)"
+# an install made before setup's macOS rule (review of 0.9.8, M02): scripts/setup.sh's words (prompts.SETUP_MACOS_OLD)
+DOCTOR_MACOS_OLD = "macOS {version} on Apple silicon; {name} needs macOS 27 or later"
+DOCTOR_MACOS_OLD_FIX = "Update macOS (System Settings → General → Software Update)"
 DOCTOR_TOOLS_HERS = "she runs as _estia: your tools (ollama, uv) are not hers; what she runs is under Her programs"
 DOCTOR_HOST_FAILED = "the check could not run ({why})"
 # the projects folder, as the user doctor runs as reads it (as her: what her project tools can read)
@@ -486,6 +494,19 @@ MODEL_CLOUD_LINE = "answers paused since {when}: {model} is an Ollama cloud mode
 SETUP_MODEL_FIX = "scripts/setup.sh (it downloads the model that fits this Mac's memory and makes local-worker from it)"
 DOCTOR_OLLAMA_OK = "{version} answers ({program}), with its JSON-schema library"
 DOCTOR_OLLAMA_HERS_OK = "{version} answers ({program}): her own, as {user}, with its JSON-schema library"
+# after a ✓ when netstat listed no socket (seen on macOS 27.0.1; 3 Nov report): the check that no other account's
+# program shares its port could not run, and the line says so instead of looking all clear
+DOCTOR_OLLAMA_OTHERS_UNREAD = "; other accounts' programs on its port could not be listed without admin rights"
+# no program found on its port while netstat listed none (fix review 1, 3 Nov): another account's may answer there.
+# A ○ ("{version} answers; " first), or the end of the "!" for an old or untested version
+DOCTOR_OLLAMA_UNSEEN = "its program and account could not be read without admin rights"
+DOCTOR_OLLAMA_UNSEEN_FIX = "to read them: /usr/bin/sudo /usr/sbin/lsof -nP -iTCP:{port} -sTCP:LISTEN"
+# the Python doctor runs on (hers) and its own OpenSSL, which the release scan of the lockfiles does not cover (3 Nov
+# report): a fact (○), as doctor reads nothing online; each release compares it by hand (docs/agents/docs-release.md)
+DOCTOR_PYTHON = "{python}, with {openssl}, which encrypts her connections to mail, calendars, maps and the web"
+# its fix (fix review 7): Python's patch, and so its OpenSSL, follows the uv on the Mac; hers comes with a deploy, the
+# checkout's from uv itself ({then})
+DOCTOR_PYTHON_FIX = "if a newer OpenSSL is out, a newer uv may bring it: brew upgrade uv, then {then}"
 # the Ollama app, chosen at setup (config: ollama = "app"; owner, 29 Oct): a "!" with its limits, in one line
 DOCTOR_OLLAMA_APP = f"the Ollama app {{version}} answers ({{program}}), as chosen at setup: {OLLAMA_APP_LIMITS}"
 DOCTOR_OLLAMA_APP_DOWN_FIX = "open the Ollama app (it runs only while someone is logged in)"
@@ -598,6 +619,7 @@ PART_REASONS = {
     "login": "TP-Link login refused",
     "unsupported": "a device uses a login not supported yet",
     "loading": "still loading",
+    "not_working": "not working (doctor says why)",  # her voice: Pocket TTS resting, missing or refused
     "bad_answer": "unreadable answer",
     "no_consent": "Calendars.Read not granted yet",
     "not_shared": "the folder cannot be read",

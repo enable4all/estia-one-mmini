@@ -2,7 +2,8 @@
 hint is kept (owner, 22 Oct: her name said in standby was missed; the hint's known risk is Whisper writing the prompt
 into silence or noise, so wakes AND false wakes are measured).
 
-No call, no microphone and no caller: Kokoro (the voice service's own English voices) says each phrase; the audio goes
+No call, no microphone and no caller: Pocket TTS (the voice service's English voices; Kokoro until it was removed, 3 Nov
+2026) says each phrase; the audio goes
 the way a caller's does (48 kHz samples with a moment of quiet before and after, the line's noise mixed in, then
 16 kHz to Whisper, the call's `pcm48_to_wav16k`), once without the hint and once with her name as it (the arms in
 turn, item by item); `wake.says_name` decides as standby does, after the call's noise filter (`is_noise_transcript`).
@@ -12,17 +13,19 @@ clicks). Audio lives only in memory (hard rule 7: no WAV is written, but for `--
 audio only); the result file holds counts and, per item, the phrase's id, voice, noise, arm, whether it woke and what
 Whisper wrote of the synthetic phrase.
 
-`--call`: standby as a call hears it (owner, 23 Oct: in standby his "hello Tiffany", said with a pause, came to
-Whisper as clips of 0.7-0.8 s, chopped by the early end at the pause, and each was heard as no words; the run above
-never cut a phrase and gave every clip 0.6 s of quiet). Each phrase is one stream on the caller's line (`--lines`:
-"clean", or "phone": a mobile line's band, the level the owner's turns had and Opus at 16 kbit/s through macOS's
-afconvert, in a private temporary folder removed at once: synthetic phrases only), cut into turns by the call's own
-listen (`CallAudio.listen`: the arms "early end", the real Smart Turn at the short pause, and "full pause"), each turn
-to Whisper as calls.py sends it, then standby's decision turn by turn (a click or a bump not sent, the noise filter,
-the hold of a turn that ends like more is coming, her name): the item wakes when one of its turns says her name. Its
-phrases: the owner's three with a pause after the first part and said whole, her name alone said briskly, all the
-phrases above, and short sounds. The pause by speech is left out (the frames go in at once, never in real time, so its
-answers would come late): the pause is by loudness, which the "loud room" noise can keep open.
+`--call`: standby as a call hears it (owner, 23 Oct: in standby his "hello Tiffany", said with a pause, came to Whisper
+as clips of 0.7-0.8 s, chopped by the early end at the pause, and each was heard as no words; the run above never cut a
+phrase and gave every clip 0.6 s of quiet). Each phrase is one stream on the caller's line (`--lines`: "clean", or
+"phone": a mobile line's band, the level the owner's turns had and Opus at 16 kbit/s through macOS's afconvert, in a
+private temporary folder removed at once: synthetic phrases only), cut into turns by the call's own listen
+(`CallAudio.listen`: the arms "early end", the real Smart Turn at the short pause, and "full pause"), each turn to
+Whisper as calls.py sends it, then standby's decision turn by turn (a click or a bump not sent, the noise filter, the
+hold of a turn that ends like more is coming, her name): the item wakes when one of its turns says her name. Its
+phrases: the owner's three with a pause after the first part and said whole, her name alone, all the phrases above, and
+short sounds. Pocket TTS has no speed, so her name alone is said once, at its own pace: the brisk clips Kokoro said (1.3
+and 1.6 times its pace, about 0.6 s) are no longer measured (a known gap). The pause by speech is left out (the frames
+go in at once, never in real time, so its answers would come late): the pause is by loudness, which the "loud room"
+noise can keep open.
 
 Run it alone: the voice service's Neural Engine and the GPU are shared (the owner's live install, other jobs' evals);
 it refuses to start while another evals job runs (`--force` to run anyway). The voice service must be one of your own
@@ -32,14 +35,15 @@ port (`tools/voice/.build/release/voice-service --port 8152`, then `--url http:/
 hint (its health says "hints"); `--call` needs its turn detector ("turn": "ready") and the hint only with `--hint` (its
 arms added).
 
-    uv run python -m evals.wake_harness                 (her name from the config, default Estia; six voices)
-    uv run python -m evals.wake_harness --name Tiffany --voices af_heart,am_michael --noises clean,room
+    uv run python -m evals.wake_harness                 (her name from the config, default Estia; five voices)
+    uv run python -m evals.wake_harness --name Tiffany --voices heart,michael --noises clean,room
     uv run python -m evals.wake_harness --url http://127.0.0.1:8152 --out evals/out
     uv run python -m evals.wake_harness --call --name Tiffany --lines phone --noises clean,room [--hint]
 
 Output: a table (wakes: phrases with her name heard as her name; false wakes: the others heard as her name; for each
 arm; with `--call` also the turns, those heard as no words and those of 1 s or less) and evals/out/wake-<UTC
-time>.json (`wake-call-` with `--call`). English only (Kokoro is English): the other ten languages are not measured.
+time>.json (`wake-call-` with `--call`). English only (Pocket TTS's English voices): the other ten languages are not
+measured.
 """
 
 from __future__ import annotations
@@ -90,7 +94,7 @@ OTHER_ACCOUNT = (
     "this branch's as you on another port, tools/voice/.build/release/voice-service --port 8152, then pass "
     "--url http://127.0.0.1:8152"
 )
-DEFAULT_VOICES = ("af_heart", "af_bella", "bf_emma", "am_michael", "am_adam", "bm_george")
+DEFAULT_VOICES = ("heart", "jane", "eve", "alba", "michael")  # Pocket TTS's on either model (vera: the 100M's only)
 ARMS = (("no hint", False), ("hint", True))  # in turn for every item
 NOISES = ("clean", "room", "loud room")  # the caller's line: none, a quiet room, a TV or a fan nearby
 QUIET_S = 0.3  # quiet before and after a phrase, as a call's clip has around a turn
@@ -333,11 +337,11 @@ class Voice(Protocol):
 
 
 class CallVoice(Protocol):
-    """What --call needs: speech at a speed too, and the turn detector (Smart Turn)."""
+    """What --call needs: the turn detector (Smart Turn) too."""
 
     def health(self) -> dict[str, object]: ...
 
-    def speak(self, text: str, voice: str, speed: float = 1.0) -> bytes: ...
+    def speak(self, text: str, voice: str) -> bytes: ...
 
     def transcribe(self, audio: bytes, hint: str) -> str: ...
 
@@ -377,8 +381,8 @@ class VoiceService:
         answer = json.loads(self._request("GET", "/health", None, ""))
         return answer if isinstance(answer, dict) else {}
 
-    def speak(self, text: str, voice: str, speed: float = 1.0) -> bytes:
-        body = json.dumps({"input": text, "voice": voice, "speed": speed}).encode()
+    def speak(self, text: str, voice: str) -> bytes:
+        body = json.dumps({"input": text, "voice": voice}).encode()
         return self._request("POST", "/v1/audio/speech", body, "application/json")
 
     def transcribe(self, audio: bytes, hint: str) -> str:
@@ -530,8 +534,7 @@ OWNER = (
     ("owner-count", ("One, two, three, four, five, six, seven.", "{name}.")),
 )
 OWNER_PAUSES_S = (0.8, 1.2)
-ALONE_SPEEDS = (1.0, 1.3, 1.6)  # her name alone, said briskly: clips of about 0.6-1 s as the call cuts them
-SPOKEN_FLOOR = 200  # Kokoro's own quiet before and after a part, trimmed so a pause is the one set
+SPOKEN_FLOOR = 200  # the voice's own quiet before and after a part, trimmed so a pause is the one set
 
 
 @dataclass(frozen=True)
@@ -539,22 +542,21 @@ class Spoken:
     """A phrase for --call: its parts said one by one with `pause_s` between them (one part: said whole)."""
 
     id: str
-    kind: str  # owner, owner paused, alone brisk; or a kind of `phrases`
+    kind: str  # owner, owner paused, alone once; or a kind of `phrases`
     parts: tuple[str, ...]
     named: bool
     pause_s: float = 0.0
-    speed: float = 1.0
     matched: bool = False  # `Phrase.matched`
 
 
 def call_phrases(name: str, *, long: bool = False) -> list[Spoken]:
-    """The owner's phrases (paused and whole), her name alone said briskly, then every phrase of `phrases`."""
+    """The owner's phrases (paused and whole), her name alone, then every phrase of `phrases`."""
     out: list[Spoken] = []
     for id_, parts in OWNER:
         filled = tuple(part.format(name=name) for part in parts)
         out.append(Spoken(f"{id_}-whole", "owner", (" ".join(filled),), True))
         out += [Spoken(f"{id_}-{pause:g}s", "owner paused", filled, True, pause) for pause in OWNER_PAUSES_S]
-    out += [Spoken(f"alone-x{speed:g}", "alone brisk", (f"{name}.",), True, speed=speed) for speed in ALONE_SPEEDS]
+    out.append(Spoken("alone-once", "alone once", (f"{name}.",), True))  # at Pocket TTS's own pace: it has no speed
     return out + [
         Spoken(phrase.id, phrase.kind, (phrase.text,), phrase.named, matched=phrase.matched)
         for phrase in phrases(name, long=long)
@@ -569,7 +571,7 @@ def short_sounds() -> list[tuple[str, str, bytes]]:
 
 
 def _trimmed(pcm: bytes) -> bytes:
-    """A part without Kokoro's own quiet before and after it."""
+    """A part without the voice's own quiet before and after it."""
     samples = array.array("h", pcm)
     loud = [i for i, x in enumerate(samples) if abs(x) > SPOKEN_FLOOR]
     return samples[loud[0] : loud[-1] + 1].tobytes() if loud else b""
@@ -800,7 +802,7 @@ def run_call(
     for spoken in call_phrases(name, long=long):
         for voice in voices:
             free()
-            parts = [_trimmed(wav_to_pcm48(service.speak(part, voice, spoken.speed))) for part in spoken.parts]
+            parts = [_trimmed(wav_to_pcm48(service.speak(part, voice))) for part in spoken.parts]
             for line in lines:
                 for noise in noises:
                     free()
@@ -866,7 +868,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m evals.wake_harness", description=__doc__.split("\n")[0])
     parser.add_argument("--url", default=DEFAULT_URL)
     parser.add_argument("--name", default=None, help="her name (default: the config's, else Estia)")
-    parser.add_argument("--voices", default=",".join(DEFAULT_VOICES), help="Kokoro voices, comma-separated")
+    parser.add_argument("--voices", default=",".join(DEFAULT_VOICES), help="Pocket TTS voices, comma-separated")
     parser.add_argument("--noises", default=",".join(NOISES), help=f"of {', '.join(NOISES)}")
     parser.add_argument("--out", default=str(OUT))
     parser.add_argument("--force", action="store_true", help="run beside another evals job")

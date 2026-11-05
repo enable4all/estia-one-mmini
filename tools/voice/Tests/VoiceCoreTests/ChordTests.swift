@@ -2,10 +2,10 @@ import Foundation
 import Testing
 import VoiceCore
 
-/// What Kokoro is given for an English text: the call's and the voice note's path (`SpeechRequest.spokenInput`).
+/// What the English passes give for a text (`SpokenEnglish`), as one line (`SpeechRequest.oneLine`): the call's and the
+/// voice note's path (`SpeechRequest.spokenInput`) before Pocket's letters and its guard (`PocketText`, PocketTests).
 private func spoken(_ text: String) throws -> String {
-    let body = try JSONSerialization.data(withJSONObject: ["input": text])
-    return try SpeechRequest(json: body).spokenInput
+    SpokenEnglish.spoken(SpeechRequest.oneLine(text))
 }
 
 /// Owner, 16 Oct, on a call: "chord progression still chinese ... # and flats have words". A chord is said as music

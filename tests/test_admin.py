@@ -63,12 +63,12 @@ def test_with_calls_the_jvm_build_gets_java_and_ipv4_from_its_environment(
 
 def test_her_commands_name_the_bridges_signal_cli_folder(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """One folder for the bridge, `estia signal`, `estia signal-login` and the Registration Lock: signal_io's."""
-    from local_assistant import app, harden, signal_io
+    from local_assistant import entry, harden, signal_io
 
     monkeypatch.setenv("HOME", str(tmp_path / "her"))
     data = str(signal_io.signal_data())
     assert data == f"{tmp_path}/her/.local/share/signal-cli"
-    assert getattr(app, "signal_data") is signal_io.signal_data  # noqa: B009 (the bridge's own import)
+    assert getattr(entry, "signal_data") is signal_io.signal_data  # noqa: B009 (the bridge's own import)
     assert getattr(admin, "signal_data") is signal_io.signal_data  # noqa: B009
     assert harden.set_pin_argv("signal-cli", NUMBER)[2:4] == ["--config", data]
     assert harden.set_pin_argv("signal-cli", NUMBER, jvm=True)[1:3] == ["--config", data]

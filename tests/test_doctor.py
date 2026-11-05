@@ -5,6 +5,7 @@ import io
 import json
 import os
 import re
+import subprocess
 import tempfile
 from collections.abc import Collection, Mapping
 from dataclasses import replace
@@ -43,6 +44,7 @@ class FakeProbe(Probe):
         self.home = home
         self.tools = {"signal-cli", "ollama", "uv"}
         self.system = ("darwin", "arm64")
+        self.macos: str | None = "27.0.1"  # `sw_vers -productVersion`; None: could not be read
         self.answers: dict[str, Any] = {
             "http://127.0.0.1:11434/api/tags": {"models": [{"name": "local-worker:latest"}]}
         }
@@ -72,6 +74,8 @@ class FakeProbe(Probe):
         self.ollama_addresses: tuple[str, ...] = ("127.0.0.1.11434",)  # where it listens (netstat's local address)
         self.ollama_uid: int | None = None  # the account that runs it (ps); None: not read
         self.ollama_others: tuple[tuple[str, int | None], ...] = ()  # another program or account on its port too
+        self.ollama_unread = False  # netstat listed no socket: another account's on its port could not be listed
+        self.python = ("3.13.16", "OpenSSL 3.5.9 29 Sep 2026")  # the Python doctor runs on, and its OpenSSL
         self.ollama_ports: list[int] = []
         self.ollama_service: str | None = None  # `launchctl print` of setup's Ollama service; None: could not be read
         self.shown: dict[str, Any] = {}  # Ollama's /api/show answer per model name; none: it does not answer
@@ -80,8 +84,11 @@ class FakeProbe(Probe):
     def ollama_listener(self, port: int) -> Listener:
         self.ollama_ports.append(port)
         if not self.ollama_at:
-            return Listener("")
-        return Listener(self.ollama_at, self.ollama_addresses, self.ollama_uid, self.ollama_others)
+            return Listener("", others_unread=self.ollama_unread)
+        return Listener(self.ollama_at, self.ollama_addresses, self.ollama_uid, self.ollama_others, self.ollama_unread)
+
+    def python_versions(self) -> tuple[str, str]:
+        return self.python
 
     def ollama_launchd(self) -> str | None:
         return self.ollama_service
@@ -137,6 +144,9 @@ class FakeProbe(Probe):
 
     def platform(self) -> tuple[str, str]:
         return self.system
+
+    def macos_version(self) -> str | None:
+        return self.macos
 
     def get_json(self, url: str) -> Any:
         self.asked.append(url)
@@ -215,6 +225,49 @@ def test_only_a_mac_with_apple_silicon_will_do(home: Path) -> None:
     assert by_part(run(write_config(home, MINIMAL), probe))["Mac"].status == "fail"
 
 
+def test_doctor_names_macos_before_27(home: Path) -> None:
+    """Review of 0.9.8, M02: setup.sh refuses a macOS before 27, but an install made before that rule (0.9.6 on
+    macOS 26.5, updated with estia-deploy) showed ✓ Mac. Doctor warns in setup's own words; 27 or later, or a
+    version it cannot read, keeps the ✓ line as it was (no guess). No 26.x line of its own (owner, 29 Oct)."""
+    path = write_config(home, MINIMAL)
+    probe = FakeProbe(home)
+    probe.macos = "26.5"
+    mac = by_part(run(path, probe))["Mac"]
+    assert mac.status == "warn" and "Estia needs macOS 27 or later" in mac.text and "26.5" in mac.text
+    assert mac.fix == "Update macOS (System Settings → General → Software Update)"
+    assert "Estia needs macOS 27 or later" in prompts.SETUP_MACOS_OLD and mac.fix in prompts.SETUP_MACOS_OLD
+    named = by_part(run(write_config(home, MINIMAL + 'name = "Tiffany"\n'), probe))["Mac"]
+    assert named.status == "warn" and "Tiffany needs macOS 27 or later" in named.text
+    path = write_config(home, MINIMAL)
+    for version in ("27.0.1", "27.1", "27", "28.0", None, "", "macOS"):
+        probe.macos = version
+        assert by_part(run(path, probe))["Mac"] == Finding("ok", "Mac", "macOS on Apple silicon"), version
+    probe.system, probe.macos = ("darwin", "x86_64"), "26.5"
+    assert by_part(run(path, probe))["Mac"].status == "fail"  # the chip first, as before
+
+
+def test_the_macos_version_is_read_with_sw_vers_by_its_full_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Read-only, fixed argv, no shell; None when it cannot be read, and never under a test's root."""
+    asked: list[list[str]] = []
+    answer: dict[str, Any] = {"code": 0, "out": "26.5\n"}
+
+    def sw_vers(argv: list[str], **kwargs: Any) -> Any:
+        asked.append(argv)
+        if answer["code"] is None:
+            raise OSError("no such file")
+        return subprocess.CompletedProcess(argv, answer["code"], answer["out"], "")
+
+    monkeypatch.setattr(subprocess, "run", sw_vers)  # doctor's own: one module
+    assert Probe(Path("/nowhere")).macos_version() is None and asked == []  # a test's root: never asked
+    monkeypatch.delenv("ESTIA_ROOT")
+    assert Probe(Path("/nowhere")).macos_version() == "26.5"
+    assert asked == [["/usr/bin/sw_vers", "-productVersion"]]
+    answer["code"] = 1
+    assert Probe(Path("/nowhere")).macos_version() is None
+    answer["code"] = None
+    assert Probe(Path("/nowhere")).macos_version() is None
+
+
 def test_ollama_must_run_and_have_the_model(home: Path) -> None:
     probe = FakeProbe(home)
     path = write_config(home, MINIMAL + 'model = "gemma4:26b"\n')
@@ -279,8 +332,69 @@ def test_the_official_ollama_with_its_library_is_a_tick(home: Path) -> None:
     probe.ollama_at = official(home / "opt/ollama/v0.40.4")
     probe.answers["http://127.0.0.1:11434/api/version"] = {"version": "0.40.4"}
     line = by_part(run(write_config(home, MINIMAL), probe))["Ollama"]
-    assert line.status == "ok" and line.text == f"0.40.4 answers ({probe.ollama_at}), with its JSON-schema library"
+    assert line.status == "ok"
+    assert " ".join(line.text.split()) == f"0.40.4 answers ({probe.ollama_at}), with its JSON-schema library"
     assert probe.ollama_ports == [11434]
+
+
+def fits(finding: Finding) -> bool:
+    """Every rendered line fits the owner's terminal (hostsec.TERMINAL), but a lone path a test's long temporary
+    folder makes longer: a path is never split."""
+    lines = render([finding]).splitlines()
+    return all(len(shown) <= hostsec.TERMINAL or " " not in shown.strip() for shown in lines)
+
+
+UNLISTED_ON_PORT = "; other accounts' programs on its port could not be listed without admin rights"
+
+
+def test_the_ollama_tick_names_what_could_not_be_listed_on_its_port(home: Path) -> None:
+    """3 Nov report: netstat listed no sockets (macOS 27.0.1, without admin rights), so another account's program
+    beside this Ollama on its port cannot be seen; the ✓ keeps what was checked and names that limit."""
+    probe = FakeProbe(home)
+    probe.ollama_at = official(home / "opt/ollama/v0.40.4")
+    probe.ollama_unread = True
+    probe.answers["http://127.0.0.1:11434/api/version"] = {"version": "0.40.4"}
+    line = by_part(run(write_config(home, MINIMAL), probe))["Ollama"]
+    assert line.status == "ok"
+    expected = f"0.40.4 answers ({probe.ollama_at}), with its JSON-schema library{UNLISTED_ON_PORT}"
+    assert " ".join(line.text.split()) == expected
+    assert prompts.DOCTOR_OLLAMA_OTHERS_UNREAD == UNLISTED_ON_PORT
+    assert fits(line)  # fix review 6: render does not wrap, so the long ✓ is split to fit the owner's terminal
+
+
+UNSEEN = "its program and account could not be read without admin rights"
+
+
+def test_an_ollama_whose_program_could_not_be_read_is_never_all_clear(home: Path) -> None:
+    """Fix review 1 (3 Nov): netstat lists nothing and lsof, as the account doctor runs as, finds no program of its
+    own on the port (another account's Ollama there). Never a silent "no line": a ○ says what could not be read, with
+    the command that reads it."""
+    probe = FakeProbe(home)
+    probe.ollama_unread = True
+    probe.answers["http://127.0.0.1:11434/api/version"] = {"version": "0.40.4"}
+    line = by_part(run(write_config(home, MINIMAL), probe))["Ollama"]
+    assert (line.status, line.text) == ("untested", f"0.40.4 answers; {UNSEEN}")
+    assert line.fix == "to read them: /usr/bin/sudo /usr/sbin/lsof -nP -iTCP:11434 -sTCP:LISTEN"
+    probe.ollama_ports.clear()
+    probe.answers["http://127.0.0.1:8151/api/version"] = {"version": "0.40.4"}
+    probe.answers["http://127.0.0.1:8151/api/tags"] = probe.answers["http://127.0.0.1:11434/api/tags"]
+    hers = by_part(run(write_config(home, MINIMAL + HERS), probe))["Ollama"]
+    assert hers.status == "untested" and hers.fix.endswith("-iTCP:8151 -sTCP:LISTEN") and probe.ollama_ports == [8151]
+
+
+@pytest.mark.parametrize(
+    ("version", "words"), [("0.40.5", "not 0.40.4, the version she is tested with"), ("0.30.0", "older than")]
+)
+def test_an_ollama_warning_names_a_program_that_could_not_be_read(home: Path, version: str, words: str) -> None:
+    """The "!" for an untested or old version keeps its fix and says its program and account could not be read."""
+    probe = FakeProbe(home)
+    probe.ollama_unread = True
+    probe.answers["http://127.0.0.1:11434/api/version"] = {"version": version}
+    line = by_part(run(write_config(home, MINIMAL), probe))["Ollama"]
+    text = " ".join(line.text.split())
+    assert line.status == "warn" and words in text and text.endswith(f"; {UNSEEN}") and fits(line)
+    probe.ollama_unread = False  # netstat listed sockets: nothing unread to name
+    assert not by_part(run(write_config(home, MINIMAL), probe))["Ollama"].text.endswith(UNSEEN)
 
 
 def test_an_ollama_open_to_other_machines_is_named(home: Path) -> None:
@@ -1264,9 +1378,6 @@ def test_a_saved_login_address_or_helper_counts_only_for_the_failure_it_fixes(
 
 VOICE = '[voice]\nurl = "http://127.0.0.1:8150"\n'
 HEALTH = "http://127.0.0.1:8150/health"
-# Kokoro's limit on a call while it stands in for Pocket TTS, in the docs' words (owner, 28 Oct: "yes to both",
-# words-04; tests/test_docs.py's KOKORO_ON_A_CALL)
-KOKORO_ON_A_CALL = "(on a call, one line each time she answers; the rest comes as a Signal text)"
 
 
 def pocket_line(text: str) -> str:
@@ -2995,12 +3106,11 @@ def test_the_english_voices_are_checked_on_the_macs_own_model(home: Path, monkey
     assert found[part] == Finding(
         "warn",
         part,
-        pocket_line(prompts.DOCTOR_POCKET_MISSING.format(size=250, stand_in="af_heart")),
+        pocket_line(prompts.DOCTOR_POCKET_MISSING.format(size=250)),
         prompts.DOCTOR_POCKET_MISSING_FIX.format(log=log),
     )
-    assert prompts.DOCTOR_POCKET_MISSING.format(size=250, stand_in="af_heart") == (
-        "not fetched yet (about 250 MB, at the voice service's start): Kokoro's af_heart says her lines meanwhile"
-        f" {KOKORO_ON_A_CALL}"
+    assert prompts.DOCTOR_POCKET_MISSING.format(size=250) == (
+        "not fetched yet (about 250 MB, at the voice service's start): her answers come as text meanwhile"
     )
     assert all(len(shown) <= hostsec.TERMINAL for shown in render([found[part]]).splitlines())
     (models / "pocket-tts/b").mkdir(parents=True)
@@ -3013,7 +3123,7 @@ def test_the_english_voices_are_checked_on_the_macs_own_model(home: Path, monkey
     # a Mac with Gemma 4 12B: the 18M's pins, about 130 MB, no vera, its own heart (owner, 29 Oct)
     monkeypatch.setattr(voice, "memory_gb", lambda: 16.0)
     probe.answers[HEALTH] = {"stt": "ready", "tts": "ready", "pocket": "loading"}
-    small_missing = prompts.DOCTOR_POCKET_MISSING.format(size=130, stand_in="af_heart")
+    small_missing = prompts.DOCTOR_POCKET_MISSING.format(size=130)
     assert by_part(run(path, probe))[part].text == pocket_line(small_missing)
     (models / "pocket-tts/a").mkdir(parents=True)
     (models / "pocket-tts/a/x.bin").write_bytes(b"x")
@@ -3034,7 +3144,7 @@ def test_the_english_voices_are_checked_on_the_macs_own_model(home: Path, monkey
         assert by_part(run(heart, probe))[part] == small
     (program.parent / "heart.safetensors").write_bytes(b"h")
     (program.parent / "heart-18m.safetensors").unlink()
-    no_small = prompts.DOCTOR_POCKET_NO_SHIPPED.format(stand_in="af_heart", file="heart-18m.safetensors")
+    no_small = prompts.DOCTOR_POCKET_NO_SHIPPED.format(file="heart-18m.safetensors")
     assert by_part(run(write_config(home, MINIMAL + VOICE), probe))[part].text == no_small
     (program.parent / "heart-18m.safetensors").write_bytes(b"s")
     vera = write_config(home, MINIMAL + VOICE + 'voice = "vera"\n')
@@ -3046,17 +3156,20 @@ def test_the_english_voices_are_checked_on_the_macs_own_model(home: Path, monkey
     store.set_state("voice_name", "jane")
     store.close()
     assert by_part(run(vera, probe))[part] == small
-    for kept in ("vera", "af_sky"):  # not used at a start here (vera) or not a voice of the list: the config's is
-        store = Store.open(database)
-        store.set_state("voice_name", kept)
-        store.close()
-        assert by_part(run(vera, probe))[part] == told, kept
+    store = Store.open(database)
+    store.set_state("voice_name", "vera")  # not used at a start here: the config's is judged
+    store.close()
+    assert by_part(run(vera, probe))[part] == told
+    store = Store.open(database)
+    store.set_state("voice_name", "af_sky")  # any Kokoro id (3 Nov 2026): heart, as the bridge reads it at its start
+    store.close()
+    assert by_part(run(vera, probe))[part] == small
     store = Store.open(database)
     store.set_state("voice_name", "eve-full")  # another name for eve
     store.close()
     assert by_part(run(vera, probe))[part] == small
     store = Store.open(database)
-    store.set_state("voice_name", "am_puck")  # a Kokoro voice of the list
+    store.set_state("voice_name", "am_puck")  # a Kokoro voice chosen before 3 Nov 2026: michael speaks it
     store.close()
     assert by_part(run(vera, probe))[part] == small
 
@@ -3065,7 +3178,7 @@ def test_hearts_file_is_checked_in_her_release(home: Path, monkeypatch: pytest.M
     """Owner, 27 Oct ("call the voice Heart"; its file in the public repository: "yes"): heart's file ships with the
     voice service, in its own bundle beside its program in her release (`voice.POCKET_SHIPPED`), where the voice
     service copies it from; doctor names it when it is not there or not the pinned one (the review of 27 Oct,
-    swift-voice-2: the voice service then leaves only heart's lines to Kokoro, its other voices Pocket's), and checks
+    swift-voice-2: then only heart is not said, its other voices are Pocket's as ever), and checks
     the models folder's copy with the other files. Beside the 18M its own file is the one asked for (owner, 29 Oct:
     `voice.POCKET_SHIPPED_18M`, heart-18m.safetensors), never the 100M's. A bundle laid out flat (the native build,
     Swift 6.2's default: swift-voice-1) is read there too."""
@@ -3092,15 +3205,15 @@ def test_hearts_file_is_checked_in_her_release(home: Path, monkeypatch: pytest.M
     path = write_config(home, MINIMAL + VOICE)
     part = "Pocket TTS voices"
     update = prompts.DOCTOR_POCKET_PROGRAM_FIX.format(deploy=ownuser.DEPLOY_CMD)
-    big = {"stand_in": "af_heart", "file": "heart.safetensors"}
+    big = {"file": "heart.safetensors"}
     assert by_part(run(path, probe))[part] == Finding(
         "warn", part, prompts.DOCTOR_POCKET_NO_SHIPPED.format(**big), update
     )
     assert prompts.DOCTOR_POCKET_NO_SHIPPED.format(**big) == (
-        "Heart's voice file (heart.safetensors) is not in her release yet: Kokoro's af_heart says only heart's lines"
+        "Heart's voice file (heart.safetensors) is not in her release yet: in heart's voice her answers come as text"
         " meanwhile"
     )
-    # heart's stand-in names it, whichever voice speaks (alba's own is am_michael)
+    # heart's file is named whichever voice speaks
     alba = write_config(home, MINIMAL + VOICE + 'voice = "alba"\n')
     assert by_part(run(alba, probe))[part].text == prompts.DOCTOR_POCKET_NO_SHIPPED.format(**big)
     (program.parent / "heart.safetensors").write_bytes(b"H")
@@ -3109,15 +3222,15 @@ def test_hearts_file_is_checked_in_her_release(home: Path, monkeypatch: pytest.M
         "fail", part, prompts.DOCTOR_POCKET_SHIPPED_CHANGED.format(**big), update
     )
     assert prompts.DOCTOR_POCKET_SHIPPED_CHANGED.format(**big) == (
-        "Heart's voice file (heart.safetensors) in her release is not the pinned one: never run; Kokoro's af_heart"
-        " says only heart's lines"
+        "Heart's voice file (heart.safetensors) in her release is not the pinned one: never run; in heart's voice her"
+        " answers come as text"
     )
     (program.parent / "heart.safetensors").write_bytes(b"h")
     probe.answers[HEALTH] = {"stt": "ready", "tts": "ready", "pocket": "ready"}
     assert by_part(run(path, probe))[part].status == "ok"
     # a 16 GB Mac (the 18M): its own file, heart-18m.safetensors, never the 100M's
     monkeypatch.setattr(voice, "memory_gb", lambda: 16.0)
-    small = {"stand_in": "af_heart", "file": "heart-18m.safetensors"}
+    small = {"file": "heart-18m.safetensors"}
     probe.answers[HEALTH] = {"stt": "ready", "tts": "ready", "pocket": "unavailable"}
     assert by_part(run(path, probe))[part] == Finding(
         "warn", part, prompts.DOCTOR_POCKET_NO_SHIPPED.format(**small), update
@@ -3161,7 +3274,7 @@ def test_janes_model_for_the_language_in_use_is_checked(home: Path, monkeypatch:
     model fetched only for the language in use. Doctor's voice line covers that language (the one set with /language,
     else the config's): its files against its pins and its state in the health (`pocket_<code>`); not fetched yet, or
     fetched and not checked since a start, is no warning; being fetched, other bytes, refused and a voice service from
-    before it are told. English, and the four languages Supertonic-3 speaks, get no such line."""
+    before it are told. English, and the four languages with no voice (owner, 3 Nov 2026), get no such line."""
     pins = {"de": {"pocket-tts/g/z.bin": hashlib.sha256(b"z").hexdigest()}, "nl": {"pocket-tts/n/y.bin": "0" * 64}}
     monkeypatch.setattr(voice, "POCKET_LANGUAGE_FILES", pins)
     probe = FakeProbe(home)
@@ -3178,7 +3291,8 @@ def test_janes_model_for_the_language_in_use_is_checked(home: Path, monkeypatch:
     found = by_part(run(path, probe))
     assert found[part] == Finding("ok", part, prompts.DOCTOR_POCKET_LANGUAGE_NOT_YET.format(language="German"))
     assert prompts.DOCTOR_POCKET_LANGUAGE_NOT_YET.format(language="German") == (
-        "not fetched yet: fetched the first time she speaks German (about 227 MB); until then Supertonic-3's F1 speaks it"
+        "not fetched yet: fetched the first time she speaks German (about 227 MB); until then her answers in German"
+        " come as text"
     )
     probe.answers[HEALTH] = {"stt": "ready", "tts": "ready", "pocket_de": "loading"}
     assert by_part(run(path, probe))[part] == Finding(
@@ -3214,16 +3328,32 @@ def test_janes_model_for_the_language_in_use_is_checked(home: Path, monkeypatch:
     assert part not in dutch and "Voice jane (Dutch)" in dutch
 
 
-def test_without_a_language_voice_no_jane_line(home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """`[voice] language_voice = ""` gives the six languages back to Supertonic-3's F1 (the review of 25 Oct): nothing of
-    jane's models is fetched or run, so doctor shows no "Voice jane" line."""
+def test_an_old_supertonic_setting_still_gets_the_jane_line(home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """`[voice] language_voice = ""` gave the six languages to Supertonic-3's F1; Supertonic-3 was removed (owner,
+    3 Nov 2026), so the setting loads as jane (config's note) and doctor checks jane's model as for any config."""
     monkeypatch.setattr(voice, "POCKET_LANGUAGE_FILES", {"de": {"pocket-tts/g/z.bin": "0" * 64}})
     probe = FakeProbe(home)
     probe.answers[HEALTH] = {"stt": "ready", "tts": "ready", "pocket_de": "idle"}
-    on = by_part(run(write_config(home, 'language = "de"\n' + MINIMAL + VOICE), probe))
-    assert "Voice jane (German)" in on
-    off = by_part(run(write_config(home, 'language = "de"\n' + MINIMAL + VOICE + 'language_voice = ""\n'), probe))
-    assert off["Config"].status == "ok" and not [part for part in off if "jane (" in part]
+    old = by_part(run(write_config(home, 'language = "de"\n' + MINIMAL + VOICE + 'language_voice = ""\n'), probe))
+    assert old["Config"].status == "ok" and "Voice jane (German)" in old
+
+
+@pytest.mark.parametrize(
+    ("code", "english"), [("ko", "Korean"), ("pl", "Polish"), ("ru", "Russian"), ("ja", "Japanese")]
+)
+def test_a_language_with_no_voice_gets_its_own_line(home: Path, code: str, english: str) -> None:
+    """Owner, 3 Nov 2026: Korean, Polish, Russian and Japanese have no voice. With [voice] and one of them in use,
+    doctor says so in the words of /language's reply (an ok line: nothing to fix); English and the six get none."""
+    probe = FakeProbe(home)
+    probe.answers[HEALTH] = {"stt": "ready", "tts": "ready", "pocket": "ready"}
+    found = by_part(run(write_config(home, f'language = "{code}"\n' + MINIMAL + VOICE), probe))
+    assert found[f"Voice ({english})"] == Finding(
+        "ok",
+        f"Voice ({english})",
+        f"no voice in {english}: answers come as text, and calls in {english} are not picked up",
+    )
+    assert not [part for part in by_part(run(write_config(home, MINIMAL + VOICE), probe)) if part.startswith("Voice (")]
+    assert f"Voice ({english})" not in by_part(run(write_config(home, f'language = "{code}"\n' + MINIMAL), probe))
 
 
 def test_a_language_models_changed_files_have_their_own_fix(home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -3282,10 +3412,34 @@ def test_a_practice_language_gets_its_own_line(home: Path, monkeypatch: pytest.M
     store.close()
 
 
+def test_practice_in_a_language_with_no_voice_gets_its_own_line(home: Path) -> None:
+    """The review of 4 Nov: Japanese practice makes every call of the user's ring out, and doctor read only the
+    language in use. A running practice in a language with no voice gets one line saying calls are not picked up
+    until /babble off; English in use, nothing else."""
+    probe = FakeProbe(home)
+    probe.answers[HEALTH] = {"stt": "ready", "tts": "ready", "pocket": "ready"}
+    path = write_config(home, MINIMAL + VOICE)
+    database = load_config(path).db_path
+    database.parent.mkdir(parents=True)
+    store = Store.open(database)
+    session = {"code": "ja", "level": "A2", "aci": ACI, "started": 1.0, "conversation": 2, "ended": 0.0, "due": 0.0}
+    store.set_state(babble.SESSION_KEY, json.dumps(session))
+    found = by_part(run(path, probe))
+    assert found["Voice (Japanese)"] == Finding(
+        "ok",
+        "Voice (Japanese)",
+        "practice in Japanese is text only: no voice in it, so calls are not picked up until /babble off",
+    )
+    assert [part for part in found if part.startswith("Voice (")] == ["Voice (Japanese)"]
+    store.set_state(babble.SESSION_KEY, json.dumps(session | {"ended": 5.0, "due": 9.0, "reason": "off"}))
+    assert "Voice (Japanese)" not in by_part(run(path, probe))
+    store.close()
+
+
 def test_the_english_voices_files_are_checked_against_their_pins(home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """With [voice]: the English voices' files (Pocket TTS: the release program beside the voice service in her
     release, the Mac's model in the voice service's models folder, every sha256), and its state in the health; whatever
-    stops them, Kokoro's af_heart says their lines meanwhile."""
+    stops them, her answers come as text meanwhile (owner, 3 Nov 2026: no other voice says a line)."""
     pins = {"pocket-tts/a/x.bin": hashlib.sha256(b"x").hexdigest()}
     monkeypatch.setattr(voice, "POCKET_FILES_100M", pins)  # the 100M's: 32 GB in the tests
     monkeypatch.setattr(voice, "POCKET_PROGRAM", {"tools/p/pocket-tts": hashlib.sha256(b"p").hexdigest()})
@@ -3307,7 +3461,7 @@ def test_the_english_voices_files_are_checked_against_their_pins(home: Path, mon
     assert by_part(run(path, probe))[part] == Finding(
         "warn",
         part,
-        pocket_line(prompts.DOCTOR_POCKET_MISSING.format(size=250, stand_in="af_heart")),
+        pocket_line(prompts.DOCTOR_POCKET_MISSING.format(size=250)),
         prompts.DOCTOR_POCKET_MISSING_FIX.format(log=log),
     )
     (models / "pocket-tts/a").mkdir(parents=True)
@@ -3317,25 +3471,20 @@ def test_the_english_voices_files_are_checked_against_their_pins(home: Path, mon
     for state, text in (("loading", prompts.DOCTOR_POCKET_LOADING), ("unavailable", prompts.DOCTOR_POCKET_UNAVAILABLE)):
         probe.answers[HEALTH] = {"stt": "ready", "tts": "ready", "pocket": state}
         found = by_part(run(path, probe))[part]
-        assert found == Finding(
-            "warn", part, pocket_line(text.format(stand_in="af_heart")), prompts.DOCTOR_POCKET_LOG_FIX.format(log=log)
-        )
+        assert found == Finding("warn", part, pocket_line(text), prompts.DOCTOR_POCKET_LOG_FIX.format(log=log))
         assert all(len(shown) <= hostsec.TERMINAL for shown in render([found]).splitlines()), state
-    assert prompts.DOCTOR_POCKET_LOADING.format(stand_in="am_michael") == (
-        f"loading: Kokoro's am_michael says her lines until it is ready {KOKORO_ON_A_CALL}"
-    )
-    assert prompts.DOCTOR_POCKET_UNAVAILABLE.format(stand_in="am_michael") == (
-        "unavailable (a download or a run failed; tried again by itself): Kokoro's am_michael says her lines meanwhile"
-        f" {KOKORO_ON_A_CALL}"
+    assert prompts.DOCTOR_POCKET_LOADING == "loading: her answers come as text until it is ready"
+    assert prompts.DOCTOR_POCKET_UNAVAILABLE == (
+        "unavailable (a download or a run failed; tried again by itself): her answers come as text meanwhile"
     )
     probe.answers[HEALTH] = {"stt": "ready", "tts": "ready"}  # a voice service from before Pocket TTS
     assert by_part(run(path, probe))[part] == Finding(
-        "warn", part, prompts.DOCTOR_POCKET_OLD.format(stand_in="af_heart"), prompts.DOCTOR_VOICE_REINSTALL
+        "warn", part, prompts.DOCTOR_POCKET_OLD, prompts.DOCTOR_VOICE_REINSTALL
     )
     (models / "pocket-tts/a/x.bin").write_bytes(b"X")  # other bytes: never run
     probe.answers[HEALTH] = {"stt": "ready", "tts": "ready", "pocket": "refused"}
     changed = by_part(run(path, probe))[part]
-    assert (changed.status, changed.text) == ("fail", prompts.DOCTOR_POCKET_CHANGED.format(stand_in="af_heart"))
+    assert (changed.status, changed.text) == ("fail", prompts.DOCTOR_POCKET_CHANGED)
     assert changed.fix == (
         f"see {log} for why; the voice service sets them aside and fetches them again when it starts again:"
         " scripts/install-voice-daemon.sh (asks for your Mac password: run it yourself); files that could not be set"
@@ -3343,7 +3492,7 @@ def test_the_english_voices_files_are_checked_against_their_pins(home: Path, mon
     )
     (models / "pocket-tts/a/x.bin").write_bytes(b"x")
     probe.answers[HEALTH] = {"stt": "ready", "tts": "ready", "pocket": "refused"}  # refused, files right again
-    assert by_part(run(path, probe))[part].text == prompts.DOCTOR_POCKET_CHANGED.format(stand_in="af_heart")
+    assert by_part(run(path, probe))[part].text == prompts.DOCTOR_POCKET_CHANGED
     (models / "pocket-tts/a").chmod(0)
     try:
         unread = by_part(run(path, probe))[part]
@@ -3357,29 +3506,22 @@ def test_the_english_voices_files_are_checked_against_their_pins(home: Path, mon
     assert by_part(run(path, probe))[part] == Finding(
         "warn",
         part,
-        prompts.DOCTOR_POCKET_NO_PROGRAM.format(stand_in="af_heart"),
+        prompts.DOCTOR_POCKET_NO_PROGRAM,
         prompts.DOCTOR_POCKET_PROGRAM_FIX.format(deploy=deploy),
     )
-    assert prompts.DOCTOR_POCKET_NO_PROGRAM.format(stand_in="af_heart") == (
-        "its program is not in her release yet: Kokoro's af_heart says her lines meanwhile"
+    assert (
+        prompts.DOCTOR_POCKET_NO_PROGRAM == "its program is not in her release yet: her answers come as text meanwhile"
     )
-    # the review of 26 Oct (R1-F1): alba's and michael's lines Kokoro's am_michael says, so doctor names him (the voice
-    # in use: the config's, or the one chosen with /voice); a Kokoro voice says its own
-    for config, stored, stand_in in (
-        ("alba", None, "am_michael"),
-        ("jane", "michael", "am_michael"),
-        ("michael", "jane", "af_heart"),
-        ("am_puck", None, "am_puck"),
-    ):
+    # whichever voice is in use (the config's, or the one chosen with /voice; a Kokoro one from before 3 Nov 2026 as
+    # its Pocket voice), the line is the same: no other voice is named
+    for config, stored in (("alba", None), ("jane", "michael"), ("michael", "jane"), ("am_puck", None)):
         chosen = write_config(home, MINIMAL + VOICE + f'voice = "{config}"\n')
         database = load_config(chosen).db_path
         database.parent.mkdir(parents=True, exist_ok=True)
         store = Store.open(database)
         store.set_state("voice_name", stored or "")
         store.close()
-        assert by_part(run(chosen, probe))[part].text == (
-            f"its program is not in her release yet: Kokoro's {stand_in} says her lines meanwhile"
-        ), (config, stored)
+        assert by_part(run(chosen, probe))[part].text == prompts.DOCTOR_POCKET_NO_PROGRAM, (config, stored)
     path = write_config(home, MINIMAL + VOICE)
     assert prompts.DOCTOR_POCKET_PROGRAM_FIX.format(deploy=deploy) == (
         f"an update puts the pinned one there: {deploy} (if it says the root-run tools differ: read the diff, run "
@@ -3390,7 +3532,7 @@ def test_the_english_voices_files_are_checked_against_their_pins(home: Path, mon
     assert by_part(run(path, probe))[part] == Finding(
         "fail",
         part,
-        prompts.DOCTOR_POCKET_PROGRAM_CHANGED.format(stand_in="af_heart"),
+        prompts.DOCTOR_POCKET_PROGRAM_CHANGED,
         prompts.DOCTOR_POCKET_PROGRAM_FIX.format(deploy=deploy),
     )
 
@@ -3439,6 +3581,47 @@ def test_her_own_ollama_is_a_tick_on_her_address_as_you_and_as_her(
         == "0.40.4 answers (/usr/local/estia/ollama/v0.40.4/ollama): her own, as _estia, with its JSON-schema library"
     )
     assert probe.ollama_ports == [8151] and parts["Model"].status == "ok"
+    probe.ollama_unread = True  # her service stood in for a socket netstat did not list (3 Nov report)
+    line = by_part(run(write_config(home, MINIMAL + HERS), probe))["Ollama"]
+    assert line.status == "ok"
+    assert " ".join(line.text.split()).endswith(f"with its JSON-schema library{UNLISTED_ON_PORT}")
+    # fix review 6: about 190 columns in one line before; render does not wrap
+    assert all(len(shown) <= hostsec.TERMINAL for shown in render([line]).splitlines())
+
+
+def test_doctor_names_her_python_and_the_openssl_that_encrypts_her_connections(home: Path) -> None:
+    """3 Nov report: the release scan reads only the lockfiles, yet her connections to the web are encrypted by her
+    Python's own OpenSSL. Doctor names both (a fact, ○: no network, so newer releases are not looked up); each release
+    compares that OpenSSL by hand (docs/agents/docs-release.md)."""
+    findings = run(write_config(home, MINIMAL), FakeProbe(home))
+    line = by_part(findings)["Python"]
+    assert line.status == "untested"
+    assert line.text == (
+        "3.13.16, with OpenSSL 3.5.9 29 Sep 2026, which encrypts her connections to mail, calendars, maps and the web"
+    )
+    assert [finding.part for finding in findings][:3] == ["Mac", "Tools", "Python"]
+    assert all(len(shown) <= 135 for shown in render([line]).splitlines())
+
+
+@pytest.mark.parametrize(
+    ("as_her", "then"), [(False, "uv python upgrade 3.13"), (True, "/usr/bin/sudo /usr/local/estia/bin/estia-deploy")]
+)
+def test_the_python_line_says_how_a_newer_openssl_comes(home: Path, as_her: bool, then: str) -> None:
+    """Fix review 7: Python's patch version, and so its OpenSSL, follows the uv on the Mac (SECURITY.md). Her own
+    Python comes with a deploy; the checkout's from uv itself."""
+    probe = FakeProbe(home)
+    probe.her = as_her
+    line = by_part(run(write_config(home, MINIMAL), probe))["Python"]
+    assert line.fix == f"if a newer OpenSSL is out, a newer uv may bring it: brew upgrade uv, then {then}"
+    assert all(len(shown) <= hostsec.TERMINAL for shown in render([line]).splitlines())
+
+
+def test_the_python_doctor_runs_on_names_its_version_and_its_ssl_library() -> None:
+    from local_assistant import deploy
+
+    python, library = Probe().python_versions()
+    assert python.startswith(f"{deploy.PYTHON_SERIES}.")  # the series a deploy installs (the tests run on it)
+    assert re.fullmatch(r"(OpenSSL|LibreSSL) [0-9][^ ]* .+", library), library  # a library's name and its version
 
 
 def test_her_address_held_by_another_account_or_open_to_other_machines_is_named(

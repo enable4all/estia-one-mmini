@@ -1,17 +1,16 @@
 // voice-service: local-assistant's ears and voice. WhisperKit (large-v3 turbo; its files pinned and checked at start,
-// see Whisper.swift) listens in the language the bridge names (one of eleven, never detected); FluidAudio speaks it:
-// Kokoro English, Supertonic-3 the other ten, both on the Neural Engine; and Pocket TTS, on the CPU, English in the
-// voices heart, jane, eve, vera, alba and michael on the Mac's model (100M beside Gemma 4 26B, 18M beside 12B, without
-// vera; heart's file for each ships in this program's own bundle beside it),
-// and jane in Spanish, Italian, Portuguese, Dutch, German and French (Pocket.swift:
-// its program beside this one, fetched by `voice-service --fetch-pocket` at a deploy; Kokoro, or Supertonic-3 in a
-// language, says a line it cannot); FluidAudio's Silero VAD tells speech in a
+// see Whisper.swift) listens in the language the bridge names (one of eleven, never detected); Pocket TTS, on the CPU,
+// is her only voice (owner, 3 Nov 2026: "remove kokoro and supertonic"; nothing replaces them): English in the voices
+// heart, jane, eve, vera, alba and michael on the Mac's model (100M beside Gemma 4 26B, 18M beside 12B, without vera:
+// heart says vera's lines there; heart's file for each ships in this program's own bundle beside it), and jane in
+// Spanish, Italian, Portuguese, Dutch, German and French (Pocket.swift: its program beside this one, fetched by
+// `voice-service --fetch-pocket` at a deploy). A line it cannot say is said by no other voice (409, `not_said`), and
+// Korean, Polish, Japanese and Russian have none (409, `no_voice`). FluidAudio's Silero VAD tells speech in a
 // call's audio (`/vad`, for barge-in and the pause), and Smart Turn judges whether a caller's sentence sounds finished
 // (`/turn`, for early end of turn), both on the CPU only. Served on 127.0.0.1:8150 for programs of its own account (the
 // bridge): a connection that no program of the service's own account holds is refused before its request is read
 // (`PeerCheck`). Logs hold metadata (sizes, durations, language, timings), never audio, transcripts or text.
 import AVFoundation
-import FluidAudio
 import Foundation
 import Network
 import VoiceCore
@@ -65,31 +64,16 @@ actor Serial {
     }
 }
 
-/// What takes an English pronunciation table: Kokoro (FluidAudio's `KokoroAneManager`), or a test's fake.
-protocol EnglishLexiconTaking {
-    func setEnglishCustomLexicon(_ entries: [String: String]) async
-}
-
-extension KokoroAneManager: EnglishLexiconTaking {}
-
-/// Kokoro's English, before its first sentence: VoiceCore's lexicon over Misaki's (capitals said as their letters,
-/// `EnglishLexicon`).
-func prepareEnglish(_ kokoro: some EnglishLexiconTaking) async {
-    await kokoro.setEnglishCustomLexicon(EnglishLexicon.entries)
-}
-
-/// Whisper and Kokoro, loaded and warmed once at start, then kept in memory; Supertonic-3 on first use; the
-/// speech and turn detectors at start too, each on its own.
+/// Whisper, loaded and warmed once at start, then kept in memory; Pocket TTS's speakers (English's checked and
+/// fetched at start, a language's once a line is asked in it) and the speech and turn detectors at start too, each on
+/// its own.
 actor Engines {
     enum State: String { case loading, ready, failed }
 
     private(set) var stt = State.loading
-    private(set) var tts = State.loading
     /// Listening failed because Whisper's files are not the pinned ones: a restart would find the same files.
     private var sttRefused = false
     private var whisper: WhisperKit?
-    private var kokoro: KokoroAneManager?
-    private let supertonic = Supertonic()
     /// The Pocket voices of this Mac (`PocketVoices`: English on the Mac's model, or a check's `--pocket`).
     let pocketVoices: PocketVoices
     /// Pocket's speakers by their model's name (`PocketVoices.models`: one a model, so every English voice shares the
@@ -100,8 +84,8 @@ actor Engines {
     private let models: URL
     private let temp: URL
     private let serial = Serial()
-    /// Pocket's own queue: its runs are on the CPU, one at a time, and never hold Whisper's and Kokoro's (a call's
-    /// transcription waits for no run of eve's; the review of 24 Oct). A speaker's first run ("Ready.") is on it too
+    /// Pocket's own queue: its runs are on the CPU, one at a time, and never hold Whisper's (a call's transcription
+    /// waits for no run of eve's; the review of 24 Oct). A speaker's first run ("Ready.") is on it too
     /// (the review of 25 Oct), its check and fetch never.
     private let pocketQueue: Serial
 
@@ -123,40 +107,25 @@ actor Engines {
         })
     }
 
-    /// Loads both engines. Listening that fails exits the process, so launchd starts it again (KeepAlive), except
-    /// when Whisper's files are not the pinned ones: listening stays "failed" and the service stays up. Speaking that
-    /// fails stays "failed" with the service up (listening and the detector work on) and is tried again in the
-    /// process (`SpeakingRetry`: 1, 5 and 30 minutes, then every 30), never by a restart that reloads Whisper. The
-    /// speech detector loads beside them, without waiting for Whisper's compile; when it fails it is only
-    /// "unavailable" (the bridge keeps its loudness rule), and the service stays up. The turn detector the same way
-    /// (unavailable: the bridge waits the full pause). The English Pocket speaker's check and fetch start before
-    /// Whisper's (`startEngines`); a language's only once a line is asked in it.
+    /// Loads listening, with the English Pocket speaker's check, fetch and first run started before it
+    /// (`startEngines`; a language's only once a line is asked in it). Listening that fails exits the process, so
+    /// launchd starts it again (KeepAlive), except when Whisper's files are not the pinned ones: listening stays
+    /// "failed" and the service stays up. A Pocket speaker that fails rests and is tried again in the process
+    /// (`PocketSpeaker`, `SpeakingRetry`: 1, 5 and 30 minutes, then every 30; `tts` in `/health` says "resting" after
+    /// failed runs, else "failed", meanwhile: `speakingState`), never by a restart that reloads Whisper. The speech detector loads beside them,
+    /// without waiting for Whisper's compile; when it fails it is only "unavailable" (the bridge keeps its loudness
+    /// rule), and the service stays up. The turn detector the same way (unavailable: the bridge waits the full pause).
     func load() async {
         let (detector, turn) = (self.detector, self.turn)
         Task { await detector.load() }
         Task { await turn.load() }
         let pockets = pocketVoices.models.filter(\.atStart).compactMap { self.pockets[$0.model.name] }
-        await startEngines(pockets: pockets, listening: { await self.loadWhisper() }, speaking: { await self.loadKokoro() })
-        log("Pocket TTS (\(PocketTTS.languages.map(\.language).joined(separator: ", ")): jane): each language's files checked and fetched only once a line is asked in it; Supertonic-3 says those lines until then")
+        await startEngines(pockets: pockets, listening: { await self.loadWhisper() })
+        log("Pocket TTS (\(PocketTTS.languages.map(\.language).joined(separator: ", ")): jane): each language's files checked and fetched only once a line is asked in it; no line is said in it until then")
         if stt == .failed && !sttRefused {
             log("listening failed to load; exiting so launchd tries again")
             exit(1)
         }
-        if tts == .failed {
-            log("speaking failed to load; the service stays up and tries it again in 1 minute")
-            Task {
-                await SpeakingRetry.run(
-                    sleep: { try? await Task.sleep(nanoseconds: UInt64($0 * 1_000_000_000)) },
-                    load: { await self.retryKokoro() })
-            }
-        }
-    }
-
-    /// One more try at speaking: true once it is ready.
-    private func retryKokoro() async -> Bool {
-        await loadKokoro()
-        if tts != .ready { log("speaking failed to load again; tried again later") }
-        return tts == .ready
     }
 
     /// Whisper's pinned files, downloaded at their commits when missing: true when every one is the pinned one. A
@@ -212,30 +181,21 @@ actor Engines {
         }
     }
 
-    private func loadKokoro() async {
-        let start = Date()
-        do {
-            let kokoro = KokoroAneManager(variant: .english)
-            try await kokoro.initialize()
-            await prepareEnglish(kokoro)
-            _ = try await kokoro.synthesize(text: "Ready.", voice: SpeechRequest.defaultVoice, speed: 1.1)  // warm-up
-            self.kokoro = kokoro
-            tts = .ready
-            log("speaking ready in \(seconds(since: start))")
-        } catch {
-            tts = .failed
-            log("speaking failed to load: \(type(of: error))")
-        }
-    }
-
-    /// The `/health` answer, every engine's and detector's state.
+    /// The `/health` answer, every engine's and detector's state; speaking (`tts`) is her English Pocket model's
+    /// (`speakingState`: ready, resting, failed or loading), as Pocket TTS is her only voice, with the shipped voices it
+    /// leaves out (`voices_left_out`).
     func health() async -> Data {
         var pocket: [String: String] = [:]
         for speech in pocketVoices.models {
             pocket[speech.health] = await pockets[speech.model.name]?.state.rawValue
         }
-        return HTTP.json(200, healthBody(stt: stt.rawValue, tts: tts.rawValue, vad: await detector.state.rawValue,
-                                         turn: await turn.state.rawValue, pocket: pocket))
+        let english = pocketVoices.models.first(where: \.atStart).flatMap { pockets[$0.model.name] }
+        let state = await english?.state.rawValue ?? ""
+        let resting = await english?.resting ?? false
+        let leftOut = await english?.leftOut ?? []
+        return HTTP.json(200, healthBody(stt: stt.rawValue, tts: speakingState(state, resting: resting),
+                                         vad: await detector.state.rawValue, turn: await turn.state.rawValue,
+                                         pocket: pocket, leftOut: leftOut))
     }
 
     /// Transcribes audio bytes of a sniffed kind in the given language, with `hint` (her name, or "") as Whisper's
@@ -259,72 +219,30 @@ actor Engines {
         return (cleanTranscript(segments, call: call), duration)
     }
 
-    /// 24 kHz mono 16-bit WAV from any engine (Kokoro writes it; Pocket's is read and set to its voice's gain;
-    /// Supertonic-3's 44.1 kHz is converted) for `text`, the request's spoken text (`SpeechRequest.spokenInput`), worked
-    /// out by the caller off this actor and before the engine queues, so text work never holds a call's listening
-    /// (review 0.9.7, C7). A line in a Pocket voice that Pocket cannot say is Kokoro's in English (am_michael for alba
-    /// and michael, af_heart for the others: `SpeechRequest.standInVoice`; the review of 26 Oct, R1-F1), Supertonic-3's
-    /// (F1) in another language, from that engine's own text (`standInText`: worked out off this actor too, on that path
-    /// only; the merge review of 25 Oct, L1), logged and marked as a stand-in (`SpokenLine.standIn`), never silence;
-    /// unless a call's line asks for no Kokoro (`SpeechRequest.standInAllowed`: its turn had its one Kokoro line, or the
-    /// line comes before her answer or a device question; owner, 28 Oct): then Kokoro never runs and the line is refused
-    /// (409, `no_stand_in`).
-    func speak(_ request: SpeechRequest, text: String) async throws -> SpokenLine {
-        switch request.engine {
-        case .pocket:
-            let (serial, pocketQueue, kokoro) = (self.serial, self.pocketQueue, self.kokoro)
-            let speech = pocketVoices.speech(request.voice, language: request.language)
-            let pocket = speech.flatMap { pockets[$0.model.name] }
-            let standIn = request.standInVoice
-            return try await SpeechFallback.speak(
-                pocket: {
-                    guard let speech, let pocket else { throw PocketFailure.notReady("no voice \(request.voice)") }
-                    return try await pocketQueue.run { try await pocket.speak(text, voice: speech.speaks, call: request.call) }
-                },
-                instead: {
-                    let standInText = await Self.standInText(request)
-                    if request.standInEngine == .supertonic { return try await self.supertonicWAV(request, text: standInText) }
-                    guard let kokoro else { throw VoiceError.notReady }
-                    return try await serial.run {
-                        try await kokoro.synthesize(text: standInText, voice: standIn, speed: Float(request.speed))
-                    }
-                },
-                standIn: standIn, standInAllowed: request.standInAllowed, log: { log($0) })
-        case .kokoro:
-            guard let kokoro else { throw VoiceError.notReady }
-            return SpokenLine(wav: try await serial.run {
-                try await kokoro.synthesize(text: text, voice: request.voice, speed: Float(request.speed))
-            })
-        case .supertonic:
-            return SpokenLine(wav: try await supertonicWAV(request, text: text))
-        }
-    }
-
-    /// A stand-in's text (`SpeechRequest.standInInput`), worked out off this actor (`@concurrent`: on the global
-    /// executor, never the caller's), so a stand-in's chords, numbers and dates never hold a call's listening (C7).
-    @concurrent private static func standInText(_ request: SpeechRequest) async -> String { request.standInInput }
-
-    /// Supertonic-3's F1 in the request's language for `text`, the language's own (`spokenInput(for: .supertonic)`),
-    /// loaded on first use outside the serial queue.
-    private func supertonicWAV(_ request: SpeechRequest, text: String) async throws -> Data {
-        let (supertonic, serial) = (self.supertonic, self.serial)
-        try await supertonic.load()
-        let samples = try await serial.run {
-            try await supertonic.synthesize(text, language: request.language, speed: Float(request.speed))
-        }
-        return SpeechAudio.wav(samples, sampleRate: Supertonic3Constants.sampleRate)
+    /// 24 kHz mono 16-bit WAV of `text`, the request's spoken text (`SpeechRequest.spokenInput`, worked out by the
+    /// caller off this actor and before the engine queues, so text work never holds a call's listening: review 0.9.7,
+    /// C7), in the request's Pocket voice (`PocketVoices.speech`), read and set to its voice's gain. A line Pocket
+    /// cannot say is said by no other voice, whatever the request asks (owner, 3 Nov 2026): logged and refused
+    /// (`PocketLine`: 409, `not_said`).
+    func speak(_ request: SpeechRequest, text: String) async throws -> Data {
+        let pocketQueue = self.pocketQueue
+        let speech = pocketVoices.speech(request.voice, language: request.language)
+        let pocket = speech.flatMap { pockets[$0.model.name] }
+        return try await PocketLine.speak({
+            guard let speech, let pocket else { throw PocketFailure.notReady("no voice \(request.voice)") }
+            return try await pocketQueue.run { try await pocket.speak(text, voice: speech.speaks, call: request.call) }
+        }, log: { log($0) })
     }
 }
 
-/// The engines' start: the English Pocket speakers first, one at a time, in a task of their own (their check and
-/// fetch are network and sha256 work, their first run on Pocket's own queue: they never hold Whisper or Kokoro), then
-/// Whisper (on a first start a download and a compile of about 15 minutes), then Kokoro, which says what Pocket cannot
-/// (the review of 26 Oct, R1-F2: after both, Pocket's fetch began only once "My voice is ready" could go out, and a
-/// fresh install's first call changed voice mid-call). A line asked before Kokoro is ready fails as before.
-func startEngines(pockets: [PocketSpeaker], listening: () async -> Void, speaking: () async -> Void) async {
+/// The engines' start: the English Pocket speakers first, one at a time, in a task of their own (their check and fetch
+/// are network and sha256 work, their first run on Pocket's own queue: they never hold Whisper), then Whisper (on a
+/// first start a download and a compile of about 15 minutes; the review of 26 Oct, R1-F2: Pocket's fetch began only
+/// after it, so "My voice is ready" waited for both one after the other). A line asked before her voice is ready is
+/// not said (409, `not_said`).
+func startEngines(pockets: [PocketSpeaker], listening: () async -> Void) async {
     Task { for pocket in pockets { await pocket.load() } }
     await listening()
-    await speaking()
 }
 
 /// A connection's other end as `PeerCheck` looks it up: its IPv4 address (an IPv6 one only when it maps one) and port;
@@ -501,7 +419,9 @@ final class Server {
         }
     }
 
-    private static func speak(_ body: Data, _ engines: Engines) async -> Data {
+    /// One line's WAV (`Engines.speak`), or a refusal: a line Pocket cannot say (409, `not_said`), a language her voice
+    /// does not speak (409, `no_voice`), a request the bridge got wrong (400). Never another voice's audio.
+    static func speak(_ body: Data, _ engines: Engines) async -> Data {
         let start = Date()
         let request: SpeechRequest
         do {
@@ -513,9 +433,9 @@ final class Server {
             return HTTP.json(400, ["error": "bad_request"])
         }
         do {
-            let line = try await engines.speak(request, text: request.spokenInput)  // off the engines' actor
-            log("spoke \(request.input.count) chars \(request.language) as \(line.wav.count) bytes in \(seconds(since: start))")
-            return HTTP.response(200, contentType: "audio/wav", body: line.wav, headers: line.headers)
+            let wav = try await engines.speak(request, text: request.spokenInput)  // off the engines' actor
+            log("spoke \(request.input.count) chars \(request.language) as \(wav.count) bytes in \(seconds(since: start))")
+            return HTTP.response(200, contentType: "audio/wav", body: wav)
         } catch let error as VoiceError {
             return error.response
         } catch {
@@ -604,7 +524,6 @@ do {
     exit(1)
 }
 pinSpeechModel()
-if let warning = KokoroAdvisory.warning(ProcessInfo.processInfo.operatingSystemVersion) { log(warning) }
 // Pocket's English model follows the Mac's Gemma (owner, 26 Oct): the 100M from 30 GB of memory (Gemma 4 26B), else
 // the 18M (12B); a check built here may name the other
 let memory = ProcessInfo.processInfo.physicalMemory

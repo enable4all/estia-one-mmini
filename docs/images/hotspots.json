@@ -1,6 +1,6 @@
 {
   "width": 1732,
-  "height": 1408,
+  "height": 1396,
   "spots": [
     {
       "name": "signal-cli",
@@ -62,7 +62,7 @@
       "x": 554,
       "y": 793,
       "w": 256,
-      "h": 64,
+      "h": 52,
       "inventory": "AgentJev (mail pre-filter)"
     },
     {
@@ -107,26 +107,8 @@
       "x": 826,
       "y": 649,
       "w": 256,
-      "h": 64,
+      "h": 196,
       "inventory": "Pocket TTS (Kyutai)"
-    },
-    {
-      "name": "Kokoro",
-      "group": "Her voices",
-      "x": 826,
-      "y": 721,
-      "w": 256,
-      "h": 64,
-      "inventory": "Kokoro"
-    },
-    {
-      "name": "Supertonic-3",
-      "group": "Her voices",
-      "x": 826,
-      "y": 793,
-      "w": 256,
-      "h": 64,
-      "inventory": "Supertonic-3 (FluidAudio)"
     },
     {
       "name": "Calendar helper",
@@ -188,7 +170,7 @@
       "x": 1098,
       "y": 793,
       "w": 256,
-      "h": 64,
+      "h": 52,
       "inventory": "Project tools (read-only)"
     },
     {
@@ -375,7 +357,7 @@
       "name": "Spotify",
       "group": "Music: commands out",
       "x": 554,
-      "y": 1121,
+      "y": 1109,
       "w": 232,
       "h": 52,
       "inventory": "Spotify"
@@ -384,7 +366,7 @@
       "name": "Philips Hue",
       "group": "Home network only",
       "x": 838,
-      "y": 1121,
+      "y": 1109,
       "w": 232,
       "h": 52,
       "inventory": "Philips Hue (Hue Bridge)"
@@ -393,7 +375,7 @@
       "name": "Kasa and Tapo",
       "group": "Home network only",
       "x": 1078,
-      "y": 1121,
+      "y": 1109,
       "w": 232,
       "h": 52,
       "inventory": "TP-Link Kasa and Tapo"
@@ -402,7 +384,7 @@
       "name": "Bose SoundTouch",
       "group": "Home network only",
       "x": 1318,
-      "y": 1121,
+      "y": 1109,
       "w": 232,
       "h": 52,
       "inventory": "Bose SoundTouch"

@@ -4,11 +4,12 @@ from __future__ import annotations
 
 # fmt: off
 __all__ = [
-    "VIDEO_CAPTIONS", "VIDEO_CUT", "VIDEO_CUT_SIZE", "VIDEO_ERRORS", "VIDEO_GENERATED", "VIDEO_IN_MESSAGE",
-    "VIDEO_KEPT", "VIDEO_KINDS", "VIDEO_LEARN_COMMAND", "VIDEO_LEARN_REFUSED", "VIDEO_MARK", "VIDEO_NOTES",
-    "VIDEO_NOT_ON_CALL", "VIDEO_NOT_SENT", "VIDEO_NO_NOTES", "VIDEO_PART_HEAD", "VIDEO_PART_INPUT",
-    "VIDEO_PART_RULES", "VIDEO_READING", "VIDEO_READING_CUT", "VIDEO_READING_SIZE", "VIDEO_READ_ABOVE",
-    "VIDEO_REFUSED", "VIDEO_STUB",
+    "VIDEO_CAPTIONS", "VIDEO_CUT", "VIDEO_CUT_SIZE", "VIDEO_ERRORS", "VIDEO_FIND_DESCRIPTION", "VIDEO_FIND_LINE",
+    "VIDEO_FIND_NONE", "VIDEO_FIND_NOT_SENT", "VIDEO_FIND_RESULT", "VIDEO_FIND_RESULT_CALL", "VIDEO_GENERATED",
+    "VIDEO_IN_MESSAGE", "VIDEO_KEPT", "VIDEO_KINDS", "VIDEO_LATE_YES", "VIDEO_LEARN_COMMAND", "VIDEO_LEARN_REFUSED",
+    "VIDEO_MARK", "VIDEO_MATCH", "VIDEO_MATCH_LAST", "VIDEO_NOTES", "VIDEO_NOT_GIVEN", "VIDEO_NOT_ON_CALL",
+    "VIDEO_NOT_SENT", "VIDEO_NO_MORE", "VIDEO_NO_NOTES", "VIDEO_PART_HEAD", "VIDEO_PART_INPUT", "VIDEO_PART_RULES",
+    "VIDEO_READING", "VIDEO_READING_CUT", "VIDEO_READING_SIZE", "VIDEO_READ_ABOVE", "VIDEO_REFUSED", "VIDEO_STUB",
 ]
 # fmt: on
 
@@ -100,3 +101,38 @@ VIDEO_IN_MESSAGE = (
     "{link}"
 )
 VIDEO_PART_INPUT = "The user's message: {question}\n\nCaptions, part {number} of {count} ({start}–{end}):\n{text}"
+
+# A video she finds herself (video_find.py, tools.find_video): code's words. The title and channel in a match are outside
+# text, cleaned and shown only here, never in her tool result.
+# find_video's description is in every request, calls included: short, and never naming a site (see read_link's, and
+# docs/agents/prompts-evals.md, Gotchas)
+VIDEO_FIND_DESCRIPTION = (
+    "Find the video the user asks for (a show, channel or topic; newest: they want the latest one). The bridge texts "
+    "them one match with its link itself; it is read only after their YES."
+)
+VIDEO_MATCH = (
+    "**Video {number} of {total}**: {title} · {channel} · {length} · {date} · {link}\n"
+    "Reply YES to read it, or another for the next one."
+)
+VIDEO_MATCH_LAST = (
+    "**Video {number} of {total}**: {title} · {channel} · {length} · {date} · {link}\nReply YES to read it."
+)
+VIDEO_NOT_GIVEN = "not given"
+VIDEO_NO_MORE = "That was the last match. Ask again with more words about the video."
+VIDEO_LATE_YES = "Too late: a YES counts for 2 minutes after the match. Ask for the video again."
+# her tool results hold no title or channel: no outside text reaches her
+VIDEO_FIND_RESULT = (
+    "Done: one match was texted to the user with its link. It is read only after their typed YES. Never say it was "
+    "read or summarised."
+)
+VIDEO_FIND_RESULT_CALL = (
+    "Done: one match was texted to the user's chat with its link. Say so in one short sentence, and that a typed YES "
+    "there gets the summary once the call ends. Never say it was read or summarised."
+)
+VIDEO_FIND_NONE = "No video found for that. Tell the user; do not guess."
+VIDEO_FIND_NOT_SENT = "Not done: the match could not be texted to the user. Tell them; do not guess."
+# last in her prompt for the answer to the user's typed YES: the one link read_link may read, and the request
+VIDEO_FIND_LINE = (
+    'The user typed YES to the video found for their request: {link}\nTheir request, in their words: "{request}"\n'
+    "Call read_link with that link and answer that request. This is the only link you may read."
+)

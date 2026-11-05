@@ -3,13 +3,14 @@ import Foundation
 /// jane in six more languages (owner, 25 Oct: "pocket does more languages than English right... lets use those, leave
 /// koroko for the ones that Pocket does not do", and after eve and jane in each: "jane jane, lets have her as default
 /// for those languages"): Spanish, Italian, Portuguese, Dutch, German and French in Pocket TTS's full model of each
-/// language (the 100M architecture, never the 24-layer previews), int8, one thread, as English; Korean, Polish,
-/// Japanese and Russian, which Pocket has no model for, stay Supertonic-3's F1. The bridge names jane with the language
-/// (`config.POCKET_LANGUAGES`); any other voice in these languages is Supertonic-3's as before. Each language's files
-/// are fetched only for the language in use ("the pocket language models we download in Estia only if they are
+/// language (the 100M architecture, never the 24-layer previews), int8, one thread, as English. jane is their only
+/// voice: a request in one of them is hers whatever voice it names (`PocketVoices.speech(_:language:)`; the bridge names
+/// jane, `config.POCKET_LANGUAGES`). Korean, Polish, Japanese and Russian, which Pocket has no model for, have no voice
+/// (`speaks`; owner, 3 Nov 2026: Supertonic-3, which spoke them, was removed and nothing replaces it). Each language's
+/// files are fetched only for the language in use ("the pocket language models we download in Estia only if they are
 /// requested right?"): its speaker is idle at every start and the first line asked in it starts its check (and its
-/// fetch, about 227 MB, when a file is missing); until it is ready, and for any line it cannot say, Supertonic-3's F1
-/// says it (`standIn(for:voice:)`).
+/// fetch, about 227 MB, when a file is missing); until it is ready, and for any line it cannot say, no other voice says
+/// it (`PocketLine`).
 extension PocketTTS {
     /// The voice the bridge names in these languages: only jane's states are pinned for them.
     public static let languageVoice = "jane"
@@ -23,17 +24,10 @@ extension PocketTTS {
         PocketSpeech(voice: languageVoice, model: .french, speaks: languageVoice, health: "pocket_fr", language: "fr"),
     ]
 
-    /// The English Pocket voices setup gives a male name (owner, 26 Oct: "alba & michael for males").
-    public static let maleVoices: Set<String> = ["alba", "michael"]
-    /// Kokoro's male voice: it says the lines alba and michael cannot (setup's male voice before 26 Oct).
-    public static let maleStandIn = "am_michael"
-
-    /// Who says a line Pocket cannot in `voice`: in English Kokoro's voice of its kind (am_michael for alba and
-    /// michael, af_heart for heart, jane, eve and vera: the review of 26 Oct, R1-F1, a male-voiced call heard a woman's
-    /// line), in another language Supertonic-3's F1 (the voice it has always spoken them in).
-    public static func standIn(for language: String, voice: String) -> String {
-        guard language == Languages.english else { return "F1" }
-        return maleVoices.contains(voice) ? maleStandIn : SpeechRequest.defaultVoice
+    /// Whether her voice speaks `language`: English and the six; Korean, Polish, Japanese and Russian have none (owner,
+    /// 3 Nov 2026), so a line in them is refused (`VoiceError.noVoice`).
+    public static func speaks(_ language: String) -> Bool {
+        language == Languages.english || languages.contains { $0.language == language }
     }
 }
 

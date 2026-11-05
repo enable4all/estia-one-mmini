@@ -80,9 +80,12 @@ def unlock() -> bool:
     return done.returncode == 0 and unlocked()
 
 
-def has(service: str, account: str, *, seconds: float = CHECK_SECONDS) -> bool:
-    """An item for this service and account is in your login keychain (its attributes only: no password is read, and
-    a locked keychain asks nothing; `seconds`: longer where macOS's own box may ask after all)."""
+NOT_FOUND = 44  # security's status for errSecItemNotFound: the search answered, and none is there
+
+
+def found(service: str, account: str, *, seconds: float = CHECK_SECONDS) -> bool | None:
+    """`has`, with no answer apart: True or False when the search answered (found, or security's NOT_FOUND); None
+    when it did not (macOS's own box cancelled or left unanswered, a locked keychain over SSH, no security)."""
     try:
         done = subprocess.run(
             [_security(), "find-generic-password", "-a", account, "-s", service, str(login_keychain())],
@@ -92,8 +95,24 @@ def has(service: str, account: str, *, seconds: float = CHECK_SECONDS) -> bool:
             check=False,
         )
     except (OSError, subprocess.SubprocessError):
-        return False
-    return done.returncode == 0
+        return None
+    if done.returncode == 0:
+        return True
+    return False if done.returncode == NOT_FOUND else None
+
+
+def has(service: str, account: str, *, seconds: float = CHECK_SECONDS) -> bool:
+    """An item for this service and account is in your login keychain (its attributes only: no password is read, and
+    a locked keychain asks nothing; `seconds`: longer where macOS's own box may ask after all)."""
+    return found(service, account, seconds=seconds) is True
+
+
+def _unanswered(there: bool | None, boxed: bool) -> bool:
+    """`boxed` (macOS's own box asks at the locked keychain): a search with no answer while the keychain stays locked,
+    its box cancelled or left unanswered, ends the save, never a second box (s06-attribute-search: whether macOS asks
+    at the attribute search is the desk check; "not found" is an answer, so a search that asks nothing changes
+    nothing)."""
+    return boxed and there is None and not unlocked()
 
 
 def lock_again(opened: list[bool]) -> None:
@@ -118,9 +137,13 @@ def _delete(service: str, account: str, keychain: str, seconds: float = CHECK_SE
     """The item for this service and account deleted, without reading it (macOS asks nothing for a delete on an open
     keychain); True once none is left. `boxed` (macOS's own box asks at a change of the locked keychain): a delete
     that failed while the keychain stays locked (the box left unanswered or cancelled) is the last one tried, never a
-    second box (fix review, signal-S06-asks-path-asks-again)."""
+    second box (fix review, signal-S06-asks-path-asks-again), and so is a search left without an answer
+    (`_unanswered`)."""
     for _ in range(3):  # one at a time, as security deletes them
-        if not has(service, account, seconds=seconds):
+        there = found(service, account, seconds=seconds)
+        if _unanswered(there, boxed):
+            return False
+        if not there:
             return True
         try:
             done = subprocess.run(
@@ -207,10 +230,13 @@ def _save_asking(service: str, account: str, secret: str, label: str, keychain: 
     then its attributes found (no secret is read, and no dialog shows). REMOVED when a copy from before was deleted
     and none is there now (review SEC-5). `boxed`: macOS's own box may ask at a change of the locked keychain; a
     delete it left undone ends the save (`_delete`), so a box left unanswered or cancelled at a delete is not asked
-    again (whether macOS asks at the attribute search, `has`, too: desk check pending; second fix review of 0.9.8,
-    setup-s06-asks-once-overclaim)."""
+    again; so does a search it left without an answer (`_unanswered`: whether macOS asks at the attribute search,
+    `has`, too is the desk check; second fix review of 0.9.8, setup-s06-asks-once-overclaim; s06-attribute-search)."""
     check = UNLOCK_SECONDS if boxed else CHECK_SECONDS
-    before = has(service, account, seconds=check)
+    there = found(service, account, seconds=check)
+    if _unanswered(there, boxed):
+        return Saved.NOT_KEPT  # nothing changed: save() makes it LOCKED
+    before = there is True
     if not _delete(service, account, keychain, check, boxed=boxed):
         return Saved.NOT_KEPT  # one is left: the copy from before stays
     command = f'add-generic-password -a "{account}" -s "{service}" -l "{label}" -T "" -w "{secret}" "{keychain}"\n'

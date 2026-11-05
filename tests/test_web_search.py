@@ -17,6 +17,8 @@ from local_assistant.web_search import (
     BRAVE_URL,
     OLLAMA_URL,
     Limits,
+    VideoResult,
+    VideoResults,
     WebResult,
     WebResults,
     WebSearch,
@@ -692,3 +694,258 @@ async def test_a_search_with_every_service_paused_records_nothing_new(tmp_path: 
     with pytest.raises(WebSearchError):
         await search.search("two")  # Ollama paused: nothing asked, the first failure stands
     assert status.snapshot() == {"web": Record(failed=NOW, reason="busy", code=429)} and len(http.requests) == 1
+
+
+# Brave's answer for a song: a video's channel and length ride in its `video` data (song parts' own search reads them,
+# T4.1); Gemma's web_search never sees them
+BRAVE_VIDEOS = {
+    "type": "search",
+    "web": {
+        "results": [
+            {
+                "title": "Harbour Lights (Official Audio) - YouTube",
+                "url": "https://www.youtube.com/watch?v=aaaaaaaaaaa",
+                "description": "The Examples · Harbour Lights",
+                "video": {"creator": "The Examples", "duration": "03:50", "views": 1234, "publisher": "YouTube"},
+            },
+            {"title": "Harbour Lights lyrics", "url": "https://lyrics.example.com/hl", "description": "The words."},
+        ]
+    },
+    "videos": {
+        "type": "videos",
+        "results": [
+            {
+                "title": "Harbour Lights (Live)",
+                "url": "https://www.youtube.com/watch?v=bbbbbbbbbbb",
+                "description": "Live at the quay.",
+                "video": {"creator": "A Fan", "duration": "4:00"},
+            }
+        ],
+    },
+}
+
+
+async def test_gemmas_web_search_results_are_byte_for_byte_as_before(tmp_path: Path, store: Store) -> None:
+    """The results, the request and the counters of Gemma's web_search are what they were before song parts' own
+    video search: Brave's video data and its video cluster are never read there."""
+    http = FakeHttp()
+    ollama_down(http)
+    http.add(BRAVE_URL, 200, BRAVE_VIDEOS)
+    search = web(tmp_path, http, store)
+    found = await search.search("harbour lights")
+    assert found == WebResults(
+        "Brave",
+        (
+            WebResult(
+                "Harbour Lights (Official Audio) - YouTube",
+                "https://www.youtube.com/watch?v=aaaaaaaaaaa",
+                "youtube.com",
+                "",
+                "The Examples · Harbour Lights",
+            ),
+            WebResult("Harbour Lights lyrics", "https://lyrics.example.com/hl", "lyrics.example.com", "", "The words."),
+        ),
+    )
+    assert http.urls()[-1] == (
+        f"{BRAVE_URL}?q=harbour+lights&count=5&country=NL&search_lang=en&safesearch=moderate&extra_snippets=true"
+        "&text_decorations=false"
+    )
+    assert json.loads(http.sent[0][1] or b"{}") == {"query": "harbour lights", "max_results": 5}
+    assert search.usage() == "Ollama 1 today, Brave backup 1/900 this month"
+    assert sources([found]) == [
+        ("youtube.com", "https://www.youtube.com/watch?v=aaaaaaaaaaa"),
+        ("lyrics.example.com", "https://lyrics.example.com/hl"),
+    ]
+
+
+async def test_the_video_search_asks_brave_first_and_reads_its_video_data(tmp_path: Path, store: Store) -> None:
+    http = FakeHttp()
+    http.add(BRAVE_URL, 200, BRAVE_VIDEOS)
+    search = web(tmp_path, http, store)
+    found = await search.search_videos("  harbour   lights youtube ")
+    assert found == VideoResults(
+        "Brave",
+        (
+            VideoResult(
+                "Harbour Lights (Official Audio) - YouTube",
+                "https://www.youtube.com/watch?v=aaaaaaaaaaa",
+                "The Examples",
+                230,
+            ),
+            VideoResult("Harbour Lights lyrics", "https://lyrics.example.com/hl"),  # no video data: not given
+            VideoResult("Harbour Lights (Live)", "https://www.youtube.com/watch?v=bbbbbbbbbbb", "A Fan", 240),
+        ),
+    )
+    assert asked(http) == [BRAVE_URL]  # Ollama is the backup here: Brave's data carries the channel and the length
+    method, url, _ = http.requests[0]
+    assert method == "GET" and http.sent[0][0]["X-Subscription-Token"] == "b-key"
+    sent = {k: v[0] for k, v in parse_qs(urlsplit(url).query).items()}
+    assert sent == {
+        "q": "harbour lights youtube",
+        "count": "20",
+        "country": "NL",
+        "search_lang": "en",
+        "safesearch": "moderate",
+        "extra_snippets": "true",
+        "text_decorations": "false",
+    }
+    assert search.usage() == "Ollama 0 today, Brave backup 1/900 this month"  # counted as any Brave search
+
+
+async def test_ollama_is_the_backup_of_the_video_search_with_title_and_link_only(tmp_path: Path, store: Store) -> None:
+    http = FakeHttp()
+    http.add(BRAVE_URL, 503, None)
+    http.add(
+        OLLAMA_URL,
+        200,
+        {
+            "results": [
+                {
+                    "title": "Harbour Lights (Official Audio)",
+                    "url": "https://www.youtube.com/watch?v=aaaaaaaaaaa",
+                    "content": "The Examples · 3:50",
+                },
+                {"title": 5, "url": ["not a link"]},
+            ]
+        },
+    )
+    found = await web(tmp_path, http, store).search_videos("harbour lights youtube")
+    assert found == VideoResults(
+        "Ollama", (VideoResult("Harbour Lights (Official Audio)", "https://www.youtube.com/watch?v=aaaaaaaaaaa"),)
+    )
+    assert asked(http) == [BRAVE_URL, OLLAMA_URL]
+    assert json.loads(http.sent[1][1] or b"{}") == {"query": "harbour lights youtube", "max_results": 10}
+
+
+async def test_without_a_brave_key_or_at_its_cap_the_video_search_uses_ollama(tmp_path: Path, store: Store) -> None:
+    http = FakeHttp()
+    http.add(OLLAMA_URL, 200, OLLAMA_ANSWER)
+    only = await web(tmp_path, http, store, text="OLLAMA_API_KEY=o-key\n").search_videos("ajax")
+    assert only.provider == "Ollama" and asked(http) == [OLLAMA_URL]
+    capped = await web(tmp_path, http, store, cap=0).search_videos("ajax")
+    assert capped.provider == "Ollama" and asked(http) == [OLLAMA_URL, OLLAMA_URL]
+
+
+@pytest.mark.parametrize(
+    ("given", "seconds"),
+    [
+        ("05:30", 330),
+        ("5:30", 330),
+        ("1:02:03", 3723),
+        ("00:59", 59),
+        ("10:00:00", 36_000),
+        ("00:00", None),
+        ("", None),
+        ("5", None),
+        ("5:75", None),
+        ("1:2:3:4", None),
+        ("-5:30", None),
+        ("5m 30s", None),
+        ("PT5M30S", None),
+        (330, None),
+        (None, None),
+    ],
+)
+async def test_a_videos_length_is_read_only_as_minutes_and_seconds_or_hours(
+    tmp_path: Path, store: Store, given: object, seconds: int | None
+) -> None:
+    answer = {
+        "type": "search",
+        "web": {
+            "results": [
+                {
+                    "title": "t",
+                    "url": "https://www.youtube.com/watch?v=aaaaaaaaaaa",
+                    "video": {"creator": "c", "duration": given},
+                }
+            ]
+        },
+    }
+    http = FakeHttp()
+    http.add(BRAVE_URL, 200, answer)
+    [video] = (await web(tmp_path, http, store).search_videos("t")).results
+    assert video.seconds == seconds and video.channel == "c"
+
+
+async def test_the_video_search_reads_no_page_and_asks_no_one_but_its_two_services(
+    tmp_path: Path, store: Store
+) -> None:
+    """Brave's top result is a YouTube page: Gemma's search reads it for more text, code's own search never does
+    (nothing reaches YouTube before the user's yes)."""
+
+    async def fetch(url: str) -> Page:
+        raise AssertionError(f"a page was read: {url}")
+
+    http = FakeHttp()
+    http.add(BRAVE_URL, 200, BRAVE_VIDEOS)
+    assert (await web(tmp_path, http, store, fetch=fetch).search_videos("harbour lights")).results
+    assert asked(http) == [BRAVE_URL]
+
+
+@pytest.mark.parametrize("query", ["", "  ", "x " * 201, "word " * 51, "mail alex@example.com", "call 0612345678"])
+async def test_a_bad_video_query_is_refused_before_any_request(tmp_path: Path, store: Store, query: str) -> None:
+    http = FakeHttp()
+    with pytest.raises(ValueError):
+        await web(tmp_path, http, store).search_videos(query)
+    assert http.requests == []
+
+
+async def test_the_video_search_is_recorded_and_fails_as_every_search_does(tmp_path: Path, store: Store) -> None:
+    status = recorder(tmp_path)
+    http = FakeHttp()
+    http.add(BRAVE_URL, 200, BRAVE_VIDEOS)
+    await web(tmp_path, http, store, status=status).search_videos("harbour lights")
+    assert status.snapshot() == {"web": Record(ok=NOW)}
+    failing = recorder(tmp_path / "again")
+    down = FakeHttp()
+    down.add(BRAVE_URL, 429, None)
+    down.fail(OLLAMA_URL, OSError("down"))
+    with pytest.raises(WebSearchError, match="not available right now"):
+        await web(tmp_path, down, store, status=failing).search_videos("harbour lights")
+    assert failing.snapshot() == {"web": Record(failed=NOW, reason="no_answer")}
+    with pytest.raises(WebSearchError, match="no keys"):
+        await WebSearch(FakeHttp(), tmp_path / "missing.env", store, country="ALL", brave_cap=1).search_videos("x")
+
+
+async def test_a_video_search_that_found_nothing_is_an_answer_and_an_unreadable_one_a_failure(
+    tmp_path: Path, store: Store
+) -> None:
+    nothing = FakeHttp()
+    nothing.add(BRAVE_URL, 200, {"type": "search", "query": {"original": "zzqx"}})  # Brave leaves "web" out
+    nothing.add(OLLAMA_URL, 200, {"results": []})
+    assert await web(tmp_path, nothing, store).search_videos("zzqx") == VideoResults("Ollama", ())
+    for body in ({"type": "videos"}, {"web": {"results": "x"}}, {"videos": {"results": None}}, ["x"], "x"):
+        broken = FakeHttp()
+        broken.add(BRAVE_URL, 200, body)
+        broken.add(OLLAMA_URL, 500, None)
+        with pytest.raises(WebSearchError, match="not available right now"):
+            await web(tmp_path, broken, store).search_videos("zzqx")
+
+
+async def test_the_video_search_keeps_brave_s_date_as_the_day_and_nothing_else(tmp_path: Path, store: Store) -> None:
+    """find_video ranks the newest first by the search's own date (`page_age`): kept as its day when it reads as one."""
+    http = FakeHttp()
+    http.add(
+        BRAVE_URL,
+        200,
+        {
+            "type": "search",
+            "web": {
+                "results": [
+                    {
+                        "title": "Show one",
+                        "url": "https://www.youtube.com/watch?v=aaaaaaaaaaa",
+                        "page_age": "2026-10-28T10:00:00",
+                    },
+                    {
+                        "title": "Show two",
+                        "url": "https://www.youtube.com/watch?v=bbbbbbbbbbb",
+                        "page_age": "last tuesday",
+                    },
+                    {"title": "Show three", "url": "https://www.youtube.com/watch?v=ccccccccccc", "page_age": 5},
+                ]
+            },
+        },
+    )
+    found = await web(tmp_path, http, store).search_videos("show youtube")
+    assert [result.date for result in found.results] == ["2026-10-28", "", ""]

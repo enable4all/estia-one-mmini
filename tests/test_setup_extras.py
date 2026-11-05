@@ -1442,6 +1442,16 @@ def test_a_house_number_is_advice_never_an_error_and_never_leaves(monkeypatch: p
     assert looked_up(http) == ["Ermou, Athens"]  # the number never goes to the map
 
 
+def test_a_postcode_before_a_town_named_st_gets_no_house_number_advice(monkeypatch: pytest.MonkeyPatch) -> None:
+    """0.9.9 (osm-st-ter-before-town): "St." right after the number was read as a street word, so the postcode of
+    "9000 St. Gallen" got the house number advice and was left out of the lookup."""
+    http = nominatim(monkeypatch, [{"lat": "47.4232", "lon": "9.3700", "name": "Bahnhofstrasse"}])
+    found = home_check()({"street": "Bahnhofstrasse", "city": "9000 St. Gallen"}, NONE, MAC)
+    assert found.value == {"street": "Bahnhofstrasse", "city": "9000 St. Gallen"}
+    assert found.shown == ""  # no SETUP_HOME_AREA_HOUSE_NUMBER
+    assert looked_up(http) == ["Bahnhofstrasse, 9000 St. Gallen"]  # the postcode goes with the town
+
+
 def test_the_place_openstreetmap_found_is_shown_and_a_no_asks_again(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -1672,7 +1682,7 @@ def test_the_last_step_names_only_the_voices_voices_lists_on_this_mac(
     listed = [line.split(":")[0] for line in commands.voices_listing(pocket_standard(memory))]
     assert named and all(name in listed for name in named)
     assert ("vera" in named) is vera and "heart" in named  # vera the 100M's only; heart on either (owner, 29 Oct)
-    assert "af_heart" not in named  # owner, 27 Oct: "not af_heart, do heart"; /voices still lists it
+    assert "af_heart" not in named  # owner, 27 Oct: "not af_heart, do heart"; Kokoro removed 3 Nov 2026
 
 
 def test_the_windows_closing_list_names_only_her_six_voices(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

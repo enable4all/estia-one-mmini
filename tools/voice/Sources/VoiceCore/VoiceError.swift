@@ -9,9 +9,13 @@ public enum VoiceError: Error, Equatable, Sendable {
     case badWindow
     /// A transcription's hint that is no name (`Hint`).
     case badHint
-    /// A call's line asked with no Kokoro stand-in (`SpeechRequest.kokoro` false: its turn had its one Kokoro line;
-    /// owner, 28 Oct, calls-03) that Pocket could not say: nothing said, never Kokoro.
-    case noStandIn
+    /// A line Pocket TTS could not say (not ready, a refused file, a run that failed or was late, a voice resting after
+    /// failures): no other voice says it, whatever the request asks (owner, 3 Nov 2026: "remove kokoro and
+    /// supertonic", and for those lines "Nothing"). The bridge then sends that answer as text.
+    case notSaid
+    /// A line in a language her voice does not speak (Korean, Polish, Japanese, Russian: Pocket TTS has no model for
+    /// them; owner, 3 Nov 2026): refused before any text work. Listening stays in all eleven.
+    case noVoice
 
     public var status: Int {
         switch self {
@@ -23,7 +27,7 @@ public enum VoiceError: Error, Equatable, Sendable {
         case .unsupportedLanguage: 400
         case .badStream, .badChunk, .badWindow, .badHint: 400
         case .unavailable: 503
-        case .noStandIn: 409
+        case .notSaid, .noVoice: 409
         }
     }
 
@@ -40,7 +44,8 @@ public enum VoiceError: Error, Equatable, Sendable {
         case .unavailable: "unavailable"
         case .badWindow: "bad_window"
         case .badHint: "bad_hint"
-        case .noStandIn: "no_stand_in"
+        case .notSaid: "not_said"
+        case .noVoice: "no_voice"
         }
     }
 

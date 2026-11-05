@@ -2,13 +2,13 @@ import Foundation
 import Testing
 @testable import VoiceCore
 
-/// What Kokoro is given for an English text: the call's and the voice note's path (`SpeechRequest.spokenInput`).
+/// What the English passes give for a text (`SpokenEnglish`), as one line (`SpeechRequest.oneLine`): the call's and the
+/// voice note's path (`SpeechRequest.spokenInput`) before Pocket's letters and its guard (`PocketText`, PocketTests).
 private func spoken(_ text: String) throws -> String {
-    let body = try JSONSerialization.data(withJSONObject: ["input": text])
-    return try SpeechRequest(json: body).spokenInput
+    SpokenEnglish.spoken(SpeechRequest.oneLine(text))
 }
 
-/// The 0.9.2 pronunciation plan's rows: what is written, what Kokoro is given. Each class keeps rows that must stay as
+/// The 0.9.2 pronunciation plan's rows: what is written, what the English passes give. Each class keeps rows that must stay as
 /// they are; every row runs through the whole English path, so a pass in the wrong order fails here.
 enum PronunciationTable {
     static let rows: [(kind: String, written: String, said: String)] = [
@@ -370,19 +370,16 @@ enum PronunciationTable {
     }
 }
 
-/// Capitals Kokoro reads as words (Misaki has "ID" as "id", "ETA" as the Greek letter, "WHO" as "who"): the custom
-/// lexicon gives them their letters' names, by exact spelling only, so "id" and "who" keep theirs.
+/// Capitals meant as their letters (Pocket reads them as words: "WHO is it?" came out "Though is it?", 24 Oct): only
+/// these, by their capitals, so "id" and "who" stay words. Pocket's text writes them as letters (`PocketText.letters`,
+/// PocketTests); Kokoro, removed on 3 Nov 2026, got them as a pronunciation table over its lexicon.
 @Suite struct CapitalsAsLetters {
-    @Test func idEtaAndWhoAreTheirLettersNames() {
-        #expect(EnglishLexicon.entries == ["ID": "ˈI dˈi", "ETA": "ˈi tˈi ˈA", "WHO": "dˈʌbᵊlju ˈAʧ ˈO"])
+    @Test func idEtaAndWhoAreSpelled() {
+        #expect(EnglishLexicon.spelledWords == ["ID", "ETA", "WHO"])
+        #expect(EnglishLexicon.spelledWords.allSatisfy { $0 == $0.uppercased() })
     }
 
-    @Test func onlyTheCapitalsHaveAnEntry() {
-        #expect(EnglishLexicon.entries["id"] == nil && EnglishLexicon.entries["who"] == nil && EnglishLexicon.entries["eta"] == nil)
-        #expect(EnglishLexicon.entries.keys.allSatisfy { $0 == $0.uppercased() })
-    }
-
-    /// The text keeps them as written: the lexicon, not the text, says them.
+    /// The passes keep them as written: Pocket's text, not the passes, spells them.
     @Test func theTextKeepsThem() throws {
         #expect(try spoken("Your ID, the ETA and the WHO") == "Your ID, the ETA and the WHO")
     }

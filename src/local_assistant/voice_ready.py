@@ -9,7 +9,9 @@ The note is owed
   soon as the voice is ready, also during quiet hours (the caller is awake);
 - to every allowed account when a read 2 minutes or more after the bridge started still said not ready (a long load;
   a voice that was never seen not ready, or ready before then, is none): held until the end of quiet hours (the
-  initiative's, 22:00-08:00 when it has none), never waking anyone.
+  initiative's, 22:00-08:00 when it has none), never waking anyone; never to an account whose call language (the
+  practised one, else the one in use) has no voice (Korean, Polish, Russian, Japanese: its calls ring out; the review
+  of 4 Nov).
 At most once per bridge start for each account, except that a "not ready" note sent later in the same run (its promise)
 is always followed by one more. Nothing goes out while /lock is on: it waits for /unlock. A call that got through
 (answered and connected, or placed and picked up) told that account already: no note then. The voice is read again
@@ -50,8 +52,12 @@ class ReadyNote:
         locked: Callable[[], bool] = lambda: False,
         clock: Callable[[], float] = time.time,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        speaks: Callable[[str], bool] = lambda aci: True,
+        busy: Callable[[str], bool] = lambda aci: False,
     ) -> None:
         self._ready = ready  # whether the voice service can take a call now (both engines ready)
+        self._speaks = speaks  # whether an account's call language has a voice (`config.has_voice`)
+        self._busy = busy  # whether a call with an account is on: its note waits for the call's end
         self._send = send  # (account, text): stored and sent as a note
         self._acis = frozenset(aci.lower() for aci in acis)
         self._tz = tz
@@ -139,5 +145,10 @@ class ReadyNote:
     def _due(self, now: float) -> list[str]:
         if self._locked():  # /lock: nothing goes out until /unlock
             return []
+        for aci, urgent in list(self._owed.items()):
+            if not urgent and not self._speaks(aci):  # its calls ring out: no invite to call (the review of 4 Nov)
+                del self._owed[aci]
+                self._told.add(aci)
+                log.info("voice ready: no long-load note (no voice in that account's call language)")
         quiet = in_quiet_hours(datetime.fromtimestamp(now, self._tz), self._quiet_hours)
-        return sorted(aci for aci, urgent in self._owed.items() if urgent or not quiet)
+        return sorted(aci for aci, urgent in self._owed.items() if (urgent or not quiet) and not self._busy(aci))

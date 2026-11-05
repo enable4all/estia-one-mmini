@@ -26,6 +26,7 @@ from tests.test_app import (
     call_settings,
     code_notes_in,
     deliver,
+    held_note,
     her_words,
     sent,
     start,
@@ -217,14 +218,15 @@ async def test_a_held_devices_note_is_kept_for_her_history(tmp_path: Path, monke
     try:
         deliver(harness.folder, "hi from a new laptop", T0, device=3)
         await until(lambda: bool(marks(harness.app.store)))
-        assert sent(harness.folder) == [prompts.DEVICE_HELD.format(device=3)]
+        held = held_note(harness, 3)
+        assert sent(harness.folder) == [held]
         incoming = harness.app.store._conn.execute("SELECT COUNT(*) FROM messages WHERE direction = 'in'").fetchone()
         assert incoming[0] == 0  # the held message: never stored
-        assert marks(harness.app.store) == [(prompts.DEVICE_HELD.format(device=3), "note")]
+        assert marks(harness.app.store) == [(held, "note")]
         deliver(harness.folder, "did you get my message?", T0 + 1)
         await until(lambda: len(sent(harness.folder)) == 2)
         [note] = code_notes_in(gemma.calls[-1])
-        assert note.endswith(prompts.DEVICE_HELD.format(device=3))
+        assert note.endswith(held)  # with the held message's time, as the user saw it
     finally:
         await stop(harness)
 
@@ -256,13 +258,34 @@ async def test_a_docs_answer_quotes_private_text(tmp_path: Path, monkeypatch: py
         await stop(harness)
 
 
+async def test_the_note_after_a_call_reaches_her_history_as_codes_note(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Hard rule 6: code's note after a call she answered (`prompts.CALL_ANSWERED_NOTE`) enters her history only as a
+    code_notes result, in the words the user saw, never as hers."""
+    gemma = FakeGemma(text("Hello."))
+    harness = await start(tmp_path, monkeypatch, gemma, **call_settings(tmp_path))
+    try:
+        note = prompts.CALL_ANSWERED_NOTE.format(span="14:02-14:10")
+        await harness.app.call_note(ME_APP, note)
+        await until(lambda: bool(marks(harness.app.store)))
+        assert marks(harness.app.store) == [("A call from one of your devices, 14:02-14:10.", "note")]
+        deliver(harness.folder, "hi", T0)
+        await until(lambda: len(sent(harness.folder)) == 2)
+        request = gemma.calls[-1]
+        assert [result.split("\n", 1)[1] for result in code_notes_in(request)] == [note]
+        assert "A call from one of your devices" not in her_words(request)  # never as her words
+    finally:
+        await stop(harness)
+
+
 async def test_after_a_call_the_summary_is_outside_text_in_her_history(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     gemma = FakeGemma(text("- the dentist moved to 11:30"))
     harness = await start(tmp_path, monkeypatch, gemma, **call_settings(tmp_path))
     try:
-        await harness.app.call_summary(ME_APP, ["User: what's on today?", "Estia: The dentist moved."], 2)
+        await harness.app.call_summary(ME_APP, ["User: what's on today?", "Estia: The dentist moved."], "14:02-14:04")
         await until(lambda: bool(marks(harness.app.store)))
         assert marks(harness.app.store)[0][1] == "outside"  # Gemma's summary of a call that may have read outside text
     finally:

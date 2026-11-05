@@ -20,7 +20,7 @@ func pinSpeechModel() {
 }
 
 /// The CoreML configuration the model loads with: the CPU only. On the Neural Engine a chunk would wait behind
-/// Whisper, Kokoro or Supertonic (one speaking or transcribing for seconds), and the bridge gives up on an answer
+/// Whisper (transcribing for seconds), and the bridge gives up on an answer
 /// later than 600 ms of audio; Silero is small enough that the CPU answers a chunk in about a millisecond.
 func speechModelConfiguration() -> MLModelConfiguration {
     let configuration = MLModelConfiguration()

@@ -95,7 +95,7 @@ DAEMONS = Path("/Library/LaunchDaemons")
 # account), never as root (M01, 30 Oct: with the file missing from this folder, launchd refused to start the job, exit
 # 78), so each must be there and hers (0600) before launchd starts the job (make_stream_logs, ollama_build.log_steps);
 # the folder is root's (0755), never one of hers, which stops a link being planted at those names. She empties them
-# in-process (app.cap_streams, LogCap)
+# in-process (entry.cap_streams, LogCap)
 STREAM_LOGS = Path("/var/log/estia")
 NEWSYSLOG = Path("/etc/newsyslog.d/local-assistant.conf")  # the old log rotation rule (logs now rotate themselves)
 BRIDGE = "com.local-assistant.bridge"
@@ -153,6 +153,18 @@ VOICE_HEALTH_URL = "http://127.0.0.1:8150/health"
 # [calls] the bridge texts once it is ready (voice_ready.ReadyNote); without them no text follows
 VOICE_LOADING = "Calls work once her voice is ready (up to about 15 minutes); she texts you then."
 VOICE_LOADING_NO_CALLS = "voice: loading (up to about 15 minutes)"
+# a voice that waiting does not bring (the review of 5 Nov, mac-deploy-voice-end-line-pocket-failed: Pocket TTS is her
+# only voice, so a program that was not fetched leaves `tts` "failed" at every update, and a rest after failed runs is
+# tried again on its own after 1, 5 and 30 minutes, no load): said at once, never as a load that ends in a text, which
+# ReadyNote does not send for a voice that does not turn ready. The words are doctor's ("not working (doctor says
+# why)") and the voice install's (prompts.SETUP_VOICE_RESTING, without its state; a test pins them). {doctor} and
+# {check}: her wrapper's commands, the checkout's own scripts before her own user (`voice_line(moved=False)`)
+VOICE_FAILED = "voice: not working (doctor says why: {doctor}); her answers come as text"
+VOICE_RESTING = (
+    "voice: resting after failed runs. It is tried again on its own, and calls work once her voice speaks.\n"
+    "Check later: {check}"
+)
+VOICE_RESTING_NO_CALLS = "voice: resting after failed runs. It is tried again on its own.\nCheck later: {check}"
 # the bridge texts only after a long load: a read still not ready 120 s after its start (voice_ready.LONG_LOAD_SECONDS),
 # its reads 15 s apart (POLL_SECONDS). Still loading this long after the bridge was seen up, it surely counts one.
 VOICE_WAIT_SECONDS = 120.0 + 2 * 15.0
@@ -173,11 +185,19 @@ SUDO_NEEDS_PASSWORD = 1  # sudo -n's exit when it would ask (curl's 1, an unsupp
 CURL_HTTP_ERROR = 22  # curl -f: the service answered with an error (her voice service's 403)
 # why her voice was not read as her (review R2-F1, R2-F4: both printed the loading line, like a real load)
 # the wait for her voice after its install, as her, one admin command (scripts/install-voice-daemon.sh's own text, one
-# line: setup's window runs it too; up to 240 looks 5 s apart); it always ends with the last answer it read
+# line: setup's window runs it with one change, below; up to 240 looks 5 s apart); it always ends with the last answer
+# it read
 VOICE_WAIT_AS_HER = (
     'state=""; for _ in $(seq 1 240); do state="$(curl -q -s --max-time 2 --max-filesize 10000 '
     'http://127.0.0.1:8150/health || true)"; if [[ "$state" == *"\\"stt\\":\\"ready\\""* && "$state" == '
     '*"\\"tts\\":\\"ready\\""* || "$state" == *failed* ]]; then break; fi; sleep 5; done; printf "%s" "$state"'
+)
+# setup's window's own wait (review W19): the same looks, its input read between them in the place of the sleep, so
+# the end of that input (the window's Stop here, a Ctrl-C in Terminal) ends it after the look it is in. macOS's
+# /bin/bash 3.2 ends `read -t` with 1 at its time limit as at the input's end: a read back within 2 s was the end.
+# Terminal's script keeps its sleep: its input may be ended from the start
+VOICE_WAIT_AS_HER_WINDOW = VOICE_WAIT_AS_HER.replace(
+    " sleep 5;", " looked=$SECONDS; read -r -t 5 _; (( SECONDS - looked > 2 )) || break;"
 )
 VOICE_NOT_SIGNED_IN = "no admin sign-in running"
 VOICE_REFUSED_HER = "her voice service refused it"
@@ -1085,14 +1105,35 @@ def _voice_ready(health: VoiceHealth) -> bool:
     return isinstance(health, Mapping) and health.get("stt") == "ready" and health.get("tts") == "ready"
 
 
-def voice_line(health: VoiceHealth, *, calls: bool = True) -> str:
+def _speaking(health: VoiceHealth) -> object:
+    """Her English Pocket model's state, as the voice service's /health says it (`tts`); None when not read."""
+    return health.get("tts") if isinstance(health, Mapping) else None
+
+
+def _voice_stuck(health: VoiceHealth) -> bool:
+    """Speaking will not come by waiting: Pocket TTS rests after failed runs or cannot run (`tts` "resting" or "failed":
+    the states `calls.voice_not_working` tells from loading), so no text is promised and no wait is spent."""
+    return _speaking(health) in ("resting", "failed")
+
+
+def voice_line(health: VoiceHealth, *, calls: bool = True, moved: bool = True) -> str:
     """What the end of a move, a setup or a deploy says about her voice: "voice: ready" when both engines are ready
-    (speech in, speech out), not read as her and why, else with [calls] when calls work (the bridge texts once it is
-    ready), else that it loads."""
+    (speech in, speech out), not read as her and why, Pocket TTS not working or resting (VOICE_FAILED, VOICE_RESTING:
+    `moved` False names the checkout's own scripts, as before her own user the wrapper does not exist), else with
+    [calls] when calls work (the bridge texts once it is ready), else that it loads."""
     if isinstance(health, VoiceNotRead):
         return VOICE_NOT_READ.format(why=health.why)
     if _voice_ready(health):
         return "voice: ready"
+    where = (
+        {"doctor": f"{ESTIA} doctor", "check": f"{ESTIA} check (log: {ESTIA} logs voice)"}
+        if moved
+        else {"doctor": "scripts/doctor.sh", "check": "scripts/check.sh"}
+    )
+    if _speaking(health) == "failed":
+        return VOICE_FAILED.format(**where)
+    if _speaking(health) == "resting":
+        return (VOICE_RESTING if calls else VOICE_RESTING_NO_CALLS).format(**where)
     return VOICE_LOADING if calls else VOICE_LOADING_NO_CALLS
 
 
@@ -1116,20 +1157,21 @@ def voice_end(
 ) -> str:
     """The voice line at the end of a move, a setup or a deploy, once the bridge was seen up. Without [calls]: the
     state now. With [calls] and the voice still loading: read again until ready or VOICE_WAIT_SECONDS from now, so
-    "she texts you then" is said only when the bridge will count a long load and text; not read as her ends it at once.
+    "she texts you then" is said only when the bridge will count a long load and text; not read as her, or Pocket TTS
+    resting or not working (`_voice_stuck`: no wait brings it), ends it at once.
     Its caller is done by then: a Ctrl-C or a hang-up ends only the wait (VOICE_STOPPED; before her own user, `moved`
     False, VOICE_STOPPED_YOURS)."""
     try:
         found = health()
-        if not calls or _voice_ready(found) or isinstance(found, VoiceNotRead):
-            return voice_line(found, calls=calls)
+        if not calls or _voice_ready(found) or isinstance(found, VoiceNotRead) or _voice_stuck(found):
+            return voice_line(found, calls=calls, moved=moved)
         say(VOICE_WAITING)
         deadline = clock() + VOICE_WAIT_SECONDS
         while True:
             sleep(VOICE_POLL_SECONDS)
             found = health()
-            if _voice_ready(found) or isinstance(found, VoiceNotRead) or clock() >= deadline:
-                return voice_line(found)
+            if _voice_ready(found) or isinstance(found, VoiceNotRead) or _voice_stuck(found) or clock() >= deadline:
+                return voice_line(found, moved=moved)
     except KeyboardInterrupt:
         return VOICE_STOPPED if moved else VOICE_STOPPED_YOURS
 

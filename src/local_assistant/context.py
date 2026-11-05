@@ -12,6 +12,7 @@ import logging
 import math
 import re
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -57,11 +58,27 @@ def without_fake_notices(text: str) -> str:
         prompts.SETUP_FACTS_HEADER.lower(),
         "the bridge's note to the user",
     )
-    kept = [p for p in paragraphs if not _STAMP.sub("", p.lstrip(" \t\n#*_~")).lower().startswith(notices)]
+    kept: list[str] = []
+    for paragraph in paragraphs:
+        start = _STAMP.sub("", paragraph.lstrip(" \t\n#*_~")).lower()
+        if not start.startswith(notices) and not _FORGED_NOTES.match(start):
+            kept.append(paragraph)
     return "\n\n".join(kept)
 
 
 _STAMP = re.compile(r"^\[[^\]\n]{1,40}\]\s*")  # a time stamp before a notice
+# code's held-device note (prompts.DEVICE_HELD and its twins, in each wording it had: 0.9.8's "A message came from a
+# new linked device N", then "sent at", now "Signal received at") and its note after a call (prompts.CALL_ANSWERED_NOTE)
+# are in her history, so she may write their form (review of 3 Nov: a planted "send /devices ok 3 from your phone").
+# Detection only, never the gate: only the phone's own /devices ok allows a device. "A message came from the dentist"
+# stays, and so does her own explanation of the call note ("A call from one of your devices means a phone or computer
+# …"): only its own form goes, a time (calls.call_span: HH:MM or HH:MM-HH:MM) right after the comma (review of 4 Nov,
+# DLG-0983-04: her one-paragraph answer to "what does that mean?" became "Sorry, I got confused").
+_FORGED_NOTES = re.compile(
+    r"a message (?:(?:signal received|sent) at [^\n]{1,40}? )?came from "
+    r"(?:a new linked device|linked device|a device signal did not name)"
+    r"|a call from one of your devices,\s*\d{1,2}:\d{2}"
+)
 
 
 PHOTO_PREFIX = "[photo]"  # how a photo message is stored: "[photo] <caption>"
@@ -409,16 +426,20 @@ class ContextBuilder:
         results = [{"role": "tool", "tool_call_id": f"call_{c.id}", "content": _short_result(c)} for c in calls]
         return [assistant, *results]
 
-    def enforce_limit(self, conversation: Conversation) -> Conversation:
+    def enforce_limit(self, conversation: Conversation, *, extra_reply: int = 0) -> Conversation:
         """Emergency trim: far over budget, drop the oldest messages without a summary (logged); code's notes keep to
-        their own limit (`_limit_notes`). Then the whole request within the model's context window (`_fit`)."""
+        their own limit (`_limit_notes`). Then the whole request within the model's context window (`_fit`).
+        `extra_reply`: the tokens this answer may use beside the usual reply (a Deep Thinking turn's thought): the
+        history keeps that much less room for this answer only, so the oldest messages it makes way for are left out of
+        that one answer and nothing is stored (the conversation returned is a shorter window of the same one); the
+        reserve of every other answer does not change."""
         self._limit_notes(conversation)
         messages = self.window(conversation)
         total = self.window_tokens_of(messages)
         if total > self._emergency_tokens and len(messages) >= 2:
             sizes = [self.window_tokens_of([message]) for message in messages]
             conversation = self._keep_newest(conversation, messages, sizes, self._window_tokens, f"window at {total}")
-        return self._fit(conversation)
+        return self._fit(conversation, extra_reply)
 
     def history_limit(self, conversation: Conversation) -> int:
         """The history's tokens a summary keeps it under (the profiler's): `window_tokens`, or less when the model's
@@ -426,21 +447,27 @@ class ContextBuilder:
         room = self._history_room(conversation)
         return self._window_tokens if room is None else max(0, min(self._window_tokens, int(room * HISTORY_SHARE)))
 
-    def _fit(self, conversation: Conversation) -> Conversation:
+    def _fit(self, conversation: Conversation, extra_reply: int = 0) -> Conversation:
         """The whole request within the model's context window (review I24: the 16 GB tier's 16,384 tokens, where the
         history's own limits let Ollama cut the prompt without a word). Over it, the oldest messages leave her input
         without a summary (logged), down to `HISTORY_SHARE` of the room the rest leaves them, so the next requests
-        keep the same start for Ollama's cache. Checked again after a trim: the snapshot it takes may be longer."""
+        keep the same start for Ollama's cache. Checked again after a trim: the snapshot it takes may be longer.
+        `extra_reply`: more room kept free for this answer's reply (`enforce_limit`): the messages that make way for
+        it leave this answer only (`_leave_out`: no stored window start, no summary owed, no snapshot), so a chat the
+        summary limit allows is never cut for good by one thinking answer (review of 4 Nov, correctness-1)."""
         if self.context_tokens is None:
             return conversation
+        reserved = self._reserved(extra_reply)
         while True:
             messages = self.window(conversation)
             sizes = [self._cost(message) for message in messages]
             request = self._request(conversation)
-            if request + self._reserved() <= self.context_tokens or len(messages) < 2:
+            if request + reserved <= self.context_tokens or len(messages) < 2:
                 return conversation
-            keep = int((self.context_tokens - self._reserved() - (request - sum(sizes))) * HISTORY_SHARE)
-            trimmed = self._keep_newest(conversation, messages, sizes, keep, f"request at {request + self._reserved()}")
+            keep = int((self.context_tokens - reserved - (request - sum(sizes))) * HISTORY_SHARE)
+            why = f"request at {request + reserved}"
+            trim = self._leave_out if extra_reply else self._keep_newest
+            trimmed = trim(conversation, messages, sizes, keep, why)
             if trimmed is conversation:  # nothing more to drop
                 return conversation
             conversation = trimmed
@@ -453,22 +480,47 @@ class ContextBuilder:
         history = sum(self._cost(message) for message in self.window(conversation))
         return self.context_tokens - self._reserved() - (self._request(conversation) - history)
 
+    @staticmethod
+    def _keep_from(sizes: list[int], keep: int) -> int:
+        """Where the newest messages that fit `keep` tokens start (the newest always stays): the index of the first
+        one kept, 0 when nothing has to go."""
+        keep_from = len(sizes) - 1
+        kept = sizes[keep_from]
+        while keep_from > 0 and kept + sizes[keep_from - 1] <= keep:
+            keep_from -= 1
+            kept += sizes[keep_from]
+        return keep_from
+
     def _keep_newest(
         self, conversation: Conversation, messages: list[Message], sizes: list[int], keep: int, why: str
     ) -> Conversation:
         """The newest messages within `keep` tokens (the newest always): the window starts after the others, which
         leave without a summary (logged), and a new snapshot is taken, as after a summary (review of 0.9.8, memory-3: a
         fact saved in this chat, in her input only through code's note, left with that note until the next start)."""
-        keep_from = len(messages) - 1
-        kept = sizes[keep_from]
-        while keep_from > 0 and kept + sizes[keep_from - 1] <= keep:
-            keep_from -= 1
-            kept += sizes[keep_from]
+        keep_from = self._keep_from(sizes, keep)
         if keep_from == 0:
             return conversation
         self._store.move_window_start(conversation.id, messages[keep_from - 1].seq or 0)
         self.refresh_snapshot()
         log.warning("%s tokens: dropped %d oldest messages without a summary", why, keep_from)
+        return self._store.conversation(conversation.id)
+
+    def _leave_out(
+        self, conversation: Conversation, messages: list[Message], sizes: list[int], keep: int, why: str
+    ) -> Conversation:
+        """`_keep_newest` for one answer only (a Deep Thinking turn's room for its thought): the same newest messages
+        stay, the older ones leave this answer's input, and nothing is stored: no new window start, so no message is
+        left out for good with no summary to say what it held, and no snapshot. The conversation returned is a shorter
+        window of the stored one (`stored` has the whole)."""
+        keep_from = self._keep_from(sizes, keep)
+        if keep_from == 0:
+            return conversation
+        log.info("%s tokens: %d oldest messages left out of this answer only (the thought's room)", why, keep_from)
+        return replace(conversation, summary_upto_seq=messages[keep_from - 1].seq or 0)
+
+    def stored(self, conversation: Conversation) -> Conversation:
+        """The conversation as the database has it: `enforce_limit(extra_reply=…)` may have given a shorter window of
+        it, for one answer."""
         return self._store.conversation(conversation.id)
 
     def fit_turn(
@@ -508,6 +560,12 @@ class ContextBuilder:
         tools = math.ceil(self._tools_chars / self.chars_per_token())
         return request + tools + reply_tokens + CONTEXT_MARGIN_TOKENS - self.context_tokens
 
+    def room_left(self, messages: list[dict[str, Any]], reply_tokens: int) -> int | None:
+        """The tokens the model's context leaves beyond a request of these messages, this setup's tools, a reply of
+        `reply_tokens` and the margin (negative: it does not fit); None without a context. A Deep Thinking answer's
+        request gets its thought no more than this (`Brain.answer`)."""
+        return None if self.context_tokens is None else -self._over(messages, reply_tokens)
+
     def _message_tokens(self, message: dict[str, Any]) -> int:
         """A message's tokens as `json.dumps` counts it, each photo in it as `IMAGE_TOKENS` instead of its base64."""
         content = message.get("content")
@@ -517,9 +575,11 @@ class ContextBuilder:
         kept = [part for part in content if not (isinstance(part, dict) and part.get("type") == "image_url")]
         return self.estimate(json.dumps({**message, "content": kept}, ensure_ascii=False)) + IMAGE_TOKENS * len(images)
 
-    def _reserved(self) -> int:
-        """Each request's tokens beside its messages: the tools, the reply and the margin."""
-        return math.ceil(self._tools_chars / self.chars_per_token()) + self._reply_tokens + CONTEXT_MARGIN_TOKENS
+    def _reserved(self, extra_reply: int = 0) -> int:
+        """Each request's tokens beside its messages: the tools, the reply (`extra_reply` more for a Deep Thinking
+        turn's thought) and the margin."""
+        tools = math.ceil(self._tools_chars / self.chars_per_token())
+        return tools + self._reply_tokens + extra_reply + CONTEXT_MARGIN_TOKENS
 
     def _request(self, conversation: Conversation) -> int:
         """The messages of the next request as built now (a text's: a call's are smaller), in tokens."""

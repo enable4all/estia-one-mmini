@@ -99,11 +99,17 @@ _NUMBER = re.compile(rf"{_BEFORE}\d{{1,5}}{_SUFFIX}?(?:{_PART})*{_AFTER}")
 # in the street part, a number of 1-3 digits after a word of 1-3 letters and a dash, or any number right after "No" or
 # "Nr", goes with the word: "A-12 Example Road", "Example Road B-7", "Example Loop No12" (third fix review of 0.9.8,
 # spec-docs-fixrev3-01: no number started after a letter or a dash, so these went to the map with no advice); never a
-# longer word's ("Example12"), a postcode's ("B-1000 Brussels", "D02 X285", "London W8"), or one after the first comma
+# longer word's ("Example12"), a postcode's ("B-1000 Brussels", "D02 X285", "London W8"; Iceland's and the Faroes',
+# as written on post, are the only ones of a dash and 3 digits, "IS-101 Reykjavik", "FO-100 Tórshavn": 0.9.9), or one
+# after the first comma
 _LABELLED_NUMBER = re.compile(
-    rf"(?<![^\W{_CJK}])(?<![{_DASH}])(?:{_LETTER}{{1,3}}[{_DASH}]\d{{1,3}}|(?i:no|nr)\d{{1,5}})"
+    rf"(?<![^\W{_CJK}])(?<![{_DASH}])(?!(?:IS|FO)[{_DASH}]\d{{3}}(?!\d))"
+    rf"(?:{_LETTER}{{1,3}}[{_DASH}]\d{{1,3}}|(?i:no|nr)\d{{1,5}})"
     rf"{_SUFFIX}?(?:{_PART})*{_AFTER}"
 )
+# in the street part, a UK postcode as written on post stays whole: "SW1A 1AA London", "M1 1AE Manchester" lost their
+# "1AA" and "1AE" to _NUMBER (0.9.9, osm-uk-postcode-first-part); in lower case it goes, with advice, as before
+_UK_POSTCODE = re.compile(r"(?<![^\W_])([A-Z]{1,2}\d[A-Z\d]?\s\d[A-Z]{2})(?![^\W_])")
 # after the first comma a house or flat number has 1-3 digits ("Via Roma, 5", "Flat 3, 12 Example Road"), so a postcode
 # stays: 4 or 5 digits ("20100 Milano", "1000 AA Town"), or 3 and 2 ("123 45 Stockholm", the first group, kept); its
 # letters only one letter (with a number after it, "7к2") or bis, ter, quater, so a UK postcode's "1AA" stays
@@ -113,34 +119,56 @@ _LATER_NUMBER = re.compile(
     rf"{_BEFORE}(\d{{3}}\s\d{{2}}){_AFTER}|{_BEFORE}\d{{1,3}}{_LATER_SUFFIX}?(?:{_LATER_PART})*{_AFTER}"
 )
 # after the first comma, 4-5 digits with an English street word later in the part are a house number, not a postcode
-# ("c/o Alex Example, 1234 Main St"; release review of 0.9.8, G01); a postcode before a town named "St …" goes too
+# ("c/o Alex Example, 1234 Main St"; release review of 0.9.8, G01)
 _STREET_WORDS = (
     "st|street|ave|avenue|blvd|boulevard|rd|road|dr|drive|ln|lane|way|ct|court|pl|place|hwy|highway|pkwy|parkway"
     "|cir|circle|ter|terrace|trl|trail|sq|square"
 )
+_STREET_WORD = rf"(?<!{_LETTER})(?i:{_STREET_WORDS})\.?(?!{_LETTER})"
+# but "St." or "Ter" right after the number (or after a Dutch postcode's two letters), with no other street word after
+# it, starts a town's name, so the number is its postcode: "9000 St. Gallen", "83990 St-Tropez", "9561 TA Ter Apel"
+# (0.9.9, osm-st-ter-before-town: they got the advice and lost their postcode); "1234 St. Example Way" still goes
+_TOWN_NAMED_ST = (
+    rf"(?:\s[A-Z]{{2}}(?!{_LETTER}))?\s+(?:(?i:st)\.?(?:\s|[{_DASH}])*|(?i:ter)\s+)(?=[^\W\d_])"
+    rf"(?:(?!{_STREET_WORD}).)*$"
+)
 # with its dash or slash parts ("1234-B Main St"; fix review of 0.9.8, redteam-02)
 _LATER_STREET_NUMBER = re.compile(
-    rf"{_BEFORE}\d{{4,5}}{_LETTER}?(?:{_PART})*{_AFTER}(?=.*(?<!{_LETTER})(?i:{_STREET_WORDS})\.?(?!{_LETTER}))"
+    rf"{_BEFORE}\d{{4,5}}{_LETTER}?(?:{_PART})*{_AFTER}(?!{_TOWN_NAMED_ST})(?=.*{_STREET_WORD})"
 )
 # a flat part's own words ("Apt 4B, 1234 Main St", "Floor 3", "Bldg 3", "Building B", "3rd Floor"): the part after it
 # is the street, so any number there goes too; so does a part left with no word ("#4")
 _UNIT_WORDS = frozenset(
     {"flat", "apt", "apartment", "unit", "suite", "ste", "room", "appartement", "appt", "app", "wohnung", "whg"}
     | {"apartamento", "apto", "dpto", "depto", "departamento", "appartamento", "interno", "int", "mieszkanie"}
-    | {"lokal", "кв", "квартира", "διαμέρισμα"}
+    | {"lokal", "кв", "квартира", "διαμέρισμα", "rm", "lot"}
 )
-_FLAT_WORDS = _UNIT_WORDS | {"floor", "fl", "building", "bldg", "block", "blk"}
+# a floor's words; "Level 2" and "Lvl 3" since 0.9.9, as "Rm 12" and "Lot 7" a flat's (osm-level-lvl-rm-lot)
+_FLOOR_WORDS = frozenset({"floor", "fl", "level", "lvl"})
+_FLAT_WORDS = _UNIT_WORDS | _FLOOR_WORDS | {"building", "bldg", "block", "blk"}
 # a flat's or a floor's label beside its word: a letter or two, maybe with a number ("B", "B2"), an ordinal ("3rd"),
-# or a number of 1-3 digits ("A-12" read as "A" and "12"; second fix review of 0.9.8, guard-03)
-_FLAT_LABEL = re.compile(rf"{_LETTER}{{1,2}}\d{{0,3}}|\d{{1,3}}(?:st|nd|rd|th)?", re.IGNORECASE)
+# or a number of 1-3 digits ("A-12" read as "A" and "12"; second fix review of 0.9.8, guard-03), or a spelled floor
+# ("Second Floor", "Ground Floor", "Top Floor": 0.9.9, osm-spelled-ordinal-floor)
+_FLAT_LABEL = re.compile(
+    rf"{_LETTER}{{1,2}}\d{{0,3}}|\d{{1,3}}(?:st|nd|rd|th)?"
+    r"|first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|ground|top",
+    re.IGNORECASE,
+)
 # after the first comma, a flat's, a building's or a block's own number of 4-5 digits right after its word ("Suite
 # 1200", "Apt #1203", "Bldg 1234"); the word stays (fix review of 0.9.8, guards-G01); never a floor's word: a floor has
 # no 4-5 digits, and "FL" is also Florida before its ZIP code, "Miami, FL 33101" (second fix review of 0.9.8, guard-02;
 # the building's and the block's words back after the fix rounds' merge, guard-fixrev3-osm-01)
-_LATER_FLAT_WORDS = _FLAT_WORDS - {"floor", "fl"}
+_LATER_FLAT_WORDS = _FLAT_WORDS - _FLOOR_WORDS
 _LATER_FLAT_NUMBER = re.compile(
     rf"(?<!{_LETTER})((?i:{'|'.join(sorted(map(re.escape, _LATER_FLAT_WORDS), key=len, reverse=True))})\.?\s?#?\s?)"
     rf"\d{{4,5}}{_LETTER}?(?:{_PART})*{_AFTER}"
+)
+# after the first comma, a flat's, a floor's or a building's label of 1-3 letters, a dash and 1-3 digits right after its
+# word ("Unit A-12", "Building B-2"); the word stays; alone it stays, as a lettered postcode does ("B-7", "IS-101")
+# (0.9.9, osm-flat-dash-label-after-comma: _BEFORE starts no number after a dash, so "A-12" went to the map)
+_LATER_FLAT_LABEL = re.compile(
+    rf"(?<!{_LETTER})((?i:{'|'.join(sorted(map(re.escape, _FLAT_WORDS), key=len, reverse=True))})\.?\s?#?\s?)"
+    rf"{_LETTER}{{1,3}}[{_DASH}]\d{{1,3}}{_LETTER}?{_AFTER}"
 )
 _KEPT = re.compile(r"[^\W_]")  # a part with no letter or digit left ("#") goes
 # in any part, a floor with its ordinal mark and its door: "3º B", "2º Esq", "3.º Izda.", "1º 2ª", "3° piano" (the word
@@ -233,9 +261,9 @@ def _numbers_out(area: str) -> tuple[list[str], bool]:
         part = " ".join(raw.split())
         bare = _FLAT.sub(" ", part)
         if street:
-            bare = _LABELLED_NUMBER.sub(" ", _NUMBER.sub(" ", bare))
+            bare = _street_numbers_out(bare)
         else:
-            bare = _LATER_FLAT_NUMBER.sub(r"\1", bare)
+            bare = _LATER_FLAT_LABEL.sub(r"\1", _LATER_FLAT_NUMBER.sub(r"\1", bare))
             bare = _LATER_STREET_NUMBER.sub(" ", _LATER_NUMBER.sub(_postcode_kept, bare))
         bare = " ".join(bare.split())
         changed = changed or bare != part
@@ -243,6 +271,15 @@ def _numbers_out(area: str) -> tuple[list[str], bool]:
         if _KEPT.search(bare):
             parts.append(bare)
     return parts, changed
+
+
+def _street_numbers_out(part: str) -> str:
+    """The street part without its numbers (`_NUMBER`, `_LABELLED_NUMBER`), read only between its UK postcodes, so
+    each postcode stays whole ("10 Downing Street SW1A 2AA" -> "Downing Street SW1A 2AA")."""
+    pieces = _UK_POSTCODE.split(part)  # the postcodes at the odd places: the pattern's one group
+    return " ".join(
+        piece if place % 2 else _LABELLED_NUMBER.sub(" ", _NUMBER.sub(" ", piece)) for place, piece in enumerate(pieces)
+    )
 
 
 def _flat_part(bare: str, *, cut: bool) -> bool:
@@ -598,13 +635,18 @@ def _distance(a: tuple[float, float], b: tuple[float, float] | None) -> float:
 
 
 def _kind(words: list[str]) -> tuple[str, tuple[str, ...]]:
-    """What to search for as the kind of place, and the words to rank its places by: the last word, or the phrase
-    that finds a kind Nominatim knows only that way ("bicycle shop"); the others of 3 or more letters, except words
-    the map describes no place by ("good", "nearest")."""
+    """What to search for as the kind of place, and the words to rank its places by: the last word the map describes
+    a place by (the last word when it describes none by any; "vegan restaurants nearby" searched for "nearby": 0.9.9,
+    found-osm-kind-unmapped-last-word), or the phrase that finds a kind Nominatim knows only that way ("bicycle
+    shop"); the others of 3 or more letters, except words the map describes no place by ("good", "nearest")."""
     folded = [word.casefold() for word in words]
     known = next((word for word in folded if word in _KINDS), "")
-    kind = _KINDS[known] if known else words[-1]
-    others = [word for word in folded if word != known] if known else folded[:-1]
+    if known:
+        kind, others = _KINDS[known], [word for word in folded if word != known]
+    else:
+        last = len(words) - 1
+        place = next((n for n in range(last, -1, -1) if folded[n] not in _UNMAPPED), last)
+        kind, others = words[place], folded[:place] + folded[place + 1 :]
     return kind, tuple(word for word in others if _KIND_WORD.fullmatch(word) and word not in _UNMAPPED)
 
 

@@ -1,10 +1,12 @@
 """Voice notes: what audio a file holds, the local voice service (tools/voice), the spoken text, AAC.
 
-The voice service listens (WhisperKit) and speaks (Kokoro for English, Supertonic-3 for the other languages) on the
-Neural Engine, Pocket TTS on the CPU for English in its voices (heart, jane, eve, vera, alba, michael, on the Mac's model:
-the 100M beside Gemma 4 26B, the 18M beside 12B, without vera) and for Spanish, Italian, Portuguese, Dutch, German and French in jane, and on a call tells how likely the caller's last 256 ms are
-speech (Silero VAD through FluidAudio) and how sure it is that the caller's sentence is finished (Smart Turn v3.2, on
-the CPU);
+The voice service listens (WhisperKit, on the Neural Engine) and speaks only with Pocket TTS, on the CPU: English in its
+voices (heart, jane, eve, vera, alba, michael, on the Mac's model: the 100M beside Gemma 4 26B, the 18M beside 12B,
+without vera) and Spanish, Italian, Portuguese, Dutch, German and French in jane. Korean, Polish, Russian and Japanese
+have no voice, and a line Pocket TTS cannot say is said by no other voice (owner, 3 Nov 2026: Kokoro and Supertonic-3
+removed, nothing replaces them; Supertonic's upstream was archived in Sept 2026). On a call it tells how likely the
+caller's last 256 ms are speech (Silero VAD through FluidAudio) and how sure it is that the caller's sentence is
+finished (Smart Turn v3.2, on the CPU);
 the bridge only talks HTTP to it on 127.0.0.1, in one language at a time, and only over a connection whose other end a
 program of its own account holds (`peer_is_ours`): in her own user a program of the owner's could take the port while
 her service is not bound, and get the audio and send back words that count as the user's. Spoken answers are cleaned
@@ -34,7 +36,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from local_assistant import signal_text, theory
-from local_assistant.config import POCKET_LANGUAGES, canonical_voice
+from local_assistant.config import LANGUAGE_VOICE, POCKET_LANGUAGES, has_voice, pocket_voice
 from local_assistant.language import ENGLISH, STAGE_DIRECTIONS, STAGE_SOFT, STAGE_STARRED, made_of
 from local_assistant.part_status import PartStatus
 
@@ -54,18 +56,9 @@ CONTEXT_CHARS = 1000  # of what she said before a sentence, sent with it (the ti
 # again every LANGUAGES_WAIT_S, LANGUAGES_TRIES times (about 5 minutes), before a language's warm-up gives up
 LANGUAGES_WAIT_S = 15.0
 LANGUAGES_TRIES = 20
-# the voice service's header on a line another voice said in the asked one's place (Pocket TTS could not: Kokoro's
-# af_heart did in English, Supertonic-3's F1 in another language); its value, the voice, when it reads like a voice's name
+# a voice service from before 3 Nov 2026 marks a line Kokoro or Supertonic-3 said in Pocket TTS's place with this
+# header: that audio is never used (VoiceNotSaidError), whatever voice it names
 STAND_IN = "x-voice-stand-in"
-_VOICE_LIKE = re.compile(r"[a-z]{2}_[a-z]{2,20}|[a-z]{2,20}|[FM][1-9]")
-
-
-class SpokenClip(bytes):
-    """A WAV from the voice service. `stand_in`: the voice that said it in the asked one's place ("" when the asked
-    voice said it; "another voice" for a name the header gives that reads like none): a call never keeps such a clip of
-    a canned line (the review of 24 Oct: a greeting Kokoro said while Pocket TTS was still fetching stayed af_heart's)."""
-
-    stand_in: str = ""
 
 
 class VoiceError(Exception):
@@ -76,10 +69,16 @@ class VoiceUnavailableError(VoiceError):
     """The voice service is not running or still loading its models."""
 
 
-class VoiceNoStandInError(VoiceError):
-    """A call's line asked with no Kokoro stand-in (`speak(kokoro=False)`: its turn had its one Kokoro line, or the line
-    comes before her answer or a device question; owner, 28 Oct, calls-03) that Pocket TTS could not say either: the
-    voice service said nothing (409, "no_stand_in")."""
+class VoiceNotSaidError(VoiceError):
+    """Pocket TTS could not say the line (a failed or late run, a refused file, a model not downloaded yet, a voice
+    resting after failures), and no other voice says it (owner, 3 Nov 2026): the voice service's 409, or a line an
+    older voice service had Kokoro or Supertonic-3 say (STAND_IN), never played. A voice note's answer then stands as
+    text alone; on a call the rest of the turn goes as a text (calls.py)."""
+
+
+class VoiceNoLanguageError(VoiceNotSaidError):
+    """A line in a language her voice does not speak (`config.has_voice`: Korean, Polish, Russian, Japanese, which
+    Pocket TTS has no model for; owner, 3 Nov 2026): refused before any request."""
 
 
 class VoiceNotHersError(VoiceUnavailableError):
@@ -155,11 +154,9 @@ class VoiceClient:
         base_url: str,
         *,
         voice: str,
-        speed: float,
         timeout: float = 120.0,
         status: PartStatus | None = None,
         language: str = ENGLISH,
-        language_voice: str = "",
         peer: Callable[[int, int, float], bool | None] = peer_is_ours,
     ) -> None:
         parts = urllib.parse.urlsplit(base_url)
@@ -168,9 +165,8 @@ class VoiceClient:
         self._port = parts.port or 80
         self._peer = peer
         self._not_hers: bool | None = False  # the last check's verdict when it was not "hers" (logged once a change)
-        self._voice = canonical_voice(voice)  # eve-full is eve (owner, 26 Oct): the voice service knows no eve-full
-        self._language_voice = language_voice  # POCKET_LANGUAGES' voice ([voice] language_voice); "": none, as before
-        self._speed = speed
+        # eve-full is eve (owner, 26 Oct), a Kokoro id the closest Pocket voice (3 Nov 2026): the service knows neither
+        self._voice = pocket_voice(voice)
         self._timeout = timeout
         self._status = status or PartStatus(None)  # what the last real request did (doctor, /status)
         self._language = language
@@ -214,51 +210,50 @@ class VoiceClient:
         return self._voice
 
     def set_voice(self, name: str) -> None:
-        """Another voice from the next answer on (/voice <voice>): Pocket TTS's or Kokoro's, as the voice service routes it;
-        another name (eve-full) as its voice's."""
-        self._voice = canonical_voice(name)
+        """Another English voice from the next answer on (/voice <voice>): another name (eve-full) as its voice, a
+        Kokoro id (a stored choice from before 3 Nov 2026) as the closest Pocket voice (`config.pocket_voice`)."""
+        self._voice = pocket_voice(name)
 
     def voice_for(self, language: str) -> str:
-        """The voice a request in `language` names: the language voice (jane) in Spanish, Italian, Portuguese, Dutch,
-        German and French, which the voice service speaks in Pocket TTS (owner, 25 Oct), else her English voice (the
-        other four languages are Supertonic-3's F1 whatever it names). Without a language voice, hers everywhere."""
-        return self._language_voice if self._language_voice and language in POCKET_LANGUAGES else self._voice
+        """The voice a request in `language` names: jane in Spanish, Italian, Portuguese, Dutch, German and French,
+        which the voice service speaks in Pocket TTS (owner, 25 Oct), else her English voice."""
+        return LANGUAGE_VOICE if language in POCKET_LANGUAGES else self._voice
 
-    async def speak(
-        self, text: str, *, language: str | None = None, context: str = "", call: bool = False, kokoro: bool = True
-    ) -> SpokenClip:
-        """WAV audio of `text`, in the configured voice and speed and the current language (or `language`: code's
-        own words on a call are said in English). `context`: what she said just before it in English (a call's
-        earlier sentences of her answer, its last CONTEXT_CHARS), read by the voice service only for a time's part of
-        the day ("at 7:30" after "tonight" is no morning); an older voice service ignores it. `call`: a call's line,
-        for which the voice service tries a Pocket TTS voice that rests after failed runs again, so Kokoro, which an
-        Apple bug can crash with the voice service and the call, says fewer lines (the review of 28 Oct, calls-03); an
-        older voice service ignores it too. `kokoro` false: a call's line after its turn's one Kokoro line, or one before
-        her answer or a device question (owner, 28 Oct): Kokoro never stands in for it, and when Pocket TTS cannot say it the voice service says nothing
-        (VoiceNoStandInError); an older voice service ignores it, and its Kokoro line says so (`SpokenClip.stand_in`)."""
+    async def speak(self, text: str, *, language: str | None = None, context: str = "", call: bool = False) -> bytes:
+        """WAV audio of `text` in Pocket TTS, in her voice and the current language (or `language`: code's own words
+        on a call are said in English). `context`: what she said just before it in English (a call's earlier sentences
+        of her answer, its last CONTEXT_CHARS), read by the voice service only for a time's part of the day ("at 7:30"
+        after "tonight" is no morning). `call`: a call's line, for which the voice service tries a Pocket TTS voice that
+        rests after failed runs again (the review of 28 Oct, calls-03). Owner, 3 Nov 2026: no other voice says what
+        Pocket TTS cannot (VoiceNotSaidError), and a language it has no model for is never asked
+        (VoiceNoLanguageError). Every request asks for no Kokoro ("kokoro": false), so a voice service from before then
+        never has it say a line (a 409); a line it had Supertonic-3 say all the same (STAND_IN) is never played."""
         spoken = language or self._language
-        fields: dict[str, Any] = {"input": text, "voice": self.voice_for(spoken), "speed": self._speed}
+        if not has_voice(spoken):
+            raise VoiceNoLanguageError(f"no voice in {spoken}")
+        fields: dict[str, Any] = {"input": text, "voice": self.voice_for(spoken)}
         if spoken != ENGLISH:
             fields["language"] = spoken
         elif context:
             fields["context"] = context[-CONTEXT_CHARS:]
         if call:
             fields["call"] = True
-        if not kokoro:
-            fields["kokoro"] = False
+        fields["kokoro"] = False
         status, body, stand_in = await self._real(
             "POST", "/v1/audio/speech", json.dumps(fields).encode(), "application/json"
         )
         if status != 200 or not body:
             if status == 200:
                 self._status.failed("voice", "bad_answer")  # no audio
+            elif status == 409:
+                await self._record_unsaid(spoken)
             else:
                 self._record(status)
             raise _refusal(status)
         self._status.ok("voice")
-        clip = SpokenClip(body)
-        clip.stand_in = (stand_in if _VOICE_LIKE.fullmatch(stand_in) else "another voice") if stand_in else ""
-        return clip
+        if stand_in:  # an older voice service had Kokoro or Supertonic-3 say it: never played
+            raise VoiceNotSaidError("another voice said the line in Pocket TTS's place")
+        return body
 
     async def health(self) -> dict[str, str | tuple[str, ...]] | None:
         """The service's state ({"stt": ..., "tts": ...}, and "languages" once it can do them), or None when it does
@@ -343,11 +338,25 @@ class VoiceClient:
             self._status.failed("voice", "no_answer")
             raise
 
+    async def _record_unsaid(self, language: str) -> None:
+        """A line Pocket TTS did not say (409, kept on the wire: calls rely on VoiceNotSaidError): the health, read once,
+        says whether speaking in `language` still loads or does not work, recorded so for /status and doctor (the review
+        of 4 Nov: recorded ok, so /status said ok while every answer came as text); a run that failed with the model
+        ready is the service working as it should (ok)."""
+        health = await self.health()
+        state = (health or {}).get("tts" if language == ENGLISH else f"pocket_{language}")
+        if state in ("loading", "idle"):
+            self._status.failed("voice", "loading", 409)
+        elif state in ("resting", "failed", "unavailable", "refused"):
+            self._status.failed("voice", "not_working", 409)
+        else:
+            self._status.ok("voice")
+
     def _record(self, status: int) -> None:
         """What a refusal says about the service: too long or unreadable audio is the service working as it should."""
         if status == 503:
             self._status.failed("voice", "loading", status)
-        elif status in (409, 413, 415, 422):  # 409: a line asked with no Kokoro that Pocket TTS could not say
+        elif status in (409, 413, 415, 422):  # 409: a line Pocket TTS could not say (no other voice says it)
             self._status.ok("voice")
         else:
             self._status.failed("voice", "refused", status)
@@ -575,7 +584,7 @@ def _timed_out(exc: BaseException) -> bool:
 
 def _refusal(status: int) -> VoiceError:
     if status == 409:
-        return VoiceNoStandInError("Pocket TTS could not say the line, and no Kokoro stand-in was asked")
+        return VoiceNotSaidError("Pocket TTS could not say the line, and no other voice says it")
     if status == 413:
         return VoiceTooLongError("over 10 MB or 3 minutes")
     if status in (415, 422):
@@ -611,6 +620,7 @@ COMMANDS = (
     "quiet",
     "initiative",
     "evening",
+    "thinking",
     "devices",
     "lock",
     "unlock",

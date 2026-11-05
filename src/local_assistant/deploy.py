@@ -773,7 +773,7 @@ class Deploy:
         """Each of heart's voice files the commit has (owner, 27 Oct: the 100M's; 29 Oct: the 18M's, `HEART_FILES`): the
         voice service's bundle in `release` holds it, in one of its two places (`heart_places`), with the commit's own
         bytes; else the deploy stops before anything goes live, naming the file (the review of 27 Oct, swift-voice-1: a
-        build that put it elsewhere left heart Kokoro's, with nothing said). The commit's file, not a pin: root's tools
+        build that put it elsewhere left heart unsaid, with nothing said). The commit's file, not a pin: root's tools
         are older than the commit they deploy, and only a live release brings new ones (`--update-tools`)."""
         for name in HEART_FILES:
             source = release / HEART_VOICES / name
@@ -791,8 +791,8 @@ class Deploy:
         the live release's copy when its voice service is this one (the same tree) and has it, else fetched by the new
         voice service itself, as the owner (`--fetch-pocket`: the pinned GitHub release, checked by its tarball's and
         both files' sha256; the root freeze then makes it root's). An extra: a fetch that fails leaves it out, says
-        why, and the deploy goes on (Kokoro says her lines in a Pocket voice's place until an update fetches it:
-        af_heart, or am_michael for alba and michael)."""
+        why, and the deploy goes on (her answers come as text until an update fetches it: no other voice says a line,
+        owner, 3 Nov 2026)."""
         if not self.voice_built and (live / POCKET.name / POCKET_PROGRAM.name).is_file():
             self.build_step([CP, "-R", "-p", str(live / POCKET.name), f"{target}/"])
             return True
@@ -802,9 +802,8 @@ class Deploy:
         except DeployError as exc:
             self.build_step([RM, "-rf", str(target / POCKET.name)])
             self.say(
-                f"! Pocket TTS's program was not fetched: {clean(str(exc))}. Kokoro says her lines meanwhile (on a call,"
-                " one line each time she answers; the rest comes as a Signal text); the next update fetches it again"
-                " (doctor names it)."
+                f"! Pocket TTS's program was not fetched: {clean(str(exc))}. Her answers come as text meanwhile; the"
+                " next update fetches it again (doctor names it)."
             )
             return False
 

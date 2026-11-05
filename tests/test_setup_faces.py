@@ -91,8 +91,32 @@ def test_plain_yes_or_no_takes_yes_and_no_and_asks_again_otherwise(
     monkeypatch.setattr("builtins.input", lambda prompt="": next(answers))
     q = Question("safe", "yes_no", "Safe", ask="Safe?", recommended="yes")
     assert PlainFace(readers(True)).confirm(q, default=True) is said
-    assert capsys.readouterr().out.count(prompts.SETUP_YES_NO_AGAIN) == len(typed) - 1
+    assert capsys.readouterr().out.count(prompts.SETUP_YES_NO_AGAIN_PLAIN) == len(typed) - 1  # none of them Greek
     assert prompts.SETUP_YES_NO_AGAIN == "Type y or n (the keyboard may be on Greek: switch it to ABC)."
+
+
+@pytest.mark.parametrize(
+    ("typed", "greek"),
+    [
+        (["ja", "y"], False),  # a German yes: not the Greek keyboard
+        (["oui", "y"], False),
+        (["υεσ", "y"], True),  # "yes" typed on the Greek layout
+        (["nαι", "y"], True),  # one Greek letter is enough
+    ],
+)
+def test_a_yes_no_names_the_greek_keyboard_only_for_greek_letters(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], typed: list[str], greek: bool
+) -> None:
+    """P06: any word yes_or_no does not know got "the keyboard may be on Greek", "ja" too. The hint is said only when
+    the word holds a Greek letter; any other word gets "Type y or n."."""
+    answers = iter(typed)
+    monkeypatch.setattr("builtins.input", lambda prompt="": next(answers))
+    q = Question("safe", "yes_no", "Safe", ask="Safe?", recommended="yes")
+    assert PlainFace(readers(True)).confirm(q, default=False) is True
+    out = capsys.readouterr().out
+    assert prompts.SETUP_YES_NO_AGAIN_PLAIN == "Type y or n."
+    assert out.count(prompts.SETUP_YES_NO_AGAIN if greek else prompts.SETUP_YES_NO_AGAIN_PLAIN) == 1
+    assert ("Greek" in out) is greek
 
 
 def test_the_end_of_input_is_never_a_yes(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

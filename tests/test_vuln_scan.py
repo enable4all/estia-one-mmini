@@ -158,7 +158,7 @@ def test_security_says_how_holes_are_managed_and_what_is_not_covered() -> None:
         # what ships without a lockfile osv-scanner reads: the interpreter (deploy's `uv python install`), Ollama
         # (install-ollama.sh), the JVM signal-cli and the call helper (tools/call-tunnel)
         "Python itself, Ollama, signal-cli's build for calls and the call helper;",
-        "the speaking voices (Kokoro, Supertonic-3), downloaded as published with no check of their files",
+        "Homebrew's programs, kept current by Homebrew (`brew upgrade`).",  # no unpinned voice since 3 Nov 2026
         # GitHub's own limit (docs.github.com, "Disabling and enabling a workflow")
         "GitHub pauses the weekly scan after 60 days without a change to the repository",
     ):
@@ -169,6 +169,35 @@ def test_the_release_steps_name_what_the_scan_does_not_cover() -> None:
     release = (ROOT / "docs" / "agents" / "docs-release.md").read_text(encoding="utf-8")
     for words in ("Python itself", "Ollama", "the JVM signal-cli", "the call helper", "60 days"):
         assert words in release, words
+
+
+def test_each_release_compares_her_pythons_openssl_by_hand() -> None:
+    """3 Nov report: osv-scanner reads only the lockfiles, yet her connections to the web are encrypted by the OpenSSL
+    inside her Python. The release steps read it as a deploy would install it and compare it with openssl.org's
+    current release of its series; SECURITY.md says so, and doctor names it (tests/test_doctor.py)."""
+    from local_assistant.deploy import PYTHON_SERIES
+
+    release = (ROOT / "docs" / "agents" / "docs-release.md").read_text(encoding="utf-8")
+    step = release.split("- Python's OpenSSL (", 1)[1].split("\n- ", 1)[0]
+    for words in (
+        "before tagging",
+        f"`uv python install {PYTHON_SERIES} --install-dir <scratch> --no-bin`",  # as deploy installs it
+        f"`<scratch>/cpython-{PYTHON_SERIES}*/bin/python3 -I -c",
+        "import ssl; print(ssl.OPENSSL_VERSION)",
+        "OpenSSL's site, openssl-library.org (https://openssl-library.org/source/)",  # openssl.org/source/ moved there
+        "https://openssl-library.org/policies/releasestrat/",  # each series' end of support
+        "goes to the owner before tagging",
+    ):
+        assert words in step, words
+    text = (ROOT / "SECURITY.md").read_text(encoding="utf-8")
+    section = " ".join(text.split("\n## Vulnerability management\n", 1)[1].split("\n## ", 1)[0].split())
+    assert (  # fix review 7: the same site in both docs
+        "Her Python's own OpenSSL encrypts her connections to mail, calendars, maps and the web. The scan does not "
+        "cover it: before each release, the OpenSSL of the Python a deploy installs then is compared by hand with the "
+        "newest release of its series on OpenSSL's site, openssl-library.org. Doctor names her Python's version and "
+        "its OpenSSL's." in section
+    )
+    assert "openssl.org" not in step and "openssl.org" not in section
 
 
 # review X6 (0.9.7): the offline scan said "No known security hole" against a database of any age, and the release

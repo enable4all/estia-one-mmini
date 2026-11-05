@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from local_assistant.config import has_voice
 from local_assistant.language import LANGUAGES
 
 # fmt: off
@@ -12,9 +13,9 @@ __all__ = [
     "BABBLE_NONE", "BABBLE_NONE_FIRST", "BABBLE_NOT_YET", "BABBLE_NOT_YET_LINE", "BABBLE_RECAP_FAILED",
     "BABBLE_RECAP_HEADER", "BABBLE_RECAP_HEARD", "BABBLE_RECAP_IDLE", "BABBLE_RECAP_NONE", "BABBLE_RECAP_NONE_KEPT",
     "BABBLE_RECAP_NOTHING", "BABBLE_RECAP_POINT", "BABBLE_RESUMED", "BABBLE_RESUMED_LIST", "BABBLE_RUNNING",
-    "BABBLE_STARTED", "BABBLE_TAKEN", "BABBLE_UNAVAILABLE", "BABBLE_UNKNOWN", "LANGUAGE_IN_PRACTICE", "LANGUAGE_LIST",
+    "BABBLE_STARTED", "BABBLE_STARTED_NO_VOICE", "BABBLE_TAKEN", "BABBLE_UNAVAILABLE", "BABBLE_UNKNOWN", "LANGUAGE_IN_PRACTICE", "LANGUAGE_LIST",
     "LANGUAGE_NOW", "LANGUAGE_SAME", "LANGUAGE_SAME_ENGLISH", "LANGUAGE_SET", "LANGUAGE_SET_ENGLISH",
-    "LANGUAGE_UNKNOWN", "LANGUAGE_VOICE_TOO_OLD", "PRACTICE_FALLBACK", "PRACTICE_LAST", "PRACTICE_NEVER",
+    "LANGUAGE_UNKNOWN", "LANGUAGE_VOICE_TOO_OLD", "NO_VOICE_MARK", "PRACTICE_FALLBACK", "PRACTICE_LAST", "PRACTICE_NEVER",
     "PRACTICE_RECAP_INPUT", "PRACTICE_RECAP_RULES", "PRACTICE_RECAP_SCHEMA", "PRACTICE_RECAP_SHORT_WHY",
     "language_label", "language_lines", "language_list", "language_name", "practice_last",
 ]
@@ -49,6 +50,9 @@ LANGUAGE_LIST = (
     "Switch with /language and a name or code, like /language nl or /language dutch."
 )
 LANGUAGE_NOW = " ← now"
+# a language her voice does not speak (Korean, Polish, Russian, Japanese; owner, 3 Nov 2026), marked in /language's,
+# setup's and /babble's lists before one is chosen (the review of 4 Nov)
+NO_VOICE_MARK = " (text only: no voice)"
 LANGUAGE_SET = (
     "Language: {own} ({code}). From now on I listen and answer in {english}. Code-written notes stay in English."
 )
@@ -126,6 +130,11 @@ BABBLE_STARTED = (  # a bold title, then paragraphs (markup, sent as Signal's te
     "Ends with /babble off, the end of a practice call, or 30 minutes without a practice message (in quiet hours that "
     "recap waits until they end). Then a recap of at most three mistakes comes as a text."
 )
+# practice in a language her voice does not speak (Japanese, offered; voice set up): the same words but calls, which
+# are not picked up during it (CALL_NO_VOICE_PRACTICE; the review of 4 Nov), and that line follows it
+BABBLE_STARTED_NO_VOICE = BABBLE_STARTED.replace("Voice notes and calls are heard", "Voice notes are heard").replace(
+    "/babble off, the end of a practice call, or 30 minutes", "/babble off or 30 minutes"
+)
 BABBLE_LIMITS = (  # with the first start only
     "Corrections come from a local model and can be wrong. No pronunciation scoring. /voice echo on shows what was "
     "heard."
@@ -164,10 +173,12 @@ def language_label(code: str) -> str:
 
 
 def language_lines(current: str = "") -> list[str]:
-    """The 11 with their own and English names and codes, like "• Nederlands, Dutch (nl)"; the current one marked."""
+    """The 11 with their own and English names and codes, like "• Nederlands, Dutch (nl)"; those her voice does not
+    speak marked (NO_VOICE_MARK), the current one marked."""
     return [
         f"• {language.own if language.own == language.english else f'{language.own}, {language.english}'}"
-        f" ({language.code}){LANGUAGE_NOW if language.code == current else ''}"
+        f" ({language.code}){'' if has_voice(language.code) else NO_VOICE_MARK}"
+        f"{LANGUAGE_NOW if language.code == current else ''}"
         for language in LANGUAGES.values()
     ]
 

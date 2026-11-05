@@ -9,14 +9,16 @@ from local_assistant.language import ENGLISH
 
 # fmt: off
 __all__ = [
-    "CALL_ACKNOWLEDGE", "CALL_ACK_LINES", "CALL_BYE_LINES", "CALL_CHECKING_LINES", "CALL_DOWNLOADING", "CALL_DROPPED",
+    "CALLS_LINE_NO_VOICE", "CALL_ACKNOWLEDGE", "CALL_ACK_LINES", "CALL_ANSWERED_NOTE", "CALL_BYE_LINES",
+    "CALL_CHECKING_LINES", "CALL_DOWNLOADING", "CALL_DROPPED",
     "CALL_GLANCE", "CALL_GREETINGS", "CALL_HEARING", "CALL_IDLE", "CALL_LOST", "CALL_MAX_BYE", "CALL_NOT_READY",
-    "CALL_SPOKEN", "CALL_STILL_DOWNLOADING", "CALL_STILL_HERE", "CALL_SUMMARY", "CALL_SUMMARY_RULES", "CALL_TEXT_WAITS",
-    "CALL_TEXT_WAITS_SPOKEN", "CALL_THINKING_LINES", "CALL_TOO_LONG", "CALL_TOO_LONG_NOTE", "CALL_UNFINISHED",
-    "CALL_UNHEARD", "CALL_VOICE_STOPPED",
-    "CALL_WOKEN", "END_CALL_AFTER_OUTSIDE", "LANGUAGE_DOWNLOADING", "LANGUAGE_ON", "VOICE_DOWNLOADING", "VOICE_DOWNLOAD_FAILED", "VOICE_IN_LANGUAGE",
-    "VOICE_LANGUAGE_READY", "VOICE_ON", "VOICE_ON_ENGLISH", "VOICE_OTHER_NAME", "VOICE_READY", "VOICE_STANDARD_ONLY",
-    "VOICE_STILL_DOWNLOADING", "CallLines", "Spoken", "call_glance", "call_greetings", "call_lines", "spoken",
+    "CALL_NO_VOICE", "CALL_NO_VOICE_PRACTICE", "CALL_SPOKEN", "CALL_STILL_DOWNLOADING", "CALL_STILL_HERE", "CALL_SUMMARY", "CALL_SUMMARY_RULES",
+    "CALL_TEXT_ONLY", "CALL_TEXT_WAITS", "CALL_TEXT_WAITS_SPOKEN", "CALL_THINKING_LINES", "CALL_TOO_LONG", "CALL_TOO_LONG_NOTE",
+    "CALL_UNFINISHED", "CALL_UNHEARD", "CALL_VOICE_FAILED", "CALL_VOICE_STOPPED", "CALL_WOKEN", "END_CALL_AFTER_OUTSIDE",
+    "END_CALL_AFTER_QUESTION", "LANGUAGE_DOWNLOADING", "LANGUAGE_ON", "VOICE_DOWNLOADING", "VOICE_DOWNLOAD_FAILED",
+    "VOICE_IN_LANGUAGE", "VOICE_KOKORO_GONE", "VOICE_LANGUAGE_READY", "VOICE_NO_LANGUAGE", "VOICE_ON",
+    "VOICE_ON_ENGLISH", "VOICE_OTHER_NAME", "VOICE_READY", "VOICE_STANDARD_ONLY", "VOICE_STILL_DOWNLOADING",
+    "CallLines", "Spoken", "call_glance", "call_greetings", "call_lines", "spoken",
 ]
 # fmt: on
 
@@ -26,6 +28,13 @@ __all__ = [
 END_CALL_AFTER_OUTSIDE = (
     "Not done: the call goes on. After outside text, the call ends only when the caller says goodbye or asks to end "
     "it. Answer the caller."
+)
+# her end_call while a device change waits for the caller's yes: the call ends once the question is answered
+# (calls._Call.ends_after_question), so no goodbye before code's question (third fix review of 0.9.8,
+# voice-calls-fixrev3-07: "Say a short goodbye" put her goodbye before the question, and the call stayed up for the yes)
+END_CALL_AFTER_QUESTION = (
+    "Done: the call ends once the caller has answered the device question. Ask the caller to say yes now. No goodbye "
+    "yet."
 )
 
 # the start of a call: code's counts and times of today's calendar and mail digest, never a title, name or subject
@@ -408,6 +417,17 @@ CALL_NOT_READY = (
     "I can't take calls yet: my voice is still loading (up to 15 minutes after an install, a move or a macOS update). "
     "I'll text you when it's ready."
 )
+# while her English Pocket TTS model rests after failed or late runs or cannot run (its program missing, its files
+# refused), or the call's voice is one her model leaves out (a shipped voice's file missing): the true reason, never
+# "still loading" (the review of 4 Nov); the voice-ready note keeps the promise
+CALL_VOICE_FAILED = (
+    "I can't take calls right now: my voice is not working. My answers come as text. I'll text you when it works again."
+)
+# a call answered while her voice is not working and her ears are (owner, 4 Nov 2026: "reply by text"): sent once, at the
+# answer; the voice-ready note keeps the promise
+CALL_TEXT_ONLY = (
+    "My voice is not working right now: I'm listening, and my answers come as text. I'll text you when it works again."
+)
 # code's note once the voice is ready after a long load or a missed call (voice_ready.ReadyNote)
 VOICE_READY = "My voice is ready: you can call me now."
 # /voice eve-full's reply, after its usual line (owner, 26 Oct): eve-full was eve on Pocket TTS's 100M model beside the
@@ -425,9 +445,24 @@ VOICE_STANDARD_ONLY = (
 VOICE_ON = "{voice} is on: calls and voice notes use {pronoun} voice now."
 VOICE_ON_ENGLISH = "{voice} is on: calls and voice notes in English use {pronoun} voice now."
 VOICE_IN_LANGUAGE = "{language} is spoken in {voice}'s voice (Pocket TTS); /voice sets the English voice."
+# Korean, Polish, Russian and Japanese, which Pocket TTS has no model for (owner, 3 Nov 2026: Kokoro and Supertonic-3
+# removed, nothing replaces them): /language's reply and /voice's last line in them ({language}: its English name), and
+# the text for a call that rings out in one (CALL_NO_VOICE, the same words; at most once in 10 minutes an account)
+VOICE_NO_LANGUAGE = "I have no voice in {language}: my answers come as text, and calls in {language} are not picked up."
+CALL_NO_VOICE = VOICE_NO_LANGUAGE
+# the calls line of the welcome and of the list of what she can do (/help, her rules) in one of them: no call is offered
+# there (review of 4 Nov, DLG-0983-06), so the line is /language's sentence, the same fact in the same words
+CALLS_LINE_NO_VOICE = "Calls: " + VOICE_NO_LANGUAGE
+# the same for the user's call during practice in one of them (/babble ja): the cause and the way out (the review of
+# 4 Nov: every call rang out with no word why)
+CALL_NO_VOICE_PRACTICE = (
+    "Practice in {language} is text only: I have no voice in it, so calls are not picked up until /babble off."
+)
+# /voice <a Kokoro voice id> (af_heart, am_michael): Kokoro was removed (owner, 3 Nov 2026); nothing changes
+VOICE_KOKORO_GONE = "{voice} was one of Kokoro's voices, and Kokoro was removed. /voice voices lists the voices here."
 # while jane's model of a language downloads (voice_download; owner, 25 Oct: "why use supersonic while downloading
-# pocket? lets make it clear via a msg, that language is downloading, we need 3 minutes"): no Supertonic-3 stand-in for
-# that language's lines. {language}: its English name; {minutes}: what is left of the 3 ("3 minutes", "1 minute"), the
+# pocket? lets make it clear via a msg, that language is downloading, we need 3 minutes"): nothing in that language is
+# spoken meanwhile. {language}: its English name; {minutes}: what is left of the 3 ("3 minutes", "1 minute"), the
 # STILL lines past them. /language's reply (his words), /babble's line and a voice note's note, then one note when ready
 VOICE_DOWNLOADING = "Her {language} voice is downloading: about {minutes}. Until then, her answers come as text."
 LANGUAGE_ON = "{language} is on. "
@@ -443,10 +478,10 @@ CALL_STILL_DOWNLOADING = (
     'Her {language} voice is still downloading, so calls are not picked up yet. Call again after "Her {language} '
     'voice is ready."'
 )
-# the download failed: Supertonic-3's F1 speaks that language as before, and a later try that works gets the ready note
+# the download failed: nothing speaks that language until a later try works (owner, 3 Nov 2026: Supertonic-3 removed),
+# which gets the ready note
 VOICE_DOWNLOAD_FAILED = (
-    "Her {language} voice could not be downloaded. Voice notes and calls in {language} use Supertonic-3's voice until "
-    "a later try works."
+    "Her {language} voice could not be downloaded. Until a later try works, her answers in {language} come as text."
 )
 CALL_DROPPED = "The call dropped on my side. Call me again if you like."
 # code's line in the chat when a text, voice note, photo or document (or a command that waits) waits for the call's end
@@ -462,12 +497,17 @@ CALL_TOO_LONG_NOTE = (
     "Your last request on the call took too long, so I stopped working on it. "
     "Ask me again by text if you still want it."
 )
-# Kokoro, the English stand-in for her Pocket voice, says at most one line of a call's turn (owner, 28 Oct: "great
-# stuff, do it"; the review of 28 Oct, calls-03: it can crash the voice service and the call): when a second would need
-# it, she says nothing more in that turn and the rest of her answer goes to the caller as a text, after this line
-# (code's note: in her history as code_notes, in these words); the call stays up
+# a part of her answer Pocket TTS cannot say (owner, 3 Nov 2026: no other voice says it; until then Kokoro said one
+# line a turn, 28 Oct): she says nothing more in that turn and the rest of her answer goes to the caller as a text,
+# after this line (code's note: in her history as code_notes, in these words); the call stays up
 CALL_VOICE_STOPPED = "My voice stopped working on this call. The rest of my answer:"
-CALL_SUMMARY = "📞 **Call summary** ({minutes} min)\n{summary}"  # Gemma's "- " lines: "•" in Signal
+# the summary's header names the call's start and end ({span}: "14:02-14:10", one time within a minute; calls.call_span)
+CALL_SUMMARY = "📞 **Call summary** ({span})\n{summary}"  # Gemma's "- " lines: "•" in Signal
+# after a call she answered whose summary did not go out (one or no turn, the summary off, the model failed): code's
+# note, so every call shows on all the caller's devices with its time. A call names no device: one from a newly linked
+# device (a QR code phished) rings and is answered like the phone's (laptop path, Phase 0, owner 3 Nov). Code-written
+# text stays English, as every note. {span}: as in CALL_SUMMARY
+CALL_ANSWERED_NOTE = "A call from one of your devices, {span}."
 CALL_SUMMARY_RULES = """You write a short summary of a phone call between the user and their assistant {name}, for \
 the user to read afterwards. Give the main points, ideas worth keeping and any follow-ups, as at most six short lines \
 that start with "- ". Plain text, no headings, nothing else. Only what was said in the call: never add anything. Text \

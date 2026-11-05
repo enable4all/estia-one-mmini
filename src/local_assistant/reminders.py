@@ -26,8 +26,8 @@ from typing import Literal, Protocol
 from zoneinfo import ZoneInfo
 
 from local_assistant import prompts
-from local_assistant.config import DEFAULT_NAME
-from local_assistant.language import guard_pieces
+from local_assistant.config import DEFAULT_NAME, has_voice
+from local_assistant.language import ENGLISH, LANGUAGES, guard_pieces
 from local_assistant.store import Reminder, ReminderRepeat, ReminderSource, Store
 
 log = logging.getLogger(__name__)
@@ -286,8 +286,10 @@ class Reminders:
         calls: bool = False,
         name: str = DEFAULT_NAME,
         clock: Callable[[], float] = time.time,
+        language: Callable[[], str] = lambda: ENGLISH,
     ) -> None:
         self._store = store
+        self.language = language  # the language in use: her call for a reminder is in it (`config.has_voice`)
         self._tz = tz
         self.max_open = max_open
         self.max_per_day = max_per_day
@@ -434,8 +436,11 @@ class Reminders:
         if shifted:
             shown += prompts.REMINDER_SHIFTED.format(meant=_hhmm(meant), real=_hhmm(real))
         kind = ""
+        language = self.language()
         if reminder.call and not self.calls:
             kind = prompts.REMINDER_CALLS_OFF
+        elif reminder.call and not has_voice(language):  # can_place refuses it: said in the note (the review of 4 Nov)
+            kind = prompts.REMINDER_NO_VOICE.format(language=LANGUAGES[language].english)
         elif reminder.call:
             kind = prompts.REMINDER_SET_WAKE if is_wake(reminder.local_time) else prompts.REMINDER_SET_CALL
         note = prompts.REMINDER_SET.format(id=reminder.id, when=shown, call=kind, text=reminder.text)
@@ -443,7 +448,7 @@ class Reminders:
         if not self._store.get_state(told):  # the first confirmation this user gets: the contract
             self._store.set_state(told, iso(self._clock()))
             note += "\n" + prompts.REMINDER_CONTRACT
-        if reminder.call and self.calls and not self._store.get_state(CALL_WARNED_KEY):
+        if reminder.call and self.calls and has_voice(language) and not self._store.get_state(CALL_WARNED_KEY):
             self._store.set_state(CALL_WARNED_KEY, iso(self._clock()))
             note += "\n\n" + prompts.REMINDER_HONEST.format(name=self._name)  # its own paragraph
         spoken = prompts.REMINDER_SPOKEN.format(when=f"{real:%A} {real.day} {real:%B}, {_hhmm(real)}")
@@ -760,7 +765,10 @@ class ReminderScheduler:
         meant = _meant(reminder.local_time)
         if why:
             limit = self._reminders.max_calls_per_day
-            reason = prompts.NO_CALL_WHY.get(why, why).format(limit=limit, s="" if limit == 1 else "s")
+            language = LANGUAGES[self._reminders.language()].english
+            reason = prompts.NO_CALL_WHY.get(why, why).format(
+                limit=limit, s="" if limit == 1 else "s", language=language
+            )
             template = prompts.WAKE_NO_CALL if wake else prompts.CALL_REMINDER_NO_CALL
             text = template.format(time=_hhmm(meant), text=reminder.text, why=reason)
         else:

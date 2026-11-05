@@ -15,7 +15,7 @@ The firewall, its stealth mode, the interpreters on its list and the keychain lo
 
 The Mac's security has two levels, named in every text a person reads (never "default"): hardened, what setup's security
 step sets and doctor can read (SSH with keys only or off, her files private, her Registration Lock), and nuclear, that,
-the firewall on and no interpreter on its list (`security_level`; stealth mode and the keychain lock do not count).
+the firewall on and python3 and ruby off its list (`security_level`; stealth mode and the keychain lock do not count).
 
 Nothing here returns or prints a secret: the Registration Lock is set or not set, never its PIN; the bot's number is only
 used to find her account.
@@ -138,7 +138,10 @@ SSH_DROP_IN = (
     "DenyUsers _estia\n"  # her role account: no password and no shell, and never an SSH login either
 )
 DROP_IN_SOURCE = "{drop-in}"  # in the SSH apply argv: harden puts the file it wrote there
-INTERPRETERS = re.compile(r"^(python[0-9.]*|ruby)$")
+# programs that run any script, by the name the firewall's list gives: python3, python3.13, python3.13t, macOS's
+# framework Python ("Python", or its "Python.app"), ruby; in any case, as a Mac's disk ignores case by default (3 Nov
+# report: a case-sensitive match let an allow for the framework Python through)
+INTERPRETERS = re.compile(r"^(python[0-9.]*t?|ruby[0-9.]*)(\.app)?$", re.IGNORECASE)
 KEYCHAIN_SECONDS = 900  # 15 minutes
 _KEY_TYPES = re.compile(
     r"^(ssh-(ed25519|rsa|dss)|ecdsa-sha2-nistp\d+|sk-(ssh-ed25519|ecdsa-sha2-nistp256)@openssh\.com)$"
@@ -414,7 +417,8 @@ def _listed_apps(out: str) -> list[tuple[str, bool]]:
 
 
 def firewall_apps(host: Host) -> Check:
-    """Interpreters (python3, ruby) allowed to take incoming connections: any script could listen through them."""
+    """Interpreters (python3, ruby) allowed to take incoming connections: any script could listen through them. Their
+    paths are shown cleaned (`clean`) and removed as the list gives them."""
     code, out = host.run([SOCKETFILTERFW, "--listapps"], read_only=True)
     if code != 0:
         return Check(
@@ -430,11 +434,12 @@ def firewall_apps(host: Host) -> Check:
         return Check(
             "firewall_apps", "ok", "Firewall list", "no interpreter (python3, ruby) may take incoming connections"
         )
+    shown = [clean(path) for path in allowed]  # a folder someone else named reaches the owner's terminal (harden)
     return Check(
         "firewall_apps",
         "warn",
         "Firewall list",
-        f"lets {', '.join(allowed)} take incoming connections: any script run with "
+        f"lets {', '.join(shown)} take incoming connections: any script run with "
         f"{'it' if len(allowed) == 1 else 'one of them'} can listen on the network",
         f"{NUCLEAR} removes them from the list (it asks first). A local server of yours that others reach may then "
         "need its own entry: System Settings → Network → Firewall → Options",
@@ -469,35 +474,62 @@ def listeners(host: Host) -> list[tuple[str, str, str]]:
 
 # a listening socket in `netstat -anv -p tcp`: its local address, then (after four counters) its process and pid
 _NETSTAT_LISTEN = re.compile(r"^tcp[46]*\s+\d+\s+\d+\s+(\S+)\s+\S+\s+LISTEN\s+(?:\d+\s+){4}(.+?):(\d+)\s")
+# doctor's line when netstat lists no socket (3 Nov report): never a ✓ about every account's listeners. A fact (○),
+# not a "!": no setting of Estia's clears it, and the listener lines it limits are about reach, not danger
+OTHERS_UNLISTED = (
+    "other accounts' listening programs could not be listed without admin rights: only the account doctor runs as was "
+    "checked"
+)
+OTHERS_UNLISTED_FIX = f"to list every account's listening programs: {SUDO} {LSOF} -nP -iTCP -sTCP:LISTEN"
+_UNLISTED = Check("firewall_others", "info", "Firewall", OTHERS_UNLISTED, OTHERS_UNLISTED_FIX)
+# doctor's line when the firewall is on but its list cannot be read (fix review 4): no listener can be weighed then
+LIST_UNREAD = "its list could not be read: listening programs not checked"
+_LIST_UNREAD = Check(
+    "firewall_list", "info", "Firewall", LIST_UNREAD, f"to read it: {SUDO} {SOCKETFILTERFW} --listapps"
+)
+# a LISTEN state in a line of netstat's list, whether its line parses or not
+_LISTEN_STATE = re.compile(r"\sLISTEN\s")
 
 
 def _only_this_mac(address: str) -> bool:
     return address in ("127.0.0.1", "::1", "localhost") or address.startswith("127.") or address.endswith("%lo0")
 
 
-def everyones_listeners(host: Host) -> list[tuple[str, str, str]]:
-    """(name, port, program) for each program of any user that takes connections from other machines: netstat names
-    every socket's process (lsof as a user names only that user's, and doctor runs as her). The program comes from
-    proc_pidpath, else lsof or ps; "" when none names it. The listeners of the user this runs as, from lsof
-    (`listeners`), are added, since netstat started from some Pythons lists no internet sockets at all: as her (`estia
-    doctor`) those are hers, so the owner's programs come from netstat alone; the owner's own from lsof only in
-    scripts/doctor.sh before the move and in harden. Read-only, fixed argv."""
-    found = _netstat_listeners(host)
+def netstat_blind(code: int, out: str) -> bool:
+    """Whether other accounts' listeners could not be read from `netstat -anv -p tcp`: it failed, listed no internet
+    socket at all (seen on macOS 27.0.1 on 3 Nov, without admin rights, from zsh; before, from some Pythons in a
+    sandbox; whether a Terminal window lists none too is not checked yet), or printed a LISTEN line in a form it does
+    not parse (fix review 5: such a line was skipped). lsof shows only the caller's own. A netstat that lists sockets
+    is taken to list every account's, as the live Mac's did (13 Oct): one that listed only the caller's own would not
+    be noticed."""
+    if code != 0:
+        return True
+    sockets = [line for line in out.splitlines() if line.startswith("tcp")]
+    return not sockets or any(_LISTEN_STATE.search(line) and not _NETSTAT_LISTEN.match(line) for line in sockets)
+
+
+def everyones_listeners(host: Host) -> tuple[list[tuple[str, str, str]], bool]:
+    """(name, port, program) for each program of any user that takes connections from other machines, and whether
+    every account's could be read: netstat names every socket's process (lsof as a user names only that user's, and
+    doctor runs as her). The program comes from proc_pidpath, else lsof or ps; "" when none names it. The listeners
+    of the user this runs as, from lsof (`listeners`), are added, since netstat may list no internet sockets at all
+    (`netstat_blind`: then only those were read, with any lines netstat did parse): as her (`estia doctor`) those are
+    hers, so the owner's programs come from netstat alone; the owner's own from lsof only in scripts/doctor.sh before
+    the move and in harden. Read-only, fixed argv."""
+    found, every_account = _netstat_listeners(host)
     for name, port, program in listeners(host):
         if not any(
             port == seen_port and (program or name) == (seen or seen_name) for seen_name, seen_port, seen in found
         ):
             found.append((name, port, program))
-    return found
+    return found, every_account
 
 
-def _netstat_listeners(host: Host) -> list[tuple[str, str, str]]:
+def _netstat_listeners(host: Host) -> tuple[list[tuple[str, str, str]], bool]:
     code, out = host.run([NETSTAT, "-anv", "-p", "tcp"], read_only=True)
-    if code != 0:
-        return []
     found: list[tuple[str, str, str]] = []
     seen: set[tuple[str, str]] = set()
-    for line in out.splitlines():
+    for line in out.splitlines() if code == 0 else []:
         listening = _NETSTAT_LISTEN.match(line)
         if not listening:
             continue
@@ -508,7 +540,7 @@ def _netstat_listeners(host: Host) -> list[tuple[str, str, str]]:
         seen.add((pid, port))
         program = host.program_path(pid) or _executable(host, pid)
         found.append((Path(program).name if program else name.strip(), port, program))
-    return found
+    return found, not netstat_blind(code, out)
 
 
 def _allow_signed(host: Host) -> tuple[bool, bool]:
@@ -585,17 +617,21 @@ def firewall_listeners(host: Host) -> list[Check]:
     its signature (ad-hoc or unsigned, or signed while that kind of signed software is not allowed on its own); one
     blocked on the list too. With block all on, one line names every listener. The fix is the two commands with the
     program's full path (none for one in a temporary folder); names and paths are printed without control
-    characters. Nothing here changes the firewall. Nothing when the firewall is off or its list cannot be read."""
+    characters. When other accounts' listeners could not be read (`netstat_blind`), a last neutral line says so, with
+    the command that lists them all. Nothing here changes the firewall. Nothing when the firewall is off; one neutral
+    line when its list cannot be read (no listener is weighed then)."""
     code, state = host.run([SOCKETFILTERFW, "--getglobalstate"], read_only=True)
     if code != 0 or "State =" not in state or "State = 0" in state:
         return []
     code, out = host.run([SOCKETFILTERFW, "--listapps"], read_only=True)
     if code != 0:
-        return []
-    found = [(_printable(name), port, program) for name, port, program in everyones_listeners(host)]
+        return [_LIST_UNREAD]
+    listening, every_account = everyones_listeners(host)
+    found = [(_printable(name), port, program) for name, port, program in listening]
+    unlisted = [] if every_account else [_UNLISTED]
     if _blocks_all(host, state):
         if not found:
-            return []
+            return unlisted
         grouped: dict[str, tuple[str, list[str]]] = {}
         for name, port, program in found:
             grouped.setdefault(program or name, (name, []))[1].append(port)
@@ -607,7 +643,8 @@ def firewall_listeners(host: Host) -> list[Check]:
                 "Firewall",
                 f"block all incoming connections is on: {_joined(named)} cannot be reached from other machines",
                 f"if other machines should reach them: {SUDO} {SOCKETFILTERFW} --setblockall off",
-            )
+            ),
+            *unlisted,
         ]
     apps = [(host.real_path(path), ok) for path, ok in _listed_apps(out)]
     built_in, downloaded = _allow_signed(host)
@@ -649,7 +686,7 @@ def firewall_listeners(host: Host) -> list[Check]:
         )
         for program, (name, ports) in blocked.items()
     ]
-    return checks + unknown
+    return checks + unknown + unlisted
 
 
 def _executable(host: Host, pid: str) -> str:
@@ -1806,7 +1843,7 @@ _NUCLEAR_KEYS = ("firewall", "firewall_apps")  # and what --nuclear adds that ca
 
 def security_level(checks: Sequence[Check]) -> str | None:
     """The Mac's security level from the checks: "nuclear" when the security step's settings hold (SSH with keys only
-    or off, her files private, her Registration Lock), the firewall is on and no interpreter is on its list;
+    or off, her files private, her Registration Lock), the firewall is on and python3 and ruby are off its list;
     "hardened" when the security step's settings hold; "" when one of them was read and does not hold; None when one
     of them could not be read (and none was read as not held). Stealth mode and the keychain lock do not count."""
     found = {check.key: check for check in checks}
@@ -1834,7 +1871,7 @@ def level_check(checks: Sequence[Check]) -> Check:
     level = security_level(checks)
     if level == NUCLEAR_LEVEL:
         text = (
-            f"{NUCLEAR_LEVEL}: {HARDENED}, the firewall on and no interpreter on its list (the strictest of the two "
+            f"{NUCLEAR_LEVEL}: {HARDENED}, the firewall on and python3 and ruby off its list (the strictest of the two "
             "levels; stealth mode and the keychain lock do not count)"
         )
         return Check("security_level", "ok", "Security level", text)

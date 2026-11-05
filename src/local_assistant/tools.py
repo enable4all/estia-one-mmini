@@ -18,7 +18,7 @@ from zoneinfo import ZoneInfo
 
 from local_assistant import code_notes, prompts
 from local_assistant.calendar_tools import CalendarRead, CalendarTools, clean_note
-from local_assistant.calls import closes_call
+from local_assistant.calls import closes_call, without_goodbye_parts
 from local_assistant.chords import CHORDS_SCHEMA, ChordTool
 from local_assistant.chords import Result as ChordResult
 from local_assistant.claims import (
@@ -51,6 +51,7 @@ from local_assistant.reminders import ReminderError, Reminders, nearest_year, ow
 from local_assistant.store import OUTSIDE_TOOL_PREFIXES, OUTSIDE_TOOLS, FollowUp, Message, SourceKind, Store
 from local_assistant.timefmt import local_date, local_stamp
 from local_assistant.video import Kept, VideoError, VideoReader, first_link, link_in, video_id
+from local_assistant.video_find import Offer, query_for, rank, request_of
 from local_assistant.web_search import Searcher, WebResults, WebSearchError
 
 log = logging.getLogger(__name__)
@@ -72,6 +73,8 @@ Consolidate = Callable[[str, int | None, SourceKind, int | None, str | None], Aw
 LearnPage = Callable[[Page, int | None, int], Awaitable[ApplyResult]]  # page, source message, document id
 StatusReport = Callable[[], Awaitable[str]]
 ToolNote = Callable[[Message, str], Awaitable[None]]  # code's note to the user during an answer (a long video)
+# texts the found video's match to the user and keeps it for their YES (App._video_present); whether it was sent
+VideoPresent = Callable[[Message, Offer], Awaitable[bool]]
 
 
 def _home_relative(path: Path) -> str:
@@ -210,12 +213,15 @@ def project_schemas(host_label: str = DEFAULT_HOST_LABEL, projects_root: Path | 
         ),
         _function(
             "project_read",
-            "Read up to 200 lines of one file of a project; start_line pages on. Its README at every level; at level "
-            "docs also its documents (todo, setup_ files, docs/*.md); at level code also its source code (any text "
-            "file git tracks).",
+            "Read up to 200 lines of one file of a project, or list a folder (file '' is the top); start_line pages on. "
+            "A file: its README at every level; at level docs also its documents (todo, setup_ files, docs/*.md); at "
+            "level code also its source code (any text file git tracks). A folder: the names git tracks, at every level.",
             {
                 "project": name,
-                "file": {"type": "string", "description": "Path inside the project, e.g. 'docs/design.md'"},
+                "file": {
+                    "type": "string",
+                    "description": "File or folder inside the project, e.g. 'docs/design.md' or 'docs'",
+                },
                 "start_line": {"type": "integer", "description": "First line to read, default 1"},
             },
             ["project", "file"],
@@ -361,6 +367,15 @@ WEB_SCHEMAS: list[dict[str, Any]] = [
         "the links itself.",
         {"query": {"type": "string", "description": "What to search for, e.g. 'Ajax PSV score'"}},
         ["query"],
+    ),
+    _function(
+        "find_video",
+        prompts.VIDEO_FIND_DESCRIPTION,
+        {
+            "what": {"type": "string", "description": "The show, channel or topic, in the user's words"},
+            "newest": {"type": "boolean", "description": "true when the user wants the latest one"},
+        },
+        ["what"],
     ),
 ]
 # offered only with [maps] (OpenStreetMap, or Google Maps first)
@@ -545,6 +560,8 @@ class Turn:
     maps_instead: bool = False
     # links the user sent that stay tappable in her answer (a kept video's link, from an earlier message)
     allowed_links: list[str] = field(default_factory=list)
+    # the one link the user's typed YES unlocked (video_find): read_link takes it as if the user had sent it
+    unlocked: str = ""
     # YouTube videos read in this answer, by ID: a second read_link of one reads nothing again (no part calls, no
     # note); their captions are what code checks her answer against (brain: never written out)
     videos_read: dict[str, Kept] = field(default_factory=dict)
@@ -669,6 +686,7 @@ class Tools:
         self._documents = documents  # the user's PDFs and text files: off without [documents]
         self._chords = chords  # chord arithmetic on the Mac: off without [chords]
         self._notify: ToolNote | None = None
+        self._present: VideoPresent | None = None
         self._profile = profile
         self._tz = tz
         self._fetch = fetch
@@ -761,6 +779,19 @@ class Tools:
             return devices.question()
         return " ".join(result for result in turn.device_results if result.startswith("Done"))
 
+    def without_goodbye(self, turn: Turn, answer: str) -> str:
+        """On a call, her answer without any goodbye part of it, wherever it stands (`calls.without_goodbye_parts`), while
+        the device change this answer asked waits for the caller's yes. The call stays open for the yes, and ends after it when the
+        caller said goodbye or she called end_call (`END_CALL_AFTER_QUESTION`), so a goodbye of hers would stand before
+        code's question: the caller hears her ask, then the question (calls-099-01; the gate run of 4 Nov: all ten
+        answers, each with her end_call, ended "Goodbye!"). Whether she called end_call does not matter: on a live call
+        she rarely does, and code ends it on the caller's own goodbye. Her answer as it is on any other turn."""
+        devices = self._devices
+        on_call = turn.message.text.startswith(prompts.CALL_MARK)
+        if devices is None or not (on_call and turn.device_results and devices.pending):
+            return answer
+        return without_goodbye_parts(answer, name=self._name, language=self._language())
+
     def set_consolidate(self, consolidate: Consolidate) -> None:
         self._consolidate = consolidate
 
@@ -779,6 +810,10 @@ class Tools:
         link = first_link(message.text)
         here = prompts.VIDEO_IN_MESSAGE.format(link=link) if link is not None else ""
         return "\n\n".join(line for line in (kept, here) if line)
+
+    def set_present(self, present: VideoPresent) -> None:
+        """How the match of find_video reaches the user, and waits for their YES."""
+        self._present = present
 
     def set_notify(self, notify: ToolNote) -> None:
         """How code's note reaches the user during an answer (before a long video is read)."""
@@ -827,6 +862,8 @@ class Tools:
             return f"({name} result not kept: Spotify content is never stored)"
         if name == "web_search" and result.startswith("Web results"):  # Brave's terms: used for this answer only
             return f"({name} result not kept: web results are never stored)"
+        if name == "find_video":  # a search like web_search's: its results are never stored
+            return f"({name} result not kept: its search results are never stored)"
         if name == "read_link" and result.startswith(prompts.VIDEO_MARK):  # captions are never stored
             return prompts.VIDEO_STUB
         if name in DOCUMENT_TOOLS:  # her index keeps the text; the log and later replays never do
@@ -901,6 +938,8 @@ class Tools:
             return await self._maps_tool(turn, self._maps, name, args)
         if name == "web_search" and self._web is not None:
             return await self._web_tool(turn, self._web, args)
+        if name == "find_video" and self._web is not None:
+            return await self._find_video(turn, self._web, args)
         if name in REMINDER_TOOLS and self._reminders is not None:
             return self._reminder_tool(turn, self._reminders, name, args)
         if name == "chords" and self._chords is not None:
@@ -911,6 +950,8 @@ class Tools:
             if not self.may_end_call(turn):
                 return prompts.END_CALL_AFTER_OUTSIDE
             turn.end_call = True
+            if self._devices is not None and self._devices.pending:  # it ends once the yes question is answered
+                return prompts.END_CALL_AFTER_QUESTION
             return "Done: the call ends after your answer. Say a short goodbye."
         raise ValueError(f"unknown tool {name!r}")
 
@@ -1156,9 +1197,10 @@ class Tools:
             raise ValueError("Spotify did not answer in time; try again in a moment.") from None
         raise ValueError(f"unknown tool {name!r}")
 
-    async def _web_tool(self, turn: Turn, web: Searcher, args: dict[str, Any]) -> str:
-        """At most two searches; never after mail, calendar, project, document or history text (Gemma could put
-        private text in a query)."""
+    @staticmethod
+    def _web_refusal(turn: Turn) -> str | None:
+        """Why no search may go out in this answer (private text must not go to a search engine): after mail, calendar,
+        project, document or history text. Shared by web_search and find_video, whose words leave the Mac alike."""
         if turn.read_mail_or_calendar:
             return (
                 "Not searched: an answer that read mail or the calendar cannot search the web (private text must not "
@@ -1180,10 +1222,25 @@ class Tools:
                 "calendar and document text, which must not go to a search engine). Tell the user to ask for the "
                 "search in a new message."
             )
-        on_call = turn.message.text.startswith(prompts.CALL_MARK)  # a call turn has 45 s in all: one search
+        return None
+
+    @staticmethod
+    def _search_limit(turn: Turn, on_call: bool) -> str | None:
+        """The per-answer cap on searches, web_search's and find_video's together: two, one on a call (a call turn has
+        45 s in all)."""
         if turn.searches >= (1 if on_call else MAX_SEARCHES):
             limit = "one search per message is" if on_call else "two searches per message are"
             return f"Not searched: {limit} the limit. Don't search again; answer with what you have."
+        return None
+
+    async def _web_tool(self, turn: Turn, web: Searcher, args: dict[str, Any]) -> str:
+        """At most two searches; never after mail, calendar, project, document or history text (Gemma could put
+        private text in a query)."""
+        if (refusal := self._web_refusal(turn)) is not None:
+            return refusal
+        on_call = turn.message.text.startswith(prompts.CALL_MARK)  # a call turn has 45 s in all: one search
+        if (limit := self._search_limit(turn, on_call)) is not None:
+            return limit
         query = " ".join(str(args.get("query") or "").split())
         if not query:
             raise ValueError("the search words are empty.")
@@ -1205,6 +1262,43 @@ class Tools:
         turn.untrusted = True
         turn.web.append(found)
         return _web_text(query, found, self._web_result_chars)
+
+    async def _find_video(self, turn: Turn, web: Searcher, args: dict[str, Any]) -> str:
+        """A video the user asks for: the same guards as web_search (its words leave the Mac alike: never after mail,
+        calendar, project, document or history text, never words drawn from a note quoting them, the same cap per
+        answer, private details refused, no key the same answer). Code searches and ranks, texts ONE match as its own
+        message and waits for the user's typed YES; her result holds no title or channel (no outside text reaches her)."""
+        if (refusal := self._web_refusal(turn)) is not None:
+            return refusal
+        on_call = turn.message.text.startswith(prompts.CALL_MARK)
+        if (limit := self._search_limit(turn, on_call)) is not None:
+            return limit
+        what = " ".join(str(args.get("what") or "").split())
+        if not what:
+            raise ValueError("the search words are empty.")
+        if self._private(turn, what):
+            return prompts.SEARCH_FROM_NOTES
+        newest = args.get("newest") is True or str(args.get("newest")).lower() == "true"
+        turn.searches += 1
+        turn.used_web = True
+        try:
+            found = await asyncio.wait_for(web.search_videos(query_for(what, newest=newest)), self._web_timeout)
+        except ValueError:
+            turn.searches -= 1  # refused before anything was sent (private details): it cost nothing
+            raise
+        except (WebSearchError, TimeoutError) as exc:
+            log.warning("video search for message %d: %s", turn.message.id, type(exc).__name__)
+            turn.searches = MAX_SEARCHES  # every provider just failed: another try would only wait again
+            return WEB_UNAVAILABLE
+        matches = rank(what, found.results, newest=newest)
+        if not matches:
+            return prompts.VIDEO_FIND_NONE
+        message = turn.message
+        offer = Offer(message.peer_aci, message.conversation_id, request_of(message), matches)
+        if self._present is None or not await self._present(message, offer):
+            return prompts.VIDEO_FIND_NOT_SENT
+        log.info("video search for message %d: %d matches, the first texted", message.id, len(matches))
+        return prompts.VIDEO_FIND_RESULT_CALL if on_call else prompts.VIDEO_FIND_RESULT
 
     async def _maps_tool(self, turn: Turn, maps: Mapper, name: str, args: dict[str, Any]) -> str:
         """Places and routes (OpenStreetMap, or Google first once set up): never after mail, the user's projects,
@@ -1623,6 +1717,8 @@ class Tools:
         kept = videos.kept(message.peer_aci, message.conversation_id, video)
         if kept is None:
             link = link_in(message.text, video)
+            if link is None and turn.unlocked and video_id(turn.unlocked) == video:
+                link = turn.unlocked  # the user's typed YES unlocked this one link (video_find): code's own, rebuilt
             if link is None:  # a link in the current message names this video (in any of its forms)
                 return prompts.VIDEO_REFUSED
             try:

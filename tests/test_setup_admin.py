@@ -430,6 +430,77 @@ def test_the_security_steps_held_section_holds_the_windows_stops(tmp_path: Path)
         assert face.admin([SUDO, "-n", "/bin/launchctl", "bootout", "system/x"]) == setup_admin.Ran(0, "")
 
 
+class ClosesAfter(Scripted):
+    """A window the person closes right after one admin command's end, before setup sends the next one."""
+
+    def __init__(self, admin: list[dict[str, Any]], after: str) -> None:
+        super().__init__(admin=admin)
+        self.after = after  # the command's id (a1, a2, …)
+
+    def done(self, aid: str, entry: dict[str, Any]) -> None:
+        super().done(aid, entry)
+        if aid == self.after:
+            self.incoming.append({"t": "closed"})
+
+
+def test_a_window_closed_inside_the_held_section_signs_in_terminal_before_her_pin(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review W20: the window closed between her bootout (through macOS's box) and her PIN, inside harden's held
+    section. Terminal then ran the PIN helper and her start with `sudo -n`, which has no sign-in there: both failed,
+    and she stayed stopped. Terminal's sudo now asks for the Mac password once, first; the PIN is set and she runs
+    again."""
+    from local_assistant import harden
+
+    plist = tmp_path / "com.local-assistant.bridge.plist"
+    plist.write_text("x")
+    monkeypatch.setattr(harden, "PLIST", plist)
+    monkeypatch.setattr(Wizard, "own_user", lambda self: True)
+    window = ClosesAfter([{"code": 0}, {"code": 0}], after="a2")  # the box's authorize, her bootout; then closed
+    _wizard, face = in_the_window(tmp_path, window)
+    said: list[str] = []
+    host = setup_admin.WindowHost(face, Path("/"), say=said.append, why=prompts.ADMIN_WHY_SECURITY)
+    terminal: list[tuple[str, ...]] = []  # what ran in Terminal (never a real command: a fake Mac)
+    signed_in = [False]  # Terminal's own sudo sign-in: the window's box never gives one
+
+    def run(self: hostsec.Host, argv: Any, **kwargs: Any) -> tuple[int, str]:
+        terminal.append(tuple(argv))
+        if list(argv) == [SUDO, "-v"]:
+            signed_in[0] = True
+            return 0, ""
+        if argv[0] == SUDO and not signed_in[0]:
+            return 1, "sudo: a password is required\n"
+        if list(argv[:2]) == [LAUNCHCTL, "print"]:
+            stopped = any("bootout" in m["argv"] for m in window.sent("admin"))
+            started = any("bootstrap" in ran for ran in terminal)
+            return (0, "pid = 77\n") if started or not stopped else (113, harden.NOT_LOADED)
+        if argv[-1] == "--set-pin":
+            return 0, "Registration Lock: on\n"
+        return 0, ""
+
+    monkeypatch.setattr(hostsec.Host, "run", run)
+    step = harden.Harden(
+        host,
+        owner="alex",
+        owner_home=tmp_path,
+        own_user=True,
+        ask=lambda question, default: True,
+        hidden=lambda prompt: "731904",
+        say=said.append,
+        tailscale_tools=(),
+        sleep=lambda seconds: None,
+        window=host.window_open,
+        held=host.stops_held,
+    )
+    step.registration_lock()
+    assert [m["argv"][1:2] for m in window.sent("admin")] == [[], ["bootout"]]  # the authorize (true), her bootout
+    sudo = [argv for argv in terminal if argv[0] == SUDO]
+    assert sudo[0] == (SUDO, "-v") and sudo.count((SUDO, "-v")) == 1  # asked once, first
+    assert sudo[1][-1] == "--set-pin" and "bootstrap" in sudo[2] and len(sudo) == 3
+    assert harden.PASSWORD_HERS in said  # Terminal's words for its password
+    assert "✓ Registration Lock: on; she runs again." in said
+
+
 def test_a_stop_pressed_while_setup_worked_is_honoured_before_the_next_command(tmp_path: Path) -> None:
     """Stop here during work setup reads nothing from (a download, a check): the next admin command or owner command
     never starts, and setup stops (review FRIEND-4: macOS's box showed after Stop)."""
@@ -1351,7 +1422,7 @@ def test_her_voice_is_installed_in_the_window_its_review_a_screen(tmp_path: Path
     window = Scripted(
         admin=[
             {"lines": ["2 new commit(s) since the live abc1234:", "  def5678 calls", REVIEW_ASK], "after": ["✓ live"]},
-            {"lines": ['{"stt":"ready","tts":"ready"}']},
+            {"lines": ['{"stt":"ready","tts":"ready"}'], "ends": True},  # its input open: it ends by itself
         ],
         answers=[True],
     )
@@ -1364,7 +1435,8 @@ def test_her_voice_is_installed_in_the_window_its_review_a_screen(tmp_path: Path
     assert review["id"] == "deploy_review" and review["ask"] == REVIEW_ASK[3:]
     assert "def5678 calls" in str(review["more"]) and review["recommended"] is None
     assert wait["argv"] == [SUDO, "-n", "-u", "_estia", "-H", "--", "/usr/bin/env", "-i", "HOME=/var/estia",
-                            "PATH=/usr/bin:/bin", "/bin/bash", "-c", ownuser.VOICE_WAIT_AS_HER]  # fmt: skip
+                            "PATH=/usr/bin:/bin", "/bin/bash", "-c", ownuser.VOICE_WAIT_AS_HER_WINDOW]  # fmt: skip
+    assert wait["open"] is True and wait["input"] is None  # its input's end ends it (W19); nothing written there
     assert {deploy["why"], wait["why"]} == {prompts.ADMIN_WHY_CALLS}
     assert any(m["line"] == "voice: ready" for m in window.sent("progress"))
 
@@ -1374,13 +1446,99 @@ def test_her_voice_is_installed_in_the_window_its_review_a_screen(tmp_path: Path
     [
         ('{"stt":"failed","tts":"ready"}', 1, "voice: failed"),
         ('{"stt":"loading","tts":"loading"}', 3, "still loading after 20 minutes"),
+        # the review of 4 Nov: Pocket TTS resting after failed runs is tried again on its own, never "failed"
+        ('{"stt":"ready","tts":"resting","pocket":"unavailable"}', 3, "voice: resting after failed runs"),
     ],
 )
 def test_her_voice_state_reads_as_the_script_reads_it(tmp_path: Path, state: str, code: int, said: str) -> None:
-    window = Scripted(admin=[{"lines": [REVIEW_ASK]}, {"lines": [state]}], answers=[True])
+    window = Scripted(admin=[{"lines": [REVIEW_ASK]}, {"lines": [state], "ends": True}], answers=[True])
     wizard, _face = in_the_window(tmp_path, window)
     assert wizard._voice_in_window() == code
     assert any(said in str(m["line"]) for m in window.sent("progress"))
+
+
+VOICE_LOADING = '{"stt":"loading","tts":"loading"}'
+
+
+def test_a_stop_during_the_voice_wait_ends_it_within_one_look(tmp_path: Path) -> None:
+    """Review W19: Stop here during the wait for her voice (up to 240 looks, 5 s apart: about 20 minutes) only said
+    that the command finishes first, and the window waited for all of it. The window's wait reads its input between
+    looks: setup ends that input at once, the wait ends after the look it is in, with its last answer, and setup
+    stops."""
+    window = Scripted(
+        admin=[{"lines": [REVIEW_ASK], "after": ["✓ live"]}, {"stop": True, "after": [VOICE_LOADING]}], answers=[True]
+    )
+    wizard, _face = in_the_window(tmp_path, window)
+    with pytest.raises(KeyboardInterrupt):
+        wizard._voice_in_window()
+    _deploy, wait = window.sent("admin")
+    assert wait["open"] is True and wait["argv"][-1] == ownuser.VOICE_WAIT_AS_HER_WINDOW
+    sent = [(m["t"], m.get("id")) for m in window.messages]
+    assert ("admin_end", wait["id"]) in sent and window.incoming == []  # its end read: never left running as root
+    assert [m["line"] for m in window.sent("progress")].count(prompts.SETUP_WINDOW_FINISHES_FIRST) == 1
+
+
+def test_a_ctrl_c_during_the_voice_wait_ends_it_too(tmp_path: Path) -> None:
+    """Review W19: a Ctrl-C in Terminal during the wait was only noted, and said nothing until the wait's end. It
+    ends the wait's input too: said at once, and setup stops after the look it is in."""
+
+    class CtrlC(Scripted):
+        def receive(self, seconds: float | None = None) -> dict[str, object] | None:
+            if self.pending is not None and self.pending[0] == "a2" and not self.inputs[1:]:
+                self.inputs.append("ctrl-c")  # once
+                os.kill(os.getpid(), signal.SIGINT)  # what the terminal sends to setup
+            return super().receive(seconds)
+
+    window = CtrlC(admin=[{"lines": [REVIEW_ASK], "after": ["✓ live"]}, {"after": [VOICE_LOADING]}], answers=[True])
+    wizard, _face = in_the_window(tmp_path, window)
+    with pytest.raises(KeyboardInterrupt):
+        wizard._voice_in_window()
+    assert {"t": "admin_end", "id": "a2"} in window.messages and window.incoming == []
+    assert [m["line"] for m in window.sent("progress")].count(prompts.SETUP_WINDOW_FINISHES_FIRST) == 1
+
+
+def curl_stand_in(folder: Path, answers: list[str]) -> Path:
+    """A stand-in for curl that never reaches her voice service: each look gets the next answer (the last one
+    again once they run out), and each look is counted in `looks`."""
+    folder.mkdir()
+    for n, answer in enumerate(answers, 1):
+        (folder / f"answer{n}").write_text(answer)
+    curl = folder / "curl"
+    curl.write_text(
+        "#!/bin/bash\n"
+        f'cd "{folder}" || exit 1\n'
+        'echo look >>looks; n=$(wc -l <looks | tr -d " ")\n'
+        f'[ -f "answer$n" ] || n={len(answers)}\n'
+        'cat "answer$n"\n'
+    )
+    curl.chmod(0o755)
+    return folder
+
+
+@pytest.mark.parametrize("ends", [True, False], ids=["input-ended", "input-open"])
+def test_the_windows_voice_wait_ends_when_its_input_ends(tmp_path: Path, ends: bool) -> None:
+    """Review W19: the window's wait text (bash 3.2, macOS's /bin/bash) with curl stood in. Its input ended (Stop
+    here, a Ctrl-C), it ends after one look with that look's answer. Its input open, it looks again 5 s later (bash
+    3.2's `read -t` ends its wait with the same exit as an ended input: told apart by the time it took)."""
+    folder = curl_stand_in(tmp_path / "bin", [VOICE_LOADING, '{"stt":"ready","tts":"ready"}'])
+    began = time.monotonic()
+    with subprocess.Popen(
+        ["/bin/bash", "-c", ownuser.VOICE_WAIT_AS_HER_WINDOW],
+        stdin=subprocess.DEVNULL if ends else subprocess.PIPE,  # open: nothing is ever written to it
+        stdout=subprocess.PIPE,
+        env={"HOME": str(tmp_path), "PATH": f"{folder}:/usr/bin:/bin"},
+        text=True,
+    ) as wait:
+        try:
+            wait.wait(timeout=30)  # its input stays open meanwhile: never communicate(), which ends it
+        finally:
+            wait.kill()  # nothing once it ended
+        out = wait.stdout.read() if wait.stdout else ""
+    looks = (folder / "looks").read_text().count("look")
+    if ends:
+        assert (out, looks) == (VOICE_LOADING, 1) and time.monotonic() - began < 3
+        return
+    assert (out, looks) == ('{"stt":"ready","tts":"ready"}', 2) and time.monotonic() - began >= 4
 
 
 def test_stop_here_at_the_deploys_question_ends_its_input_and_stops_after_it(tmp_path: Path) -> None:
@@ -1419,7 +1577,9 @@ def test_her_updates_whole_list_is_in_its_more_fold_one_item_a_line(tmp_path: Pa
 def test_admin_rights_not_given_at_the_voice_wait_say_so(tmp_path: Path) -> None:
     """Review W04 (optional part): Cancel at macOS's box for the wait that reads her voice, then Not now: nothing
     failed, so calls are said as not on yet for admin rights not given, never "stopped. Fix what it says above"."""
-    window = Scripted(admin=[{"lines": [REVIEW_ASK], "after": ["✓ live"]}, {"refuse": True}], answers=[True, False])
+    window = Scripted(
+        admin=[{"lines": [REVIEW_ASK], "after": ["✓ live"]}, {"refuse": True, "ends": True}], answers=[True, False]
+    )
     wizard, _face = in_the_window(tmp_path, window)
     assert wizard._voice_in_window() == 1
     assert wizard.calls_not_on == prompts.SETUP_CALLS_REFUSED
@@ -1471,7 +1631,6 @@ def test_calls_not_on_after_a_no_or_admin_rights_not_given_say_so(
     for name in ("_release_has_calls", "_voice_installed", "_tunnel_built"):
         monkeypatch.setattr(setup_extras, name, lambda: False)
     monkeypatch.setattr(setup_extras.ExtrasSteps, "_signal_cli_version", lambda self: [])
-    monkeypatch.setattr(setup_extras, "_macos_version", lambda: "27.1")
     window = Scripted(admin=[entry], answers=answers)
     wizard, _face = in_the_window(tmp_path, window)
     wizard.planned["calls"] = "yes"
@@ -1530,10 +1689,14 @@ def test_the_calls_step_in_the_window_installs_her_voice_and_deploys_there(
 def test_the_window_waits_for_her_voice_as_the_script_does() -> None:
     script = (ROOT / "scripts/install-voice-daemon.sh").read_text(encoding="utf-8")
     assert f"wait_as_her='{ownuser.VOICE_WAIT_AS_HER}'" in script
+    # the window's own differs in one place only: it reads its input between looks, so its end ends it (W19)
+    look = "looked=$SECONDS; read -r -t 5 _; (( SECONDS - looked > 2 )) || break;"
+    assert ownuser.VOICE_WAIT_AS_HER.replace(" sleep 5;", f" {look}") == ownuser.VOICE_WAIT_AS_HER_WINDOW
+    assert ownuser.VOICE_WAIT_AS_HER.count(" sleep 5;") == 1
     assert '"$sudo" "$estia_deploy" --voice "$repo"' in script
-    for line in prompts.SETUP_VOICE_WARN_27.splitlines():
-        assert line in script, line
-    assert not hasattr(prompts, "SETUP_VOICE_WARN_26") and "26.4" not in script  # macOS 27 or later only (29 Oct)
+    # no macOS warning: 27.0.x's was about Kokoro, removed 3 Nov 2026; macOS 27 or later only (29 Oct)
+    assert not hasattr(prompts, "SETUP_VOICE_WARN_27") and "Apple bug" not in script and "sw_vers" not in script
+    assert not hasattr(prompts, "SETUP_VOICE_WARN_26") and "26.4" not in script
     from local_assistant import deploy
 
     assert deploy.ASK_MARK == setup_admin.ASK_MARK
@@ -1557,9 +1720,11 @@ def test_a_script_that_runs_her_command_runs_it_as_her_in_the_window(
 ) -> None:
     """In her own macOS account these scripts only run her command as her (`exec sudo estia …`): sudo has no
     terminal in the window, so the window runs her command itself, macOS's own box asking for the admin rights."""
-    from local_assistant import setup
+    from local_assistant import setup, setup_extras
 
     monkeypatch.setattr(Wizard, "own_user", lambda self: True)
+    for relative in setup_extras.FLUSHES.values():  # her release prints each line at once (W22)
+        her_release_file(relative, "def said(line: str) -> None:\n")
     window = Scripted(admin=[{"lines": ["✓ found"]}])
     wizard, _face = in_the_window(tmp_path, window)
     assert wizard._extra_offer(name, [str(setup.REPO / "scripts" / script), *args]) is True
@@ -1845,8 +2010,81 @@ def test_her_release_from_before_the_windows_spotify_sign_in_names_it_for_termin
     script = "spotify-login.sh"
     wizard._extra_offer("music", [str(setup.REPO / "scripts" / script)], window=wizard._in_window(script))
     assert not window.sent("admin")
-    text = prompts.SETUP_WINDOW_SPOTIFY_OLD.format(command=f"{SUDO} {ESTIA} spotify-login")
+    text = old_release_line("spotify-login", f"{SUDO} {ESTIA} spotify-login")
+    assert text.startswith(
+        "Her release asks for Spotify's address only in Terminal (an update brings the window's way)"
+    )
     assert text in [m["line"] for m in window.sent("progress")] and wizard.for_terminal == (text,)
+
+
+def old_release_line(hers: str, command: str) -> str:
+    """The line that names her command for Terminal when her live release does it only there."""
+    return prompts.SETUP_WINDOW_RELEASE_OLD.format(what=prompts.SETUP_WINDOW_RELEASE_OLD_WHAT[hers], command=command)
+
+
+def her_release_file(relative: str, text: str) -> None:
+    """One file of her live release, under the test's root (her release is root's, 0755: setup reads it as you)."""
+    from local_assistant.hostsec import estia_root
+
+    source = estia_root() / ownuser.CURRENT.relative_to("/") / relative
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_text(text)
+
+
+@pytest.mark.parametrize("flushes", [False, True], ids=["old-release", "flushing-release"])
+def test_window_lights_with_an_old_live_release_names_the_terminal_command(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, flushes: bool
+) -> None:
+    """W22: her live release's hue.py from before its flushing said() holds the prompt to press the Hue Bridge's button
+    until the pairing ends, after its 60 seconds: in the window `estia hue-pair` never runs, and setup names it for
+    Terminal, in the log and the closing list. A release with said() runs it in the window as before."""
+    from local_assistant import setup
+
+    monkeypatch.setattr(Wizard, "own_user", lambda self: True)
+    her_release_file("tools/tapo/hue.py", "def said(line: str) -> None:\n" if flushes else "print('Press it now')\n")
+    window = Scripted(admin=[{"lines": ["✓ Paired."], "code": 0}], answers=[True])
+    wizard, _face = in_the_window(tmp_path, window)
+    script = "hue-pair.sh"
+    ran = wizard._extra_offer("lights", [str(setup.REPO / "scripts" / script)], window=wizard._in_window(script))
+    lines = [m["line"] for m in window.sent("progress")]
+    text = old_release_line("hue-pair", "/usr/bin/sudo /usr/local/estia/bin/estia hue-pair")
+    if flushes:
+        [admin] = window.sent("admin")
+        assert ran and admin["argv"] == [ESTIA, "hue-pair"]
+        assert text not in lines and wizard.for_terminal == ()
+        return
+    assert not ran and not window.sent("admin") and not window.sent("screen")  # nothing to run here: no Run it
+    assert text in lines and wizard.for_terminal == (text,)
+    assert "/usr/bin/sudo /usr/local/estia/bin/estia hue-pair" in text and "Hue Bridge's button" in text
+
+
+@pytest.mark.parametrize("flushes", [False, True], ids=["old-release", "flushing-release"])
+def test_window_mail_with_an_old_live_release_names_the_terminal_command(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, flushes: bool
+) -> None:
+    """W22: her live release's mail_auth.py from before its flushing said() holds Microsoft's code until the sign-in
+    ends, up to 15 minutes later: in the window `estia mail-login` never runs, and setup names it for Terminal, with
+    the mailbox's address, in the log and the closing list. A release with said() runs it in the window as before."""
+    from local_assistant import setup
+
+    monkeypatch.setattr(Wizard, "own_user", lambda self: True)
+    source = "def said(line: str) -> None:\n" if flushes else "print(message)\n"
+    her_release_file("src/local_assistant/mail_auth.py", source)
+    window = Scripted(admin=[{"lines": ["✓ Signed in."], "code": 0}], answers=[True])
+    wizard, _face = in_the_window(tmp_path, window)
+    script = "mail-login.sh"
+    command = [str(setup.REPO / "scripts" / script), "you@example.com"]
+    ran = wizard._extra_offer("mail", command, window=wizard._in_window(script))
+    lines = [m["line"] for m in window.sent("progress")]
+    text = old_release_line("mail-login", "/usr/bin/sudo /usr/local/estia/bin/estia mail-login you@example.com")
+    if flushes:
+        [admin] = window.sent("admin")
+        assert ran and admin["argv"] == [ESTIA, "mail-login", "you@example.com"]
+        assert text not in lines and wizard.for_terminal == ()
+        return
+    assert not ran and not window.sent("admin") and not window.sent("screen")  # nothing to run here: no Run it
+    assert text in lines and wizard.for_terminal == (text,)
+    assert "Microsoft's sign-in code" in text
 
 
 @pytest.mark.runs_commands  # its own program, never a script of the repo

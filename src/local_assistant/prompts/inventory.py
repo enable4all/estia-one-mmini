@@ -10,7 +10,8 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-from local_assistant.config import DEFAULT_HOST_LABEL, DEFAULT_VOICE, POCKET_VOICES, canonical_voice
+from local_assistant.config import DEFAULT_HOST_LABEL, has_voice
+from local_assistant.language import ENGLISH
 
 # fmt: off
 __all__ = [
@@ -39,14 +40,15 @@ TOOL_LINES = {
     "remember": "a lasting fact about you saved, only when you ask (/profile lists them)",
     "forget": "a fact taken off your profile, only when you ask",
     "learn_link": "a page you send, read for facts about you to save, only when you ask",
-    "read_link": "a page or a YouTube video you send, summarised; a page's text kept for later searches",
+    "read_link": "a page or a YouTube video you send, or one I found after you type YES, summarised; a page's text "
+    "kept for later searches",
     "mini_status": "{Host}'s health: the model, disk, memory, uptime, errors and Signal",
     "mail_digest": "your mail now: what needs a reply and new actions, read only",
     "mail_search": "your mail searched by sender, subject or words, read only",
     "mail_read": "one mail read in full, by its number; mail is never sent, moved, deleted or marked",
     "project_list": "your projects, each with its level (summary, docs or code)",
     "project_status": "one project's overview: its README, open items and recent changes, read only",
-    "project_read": "one file of a project that git tracks, within the project's level, read only",
+    "project_read": "one file of a project that git tracks, within the project's level, or a folder's file names, read only",
     "project_search": "a project's files searched for words, at level docs or code, read only",
     "search_documents": "your PDFs and text files searched; each answer names the document and the page",
     "read_document": "a page of one of your PDFs or text files read, up to three at a time, read only",
@@ -56,6 +58,7 @@ TOOL_LINES = {
     "calendar_agenda": "your calendar for a day or up to 14 days, read only, never changed",
     "calendar_search": "your calendar searched for an event in the coming year, read only, never changed",
     "web_search": "the web searched for current facts; answers name their sources",
+    "find_video": "a video found for you: one match texted with its link, read only after you type YES",
     "places_search": "places near you or near a place you name, from Google Maps, with rating, price and opening hours",
     "route": "travel time, distance and public transport lines, from Google Maps",
     "device_status": "whether your lights and plugs are on",
@@ -95,16 +98,9 @@ HELPER_LINES = {
 }
 _CALLS_HOW = {False: "answered", True: "answered, and placed by me at a time you set (wake-up calls and reminders)"}
 _HEARD = {False: "voice notes", True: "voice notes and calls"}  # what the voice service hears: calls only with [calls]
-# who speaks her answers, by (her English voice is Pocket TTS's, jane speaks the six languages: `[voice]
-# language_voice`): Pocket TTS its English voices and jane's six, Kokoro an English line Pocket TTS cannot say and its
-# own voices, Supertonic-3 the other languages and a line Pocket TTS cannot say in one of the six (review of 0.9.8,
-# guards-6: the line named Kokoro and Supertonic-3 only, while Pocket TTS speaks heart and jane, the defaults)
-_SPOKEN = {
-    (True, True): "Pocket TTS, with Kokoro and Supertonic-3 for what it cannot say",
-    (True, False): "Pocket TTS and Kokoro in English, Supertonic-3 in the other languages",
-    (False, True): "Kokoro in English, Pocket TTS and Supertonic-3 in the other languages",
-    (False, False): "Kokoro in English, Supertonic-3 in the other languages",
-}
+# who speaks her answers: Pocket TTS only, in the languages it has a model for (owner, 3 Nov 2026: Kokoro and
+# Supertonic-3 removed, nothing replaces them; review of 0.9.8, guards-6: the line names the engine that speaks)
+_SPOKEN = "Pocket TTS, in English, Spanish, Italian, Portuguese, Dutch, German and French only"
 
 
 @dataclass(frozen=True)
@@ -139,18 +135,18 @@ def inventory(
     ask_first: bool = False,
     documents: bool = False,
     osm: bool = False,
-    english_voice: str = DEFAULT_VOICE,
-    language_voice: str = "jane",
     read_pages: int = 3,
+    language: str = ENGLISH,
 ) -> Inventory:
     """Her list for this install, every line true here. `tools`: each offered tool's name and description
-    (Tools.inventory_tools); `voice`: the voice service runs (voice notes or calls), `english_voice` her English voice
-    in use (Pocket TTS's or Kokoro's), `language_voice` the config's voice of the six languages ("": Supertonic-3's);
-    `read_pages`: the pages one read_document call reads; `calls`: [calls], `wake_calls`
-    whether a "call me" reminder places a call (else the reminders' lines name no call); `calendars`: the services of
-    the calendars the calendar helper reads (never Outlook's: Microsoft Graph); `devices`: the lights' and plugs'
-    brands, `ask_first` whether one of them waits for the user's yes; `documents`: [documents]; `osm`: places and
-    routes from OpenStreetMap (no Google Maps key). The YouTube helper comes with read_link."""
+    (Tools.inventory_tools); `voice`: the voice service runs (voice notes or calls); `read_pages`: the pages one
+    read_document call reads; `calls`: [calls], `wake_calls` whether a "call me" reminder places a call (else the
+    reminders' lines name no call); `calendars`: the services of the calendars the calendar helper reads (never
+    Outlook's: Microsoft Graph); `devices`: the lights' and plugs' brands, `ask_first` whether one of them waits for the
+    user's yes; `documents`: [documents]; `osm`: places and routes from OpenStreetMap (no Google Maps key); `language`:
+    the one in use, where her voice has none (`has_voice`) a "call me" reminder is a text, as without wake-up calls
+    (review of 4 Nov, DLG-0983-06). The YouTube helper comes with read_link."""
+    wake_calls = wake_calls and has_voice(language)
     named = {"Host": host[:1].upper() + host[1:], "host": host}
     own = {**TOOL_LINES, **({} if wake_calls else TOOL_LINES_NO_CALLS), **(TOOL_LINES_OSM if osm else {})}
     own.update(TOOL_LINES_ONE_PAGE if read_pages == 1 else {})
@@ -163,7 +159,7 @@ def inventory(
     helpers = [
         (
             voice,
-            HELPER_LINES["voice"].format(heard=_HEARD[calls], spoken=_spoken(english_voice, language_voice), host=host),
+            HELPER_LINES["voice"].format(heard=_HEARD[calls], spoken=_SPOKEN, host=host),
         ),
         (calls, HELPER_LINES["calls"].format(how=_CALLS_HOW[wake_calls])),
         (bool(calendars), HELPER_LINES["calendar"].format(services=_listed(calendars))),
@@ -172,11 +168,6 @@ def inventory(
         (documents, HELPER_LINES["documents"].format(host=host)),
     ]
     return Inventory(lines, tuple(f"• {line}" for on, line in helpers if on))
-
-
-def _spoken(english_voice: str, language_voice: str) -> str:
-    """Who speaks her answers with these voices (`_SPOKEN`)."""
-    return _SPOKEN[canonical_voice(english_voice) in POCKET_VOICES, bool(language_voice)]
 
 
 def inventory_text(listed: Inventory) -> str:

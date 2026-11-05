@@ -105,9 +105,10 @@ def pair(note: Note, tz: ZoneInfo) -> list[dict[str, Any]]:
 def in_order(window: Sequence[Message], notes: Sequence[Note], answered: int | None) -> list[Message | Note]:
     """The window's messages with code's notes among them, in conversation order. A note sent while she was answering
     never splits her turn: one about that answer (the busy note, a document's or a voice note's line before it) is
-    left out, any other (a reminder that fired meanwhile) comes after her answer; a note after the message being
-    answered (`answered`, not answered yet) is that answer's own, never in its request. The same note right after
-    itself (one alert to each allowed account) comes once."""
+    left out (also when the window starts between the request and her answer, so only the answer is in it), any other
+    (a reminder that fired meanwhile) comes after her answer; a note after the message being answered (`answered`, not
+    answered yet) is that answer's own, never in its request. The same note right after itself (one alert to each
+    allowed account) comes once."""
     answer_at = {m.reply_to_id: m.seq or 0 for m in window if m.direction == "out" and m.reply_to_id is not None}
     last = next((m.seq for m in window if m.id == answered and m.id not in answer_at), None)
     items: list[tuple[int, Message | Note]] = [(m.seq or 0, m) for m in window]
@@ -119,9 +120,12 @@ def in_order(window: Sequence[Message], notes: Sequence[Note], answered: int | N
         if isinstance(item, Note):
             if last is not None and seq > last:
                 continue
+            about = item.message.reply_to_id
+            if about is not None and answer_at.get(about, 0) > seq:
+                continue  # about an answer that comes later in the window, whether its request is still in it or not
             if open_turn is None:
                 _add(ordered, item)
-            elif item.message.reply_to_id != open_turn:
+            else:
                 held.append(item)
             continue
         ordered.append(item)

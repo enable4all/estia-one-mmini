@@ -16,12 +16,12 @@ import pytest
 
 from local_assistant import prompts, voice
 from local_assistant.config import (
-    LANGUAGE_VOICES,
-    MALE_POCKET_VOICES,
+    LANGUAGE_VOICE,
     POCKET_LANGUAGES,
     POCKET_ORDER,
     POCKET_VOICES,
-    kokoro_stand_in,
+    has_voice,
+    pocket_voice,
 )
 from local_assistant.part_status import PartStatus, Record
 from local_assistant.voice import (
@@ -30,11 +30,11 @@ from local_assistant.voice import (
     POCKET_FILES_100M,
     POCKET_PROGRAM,
     VAD_TIMEOUT,
-    SpokenClip,
     Transcript,
     VoiceClient,
     VoiceError,
-    VoiceNoStandInError,
+    VoiceNoLanguageError,
+    VoiceNotSaidError,
     VoiceTooLongError,
     VoiceUnavailableError,
     VoiceUnreadableError,
@@ -75,7 +75,7 @@ def test_the_first_bytes_decide_what_audio_it_is() -> None:
 
 async def test_transcribe_sends_the_bytes_and_returns_the_text() -> None:
     with FakeVoiceService() as service:
-        client = VoiceClient(service.url, voice="af_heart", speed=1.1)
+        client = VoiceClient(service.url, voice="heart")
         assert await client.transcribe(M4A) == Transcript("Turn off the lamp.", 2.4)
         method, path, headers, body = service.requests[0]
         assert (method, path, body) == ("POST", "/v1/audio/transcriptions", M4A)
@@ -90,23 +90,26 @@ async def test_service_refusals_become_errors(status: int, error: type[VoiceErro
     with FakeVoiceService() as service:
         service.status["/v1/audio/transcriptions"] = status
         with pytest.raises(error):
-            await VoiceClient(service.url, voice="af_heart", speed=1.1).transcribe(M4A)
+            await VoiceClient(service.url, voice="heart").transcribe(M4A)
 
 
 async def test_a_service_that_is_not_running_is_unavailable() -> None:
-    client = VoiceClient(closed_port_url(), voice="af_heart", speed=1.1)
+    client = VoiceClient(closed_port_url(), voice="heart")
     with pytest.raises(VoiceUnavailableError):
         await client.transcribe(M4A)
     assert await client.health() is None
 
 
-async def test_speak_sends_the_text_voice_and_speed() -> None:
+async def test_speak_sends_the_text_and_the_voice_and_asks_for_no_other_voice() -> None:
+    """Owner, 3 Nov 2026: Pocket TTS is her only voice. Every speech request asks for no Kokoro ("kokoro": false), so a
+    voice service that still has it never has it say a line; one without it ignores the field. No speed: Pocket TTS
+    has none (only Kokoro and Supertonic-3 read it)."""
     with FakeVoiceService() as service:
-        client = VoiceClient(service.url, voice="bf_emma", speed=1.2)
+        client = VoiceClient(service.url, voice="eve")
         assert await client.speak("The lamp is off.") == service.speech
         method, path, headers, body = service.requests[0]
         assert (method, path, headers["content-type"]) == ("POST", "/v1/audio/speech", "application/json")
-        assert json.loads(body) == {"input": "The lamp is off.", "voice": "bf_emma", "speed": 1.2}
+        assert json.loads(body) == {"input": "The lamp is off.", "voice": "eve", "kokoro": False}
         assert await client.health() == {"stt": "ready", "tts": "ready"}
 
 
@@ -114,7 +117,7 @@ async def test_speech_that_fails_is_an_error() -> None:
     with FakeVoiceService() as service:
         service.status["/v1/audio/speech"] = 500
         with pytest.raises(VoiceError):
-            await VoiceClient(service.url, voice="af_heart", speed=1.1).speak("Hello there.")
+            await VoiceClient(service.url, voice="heart").speak("Hello there.")
 
 
 def test_spoken_text_flattens_markdown() -> None:
@@ -417,9 +420,30 @@ def test_sentences_never_end_at_a_title_or_an_abbreviation_inside_one(spoken: st
 
 
 def test_the_voice_can_be_changed_while_running() -> None:
-    client = VoiceClient("http://127.0.0.1:1", voice="am_michael", speed=1.1)
+    client = VoiceClient("http://127.0.0.1:1", voice="michael")
+    client.set_voice("jane")
+    assert client.voice == "jane"
+
+
+def test_a_kokoro_voice_is_asked_as_the_closest_pocket_voice() -> None:
+    """Owner, 3 Nov 2026: Kokoro was removed. A Kokoro voice id that still reaches the client (an old config, a stored
+    /voice choice) is never sent: a male one (its second letter m) is michael, any other heart (af_heart's clone)."""
+    client = VoiceClient("http://127.0.0.1:1", voice="am_michael")
+    assert client.voice == "michael"
+    client.set_voice("af_bella")
+    assert client.voice == "heart"
     client.set_voice("bm_george")
-    assert client.voice == "bm_george"
+    assert client.voice == "michael"
+    client.set_voice("eve-full")
+    assert client.voice == "eve"
+    assert [pocket_voice(name) for name in ("af_heart", "bf_emma", "am_puck", "heart", "vera", "zoe")] == [
+        "heart",
+        "heart",
+        "michael",
+        "heart",
+        "vera",
+        "zoe",
+    ]
 
 
 NOW = 1_791_452_400.0
@@ -432,7 +456,7 @@ def recorder(tmp_path: Path) -> PartStatus:
 async def test_transcripts_and_speech_record_the_voice_service(tmp_path: Path) -> None:
     status = recorder(tmp_path)
     with FakeVoiceService() as service:
-        client = VoiceClient(service.url, voice="af_heart", speed=1.1, status=status)
+        client = VoiceClient(service.url, voice="heart", status=status)
         await client.transcribe(M4A)
         assert status.snapshot() == {"voice": Record(ok=NOW)}
         service.status["/v1/audio/speech"] = 500
@@ -459,25 +483,25 @@ async def test_the_voice_service_answers_are_recorded(tmp_path: Path, answer: in
     with FakeVoiceService() as service:
         service.status["/v1/audio/transcriptions"] = answer
         with pytest.raises(VoiceError):
-            await VoiceClient(service.url, voice="af_heart", speed=1.1, status=status).transcribe(M4A)
+            await VoiceClient(service.url, voice="heart", status=status).transcribe(M4A)
     assert status.snapshot() == {"voice": record}
 
 
 async def test_a_voice_service_that_is_not_running_is_recorded(tmp_path: Path) -> None:
     status = recorder(tmp_path)
     with pytest.raises(VoiceUnavailableError):
-        await VoiceClient(closed_port_url(), voice="af_heart", speed=1.1, status=status).speak("Hello there.")
+        await VoiceClient(closed_port_url(), voice="heart", status=status).speak("Hello there.")
     assert status.snapshot() == {"voice": Record(failed=NOW, reason="no_answer")}
 
 
 async def test_english_requests_are_exactly_as_before_the_languages() -> None:
     # an older voice service (no languages) keeps working in English: no query, no field
     with FakeVoiceService() as service:
-        client = VoiceClient(service.url, voice="af_heart", speed=1.1, language="en")
+        client = VoiceClient(service.url, voice="heart", language="en")
         await client.transcribe(M4A)
         await client.speak("Hi.")
         assert service.paths() == ["/v1/audio/transcriptions", "/v1/audio/speech"]
-        assert service.requests[1][3] == json.dumps({"input": "Hi.", "voice": "af_heart", "speed": 1.1}).encode()
+        assert service.requests[1][3] == json.dumps({"input": "Hi.", "voice": "heart", "kokoro": False}).encode()
         assert service.request_languages == ["en", "en"]
 
 
@@ -487,7 +511,7 @@ async def test_what_she_said_before_goes_with_english_speech_for_the_times() -> 
     last 1,000 characters), read only for a time's part of the day; never in another language, never empty, so every
     other request stays byte for byte as before."""
     with FakeVoiceService() as service:
-        client = VoiceClient(service.url, voice="eve", speed=1.05, language="en")
+        client = VoiceClient(service.url, voice="eve", language="en")
         await client.speak("Shall I remind you at 7:30?", context="It closes at 8 tonight.")
         await client.speak("Hi.", context="")
         await client.speak("Om half acht?", language="nl", context="Het sluit vanavond.")
@@ -496,70 +520,111 @@ async def test_what_she_said_before_goes_with_english_speech_for_the_times() -> 
         assert bodies[0] == {
             "input": "Shall I remind you at 7:30?",
             "voice": "eve",
-            "speed": 1.05,
             "context": "It closes at 8 tonight.",
+            "kokoro": False,
         }
-        assert service.requests[1][3] == json.dumps({"input": "Hi.", "voice": "eve", "speed": 1.05}).encode()
+        assert service.requests[1][3] == json.dumps({"input": "Hi.", "voice": "eve", "kokoro": False}).encode()
         assert "context" not in bodies[2] and bodies[2]["language"] == "nl"
         assert bodies[3]["context"] == "x" * 1000
 
 
 async def test_a_calls_line_says_it_is_a_calls() -> None:
     """The review of 28 Oct (calls-03): on a call, a Pocket TTS voice resting after failed runs is tried again for each
-    line, so that Kokoro, which an Apple bug can crash with the voice service and the call, says fewer of them. The
-    request says it is a call's (`"call": true`); every other request stays byte for byte as before."""
+    line. The request says it is a call's (`"call": true`); every other request goes without it."""
     with FakeVoiceService() as service:
-        client = VoiceClient(service.url, voice="heart", speed=1.05, language="en")
+        client = VoiceClient(service.url, voice="heart", language="en")
         await client.speak("Two meetings.", call=True)
         await client.speak("Hi.")
         bodies = [json.loads(request[3]) for request in service.requests]
-        assert bodies[0] == {"input": "Two meetings.", "voice": "heart", "speed": 1.05, "call": True}
-        assert service.requests[1][3] == json.dumps({"input": "Hi.", "voice": "heart", "speed": 1.05}).encode()
+        assert bodies[0] == {"input": "Two meetings.", "voice": "heart", "call": True, "kokoro": False}
+        assert service.requests[1][3] == json.dumps({"input": "Hi.", "voice": "heart", "kokoro": False}).encode()
 
 
-async def test_a_calls_line_after_its_turns_kokoro_line_asks_for_no_kokoro(tmp_path: Path) -> None:
-    """Owner, 28 Oct (calls-03): on a call Kokoro says at most one line of a turn. A later line of that turn asks for
-    no Kokoro stand-in ("kokoro": false): when Pocket TTS cannot say it, the voice service says nothing (409,
-    "no_stand_in"), a VoiceNoStandInError, and the voice service stays ok in the status (it did as asked). Every other
-    request is byte for byte as before."""
+async def test_a_line_pocket_cannot_say_is_said_by_no_other_voice(tmp_path: Path) -> None:
+    """Owner, 3 Nov 2026: no voice replaces Pocket TTS. A line it cannot say (a failed or late run, a refused file, a
+    model not downloaded yet, a voice resting after failures) the voice service refuses (409): a VoiceNotSaidError,
+    and the voice service stays ok in the status (it did as asked)."""
     status = recorder(tmp_path)
     with FakeVoiceService() as service:
-        client = VoiceClient(service.url, voice="heart", speed=1.05, language="en", status=status)
-        await client.speak("Two meetings.", call=True, kokoro=False)  # Pocket TTS said it
-        await client.speak("Hi.", call=True)
-        bodies = [json.loads(request[3]) for request in service.requests]
-        assert bodies[0] == {"input": "Two meetings.", "voice": "heart", "speed": 1.05, "call": True, "kokoro": False}
-        assert (
-            service.requests[1][3]
-            == json.dumps({"input": "Hi.", "voice": "heart", "speed": 1.05, "call": True}).encode()
-        )
-        service.stand_in = "af_heart"  # Pocket TTS cannot say it now: Kokoro would
-        with pytest.raises(VoiceNoStandInError):
-            await client.speak("One at nine.", call=True, kokoro=False)
+        client = VoiceClient(service.url, voice="heart", language="en", status=status)
+        service.unsaid = True
+        with pytest.raises(VoiceNotSaidError):
+            await client.speak("One at nine.", call=True)
+        with pytest.raises(VoiceNotSaidError):
+            await client.speak("Hallo.", language="de")
         assert status.snapshot()["voice"] == Record(ok=NOW)
-        assert (await client.speak("One at nine.", call=True)).stand_in == "af_heart"  # asked as before: Kokoro's
 
 
-async def test_a_line_another_voice_said_in_her_voices_place_says_so() -> None:
-    """The review of 24 Oct: what Pocket TTS cannot say (still fetching, resting, a failed run) Kokoro's af_heart says,
-    and the voice service marks it (X-Voice-Stand-In), so a call never keeps that clip of a canned line. A value that is
-    no voice's name is "another voice"; none: the asked voice said it."""
+@pytest.mark.parametrize(
+    ("language", "health", "reason"),
+    [
+        ("en", {"tts": "loading"}, "loading"),  # a first start: the English model downloads
+        ("en", {"tts": "resting"}, "not_working"),  # resting after failed or late runs
+        ("en", {"tts": "failed"}, "not_working"),  # its program missing or its files refused
+        ("de", {"pocket_de": "idle"}, "loading"),  # jane's German model not loaded yet
+        ("de", {"pocket_de": "loading"}, "loading"),
+        ("de", {"pocket_de": "refused"}, "not_working"),
+        ("de", {"pocket_de": "unavailable"}, "not_working"),
+    ],
+)
+async def test_a_line_refused_while_her_voice_cannot_speak_records_why(
+    tmp_path: Path, language: str, health: dict[str, str], reason: str
+) -> None:
+    """The review of 4 Nov: every line Pocket TTS could not say was 409 and recorded ok, so while the English model
+    downloaded (or after its files were refused) every voice-note answer came as text while /status's voice part said
+    ok. The 409 stays (calls rely on it); the bridge reads the health once on it: speaking still loading or not working
+    is recorded so (a single failed run with the model ready stays ok)."""
+    status = recorder(tmp_path)
     with FakeVoiceService() as service:
-        client = VoiceClient(service.url, voice="eve", speed=1.05)
-        clip = await client.speak("Got it.")
-        assert clip == service.speech and isinstance(clip, SpokenClip) and clip.stand_in == ""
-        service.stand_in = "af_heart"
-        clip = await client.speak("Got it.")
-        assert clip == service.speech and isinstance(clip, SpokenClip) and clip.stand_in == "af_heart"
-        service.stand_in = "../not a voice"
-        assert (await client.speak("Got it.")).stand_in == "another voice"
+        service.unsaid = True
+        service.health |= health
+        client = VoiceClient(service.url, voice="heart", language=language, status=status)
+        with pytest.raises(VoiceNotSaidError):
+            await client.speak("Hallo." if language == "de" else "Hello.")
+        assert status.snapshot()["voice"] == Record(failed=NOW, reason=reason, code=409)
+        service.unsaid = False
+        await client.speak("Hallo." if language == "de" else "Hello.")
+        assert status.snapshot()["voice"] == Record(ok=NOW)
+
+
+@pytest.mark.parametrize(("language", "other"), [("en", "af_heart"), ("de", "F1"), ("en", "../not a voice")])
+async def test_a_line_an_older_voice_service_had_another_voice_say_is_never_played(
+    tmp_path: Path, language: str, other: str
+) -> None:
+    """A voice service from before 3 Nov 2026 still has Kokoro and Supertonic-3 and marks a line one of them said in
+    Pocket TTS's place (X-Voice-Stand-In): that audio is never returned, the line is not said (VoiceNotSaidError), and
+    the voice service stays ok in the status."""
+    status = recorder(tmp_path)
+    with FakeVoiceService() as service:
+        service.stand_in, service.stands_in_always = other, True
+        client = VoiceClient(service.url, voice="eve", language=language, status=status)
+        with pytest.raises(VoiceNotSaidError):
+            await client.speak("Einen Moment." if language == "de" else "Got it.")
+        assert status.snapshot()["voice"] == Record(ok=NOW)
+
+
+@pytest.mark.parametrize("language", ["ko", "pl", "ru", "ja", "el"])
+async def test_a_language_pocket_has_no_model_for_is_never_asked(language: str) -> None:
+    """Owner, 3 Nov 2026: Korean, Polish, Russian and Japanese have no voice (Pocket TTS has no model for them; nothing
+    replaces Supertonic-3). A line in one of them is refused before any request (VoiceNoLanguageError, a
+    VoiceNotSaidError), and so is a language Estia does not have."""
+    with FakeVoiceService() as service:
+        client = VoiceClient(service.url, voice="eve", language=language)
+        with pytest.raises(VoiceNoLanguageError):
+            await client.speak("…")
+        assert service.requests == []
+        assert issubclass(VoiceNoLanguageError, VoiceNotSaidError)
+    assert [code for code in ("en", "es", "it", "pt", "nl", "de", "fr", "ko", "pl", "ru", "ja") if has_voice(code)] == [
+        "en",
+        *POCKET_LANGUAGES,
+    ]
 
 
 async def test_her_name_goes_as_whispers_hint_only_when_given() -> None:
     """On a call in standby the bridge sends her name, so Whisper writes it when it is said (owner, 22 Oct); an older
     voice service reads only the language and ignores it. Never the hint without being asked: voice notes go as before."""
     with FakeVoiceService() as service:
-        client = VoiceClient(service.url, voice="af_heart", speed=1.1, language="en")
+        client = VoiceClient(service.url, voice="heart", language="en")
         await client.transcribe(M4A, hint="Estia")
         await client.transcribe(M4A, language="nl", hint="Mary Jane")
         await client.transcribe(M4A, language="ja", hint="エスティア")
@@ -577,7 +642,7 @@ async def test_a_calls_turn_goes_with_the_call_flag() -> None:
     """A call's turn says so (`call=1`): the voice service keeps a bare "Bye." or "Thank you." it erases from a voice
     note (review I23); an older service reads only the language and the hint and ignores it."""
     with FakeVoiceService() as service:
-        client = VoiceClient(service.url, voice="af_heart", speed=1.1, language="en")
+        client = VoiceClient(service.url, voice="heart", language="en")
         await client.transcribe(M4A, call=True)
         await client.transcribe(M4A, language="nl", hint="Estia", call=True)
         await client.transcribe(M4A)
@@ -591,14 +656,14 @@ async def test_a_calls_turn_goes_with_the_call_flag() -> None:
 async def test_the_fake_service_erases_a_bare_bye_as_the_real_one_does() -> None:
     with FakeVoiceService() as service:
         service.transcript = "Bye."
-        client = VoiceClient(service.url, voice="af_heart", speed=1.1, language="en")
+        client = VoiceClient(service.url, voice="heart", language="en")
         assert (await client.transcribe(M4A)).text == ""
         assert (await client.transcribe(M4A, call=True)).text == "Bye."
 
 
 async def test_another_language_goes_with_every_request() -> None:
     with FakeVoiceService() as service:
-        client = VoiceClient(service.url, voice="af_heart", speed=1.1, language="nl")
+        client = VoiceClient(service.url, voice="heart", language="nl")
         assert client.language == "nl"
         await client.transcribe(M4A)
         await client.speak("Hoi.")
@@ -606,22 +671,24 @@ async def test_another_language_goes_with_every_request() -> None:
         assert service.paths() == ["/v1/audio/transcriptions?language=nl", "/v1/audio/speech", "/v1/audio/speech"]
         assert json.loads(service.requests[1][3]) == {
             "input": "Hoi.",
-            "voice": "af_heart",
-            "speed": 1.1,
+            "voice": "jane",
             "language": "nl",
+            "kokoro": False,
         }
         assert "language" not in json.loads(service.requests[2][3])
         assert service.request_languages == ["nl", "nl", "en"]
         client.set_language("ja")
-        await client.speak("はい。")
-        assert service.request_languages[-1] == "ja"
+        with pytest.raises(VoiceNoLanguageError):  # no voice in Japanese: nothing asked
+            await client.speak("はい。")
+        await client.transcribe(M4A)  # heard all the same
+        assert service.request_languages[-1] == "ja" and len(service.requests) == 4
         await client.transcribe(M4A, language="ko")  # a call keeps the language it started with
         assert service.paths()[-1] == "/v1/audio/transcriptions?language=ko"
 
 
 async def test_the_health_says_which_languages_the_service_has() -> None:
     with FakeVoiceService() as service:
-        client = VoiceClient(service.url, voice="af_heart", speed=1.1)
+        client = VoiceClient(service.url, voice="heart")
         assert await client.health() == {"stt": "ready", "tts": "ready"}  # older than the languages
         service.languages = ["en", "nl"]
         assert await client.health() == {"stt": "ready", "tts": "ready", "languages": ("en", "nl")}
@@ -629,18 +696,18 @@ async def test_the_health_says_which_languages_the_service_has() -> None:
 
 async def test_the_languages_of_the_installed_service() -> None:
     with FakeVoiceService() as service:
-        client = VoiceClient(service.url, voice="af_heart", speed=1.1)
+        client = VoiceClient(service.url, voice="heart")
         assert await client.languages() == ()  # answers, but older than the language feature
         service.languages = ["en", "nl"]
         assert await client.languages() == ("en", "nl")
-    assert await VoiceClient("http://127.0.0.1:1", voice="af_heart", speed=1.1).languages() is None  # not answering
+    assert await VoiceClient("http://127.0.0.1:1", voice="heart").languages() is None  # not answering
 
 
 async def test_a_language_the_service_does_not_have_is_an_error() -> None:
     with FakeVoiceService() as service:
-        client = VoiceClient(service.url, voice="af_heart", speed=1.1, language="el")
+        client = VoiceClient(service.url, voice="heart", language="el")
         with pytest.raises(VoiceError, match="400"):
-            await client.speak("Γεια.")
+            await client.transcribe(M4A)
 
 
 def test_japanese_is_spoken_sentence_by_sentence_too() -> None:
@@ -659,7 +726,7 @@ CHUNK = array.array("h", (int(3000 * math.sin(2 * math.pi * 220 * i / 16_000)) f
 async def test_the_speech_detector_gets_one_chunk_and_answers_a_probability() -> None:
     with FakeVoiceService() as service:
         service.vad = "ready"
-        client = VoiceClient(service.url, voice="af_heart", speed=1.1)
+        client = VoiceClient(service.url, voice="heart")
         assert await client.vad(CHUNK, stream="0a1b2c") == 1.0
         assert await client.vad(bytes(8192), stream="0a1b2c") == 0.02
         method, path, headers, body = service.requests[0]
@@ -687,13 +754,13 @@ async def test_a_speech_detector_that_cannot_answer_is_an_http_failure_never_an_
     status = recorder(tmp_path)
     with FakeVoiceService() as service:
         service.vad, service.vad_answer = vad, answer
-        client = VoiceClient(service.url, voice="af_heart", speed=1.1, status=status)
+        client = VoiceClient(service.url, voice="heart", status=status)
         assert await client.vad(chunk, stream="s1") == "http"
     assert status.snapshot() == {}  # the detector is not the voice: a failure never marks the voice as failing
 
 
 async def test_a_speech_detector_that_does_not_answer_is_an_http_failure() -> None:
-    assert await VoiceClient(closed_port_url(), voice="af_heart", speed=1.1).vad(CHUNK, stream="s1") == "http"
+    assert await VoiceClient(closed_port_url(), voice="heart").vad(CHUNK, stream="s1") == "http"
 
 
 def hers(port: int, local: int, seconds: float) -> bool | None:
@@ -704,9 +771,7 @@ async def test_a_slow_speech_detector_is_given_up_on_quickly_as_a_timeout() -> N
     with FakeVoiceService() as service:
         service.vad, service.vad_delay = "ready", 0.8
         started = time.monotonic()
-        assert (
-            await VoiceClient(service.url, voice="af_heart", speed=1.1, peer=hers).vad(CHUNK, stream="s1") == "timeout"
-        )
+        assert await VoiceClient(service.url, voice="heart", peer=hers).vad(CHUNK, stream="s1") == "timeout"
         assert time.monotonic() - started < 0.6  # a call never waits for the detector
 
 
@@ -718,7 +783,7 @@ async def test_the_check_of_whose_program_it_is_counts_within_the_detectors_own_
     with FakeVoiceService() as service:
         service.vad, service.vad_delay = "ready", 0.2
         started = time.monotonic()
-        client = VoiceClient(service.url, voice="af_heart", speed=1.1, peer=slow_check)
+        client = VoiceClient(service.url, voice="heart", peer=slow_check)
         assert await client.vad(CHUNK, stream="s1") == "timeout"  # 0.25 checking + 0.2 answering: over 0.3
         assert time.monotonic() - started < 0.5
 
@@ -746,7 +811,7 @@ WINDOW = CHUNK * 10  # 2.56 s
 async def test_turn_posts_the_window_and_returns_p() -> None:
     with FakeVoiceService() as service:
         service.turn, service.turn_p = "ready", 0.91
-        client = VoiceClient(service.url, voice="af_heart", speed=1.1)
+        client = VoiceClient(service.url, voice="heart")
         assert await client.turn(WINDOW) == 0.91
         service.turn_p = 0
         assert await client.turn(bytes(256_000)) == 0.0  # 8 s, the whole window
@@ -780,7 +845,7 @@ async def test_turn_failures_are_kinds_never_raised(
     status = recorder(tmp_path)
     with FakeVoiceService() as service:
         service.turn, service.turn_answer = turn, answer
-        client = VoiceClient(service.url, voice="af_heart", speed=1.1, status=status)
+        client = VoiceClient(service.url, voice="heart", status=status)
         assert await client.turn(window) == "http"
     assert status.snapshot() == {}  # the turn detector is not the voice: a failure never marks the voice as failing
 
@@ -806,11 +871,11 @@ def test_the_fake_refuses_a_bad_window_before_its_state_as_the_service_does(stat
 
 
 async def test_a_turn_detector_that_does_not_answer_is_http_and_a_slow_one_a_timeout() -> None:
-    assert await VoiceClient(closed_port_url(), voice="af_heart", speed=1.1).turn(WINDOW) == "http"
+    assert await VoiceClient(closed_port_url(), voice="heart").turn(WINDOW) == "http"
     with FakeVoiceService() as service:
         service.turn, service.turn_delay = "ready", 0.8
         started = time.monotonic()
-        assert await VoiceClient(service.url, voice="af_heart", speed=1.1, peer=hers).turn(WINDOW) == "timeout"
+        assert await VoiceClient(service.url, voice="heart", peer=hers).turn(WINDOW) == "timeout"
         assert time.monotonic() - started < 0.6  # a call never waits for the detector: VAD_TIMEOUT
     assert VAD_TIMEOUT == 0.3
 
@@ -821,7 +886,7 @@ async def test_nothing_goes_to_a_turn_detector_that_is_not_hers() -> None:
 
     with FakeVoiceService() as service:
         service.turn = "ready"
-        assert await VoiceClient(service.url, voice="af_heart", speed=1.1, peer=theirs).turn(WINDOW) == "http"
+        assert await VoiceClient(service.url, voice="heart", peer=theirs).turn(WINDOW) == "http"
         assert service.requests == []
 
 
@@ -912,7 +977,7 @@ async def test_the_check_is_asked_about_this_very_connection_before_anything_is_
 
     with FakeVoiceService() as service:
         service.vad = "ready"
-        client = VoiceClient(service.url, voice="af_heart", speed=1.1, peer=checked)
+        client = VoiceClient(service.url, voice="heart", peer=checked)
         assert await client.transcribe(M4A) == Transcript("Turn off the lamp.", 2.4)
         assert isinstance(await client.vad(CHUNK, stream="s1"), float)
     assert [port for port, _, _ in asked] == [port_of(service.url)] * 2
@@ -936,7 +1001,7 @@ async def test_nothing_goes_to_a_program_that_is_not_hers_or_unchecked(
         return verdict
 
     with FakeVoiceService() as service:
-        client = VoiceClient(service.url, voice="af_heart", speed=1.1, status=status, peer=check)
+        client = VoiceClient(service.url, voice="heart", status=status, peer=check)
         with pytest.raises(VoiceUnavailableError):
             await client.transcribe(M4A)
         with pytest.raises(VoiceUnavailableError):
@@ -957,7 +1022,7 @@ async def test_her_own_service_again_is_said_once_and_used() -> None:
         return verdicts.pop(0)
 
     with FakeVoiceService() as service:
-        client = VoiceClient(service.url, voice="af_heart", speed=1.1, peer=check)
+        client = VoiceClient(service.url, voice="heart", peer=check)
         with pytest.raises(VoiceUnavailableError):
             await client.transcribe(M4A)
         assert await client.transcribe(M4A) == Transcript("Turn off the lamp.", 2.4)
@@ -966,7 +1031,7 @@ async def test_her_own_service_again_is_said_once_and_used() -> None:
 
 async def test_localhost_is_reached_at_127_0_0_1_where_her_service_listens() -> None:
     with FakeVoiceService() as service:
-        client = VoiceClient(service.url.replace("127.0.0.1", "localhost"), voice="af_heart", speed=1.1)
+        client = VoiceClient(service.url.replace("127.0.0.1", "localhost"), voice="heart")
         assert await client.transcribe(M4A) == Transcript("Turn off the lamp.", 2.4)
 
 
@@ -1165,22 +1230,7 @@ def test_pocket_languages_are_the_voice_services() -> None:
         swift,
     )
     assert [code for _, code in spoken] == list(POCKET_LANGUAGES) == ["es", "it", "pt", "nl", "de", "fr"]
-    assert frozenset({"jane"}) == LANGUAGE_VOICES and 'public static let languageVoice = "jane"' in swift
-    # the review of 26 Oct (R1-F1): Kokoro's am_michael says what alba and michael cannot, in both (doctor names him)
-    males = re.search(r"public static let maleVoices: Set<String> = \[([^\]]*)\]", swift)
-    assert males is not None and frozenset(re.findall(r'"([a-z]+)"', males.group(1))) == MALE_POCKET_VOICES
-    assert 'public static let maleStandIn = "am_michael"' in swift
-    # heart's is af_heart, the voice it was cloned from (owner, 27 Oct)
-    assert [kokoro_stand_in(v) for v in ("heart", "jane", "eve", "vera", "alba", "michael", "af_heart", "am_puck")] == [
-        "af_heart",
-        "af_heart",
-        "af_heart",
-        "af_heart",
-        "am_michael",
-        "am_michael",
-        "af_heart",
-        "am_puck",
-    ]
+    assert LANGUAGE_VOICE == "jane" and 'public static let languageVoice = "jane"' in swift
     names = dict((code, name) for name, code in spoken)
     assert set(voice.POCKET_LANGUAGE_FILES) == set(POCKET_LANGUAGES)
     for code, pins in voice.POCKET_LANGUAGE_FILES.items():
@@ -1199,30 +1249,19 @@ def test_pocket_languages_are_the_voice_services() -> None:
 
 
 async def test_jane_speaks_the_six_languages_and_the_english_voice_stays_englishs() -> None:
-    """The language voice (`[voice] language_voice`, jane) goes with every request in Spanish, Italian, Portuguese, Dutch,
-    German and French; English keeps her voice of now, and Korean, Polish, Japanese and Russian, which Pocket TTS has no
-    model for, keep the request as before (Supertonic-3 speaks them in its F1 whatever the voice)."""
+    """jane goes with every request in Spanish, Italian, Portuguese, Dutch, German and French (Pocket TTS's model of
+    each); English keeps her voice of now. Korean, Polish, Japanese and Russian, which Pocket TTS has no model for,
+    have no voice (owner, 3 Nov 2026): nothing is asked in them."""
     with FakeVoiceService() as service:
-        client = VoiceClient(service.url, voice="eve", speed=1.05, language="de", language_voice="jane")
+        client = VoiceClient(service.url, voice="eve", language="de")
         await client.speak("Hallo.")
         await client.speak("Shall I switch heater off?", language="en")  # code's own words: English, in eve
         await client.speak("Hoi.", language="nl")
         client.set_language("ko")
-        await client.speak("네.")
+        with pytest.raises(VoiceNoLanguageError):
+            await client.speak("네.")
         bodies = [json.loads(request[3]) for request in service.requests]
-        assert [body["voice"] for body in bodies] == ["jane", "eve", "jane", "eve"]
+        assert [body["voice"] for body in bodies] == ["jane", "eve", "jane"]
         assert [client.voice_for(code) for code in ("en", "fr", "pl", "ja")] == ["eve", "jane", "eve", "eve"]
-        client.set_voice("af_heart")  # /voice sets the English voice only
-        assert client.voice_for("de") == "jane" and client.voice_for("en") == "af_heart"
-    # without a language voice (an older config's client), every language as before
-    plain = VoiceClient("http://127.0.0.1:8150", voice="eve", speed=1.05)
-    assert plain.voice_for("de") == "eve"
-
-
-async def test_supertonics_f1_standing_in_for_jane_says_so() -> None:
-    """What jane cannot say in a language (still fetching, resting, a failed run) Supertonic-3's F1 says, marked
-    `X-Voice-Stand-In: F1`, so a call never keeps that clip of a canned line."""
-    with FakeVoiceService() as service:
-        client = VoiceClient(service.url, voice="eve", speed=1.05, language="de", language_voice="jane")
-        service.stand_in = "F1"
-        assert (await client.speak("Einen Moment.")).stand_in == "F1"
+        client.set_voice("michael")  # /voice sets the English voice only
+        assert client.voice_for("de") == "jane" and client.voice_for("en") == "michael"

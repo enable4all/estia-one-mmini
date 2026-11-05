@@ -715,6 +715,48 @@ def test_the_plan_through_the_window_keeps_what_terminal_keeps(tmp_path: Path, m
     assert steps[10:12] == [(10, 13), (11, 14)] and steps[-1] == (14, 14)  # the home area with places picked
 
 
+def test_setup_window_route2_meanwhile_on_screen(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """W14: route 2's "Meanwhile, on the spare or borrowed Android phone" was said the moment the route was picked,
+    as a log line no question screen draws, and the model step then said "Nothing to answer meanwhile." It comes
+    after the plan's last screen, where the window shows its log, before Step 1; the model step leaves that
+    sentence out."""
+
+    def pull(self: Wizard, tag: str, *, size: int = 0) -> str:
+        raise Stopped  # the model step has said its lines: stop before any download
+
+    monkeypatch.setattr(Wizard, "ollama", lambda self: None)
+    monkeypatch.setattr(Wizard, "pull", pull)
+    folder = a_window(
+        tmp_path,
+        monkeypatch,
+        {"answer": "Juno"},
+        {"answer": "male"},
+        {"answer": True},  # Signal on the phone
+        {"answer": "no_number"},  # route 2, no Account ID kept from before
+        {"answer": "nl"},
+        {"answer": "playful"},
+        {"answer": "no"},
+        {"answer": ["web", "maps"]},
+        {"answer": {}},
+        {"answer": {}},
+        {"answer": False},
+        {"answer": False},
+    )
+    monkeypatch.setattr("builtins.input", refuse)  # nothing asked in Terminal
+    with pytest.raises(Stopped):
+        main(["--config", str(tmp_path / "window" / "config.toml")])
+    messages = received(folder)
+    shown = [at for at, m in enumerate(messages) if m["t"] == "screen"]
+    assert messages[shown[-1]]["id"] == "security"  # the plan's last screen
+    log = [(at, str(m["line"])) for at, m in enumerate(messages) if m["t"] == "progress"]
+    heads_up = plain_text(prompts.SETUP_ROUTE_NO_NUMBER_NEXT).splitlines()[0]
+    meanwhile = [at for at, line in log if line.startswith(heads_up)]
+    step_1 = next(at for at, line in log if "Step 1 of" in line)
+    assert len(meanwhile) == 1 and shown[-1] < meanwhile[0] < step_1
+    assert not any("Nothing to answer meanwhile" in line for _, line in log)
+    assert any(prompts.SETUP_DOWNLOAD.splitlines()[1].strip() in line for _, line in log)  # the rest is said
+
+
 def test_a_refused_answer_comes_back_with_the_checks_message(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     folder = a_window(tmp_path, monkeypatch, {"answer": "R2-D2!"}, {"answer": "Maya"})
     stop_at_ollama(monkeypatch)
@@ -1356,6 +1398,26 @@ def test_no_answer_at_the_sms_code_comes_back_naming_the_network_in_the_window(
     assert refused == [("sms_code", prompts.SETUP_WINDOW_CODE_NO_ANSWER.format(reason=reason))]
     message = refused[0][1]
     assert isinstance(message, str) and " q " not in f" {message} " and "Check the code" not in message
+
+
+def test_an_expired_sms_code_stops_in_the_window_too(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """sms-code-expired: the window takes Terminal's stop, never "Check the code" on the code's screen again."""
+    from tests.fakes.fake_signal_cli import EXPIRED_CODE
+    from tests.setup_helpers import fake_signal_cli
+
+    folder = a_window(tmp_path, monkeypatch, {"answer": "111111"}, {"answer": "111111"})
+    program, _signal = fake_signal_cli(tmp_path, monkeypatch, FAKE_SIGNAL_VERIFY_ERROR="expired")
+    wizard = Wizard(tmp_path / "c.toml", dry_run=False)
+    wizard.signal_cli = program
+    face = setup_window.face(argparse.Namespace(), Mac(), wizard)
+    assert face is not None
+    wizard.face = face
+    with pytest.raises(SystemExit) as stopped:
+        wizard.verify_number(BOT)
+    assert str(stopped.value) == prompts.SETUP_CODE_EXPIRED.format(reason=EXPIRED_CODE)
+    messages = received(folder)
+    assert [m["id"] for m in messages if m["t"] == "screen"] == ["sms_code"]  # asked once
+    assert not any(m["t"] == "checked" and not m["ok"] for m in messages)
 
 
 @pytest.mark.parametrize(

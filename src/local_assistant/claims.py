@@ -586,9 +586,13 @@ _CLOCK_FIRST = re.compile(
     re.IGNORECASE,
 )
 _QUOTED = re.compile(r'"[^"\n]*"|“[^”\n]*”|«[^»\n]*»')
-# in its sentence, a change that waits for the user's word or a condition ("once you say yes", "if you like"); "after
-# that" and "when the dentist is done" are the day's order, no condition
-_UNTIL_YES = re.compile(r"\b(?:if|unless)\b|\b(?:once|when|after|as soon as|until)\s+(?:you|your|i)\b", re.IGNORECASE)
+# in its sentence, a change that waits for the user's word or a condition of theirs ("once you say yes", "if you like",
+# "if so"); "after that" and "when the dentist is done" are the day's order, no condition, and "unless you object",
+# "even if you say no" or "if nobody is home" wait for no word of the user's: the change is told as set (0.9.9, review
+# of 0.9.8, G03's "if"/"unless" part)
+_UNTIL_YES = re.compile(
+    r"(?<!\beven\s)\b(?:if\s+(?:you|your|i|so)|(?:once|when|after|as soon as|until)\s+(?:you|your|i))\b", re.IGNORECASE
+)
 # a change tied to the yes ("reply yes and the heater will be switched off", "with your yes"; guards-3): no claim only
 # while a change waits for it (release review of 0.9.8, G03: a planted "no need for your confirmation" went out), and
 # only about that change (its fix review, guards-G03-any-waiting-device: a lamp line went out while the heater waited)
@@ -596,12 +600,35 @@ _TIED_TO_YES = re.compile(
     r"\b(?:reply|say|answer|text)\s+(?:with\s+)?[\"“']?(?:yes|ok|okay)\b|\byour\s+(?:yes|ok|okay|go-ahead|confirmation)\b",
     re.IGNORECASE,
 )
-# a negation in the yes's clause: "no need for your confirmation", "without your go-ahead", "you don't need to say yes"
-# tie nothing to the yes (its fix review, redteam-05), and nor do "your confirmation is not needed" or "regardless of
-# your confirmation" (its second fix review, guard-04); "yes or no" is no negation
-_NOT_TIED = re.compile(r"\b(?:no|not|never|without|nor|regardless|irrespective)\b|n['’]t\b", re.IGNORECASE)
+# a negation or a dismissal anywhere in the yes's sentence: "no need for your confirmation", "without your go-ahead",
+# "you don't need to say yes" tie nothing to the yes (its fix review, redteam-05), and nor do "your confirmation is not
+# needed" or "regardless of your confirmation" (its second fix review, guard-04), "your confirmation is optional",
+# "either way" or "whether you say yes or no" (0.9.9, guard-fixrev3-claims-01), past a comma or a parenthesis, or
+# beside a second yes phrase ("No need for your confirmation, but reply yes anyway"; 0.9.9,
+# redteam-claims-negation-scope-and-second-yes-phrase); "yes or no" is no negation
+_NOT_TIED = re.compile(
+    r"\b(?:no|not|never|without|nor|regardless|irrespective|optional|unnecessary|needless|anyway|anyhow|whether)\b"
+    r"|\beither\s+way\b|\bin\s+any\s+case\b|n['’]t\b",
+    re.IGNORECASE,
+)
 _YES_OR_NO = re.compile(r"\bor\s+no\b", re.IGNORECASE)
-_CLAUSE_BREAK = re.compile(r"[,;:—–()]")
+# a time beside the yes, read only by `_tied_to_yes` (0.9.9, guard-fixrev3-claims-01): a clock time or "at eleven"
+# (_EN_TIME), a time in words after at, by, before, after, past, until, from or around ("before midnight"), a while
+# ("in ten minutes", "in half an hour"; never the yes's own "within 5 minutes" or "in the next 5 minutes"), "later", a
+# part of the day ("in the morning", "overnight") or a weekday
+_YES_TIME = re.compile(
+    rf"{_EN_TIME}|\b(?:at|by|before|after|past|until|till|from|around)\s+{_EN_HOURS}\b"
+    r"|\bin\s+(?!the\s+next\b)(?:[\w-]+\s+){1,3}(?:minutes?|mins?|hours?|seconds?|secs?)\b|\bhalf\s+an\s+hour\b"
+    r"|\blater\b|\b(?:in|during)\s+the\s+(?:morning|afternoon|evening|night)\b|\b(?:at\s+night|overnight)\b"
+    r"|\b(?:mon|tues|wednes|thurs|fri|satur|sun)days?\b|\bweekends?\b",
+    re.IGNORECASE,
+)
+# what is left of a clause that is only a time ("At 23:00", "Tonight", "at 23:00 sharp") once its time is out
+_ONLY_A_TIME = re.compile(
+    r"^(?:\W|\b(?:and|then|so|or|on|onwards|sharp|exactly|precisely|about|approximately|roughly|at|the|latest"
+    r"|earliest)\b)*$",
+    re.IGNORECASE,
+)
 
 
 def _timed(sentence: str) -> bool:
@@ -612,18 +639,27 @@ def _timed(sentence: str) -> bool:
     )
 
 
-def _tied_to_yes(sentence: str) -> bool:
-    """Whether a sentence ties a change to the user's yes (_TIED_TO_YES) with no negation in the yes's clause, before or
-    after its words (_NOT_TIED), and no time of day (_timed): a change that waits for the yes runs at the yes, never at
-    a clock time ("Say yes and the lamp will be turned off at 16:30"; second fix review of 0.9.8, guard-04)."""
-    if _timed(sentence):
+def _timed_change(clause: str) -> bool:
+    """Whether a clause gives the change a time (_AT_A_TIME, _YES_TIME, or a clock time at its start, _CLOCK_FIRST): it
+    holds the change (_SCHEDULED, _NOW_CHANGE) or is only a time ("At 23:00", "Tonight"); "It's cold tonight" is
+    neither."""
+    if not (_AT_A_TIME.search(clause) or _YES_TIME.search(clause) or _CLOCK_FIRST.match(clause)):
         return False
-    for found in _TIED_TO_YES.finditer(sentence):
-        before = _CLAUSE_BREAK.split(sentence[: found.start()])[-1]
-        after = _YES_OR_NO.sub(" ", _CLAUSE_BREAK.split(sentence[found.end() :])[0])
-        if not _NOT_TIED.search(before) and not _NOT_TIED.search(after):
-            return True
-    return False
+    rest = _YES_TIME.sub(" ", _AT_A_TIME.sub(" ", clause))
+    return bool(_SCHEDULED.search(clause) or _NOW_CHANGE.search(clause) or _ONLY_A_TIME.match(rest))
+
+
+def _tied_to_yes(sentence: str) -> bool:
+    """Whether a sentence ties a change to the user's yes (_TIED_TO_YES) with no negation or dismissal anywhere in it,
+    "yes or no" aside (_NOT_TIED), and no clause that gives the change a time (`_timed_change`): a change that waits for
+    the yes runs at the yes, never at a clock time ("Say yes and the lamp will be turned off at 16:30"; second fix
+    review of 0.9.8, guard-04); a time in words counts ("in ten minutes", "before midnight", "on Friday"), and a time in
+    another clause does not ("It's cold tonight, so reply yes and …"; 0.9.9, guard-fixrev3-claims-01 and -02). The
+    cost: a true tied line with a "no" or a "not" elsewhere ("…, no other device changes") gets code's note in its
+    place."""
+    if any(_timed_change(clause) for clause, _ in clauses(sentence, fine=True)):
+        return False
+    return _TIED_TO_YES.search(sentence) is not None and _NOT_TIED.search(_YES_OR_NO.sub(" ", sentence)) is None
 
 
 _NONE_SET = re.compile(r"\b(?:nothing|none|no one)\b", re.IGNORECASE)
@@ -633,11 +669,11 @@ def scheduled_switch_clauses(text: str, *, waiting: Callable[[str], bool] | None
     """The text's clauses that tell a light or plug change as set for later (English first, `_SCHEDULED`, or told now
     with a time of day in its sentence, `_NOW_CHANGE`): read as the phone shows it (`shown`), quotes left out (a title
     quoted as a title); no question, no negation, "no", "nothing", "cannot" or "unable" before the claim's end (in an
-    automation's or a timer's whole clause), and no "if", "unless", or "once", "when", "after" or "until" before
-    "you", "your" or "I" in its sentence (an offer, or a change that waits for the user's yes); while a change waits for
-    the yes (`waiting`: whether a sentence is about that change), none of that change's tied to the yes either ("reply
-    yes", "your confirmation"; never "no need for your confirmation", "your confirmation is not needed" or one with a
-    time of day: `_tied_to_yes`)."""
+    automation's or a timer's whole clause), and no "if", "once", "when", "after" or "until" before "you", "your" or
+    "I" (or "if so") in its sentence (an offer, or a change that waits for the user's yes; never "unless you object" or
+    "even if you say no": `_UNTIL_YES`); while a change waits for the yes (`waiting`: whether a sentence is about that
+    change), none of that change's tied to the yes either ("reply yes", "your confirmation"; never "no need for your
+    confirmation", "your confirmation is not needed" or one that gives the change a time: `_tied_to_yes`)."""
     found_in: list[str] = []
     for line in _QUOTED.sub('""', shown(text)).splitlines():
         for sentence in sentences(line):

@@ -148,6 +148,16 @@ def no_answer(code: int | None, why: str) -> bool:
     return code is None or (code == NETWORK_ERROR and _NETWORK_WORDS.search(why) is not None)
 
 
+_EXPIRED = re.compile(r"\bexpired\b", re.IGNORECASE)
+
+
+def code_expired(code: int | None, why: str) -> bool:
+    """Signal takes this SMS code no more (sms-code-expired): signal-cli 0.14.9's -3, "Verify error: Verification
+    code expired, please request a new one by registering again." (its MustRequestNewCodeException). Typed again, it
+    fails the same way, each try one more verify: only a new registration sends a new code."""
+    return code == NETWORK_ERROR and _EXPIRED.search(why) is not None
+
+
 _UTC_TIME = re.compile(
     r"\b(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2})(?::\d{2})?(?:\.\d+)?Z\b"
 )  # signal-cli's "2026-10-25T09:40Z"
@@ -783,7 +793,8 @@ class SignalSteps(WizardBase):
         of the number's past only when Signal says it has one, then asked again until Signal takes it (the code kept).
         A code Signal refuses is asked again, the reason on its screen (no answer from Signal, a -3 naming the network:
         the Wi-Fi, never the code); Signal's limit stops, as a registration's does, its time in local time (review S05: each try was one
-        more verify); q stops. Neither is ever shown or kept."""
+        more verify), and so does a code Signal says expired, with the stop's register-again lines (sms-code-expired);
+        q stops. Neither is ever shown or kept."""
         refused = ""  # why the code before was refused: said on the code's screen
         while True:
             code = self.answer("sms_code", refused=refused, number=number)
@@ -805,6 +816,8 @@ class SignalSteps(WizardBase):
                 raise SystemExit(register_failed(why, status))
             if no_answer(status, why):
                 refused = self._said(prompts.SETUP_CODE_NO_ANSWER, prompts.SETUP_WINDOW_CODE_NO_ANSWER, why)
+            elif code_expired(status, why):  # never "Check the code": every retype fails the same way, in either face
+                raise SystemExit(prompts.SETUP_CODE_EXPIRED.format(reason=why.strip()[:300]))
             else:
                 refused = self._said(prompts.SETUP_CODE_FAILED, prompts.SETUP_WINDOW_CODE_FAILED, why)
 

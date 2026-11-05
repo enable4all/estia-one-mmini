@@ -13,7 +13,7 @@ __all__ = [
     "REMINDER_HONEST", "REMINDER_LATE", "REMINDER_LATE_CALL", "REMINDER_LATE_LINE", "REMINDER_LATE_MAYBE",
     "REMINDER_LATE_MORE", "REMINDER_LATE_UNTIL", "REMINDER_LATE_WAKE", "REMINDER_NOTE", "REMINDER_NOTE_LATE",
     "REMINDER_NOT_CANCELLED",
-    "REMINDER_NOT_SET", "REMINDER_NOT_SET_ONE", "REMINDER_NOT_SET_ONE_SPOKEN", "REMINDER_NOT_SET_WHAT",
+    "REMINDER_NOT_SET", "REMINDER_NOT_SET_ONE", "REMINDER_NOT_SET_ONE_SPOKEN", "REMINDER_NOT_SET_WHAT", "REMINDER_NO_VOICE",
     "REMINDER_ONLY_ONCE", "REMINDER_ONLY_TEXT", "REMINDER_ONLY_TEXT_ONCE",
     "REMINDER_OUTCOMES", "REMINDER_OWN_WORDS", "REMINDER_PHOTO", "REMINDER_REASONS", "REMINDER_REASONS_SPOKEN",
     "REMINDER_REFUSED",
@@ -34,6 +34,9 @@ REMINDER_CONTRACT = "Only this note means a reminder is set."
 REMINDER_SET_WAKE = " · wake-up call"
 REMINDER_SET_CALL = " · call"
 REMINDER_CALLS_OFF = " · calls are off: a text only"
+# a call reminder set while a language her voice does not speak is in use ({language}: its English name): no call is
+# placed (`can_place`: no_voice), said inside the note (the review of 4 Nov)
+REMINDER_NO_VOICE = " · no call while {language} is in use: I have no voice in it"
 REMINDER_REPEAT_WHEN = "{repeat} at {time} (first: {day})"  # a repeating reminder's {when} in REMINDER_SET
 REMINDER_SHIFTED = " ({meant} does not exist that day, the clocks go forward: {real} instead)"
 REMINDER_HONEST = (  # with the first call reminder ({name}: hers)
@@ -105,6 +108,7 @@ NO_CALL_WHY = {
     "in_call": "we were already on a call",
     "locked": "I was locked (/lock)",
     "late": "it is more than 5 minutes late",
+    "no_voice": "I have no voice in {language}",  # Korean, Polish, Russian, Japanese (owner, 3 Nov 2026), named
     "not_ready": "the voice service is not ready",
     "downloading": "her voice in the language in use is still downloading",  # jane's model of it (voice_download)
     "day_cap": "that was the limit of {limit} call{s} a day",

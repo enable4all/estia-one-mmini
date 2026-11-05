@@ -234,7 +234,7 @@ import WhisperKit
     private func chunk() -> Data { Data(count: 8192) }
 
     @Test func theDetectorRunsOnTheCPUOnly() {
-        // never on the Neural Engine, where a chunk would wait behind Whisper, Kokoro or Supertonic: both the CoreML
+        // never on the Neural Engine, where a chunk would wait behind Whisper: both the CoreML
         // model's configuration and FluidAudio's VadConfig say so
         #expect(speechModelConfiguration().computeUnits == .cpuOnly)
         #expect(speechVadConfig().computeUnits == .cpuOnly)
@@ -342,32 +342,59 @@ import WhisperKit
 }
 
 /// NeMo's text normalisation stays out (owner, 16 Oct: dropped as too big for what it reads well): English numbers and
-/// times reach Kokoro as VoiceCore's words. A FluidAudio upgrade that linked it again (a new default, a SwiftPM that
-/// ignores `traits: []`) would put its readings over them ("thirteen o'clock") and add its 9 MB.
+/// times reach her voice as VoiceCore's words. FluidAudio stays linked for the speech detector (Silero VAD); an upgrade
+/// that linked NeMo again (a new default, a SwiftPM that ignores `traits: []`) would add its 9 MB.
 @Suite struct EnglishNumbers {
     @Test func nemoTextNormalisationIsNotLinked() {
         #expect(!NemoTextNormalizer.isAvailable)
     }
 
-    @Test func kokoroGetsTheTimeInWords() throws {
+    @Test func herVoiceGetsTheTimeInWords() throws {
         let request = try SpeechRequest(json: Data(#"{"input": "Lunch at 13:00, the call at 7:30 PM."}"#.utf8))
-        #expect(request.engine == .kokoro)
+        #expect(request.voice == "heart")
         #expect(request.spokenInput == "Lunch at one in the afternoon, the call at seven thirty in the evening.")
     }
 }
 
-/// Kokoro gets VoiceCore's lexicon (capitals said as their letters) before its first sentence.
-@Suite struct EnglishLexiconWiring {
-    actor FakeKokoro: EnglishLexiconTaking {
-        var entries: [String: String]?
-        func setEnglishCustomLexicon(_ entries: [String: String]) { self.entries = entries }
+/// Owner, 3 Nov 2026 ("remove kokoro and supertonic"; for a line Pocket fails: "Nothing"): Pocket TTS is her only
+/// voice. A line it cannot say (here: her English model not loaded yet) is refused, 409 `not_said`, whatever the
+/// request asks (an older bridge's `"kokoro"` and `speed` taken and never read), never another voice's audio; a line in
+/// Korean, Polish, Japanese or Russian is refused, 409 `no_voice`; `tts` in `/health` is her English Pocket model's
+/// state. Nothing here loads, fetches or runs a model.
+@Suite struct PocketOnly {
+    private func engines() -> Engines {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent("voice-pocket-only-\(UUID().uuidString)")
+        return Engines(models: folder, temp: folder, programs: folder, pocket: PocketVoices(english: .english18M))
     }
 
-    @Test func kokoroGetsVoiceCoresLexicon() async {
-        let kokoro = FakeKokoro()
-        await prepareEnglish(kokoro)
-        #expect(await kokoro.entries == EnglishLexicon.entries)
-        #expect(await kokoro.entries?["ID"] == "ˈI dˈi")
+    @Test func aLinePocketCannotSayIsRefusedWhateverTheRequestAsks() async {
+        let engines = engines()
+        for extra in ["", #", "kokoro": true"#, #", "kokoro": false"#, #", "speed": 1.2, "call": true"#] {
+            for voice in ["heart", "vera", "af_heart", "michael"] {
+                let body = Data(#"{"input": "Hi there.", "voice": "\#(voice)"\#(extra)}"#.utf8)
+                let answer = String(decoding: await Server.speak(body, engines), as: UTF8.self)
+                #expect(answer.hasPrefix("HTTP/1.1 409 Conflict\r\n") && answer.hasSuffix(#"{"error":"not_said"}"#), "\(voice)\(extra)")
+                #expect(!answer.contains("X-Voice-Stand-In") && !answer.contains("audio/wav"), "\(voice)\(extra)")
+            }
+        }
+    }
+
+    @Test func aLanguageWithNoVoiceIsRefused() async {
+        let engines = engines()
+        for code in ["ko", "pl", "ja", "ru"] {
+            for extra in ["", #", "kokoro": true"#] {
+                let body = Data(#"{"input": "Hallo.", "voice": "jane", "language": "\#(code)"\#(extra)}"#.utf8)
+                let answer = String(decoding: await Server.speak(body, engines), as: UTF8.self)
+                #expect(answer.hasPrefix("HTTP/1.1 409 Conflict\r\n") && answer.hasSuffix(#"{"error":"no_voice"}"#), "\(code)")
+            }
+        }
+    }
+
+    @Test func speakingIsHerEnglishPocketModelsState() async {
+        let health = String(decoding: await engines().health(), as: UTF8.self)
+        #expect(health.contains(#""tts":"loading""#) && health.contains(#""pocket":"loading""#))
+        #expect(health.contains(#""pocket_de":"idle""#))
+        #expect(!health.contains("voices_left_out"))  // only a ready model with a shipped voice left out lists one
     }
 }
 

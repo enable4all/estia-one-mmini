@@ -1,6 +1,6 @@
 import Foundation
 
-/// English text as Kokoro is to read it (Kokoro only: the other ten languages keep their digits). One list of passes
+/// English text as her voice is to read it (then Pocket's letters and guard: `PocketText`). One list of passes
 /// in one run order, the 0.9.2 plan's; a pass that runs early owns its text (times take their colon before any number
 /// is read, a chord its digits). Every pattern is compiled once: 14 passes, about 55 patterns, run on every sentence
 /// of a call.
@@ -42,7 +42,7 @@ public enum SpokenEnglish {
     /// The passes' names in their run order.
     public static var order: [String] { passes.map(\.name) }
 
-    /// `text` as Kokoro is to read it; `before`: what she said just before it (on a call, her answer's sentences
+    /// `text` as her voice is to read it; `before`: what she said just before it (on a call, her answer's sentences
     /// before this one), read only for the times' part of the day.
     public static func spoken(_ text: String, before: String = "") -> String {
         passes.reduce(text) { text, pass in pass.run(text, before) }

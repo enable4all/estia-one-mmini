@@ -106,17 +106,12 @@
 <g transform="translate(841 560) scale(0.7500)" fill="none" stroke="#4A4B44" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M5 8h13l-3-3M19 16H6l3 3"/></g>
 <text class="esl-n" x="872" y="560">Turn detector</text>
 <text class="esl-s" x="872" y="578">Smart Turn v3.2, on calls</text>
-<rect x="826" y="649" width="256" height="196" rx="10" fill="#FFFFFF" stroke="#B0AFA2" stroke-width="1.2"/>
+<rect x="826" y="649" width="256" height="64" rx="10" fill="#FFFFFF" stroke="#B0AFA2" stroke-width="1.2"/>
 <rect x="836" y="667" width="28" height="28" rx="6.72" fill="#ECEBE1" stroke="#CFCEC3" stroke-width="1"/>
 <g transform="translate(841 672) scale(0.7500)" fill="none" stroke="#4A4B44" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M4 9.5h3.5L12 5.5v13l-4.5-4H4z"/><path d="M15.5 9a4 4 0 0 1 0 6M18 6.5a8 8 0 0 1 0 11"/></g>
 <text class="esl-n" x="872" y="672">Pocket TTS</text>
 <text class="esl-s" x="872" y="690">Heart by default; the others</text>
 <text class="esl-s" x="872" y="706">by name, on the processor</text>
-<line x1="872" y1="717" x2="1072" y2="717" stroke="#B0AFA2" stroke-width="1" stroke-linecap="butt"/>
-<text class="esl-s" x="872" y="757.5">Jane in six more languages</text>
-<line x1="872" y1="789" x2="1072" y2="789" stroke="#B0AFA2" stroke-width="1" stroke-linecap="butt"/>
-<text class="esl-s" x="872" y="815.5">Korean, Polish, Russian and</text>
-<text class="esl-s" x="872" y="831.5">Japanese: no voice, text only</text>
 <text class="esl-gh" x="1098" y="331" fill="#45463F">HELPERS</text>
 <line x1="1098" y1="340" x2="1354" y2="340" stroke="#8D9298" stroke-width="1" stroke-linecap="butt"/>
 <text class="esl-gh" x="1098" y="635" fill="#45463F">MEMORY AND FILES</text>
